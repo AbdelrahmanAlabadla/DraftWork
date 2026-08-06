@@ -5,10 +5,15 @@ from pathlib import Path
 from typing import Any
 
 from app.logging_conf import get_logger, set_request_id
-from app.offline.chunker import build_hierarchical_chunks
+from app.offline.chunk_report import save_chunk_report
 from app.offline.cleaner import clean_pages
 from app.offline.embeddings import embed_texts
 from app.offline.parser import LlamaParser
+from app.offline.semantic_chunker import (
+    build_semantic_structure,
+    verify_chunk_invariants,
+)
+from app.offline.structure_store import save_structure
 from app.offline.vector_store import VectorStore
 
 logger = get_logger("PIPELINE")
@@ -43,16 +48,43 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
         if not pages:
             raise PipelineError("Cleaning removed all content")
 
-        # --- Stage 3: Hierarchical chunking ------------------------------------
+        # --- Stage 3: Semantic structure generation (parents + children) ----
         t0 = time.perf_counter()
-        chunks = build_hierarchical_chunks(pages, document_id)
+        chunks = build_semantic_structure(pages, document_id)
         timings["chunking"] = time.perf_counter() - t0
         parents = chunks["parents"]
         children = chunks["children"]
         if not children:
             raise PipelineError("Chunking produced no children")
 
-        # --- Stage 4: Embeddings ------------------------------------------------
+        logger.info(
+            "CHUNK SUMMARY | document_id=%s | parent_chunks=%d | child_chunks=%d",
+            document_id,
+            len(parents),
+            len(children),
+        )
+
+        # --- Stage 3a: Overlap invariant spot-check ---------------------------
+        t0 = time.perf_counter()
+        warnings = verify_chunk_invariants(chunks)
+        timings["overlap_check"] = time.perf_counter() - t0
+        if warnings:
+            logger.warning(
+                "Chunk invariants violated | document_id=%s | warnings=%d",
+                document_id,
+                len(warnings),
+            )
+            for warning in warnings:
+                logger.warning("  - %s", warning)
+        else:
+            logger.info("Chunk invariants OK | document_id=%s", document_id)
+
+        # --- Stage 3b: Chunking evaluation report (before Qdrant) ------------
+        t0 = time.perf_counter()
+        chunk_report_path = save_chunk_report(document_id, chunks)
+        timings["chunk_report"] = time.perf_counter() - t0
+
+        # --- Stage 4: Embed children only (retrieval units) ------------------
         t0 = time.perf_counter()
         child_texts = [c["content"] for c in children]
         embeddings = embed_texts(child_texts)
@@ -62,13 +94,18 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
                 f"Embedding count mismatch: {len(embeddings)} vs {len(children)}"
             )
 
-        # --- Stage 5: Store in Qdrant -------------------------------------------
+        # --- Stage 5: Store children in Qdrant -------------------------------
         t0 = time.perf_counter()
         store = VectorStore()
         store.ensure_collection()
         store.delete_document(document_id)
         vectors_uploaded = store.upsert(children, embeddings)
         timings["qdrant_upload"] = time.perf_counter() - t0
+
+        # --- Stage 6: Persist parent structure (sections) to JSON ------------
+        t0 = time.perf_counter()
+        structures_path = save_structure(document_id, chunks)
+        timings["structure_save"] = time.perf_counter() - t0
 
     except Exception as exc:
         total = time.perf_counter() - t_pipeline
@@ -92,6 +129,8 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
         "total_parents": len(parents),
         "total_children": len(children),
         "vectors_stored": vectors_uploaded,
+        "structure_file": str(structures_path),
+        "chunk_report_file": str(chunk_report_path),
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "total_time": round(total, 3),
     }
@@ -102,8 +141,11 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
     logger.info("Parsing ........... %.3f sec", timings.get("parsing", 0))
     logger.info("Cleaning .......... %.3f sec", timings.get("cleaning", 0))
     logger.info("Chunking .......... %.3f sec", timings.get("chunking", 0))
+    logger.info("Overlap Check ..... %.3f sec", timings.get("overlap_check", 0))
+    logger.info("Chunk Report ...... %.3f sec", timings.get("chunk_report", 0))
     logger.info("Embeddings ........ %.3f sec", timings.get("embeddings", 0))
     logger.info("Qdrant Upload ..... %.3f sec", timings.get("qdrant_upload", 0))
+    logger.info("Structure Save .... %.3f sec", timings.get("structure_save", 0))
     logger.info("Total Pipeline .... %.3f sec", total)
     logger.info(
         "pages=%d | parents=%d | children=%d | vectors_stored=%d | status=SUCCESS",

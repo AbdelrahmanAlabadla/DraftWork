@@ -13,6 +13,7 @@ from app.api import storage as registry
 from app.config import UPLOAD_DIR
 from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
+from app.offline.structure_store import load_structure
 from app.online.exam_builder import assemble_exam, generate_exam
 
 logger = get_logger("API")
@@ -42,6 +43,8 @@ class GenerateRequest(BaseModel):
     # --- V1 single-type payload -------------------------------------------
     question_type: Optional[str] = None
     number_of_questions: Optional[int] = Field(default=None, ge=1, le=100)
+    # --- Selected subsections (exam content scope) -------------------------
+    child_ids: Optional[list[str]] = None
 
 
 @router.get("/health")
@@ -130,6 +133,7 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
         "document_id": document_id,
         "message": f"File '{filename}' indexed successfully.",
         "stats": summary,
+        "structure": load_structure(document_id),
     }
 
 
@@ -143,6 +147,12 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         )
     if not registry.get_document(document_id):
         raise HTTPException(status_code=404, detail=f"Unknown document_id: {document_id}")
+
+    if body.child_ids is not None and not body.child_ids:
+        raise HTTPException(
+            status_code=400,
+            detail="Please select at least one subsection to include in the exam.",
+        )
 
     set_request_id(document_id)
 
@@ -171,7 +181,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         )
 
     t_total = time.perf_counter()
-    result = generate_exam(document_id, tasks)
+    result = generate_exam(document_id, tasks, body.child_ids)
     all_questions = result["questions"]
     warnings = result["warnings"]
 

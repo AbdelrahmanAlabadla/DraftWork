@@ -10,6 +10,7 @@ class ExamState(TypedDict):
     document_id: str
     question_type: str          # "mcq" | "true_false" | "short_answer"
     number_of_questions: int
+    selected_child_ids: Optional[list[str]]   # subsection scope for retrieval
     # --- Retrieval ------------------------------------------------------
     retrieved_chunks: list[dict[str, Any]]
     context: str

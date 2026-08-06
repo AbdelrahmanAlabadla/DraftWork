@@ -30,7 +30,7 @@ def _install_fakes(monkeypatch, document_id: str = "doc-x") -> None:
 
     # Vector store fake.
     class FakeStore:
-        def hybrid_search(self, dense, sparse, document_id, top_k=6):
+        def hybrid_search(self, dense, sparse, document_id, top_k=6, selected_child_ids=None):
             return [
                 {
                     "child_id": f"c{i}",
@@ -204,7 +204,7 @@ def test_generate_repairs_malformed_json(monkeypatch):
     )
 
     class FakeStore:
-        def hybrid_search(self, dense, sparse, document_id, top_k=6):
+        def hybrid_search(self, dense, sparse, document_id, top_k=6, selected_child_ids=None):
             return [
                 {
                     "child_id": f"c{i}", "parent_id": "p1", "page": 1,
@@ -220,3 +220,46 @@ def test_generate_repairs_malformed_json(monkeypatch):
     assert resp.status_code == 200
     data = resp.json()
     assert data["questions"]["mcq"][0]["question"].startswith("Repaired question?")
+
+
+def test_generate_empty_selection_returns_400(monkeypatch):
+    _install_fakes(monkeypatch)
+    resp = client.post(
+        "/generate", json={"document_id": "doc-x", "mcq_count": 1, "child_ids": []}
+    )
+    assert resp.status_code == 400
+    assert "select at least one subsection" in resp.json()["detail"]
+
+
+def test_generate_passes_child_ids_to_retrieval(monkeypatch):
+    _install_fakes(monkeypatch)
+
+    captured = {}
+
+    class CapturingStore:
+        def hybrid_search(self, dense, sparse, document_id, top_k=6, selected_child_ids=None):
+            captured["child_ids"] = selected_child_ids
+            return [
+                {
+                    "child_id": cid,
+                    "parent_id": "p1",
+                    "page": 1,
+                    "heading": "Heading",
+                    "content": f"Selected context for {cid}.",
+                    "score": 1.0,
+                }
+                for cid in selected_child_ids
+            ]
+
+    monkeypatch.setattr("app.online.retrieval.VectorStore", CapturingStore)
+
+    resp = client.post(
+        "/generate",
+        json={
+            "document_id": "doc-x",
+            "mcq_count": 1,
+            "child_ids": ["c1", "c2", "c3"],
+        },
+    )
+    assert resp.status_code == 200
+    assert captured["child_ids"] == ["c1", "c2", "c3"]

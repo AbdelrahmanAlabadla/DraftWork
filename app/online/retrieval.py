@@ -40,8 +40,13 @@ def retrieve_context(state: ExamState) -> dict:
     dense = embeddings[0]["dense"]
     sparse = embeddings[0]["sparse"]
 
+    selected_child_ids = state.get("selected_child_ids") or None
     chunks = VectorStore().hybrid_search(
-        dense=dense, sparse=sparse, document_id=document_id, top_k=top_k
+        dense=dense,
+        sparse=sparse,
+        document_id=document_id,
+        top_k=top_k,
+        selected_child_ids=selected_child_ids,
     )
     if not chunks:
         logger.warning(

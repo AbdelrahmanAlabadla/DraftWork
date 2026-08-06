@@ -27,7 +27,11 @@ def _is_duplicate(qtype: str, question: dict[str, Any], seen: set[tuple[str, str
 
 
 def _generate_type(
-    document_id: str, qtype: str, count: int, seen: set[tuple[str, str]]
+    document_id: str,
+    qtype: str,
+    count: int,
+    seen: set[tuple[str, str]],
+    selected_child_ids: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Generate up to `count` valid questions for one type, retrying as needed."""
     graph = get_exam_graph()
@@ -46,6 +50,7 @@ def _generate_type(
                 "document_id": document_id,
                 "question_type": qtype,
                 "number_of_questions": remaining,
+                "selected_child_ids": selected_child_ids,
             }
         )
         if state.get("error"):
@@ -103,11 +108,15 @@ def _generate_type(
 
 
 def generate_exam(
-    document_id: str, tasks: list[tuple[str, int]]
+    document_id: str,
+    tasks: list[tuple[str, int]],
+    selected_child_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Generate all requested question types with validation/retries.
 
-    Returns {"questions": {qtype: [...]}, "warnings": [...]}.
+    ``selected_child_ids`` scopes retrieval to the chosen subsections; when
+    empty/None the whole document is used. Returns
+    {"questions": {qtype: [...]}, "warnings": [...]}.
     """
     t0 = time.perf_counter()
     questions: dict[str, list[dict[str, Any]]] = {}
@@ -115,7 +124,9 @@ def generate_exam(
     seen: set[tuple[str, str]] = set()
 
     for qtype, count in tasks:
-        questions[qtype], type_warnings = _generate_type(document_id, qtype, count, seen)
+        questions[qtype], type_warnings = _generate_type(
+            document_id, qtype, count, seen, selected_child_ids
+        )
         warnings.extend(type_warnings)
 
     elapsed = time.perf_counter() - t0

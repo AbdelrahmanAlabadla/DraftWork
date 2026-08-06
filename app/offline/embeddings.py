@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Any
@@ -20,6 +21,25 @@ _model_lock = threading.Lock()
 
 def device_name() -> str:
     return _DEVICE
+
+
+def dense_vector(texts: list[str], max_length: int = 512) -> list[list[float]]:
+    """Return only the dense embedding vectors for the given texts."""
+    if not texts:
+        return []
+    return [v["dense"] for v in embed_texts(texts, batch_size=len(texts), max_length=max_length)]
+
+
+def cosine_sim(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two dense vectors (range roughly -1..1)."""
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / (na * nb)
 
 
 def get_model() -> Any:
@@ -49,7 +69,7 @@ def get_model() -> Any:
 
 
 def embed_texts(
-    texts: list[str], batch_size: int = 16
+    texts: list[str], batch_size: int = 16, max_length: int = 8192
 ) -> list[dict[str, Any]]:
     """Embed a list of texts -> [{"dense": [...], "sparse": {token_id: weight}}]."""
     if not texts:
@@ -58,15 +78,16 @@ def embed_texts(
     model = get_model()
     t0 = time.perf_counter()
     logger.info(
-        "Embedding generation started | texts=%d | batch_size=%d",
+        "Embedding generation started | texts=%d | batch_size=%d | max_length=%d",
         len(texts),
         batch_size,
+        max_length,
     )
 
     out = model.encode(
         texts,
         batch_size=batch_size,
-        max_length=8192,
+        max_length=max_length,
         return_dense=True,
         return_sparse=True,
         return_colbert_vecs=False,

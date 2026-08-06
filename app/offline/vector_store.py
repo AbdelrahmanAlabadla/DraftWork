@@ -115,15 +115,21 @@ class VectorStore:
         sparse: dict[int, float],
         document_id: str,
         top_k: int = 6,
+        selected_child_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         t0 = time.perf_counter()
-        filter_ = qm.Filter(
-            must=[
+        must = [
+            qm.FieldCondition(
+                key="document_id", match=qm.MatchValue(value=document_id)
+            )
+        ]
+        if selected_child_ids:
+            must.append(
                 qm.FieldCondition(
-                    key="document_id", match=qm.MatchValue(value=document_id)
+                    key="child_id", match=qm.MatchAny(any=selected_child_ids)
                 )
-            ]
-        )
+            )
+        filter_ = qm.Filter(must=must)
         prefetch_k = top_k * 3
         response = self.client.query_points(
             collection_name=self.collection,
