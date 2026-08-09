@@ -58,8 +58,9 @@ def save_chunk_report(document_id: str, chunks: dict[str, Any]) -> Path:
         for i, child in enumerate(psubs, 1):
             cwords = count_words(child.get("content") or "")
             lines.append(thin)
+            label = child.get("title") or "(single subsection - suppressed)"
             lines.append(
-                f"  SUBSECTION {i}/{len(psubs)} {child.get('title') or 'UNTITLED'} "
+                f"  SUBSECTION {i}/{len(psubs)} {label} "
                 f"| id={child.get('child_id')} "
                 f"| pages={child.get('page_start')}-{child.get('page_end')} "
                 f"| words={cwords} | est_tokens={_est_tokens(cwords)}"

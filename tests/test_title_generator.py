@@ -5,6 +5,7 @@ from app.logging_conf import configure_logging
 configure_logging("WARNING")
 
 from app.offline import title_generator as tg  # noqa: E402
+from app.offline.title_nlp import title_appears_in_text  # noqa: E402
 
 
 class _FakeClient:
@@ -214,3 +215,297 @@ def test_prompts_share_style_abstraction_and_self_check():
 def test_fallback_prompt_is_toc_style():
     assert "Table of Contents" in tg._FALLBACK_PROMPT
     assert "{max_words}" in tg._FALLBACK_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Batch title generation (deduplicates sibling headers)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_title_list_extracts_numbered_headers():
+    raw = "1. Linear Regression\n2. Neural Networks\n3) Gradient Descent\n4: Feature Scaling"
+    assert tg._parse_title_list(raw) == [
+        "Linear Regression",
+        "Neural Networks",
+        "Gradient Descent",
+        "Feature Scaling",
+    ]
+
+
+def test_batch_returns_one_distinct_title_per_chunk():
+    client = _FakeClient(
+        lambda p: "1. Linear Regression\n2. Neural Networks\n3. Gradient Descent"
+    )
+    titles = tg.generate_batch_titles(
+        ["a" * 50, "b" * 50, "c" * 50], client, level="subsection"
+    )
+    assert titles == ["Linear Regression", "Neural Networks", "Gradient Descent"]
+    assert len(set(titles)) == len(titles)
+
+
+def test_batch_backfills_missing_or_invalid_header():
+    client = _FakeClient(lambda p: "1. What Is Machine Learning?\n2. Neural Networks")
+    titles = tg.generate_batch_titles(
+        ["Supervised Learning studies labeled data.", "Neural Networks learn."],
+        client,
+        level="subsection",
+    )
+    assert titles[1] == "Neural Networks"
+    assert titles[0]  # question form rejected -> fallback filled
+
+
+def test_batch_dedupes_repeated_titles():
+    client = _FakeClient(lambda p: "1. Neural Networks\n2. Neural Networks")
+    titles = tg.generate_batch_titles(
+        ["Neural Networks learn patterns.", "Support Vector Machines separate data."],
+        client,
+        level="subsection",
+    )
+    assert titles[0] == "Neural Networks"
+    assert titles[1] != "Neural Networks"
+    assert len(set(titles)) == len(titles)
+
+
+def test_batch_keeps_headers_distinct_after_clean():
+    client = _FakeClient(lambda p: "1. Neural Networks\n2. neural networks")
+    titles = tg.generate_batch_titles(
+        ["Neural Networks learn patterns.", "Neural Networks revisit patterns."],
+        client,
+        level="subsection",
+    )
+    assert len(set(titles)) == len(titles)
+
+
+def test_batch_section_level_uses_section_framing():
+    client = _FakeClient(lambda p: "1. Machine Learning Applications\n2. Data Preprocessing")
+    titles = tg.generate_batch_titles(
+        ["Spam filtering and image classification.", "Missing values and outliers."],
+        client,
+        level="section",
+    )
+    assert titles[0] == "Machine Learning Applications"
+    assert len(set(titles)) == len(titles)
+
+
+def test_make_titles_unique_never_doubles_roman_suffix():
+    # Two chunks can both be titled "Machine Learning Overview II" (e.g. the
+    # reviewer rewrote one to match another). The dedup must advance the Roman
+    # numeral, not produce "... II II". Empty contents prevent the noun-phrase
+    # fallback from masking the suffix path.
+    out = tg.make_titles_unique(
+        ["Machine Learning Overview II", "Machine Learning Overview II"],
+        ["", ""],
+        6,
+    )
+    assert out[0] == "Machine Learning Overview II"
+    assert out[1] == "Machine Learning Overview III"
+    assert len(set(out)) == len(out)
+    assert not any(t.endswith("II II") for t in out)
+
+
+def test_make_titles_unique_advances_triple_suffix():
+    out = tg.make_titles_unique(
+        ["Data Mining", "Data Mining", "Data Mining"],
+        ["", "", ""],
+        6,
+    )
+    assert out == ["Data Mining", "Data Mining II", "Data Mining III"]
+
+
+def test_safe_fallback_rejects_single_word_stub():
+    # "option" is a real noun but too thin to be a navigation header; the fallback
+    # must widen it to a phrase instead of emitting a bare stub.
+    label = tg._safe_fallback(
+        "It is also a good option if you have limited computing resources: once an "
+        "online learning system has learned about new data instances, it does not "
+        "need them anymore, so you can discard them",
+        6,
+    )
+    assert len(label.split()) >= 2
+
+
+def test_apply_verdict_keep_retains_valid_title(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    client = _FakeClient(lambda p: "10")
+
+    class _Item:
+        title = "Regularization Methods"
+        content = "Regularization methods shrink the weight vectors."
+
+    final = tg._apply_verdict(client, _Item(), "subsection", 9, "KEEP", "")
+    assert final == "Regularization Methods"
+
+
+def test_apply_verdict_keep_cannot_retain_invalid_single_word(monkeypatch):
+    # A "KEEP" on a one-word stub ("Option") that violates min_words must not be
+    # trusted; it falls through to the rewrite path and returns a valid title.
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    monkeypatch.setattr(
+        tg,
+        "_generate_candidates",
+        lambda client, content, *, level, header="", n=4: ["Good Option"],
+    )
+    client = _FakeClient(lambda p: "10")
+
+    class _Item:
+        title = "Option"
+        content = "Limited computing resources make the option attractive in practice."
+
+    final = tg._apply_verdict(client, _Item(), "subsection", 9, "KEEP", "")
+    assert final not in ("", "Option")
+
+
+def test_apply_verdict_best_of_batch_returns_first_good(monkeypatch):
+    # When the best-of-N candidate rescore clears the good threshold it is used.
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    monkeypatch.setattr(
+        tg,
+        "_generate_candidates",
+        lambda client, content, *, level, header="", n=4: [
+            "Weak Heading",
+            "Strong Heading",
+        ],
+    )
+    scores = iter(["9"])  # verify of the first candidate
+
+    class _Fake:
+        def chat(self, prompt, system_prompt=None, temperature=None, max_tokens=None, timeout=None):
+            return next(scores)
+
+    client = _Fake()
+
+    class _Item:
+        title = "Bad Title"
+        content = "A passage that teaches something about strong headings here."
+
+    final = tg._apply_verdict(client, _Item(), "subsection", 3, "REPLACE", "")
+    assert final == "Weak Heading"
+
+
+def test_apply_verdict_retries_then_falls_back(monkeypatch):
+    # Two failing batches + bad rescore -> deterministic fallback, never the
+    # original bad title.
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    monkeypatch.setattr(
+        tg,
+        "_generate_candidates",
+        lambda client, content, *, level, header="", n=4: [],
+    )
+    client = _FakeClient(lambda p: "2")
+
+    class _Item:
+        title = "Bad Title"
+        content = "Only a short fragment for fallback extraction."
+
+    final = tg._apply_verdict(client, _Item(), "subsection", 1, "REPLACE", "")
+    assert final not in ("", "Bad Title")
+
+
+def test_generate_candidates_rejects_verbatim_lift(monkeypatch):
+    # A candidate that appears verbatim in the passage (a proper-noun example,
+    # not the section topic) must be dropped by the candidate filter.
+    client = _FakeClient(
+        lambda p: "1. Learning About Data\n2. Data and Knowledge Concepts\n3. Information Systems"
+    )
+    content = (
+        "Crown Prince Salman was appointed in 2017. This chapter teaches about "
+        "data, information and knowledge. Understanding these concepts is central "
+        "to the course."
+    )
+    out = tg._generate_candidates(client, content, level="section")
+    assert out
+    assert all("Salman" not in c for c in out)
+    assert all(title_appears_in_text(c, content) is False for c in out)
+
+
+# ---------------------------------------------------------------------------
+# Title review (post-generation pass)
+# ---------------------------------------------------------------------------
+
+
+class _StubItem:
+    """Minimal stand-in for ParentChunk / ChildChunk for review tests."""
+
+    def __init__(self, title, content, parent_id="p1"):
+        self.title = title
+        self.content = content
+        self.parent_id = parent_id
+
+
+def test_parse_review_builds_order_indexed_rows():
+    raw = (
+        "1. score=9 KEEP\n"
+        "2. score=2 REPLACE: Regularization Techniques\n"
+        "3. score=6 REFINE: Cross-Validation\n"
+    )
+    rows = tg._parse_review(raw)
+    assert rows == {
+        1: (9, "KEEP", ""),
+        2: (2, "REPLACE", "Regularization Techniques"),
+        3: (6, "REFINE", "Cross-Validation"),
+    }
+
+
+def test_review_titles_keeps_good_replaces_bad(monkeypatch):
+    # Nouns always "grammatical" in this deterministic context.
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+
+    def responder(prompt):
+        if "Score:" in prompt:
+            return "10"
+        return "1. score=9 KEEP\n2. score=2 REPLACE: Outlier Handling"
+
+    parent = _StubItem("Data Preprocessing", "Missing values must be handled before modeling.")
+    child = _StubItem(
+        "Stepping",
+        "Outlier handling removes values that skew the training signal.",
+    )
+    tg.review_titles([parent], [child], client=_FakeClient(responder))
+    assert parent.title == "Data Preprocessing"
+    assert child.title == "Outlier Handling"
+
+
+def test_review_titles_refines_polished_title(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+
+    def responder(prompt):
+        if "Score:" in prompt:
+            return "9"
+        return "1. score=6 REFINE: Regularization Methods"
+
+    parent = _StubItem("Regularization", "L2 penalty shrinks the weight vector.")
+    tg.review_titles([parent], [], client=_FakeClient(responder))
+    assert parent.title == "Regularization Methods"
+
+
+def test_review_titles_ignores_low_conf_verification(monkeypatch):
+    # Rewrite proposed but a low re-score keeps the better-scoring candidate.
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    calls = {"n": 0}
+
+    def responder(prompt):
+        if "Score:" in prompt:
+            calls["n"] += 1
+            return "1"
+        return "1. score=2 REPLACE: Robust Regression"
+
+    parent = _StubItem("Stepping", "A robust regression resists outliers in the data.")
+    tg.review_titles([parent], [], client=_FakeClient(responder))
+    # Verification failed (score=1) so a fresh generation path is attempted;
+    # with the fake always returning score=1 the rewrite is still applied as
+    # the better of the two candidates.
+    assert parent.title == "Robust Regression"
+    assert calls["n"] >= 1
+
+
+def test_review_titles_disabled_no_llm_call(monkeypatch):
+    monkeypatch.setattr(tg, "TITLE_REVIEW_ENABLED", False)
+    counter = {"n": 0}
+
+    def responder(prompt):  # pragma: no cover - must never be called
+        counter["n"] += 1
+        return ""
+
+    parent = _StubItem("Anything", "Some content here.")
+    tg.review_titles([parent], [], client=_FakeClient(responder))
+    assert counter["n"] == 0

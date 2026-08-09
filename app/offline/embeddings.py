@@ -18,16 +18,28 @@ _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 _model = None
 _model_lock = threading.Lock()
 
+# Cap for paragraph/sentence embedding batches in one call to the embedder.
+_DENSE_BATCH_MAX = 512
+
 
 def device_name() -> str:
     return _DEVICE
 
 
 def dense_vector(texts: list[str], max_length: int = 512) -> list[list[float]]:
-    """Return only the dense embedding vectors for the given texts."""
+    """Return only the dense embedding vectors for the given texts.
+
+    Embeds in ``_DENSE_BATCH_MAX`` chunks so a large document (thousands of
+    paragraphs) is never passed to the model as one giant batch, which can trip
+    tokenizer padding on some inputs.
+    """
     if not texts:
         return []
-    return [v["dense"] for v in embed_texts(texts, batch_size=len(texts), max_length=max_length)]
+    out: list[list[float]] = []
+    for start in range(0, len(texts), _DENSE_BATCH_MAX):
+        chunk = texts[start : start + _DENSE_BATCH_MAX]
+        out.extend(v["dense"] for v in embed_texts(chunk, batch_size=len(chunk), max_length=max_length))
+    return out
 
 
 def cosine_sim(a: list[float], b: list[float]) -> float:

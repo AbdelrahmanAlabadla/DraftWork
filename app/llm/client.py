@@ -17,9 +17,17 @@ logger = get_logger("LLM")
 class LMStudioClient:
     """Client for LM Studio's /api/v1/chat endpoint (stateless)."""
 
-    def __init__(self, url: str | None = None, model: str | None = None) -> None:
+    def __init__(
+        self,
+        url: str | None = None,
+        model: str | None = None,
+        reasoning: str | None = None,
+    ) -> None:
         self.url = (url or LMS_URL).rstrip("/")
         self.model = model or LMS_MODEL
+        # Optional reasoning override: "off"|"low"|"medium"|"high"|"on".
+        # Only sent when set, so non-reasoning models never error.
+        self.reasoning = reasoning
 
     def chat(
         self,
@@ -37,6 +45,8 @@ class LMStudioClient:
             "stream": False,
             "store": False,
         }
+        if getattr(self, "reasoning", None):
+            payload["reasoning"] = self.reasoning
         if system_prompt:
             payload["system_prompt"] = system_prompt
 

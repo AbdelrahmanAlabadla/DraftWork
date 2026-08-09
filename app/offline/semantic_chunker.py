@@ -3,8 +3,10 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 from app.config import (
@@ -17,13 +19,20 @@ from app.config import (
     QUESTION_PARENT_MIN_SHARE,
     SIMILARITY_THRESHOLD,
     SIMILARITY_THRESHOLD_CHILD,
+    TITLE_BATCH_SIZE,
     TITLE_PARALLELISM,
     WORDS_PER_TOKEN,
+    FALLBACK_SECTION_MAX_WORDS,
+    FALLBACK_SUBSECTION_MAX_WORDS,
 )
 from app.logging_conf import get_logger
 from app.offline.embeddings import cosine_sim, dense_vector
 from app.offline.parser_items import item_text, page_items, page_number
-from app.offline.title_generator import generate_section_title, generate_subsection_title
+from app.offline.title_generator import (
+    generate_batch_titles,
+    make_titles_unique,
+    review_titles,
+)
 
 logger = get_logger("SEMANTIC_CHUNKER")
 
@@ -92,9 +101,11 @@ class ChildChunk:
 def extract_paragraphs(pages: list[dict[str, Any]]) -> list[Paragraph]:
     """Return the document body as ordered, page-tagged paragraphs.
 
-    Every non-empty LlamaParse item (text, table, and headings alike) becomes
-    one paragraph unit; headings are treated as ordinary paragraphs. Parent
-    chunking then merges consecutive paragraphs purely by embedding similarity.
+    Every non-empty LlamaParse item (including headings) becomes one paragraph
+    unit. Headings are kept so their text remains as a natural section boundary
+    and can be reused as the title; the title prompt is told to lean on a
+    meaningful heading and only write a new one when it is missing or bad.
+    Parent chunking then merges consecutive paragraphs purely by similarity.
     """
     paragraphs: list[Paragraph] = []
     for page in pages:
@@ -360,48 +371,71 @@ def build_parents(
 # ---------------------------------------------------------------------------
 
 
-def generate_section_titles(parents: list[ParentChunk], **kwargs) -> None:
-    if not parents:
-        return
-    with ThreadPoolExecutor(max_workers=TITLE_PARALLELISM) as ex:
-        titles = list(
-            ex.map(
-                lambda parent: generate_section_title(
-                    content=parent.content, **kwargs
-                ),
-                parents,
-            )
-        )
-    for parent, title in zip(parents, titles):
-        parent.title = title
-        logger.info(
-            "Section title | parent_id=%s | words=%d | title=%s",
-            parent.parent_id,
-            count_words(parent.content),
-            parent.title,
-        )
+def _run_batches(chunks, *, level: str) -> None:
+    """Label sibling chunks in batches so the model sees neighbors.
 
-
-def generate_subsection_titles(children: list[ChildChunk], **kwargs) -> None:
-    if not children:
+    Chunks are grouped in document order (``TITLE_BATCH_SIZE`` each) and the
+    batches run in parallel. Each batch's prompt includes the titles produced
+    by already-finished batches, so sibling awareness is preserved without
+    paying the cost of one LLM call per chunk. Results are applied in document
+    order regardless of which batch finishes first.
+    """
+    if not chunks:
         return
+    batches = [
+        chunks[i : i + TITLE_BATCH_SIZE]
+        for i in range(0, len(chunks), TITLE_BATCH_SIZE)
+    ]
+    assigned: list[tuple] = []
+    lock = Lock()
+
+    def do(batch):
+        contents = [getattr(c, "content") for c in batch]
+        with lock:
+            before = [t for _, t in assigned]
+        titles = generate_batch_titles(contents, level=level, before=before)
+        with lock:
+            for child, title in zip(batch, titles):
+                child.title = title
+                assigned.append((child, title))
+        return batch, titles
+
     with ThreadPoolExecutor(max_workers=TITLE_PARALLELISM) as ex:
-        titles = list(
-            ex.map(
-                lambda child: generate_subsection_title(
-                    content=child.content, **kwargs
-                ),
-                children,
-            )
-        )
-    for child, title in zip(children, titles):
+        futures = [ex.submit(do, b) for b in batches]
+        for batch, titles in [f.result() for f in futures]:
+            for child, title in zip(batch, titles):
+                child.title = title
+
+    # Global dedup once across the whole run. Parallel batches only see the
+    # titles of completed batches, so two batches can still collide on the same
+    # concept ("Machine Learning Definition", "Data Preprocessing" twice).
+    # Re-apply uniqueness over every title so each is distinct document-wide.
+    max_words = (
+        FALLBACK_SECTION_MAX_WORDS if level == "section" else FALLBACK_SUBSECTION_MAX_WORDS
+    )
+    contents = [getattr(c, "content") for c in chunks]
+    titles = [c.title for c in chunks]
+    final = make_titles_unique(titles, contents, max_words)
+    for child, title in zip(chunks, final):
         child.title = title
+
+    for child in chunks:
+        cid = getattr(child, "child_id", None) or getattr(child, "parent_id", "")
         logger.info(
-            "Subsection title | child_id=%s | words=%d | title=%s",
-            child.child_id,
+            "%s title | id=%s | words=%d | title=%s",
+            level.title(),
+            cid,
             count_words(child.content),
             child.title,
         )
+
+
+def generate_section_titles(parents: list[ParentChunk], **kwargs) -> None:
+    _run_batches(parents, level="section")
+
+
+def generate_subsection_titles(children: list[ChildChunk], **kwargs) -> None:
+    _run_batches(children, level="subsection")
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +455,71 @@ def _last_sentence_of(content: str) -> str:
 def count_tokens(text: str) -> int:
     """Approximate token count from the word count via WORDS_PER_TOKEN."""
     return int(count_words(text) / WORDS_PER_TOKEN)
+
+
+# Stray diagram/axis labels that must never survive as a chunk sentence.
+_JUNK_LABEL_RE = re.compile(
+    r"^\s*(?:feature\s*(?:\d+\s*)?\??|value\s*(?:value|feature|example)?\??|"
+    r"class\??|input\s*\??|output\s*\??|data\s*\??|training\s+set|"
+    r"new\s+instance|launch\s*!?\s*|update\s+data|analyze\s+errors|"
+    r"can\s+be\s+automated|study\s+the\s+problem|evaluate\s*(?:solution)?\s*|"
+    r"this\s+feature\s+based\s*\??)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+# Orphan remainders left when an image/figure label was dropped, e.g.
+# "... feature extraction is called." or a lone trailing verb.
+_ORPHAN_TAIL_RE = re.compile(
+    r"^\s*[\w\s'-]{0,40}\b(?:is|are|was|were|been|has|have|uses|used|called|"
+    r"shown|pictured|depicted)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+_FUNCTION_WORDS = frozenset(
+    {
+        "a", "an", "the", "of", "to", "in", "on", "for", "and", "or", "but",
+        "is", "are", "was", "were", "be", "been", "being", "it", "its", "this",
+        "that", "then", "here", "there", "by", "with", "from", "as", "at",
+        "into", "which", "where", "when", "how", "why", "who", "whose", "what",
+        "any", "all", "both", "each", "some", "other", "more", "most", "such",
+        "than", "also", "very", "just", "only", "often", "usually", "maybe",
+    }
+)
+
+
+def _content_words(sentence: str) -> list[str]:
+    return [w for w in sentence.split() if _strip_punct_word(w).lower() not in _FUNCTION_WORDS]
+
+
+def _strip_punct_word(token: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", token)
+
+
+def _normalize_sentence(sentence: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", sentence.lower())
+
+
+def _is_junk_sentence(sentence: str) -> bool:
+    """True when a sentence is a stray diagram label or a broken fragment."""
+    stripped = sentence.strip()
+    if not stripped:
+        return True
+    # Single stray OCR letter glued onto a fragment (e.g. "S In machine ...").
+    if re.match(r"^[A-Za-z]\s+[A-Z]", stripped):
+        return True
+    # Fewer than two words -> too short to be meaningful ("Want", "by").
+    words = stripped.split()
+    if len(words) < 2:
+        return True
+    # Axis / diagram labels standing alone.
+    if _JUNK_LABEL_RE.match(stripped):
+        return True
+    if _ORPHAN_TAIL_RE.match(stripped):
+        return True
+    # Nothing but connecting/leftover words ("feature extraction is called.").
+    if not _content_words(stripped):
+        return True
+    return False
 
 
 # Structural words that introduce a number that MUST be kept after them
@@ -513,6 +612,36 @@ def _apply_min_floor(groups: list[str]) -> list[str]:
     return out
 
 
+def _dispatch_pages(
+    bodies: list[str], start: int | None, end: int | None
+) -> list[tuple[int, int]]:
+    """Spread a parent's page range across its children by word share.
+
+    Children currently inheriting the full parent span (e.g. all ``3-10``) makes
+    navigation useless. This assigns each child a proportional slice of the
+    parent's real range so adjacent children get distinct, ordered pages.
+    """
+    if not bodies:
+        return []
+    if start is None:
+        start = 1
+    if end is None or end < start:
+        end = start
+    total = sum(count_words(b) for b in bodies) or 1
+    span = end - start
+    out: list[tuple[int, int]] = []
+    cum = 0.0
+    for body in bodies:
+        frac = count_words(body) / total
+        s_page = start + round(cum)
+        cum += frac * span
+        e_page = start + round(cum)
+        s_page = max(start, min(end, s_page))
+        e_page = max(s_page, min(end, e_page))
+        out.append((s_page, e_page))
+    return out
+
+
 def build_children(parent: ParentChunk) -> list[ChildChunk]:
     """Split one parent's content into focused child chunks (sentence packing).
 
@@ -560,9 +689,20 @@ def build_children(parent: ParentChunk) -> list[ChildChunk]:
     if not combined:
         return []
 
-    child_sents = [Sentence(s, page=parent.page_start) for s in split_sentences(combined)]
-    if not child_sents:
+    # Drop stray diagram labels, broken fragments, and repeated sentences so a
+    # chunk never carries OCR noise that would pollute its title/embedding.
+    selected: list[str] = []
+    for s in split_sentences(combined):
+        if _is_junk_sentence(s):
+            continue
+        norm = _normalize_sentence(s)
+        if selected and _normalize_sentence(selected[-1]) == norm:
+            continue
+        selected.append(s.strip())
+    if not selected:
         return []
+
+    child_sents = [Sentence(s, page=None) for s in selected]
 
     max_child_words = _max_child_words()
     current_chunk = child_sents[0].text
@@ -625,21 +765,46 @@ def build_children(parent: ParentChunk) -> list[ChildChunk]:
     )
 
     children: list[ChildChunk] = []
-    for body in filtered:
-        if not body:
-            continue
+    body_pages = _dispatch_pages(
+        [b for b in filtered if b], parent.page_start, parent.page_end
+    )
+    for body, (s_page, e_page) in zip(
+        [b for b in filtered if b], body_pages
+    ):
         children.append(
             ChildChunk(
                 child_id=str(uuid.uuid4()),
                 parent_id=parent.parent_id,
                 document_id=parent.document_id,
                 title=None,
-                page_start=parent.page_start,
-                page_end=parent.page_end,
+                page_start=s_page,
+                page_end=e_page,
                 content=body.strip(),
             )
         )
     return children
+
+
+def _dedupe_across_levels(
+    parents: list[ParentChunk], children: list[ChildChunk]
+) -> None:
+    """One document-wide uniqueness pass over section + subsection titles.
+
+    Parallel batches only see completed batches, and sections/subsections are
+    titled separately, so the same concept can still win in two places (e.g. a
+    section and its subsection both called "Machine Learning Overview"). Re-run
+    uniqueness over the union so no two displayed titles collide.
+    """
+    titled = [c for c in children if c.title]
+    items = parents + titled
+    if not items:
+        return
+    contents = [x.content for x in items]
+    titles = [x.title for x in items]
+    max_words = max(FALLBACK_SECTION_MAX_WORDS, FALLBACK_SUBSECTION_MAX_WORDS)
+    final = make_titles_unique(titles, contents, max_words)
+    for item, title in zip(items, final):
+        item.title = title
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +885,14 @@ def build_semantic_structure(
     for parent in parents:
         children.extend(build_children(parent))
 
+    # A subsection that is the ONLY child of its section just mirrors the
+    # parent; suppress its heading so only the parent is shown.
+    child_counts = Counter(c.parent_id for c in children)
+    for c in children:
+        if child_counts[c.parent_id] == 1:
+            c.title = None
+    titled_children = [c for c in children if child_counts[c.parent_id] > 1]
+
     logger.info(
         "CHUNK COUNTS | document_id=%s | parent_chunks=%d | child_chunks=%d",
         document_id,
@@ -727,8 +900,19 @@ def build_semantic_structure(
         len(children),
     )
 
-    if children:
-        generate_subsection_titles(children)
+    if titled_children:
+        generate_subsection_titles(titled_children)
+
+    # One document-wide uniqueness pass across sections and subsections.
+    _dedupe_across_levels(parents, children)
+
+    # Reviewer pass: score every header against its own passage and replace the
+    # bad ones. Runs after dedup so it reviews the final, unique titles.
+    review_titles(parents, children)
+
+    # Review replacements may collide with a surviving title; a final uniqueness
+    # pass keeps every displayed header distinct.
+    _dedupe_across_levels(parents, children)
 
     elapsed = time.perf_counter() - t0
     logger.info(

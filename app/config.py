@@ -57,7 +57,7 @@ CHILD_MAX_SIZE: int = int(_env("CHILD_MAX_SIZE", "800") or "800")
 # - at or below CHILD_MIN_TOKENS_DROP  -> discarded entirely
 # - between DROP and CHILD_MIN_TOKENS_MERGE -> merged into the previous child
 CHILD_MIN_TOKENS_DROP: int = int(_env("CHILD_MIN_TOKENS_DROP", "6") or "6")
-CHILD_MIN_TOKENS_MERGE: int = int(_env("CHILD_MIN_TOKENS_MERGE", "10") or "10")
+CHILD_MIN_TOKENS_MERGE: int = int(_env("CHILD_MIN_TOKENS_MERGE", "45") or "45")
 
 # A parent is treated as an atomic "questions" unit when this share of its
 # sentences are numbered questions (e.g. "1. How would you define ML?").
@@ -106,3 +106,24 @@ FALLBACK_SECTION_MAX_WORDS: int = int(_env("FALLBACK_SECTION_MAX_WORDS", "6") or
 FALLBACK_SUBSECTION_MAX_WORDS: int = int(
     _env("FALLBACK_SUBSECTION_MAX_WORDS", "6") or "6"
 )
+
+# --- Title review (spell-check pass over generated headers) -----------------
+# After all titles are generated a reviewer LLM call per section (section +
+# its subsections, one call each) scores every header against its passage and
+# rewrites the bad ones. Rewritten headers are re-scored afterwards to confirm
+# the fix stuck.
+TITLE_REVIEW_ENABLED: bool = str(_env("TITLE_REVIEW_ENABLED", "true")).lower() in (
+    "1", "true", "yes", "on"
+)
+# Preview length seen by the reviewer / verifier.
+TITLE_REVIEW_CONTEXT_WORDS: int = int(
+    _env("TITLE_REVIEW_CONTEXT_WORDS", "150") or "150"
+)
+# Score bands: >= GOOD keep; between POLISH_MIN and GOOD refine; below replace.
+TITLE_REVIEW_GOOD_SCORE: int = int(_env("TITLE_REVIEW_GOOD_SCORE", "8") or "8")
+TITLE_REVIEW_POLISH_MIN: int = int(_env("TITLE_REVIEW_POLISH_MIN", "4") or "4")
+# When a rewritten title is needed, the model proposes this many candidates in
+# ONE call; the best locally-valid one is picked. If it fails the rescore, this
+# many extra candidate batches are tried before the deterministic fallback.
+TITLE_REVIEW_CANDIDATES: int = int(_env("TITLE_REVIEW_CANDIDATES", "4") or "4")
+TITLE_REVIEW_RETRIES: int = int(_env("TITLE_REVIEW_RETRIES", "1") or "1")

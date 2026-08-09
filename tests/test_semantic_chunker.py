@@ -48,6 +48,11 @@ def _patch_titles(monkeypatch):
         "app.offline.semantic_chunker.generate_subsection_titles",
         lambda children: [setattr(c, "title", "CT") for c in children],
     )
+    # Review runs a real LLM call per section; tests keep it inert.
+    monkeypatch.setattr(
+        "app.offline.semantic_chunker.review_titles",
+        lambda parents, children, client=None: None,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -235,13 +240,28 @@ def test_build_children_respects_size_cap_and_cuts_at_sentence_boundary(monkeypa
     monkeypatch.setattr(sc, "dense_vector", lambda texts: [list(E)] * len(texts))
     monkeypatch.setattr(sc, "CHILD_MAX_SIZE", 100)
     monkeypatch.setattr(sc, "WORDS_PER_TOKEN", 1.0)
-    sentence = (
-        "All related sentences share the same topic with enough words to "
-        "consume the token budget quickly."
-    )
+    # Distinct, clearly-over-budget sentences: repeated-sentence dedup must not
+    # collapse them, so the CHILD_MAX_SIZE cap alone forces the boundary. Each
+    # sentence ~24 words; five of them ~120 words vs. the 100-word cap => 2.
+    sentences = [
+        "The related model training narrative covers a very long continuous "
+        "stream of connected ideas that keep building across many consecutive "
+        "clauses and clauses.",
+        "A second sentence of the very same broad topic continues the story "
+        "with still more words so that together these sentences fully consume "
+        "the permitted token budget.",
+        "Here the shared subject presses onward through many additional words "
+        "adding still more detail and context all on the identical theme for "
+        "the reader to see.",
+        "This fourth line remains squarely on the one unifying topic while it "
+        "piles on generous amounts of extra wording to guarantee the ceiling "
+        "is passed very soon.",
+        "The concluding statement wraps up the same single theme using the "
+        "remaining words and this definitely ensures crossing over the limit.",
+    ]
     parent = ParentChunk(
         parent_id="p1", document_id="d", title=None, page_start=1, page_end=1,
-        content=" ".join([sentence] * 8) + ".",
+        content=" ".join(sentences) + ".",
     )
     children = build_children(parent)
     assert len(children) == 2
@@ -330,17 +350,19 @@ def test_build_semantic_structure_shape(monkeypatch):
     for child in result["children"]:
         assert child["parent_id"] in parent_ids
         assert child["child_id"]
-        assert child["title"] == "CT"
-        assert child["heading"] == "CT"
+        # This parent has exactly one child, so its synthetic subsection title
+        # is suppressed (the section itself is the leaf); parent keeps its own.
+        assert child["title"] is None
+        assert child["heading"] is None
     for p in result["parents"]:
         assert p["title"] == "ST"
 
 
 def test_generate_section_titles_parallel_preserves_order(monkeypatch):
-    def fake(client=None, content=""):
-        return f"Title {content.split()[0]}"
+    def fake(contents, *, level="section", before=None):
+        return [f"Title {c.split()[0]}" for c in contents]
 
-    monkeypatch.setattr("app.offline.semantic_chunker.generate_section_title", fake)
+    monkeypatch.setattr("app.offline.semantic_chunker.generate_batch_titles", fake)
     parents = [
         ParentChunk(
             parent_id=f"p{i}", document_id="d1", title=None,

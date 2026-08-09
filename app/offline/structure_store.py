@@ -33,6 +33,9 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
         parent_children = [
             c for c in children if c["parent_id"] == parent["parent_id"]
         ]
+        # Single-child subsections are suppressed (title is None): they only
+        # mirror the parent, so do not render a separate row for them.
+        shown = [c for c in parent_children if c.get("title")]
         subsections = [
             {
                 "child_id": c["child_id"],
@@ -41,14 +44,14 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
                 "page_end": c.get("page_end"),
                 "order": i,
             }
-            for i, c in enumerate(parent_children)
+            for i, c in enumerate(shown)
         ]
         sections.append(
             {
                 "parent_id": parent["parent_id"],
                 "title": parent.get("title"),
                 "child_ids": [c["child_id"] for c in parent_children],
-                "child_count": len(parent_children),
+                "child_count": len(subsections),
                 "page_start": parent.get("page_start"),
                 "page_end": parent.get("page_end"),
                 "subsections": subsections,
