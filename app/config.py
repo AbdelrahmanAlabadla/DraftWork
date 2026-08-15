@@ -30,6 +30,14 @@ REGISTRY_FILE: str = _env("REGISTRY_FILE", "data/documents.json") or "data/docum
 
 LOG_LEVEL: str = _env("LOG_LEVEL", "INFO") or "INFO"
 
+# --- Online exam planning --------------------------------------------------
+# The planner LLM receives a LIGHTWEIGHT context per selected child chunk:
+# the chunk title plus only this many leading tokens of its text. It decides
+# WHAT each question should test (question_type / topic / concept_to_test) but
+# never writes the question. Actual question generation keeps using the FULL
+# selected child-chunk content.
+PLANNER_SNIPPET_TOKENS: int = int(_env("PLANNER_SNIPPET_TOKENS", "100") or "100")
+
 # --- Semantic structure generation (offline) ------------------------------
 STRUCTURES_DIR: str = _env("STRUCTURES_DIR", "data/structures") or "data/structures"
 
@@ -95,11 +103,15 @@ TITLE_PARALLELISM: int = int(_env("TITLE_PARALLELISM", "4") or "4")
 # snapshot (from previously completed batches only).
 TITLE_BATCH_SIZE: int = int(_env("TITLE_BATCH_SIZE", "4") or "4")
 
+# How many of the most recent accepted titles are shown to the LLM in each
+# family-batch call so it avoids reusing a heading seen just before.
+TITLE_CONTEXT_RECENT: int = int(_env("TITLE_CONTEXT_RECENT", "4") or "4")
+
 # Navigation-label word bounds: sections and subsections 2-5 words.
 SECTION_TITLE_MIN_WORDS: int = int(_env("SECTION_TITLE_MIN_WORDS", "2") or "2")
-SECTION_TITLE_MAX_WORDS: int = int(_env("SECTION_TITLE_MAX_WORDS", "5") or "5")
+SECTION_TITLE_MAX_WORDS: int = int(_env("SECTION_TITLE_MAX_WORDS", "15") or "15")
 SUBSECTION_TITLE_MIN_WORDS: int = int(_env("SUBSECTION_TITLE_MIN_WORDS", "2") or "2")
-SUBSECTION_TITLE_MAX_WORDS: int = int(_env("SUBSECTION_TITLE_MAX_WORDS", "5") or "5")
+SUBSECTION_TITLE_MAX_WORDS: int = int(_env("SUBSECTION_TITLE_MAX_WORDS", "15") or "15")
 
 # Fallback (safety-net) label caps.
 FALLBACK_SECTION_MAX_WORDS: int = int(_env("FALLBACK_SECTION_MAX_WORDS", "6") or "6")
@@ -107,12 +119,30 @@ FALLBACK_SUBSECTION_MAX_WORDS: int = int(
     _env("FALLBACK_SUBSECTION_MAX_WORDS", "6") or "6"
 )
 
+# Generic filler headings that never make a usable navigation header. A title
+# is rejected only when it EQUALS one of these ("Data Overview" stays valid;
+# bare "Overview", "Key Concepts" do not) or when it starts with one of the
+# filler prefixes in title_generator ("Introduction to X", "Overview of X").
+TITLE_BLOCKLIST: frozenset[str] = frozenset(
+    w.strip().lower()
+    for w in _env(
+        "TITLE_BLOCKLIST",
+        "overview,introduction,summary,conclusion,key concepts,key terms,"
+        "discussion,task,activity,exercises,questions,notes,basics,"
+        "fundamentals,review,reading,objectives,aims,outline,definitions",
+    ).split(",")
+    if w.strip()
+)
+
 # --- Title review (spell-check pass over generated headers) -----------------
 # After all titles are generated a reviewer LLM call per section (section +
 # its subsections, one call each) scores every header against its passage and
 # rewrites the bad ones. Rewritten headers are re-scored afterwards to confirm
 # the fix stuck.
-TITLE_REVIEW_ENABLED: bool = str(_env("TITLE_REVIEW_ENABLED", "true")).lower() in (
+# Disabled by default: the family-batch generator now titles sections and their
+# subsections together in one call with local blocklist/format checks, so the
+# separate reviewer pass is an opt-in extra.
+TITLE_REVIEW_ENABLED: bool = str(_env("TITLE_REVIEW_ENABLED", "false")).lower() in (
     "1", "true", "yes", "on"
 )
 # Preview length seen by the reviewer / verifier.

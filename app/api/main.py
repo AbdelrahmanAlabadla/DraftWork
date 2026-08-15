@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import threading
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,15 +11,34 @@ from starlette.responses import JSONResponse
 
 from app import config
 from app.api.routes import router
-from app.logging_conf import configure_logging, set_request_id
+from app.logging_conf import configure_logging, get_logger, set_request_id
 
 configure_logging(config.LOG_LEVEL)
+
+
+def _preload_models() -> None:
+    """Load the embedding model (GPU) and the spaCy NLP model at startup."""
+    logger = get_logger("WARMUP")
+    logger.info("Model warmup started")
+    from app.offline import embeddings
+    from app.offline import title_nlp
+
+    embeddings.warmup()
+    title_nlp.warmup()
+    logger.info("Model warmup completed | device=%s", embeddings.device_name())
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    threading.Thread(target=_preload_models, daemon=True).start()
+    yield
 
 app = FastAPI(
     title="ExamGen AI",
     description="Exam Generator V1 — API-first backend. Upload a PDF, then generate exams "
     "(MCQ / True-False / Short Answer) grounded in the uploaded document.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

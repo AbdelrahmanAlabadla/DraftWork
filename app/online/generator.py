@@ -17,6 +17,8 @@ def generate_questions(state: ExamState) -> dict:
     qtype = state["question_type"]
     count = state["number_of_questions"]
     context = state.get("context", "")
+    difficulty = state.get("difficulty") or "mix"
+    model_number = state.get("model_number") or 1
 
     if state.get("error") or not context:
         logger.warning("Skipping generation | document has no context")
@@ -24,19 +26,22 @@ def generate_questions(state: ExamState) -> dict:
 
     t0 = time.perf_counter()
     logger.info(
-        "Generation started | model=%s | type=%s | count=%d",
+        "Generation started | model=%s | type=%s | count=%d | difficulty=%s | model_number=%d",
         LMS_MODEL,
         qtype,
         count,
+        difficulty,
+        model_number,
     )
 
-    system_prompt, user_prompt = build_prompt(qtype, count, context)
+    system_prompt, user_prompt = build_prompt(qtype, count, context, difficulty, model_number)
     feedback = state.get("rejection_feedback") or ""
     if feedback:
         user_prompt += (
-            "\n\n## Feedback from previous attempts\n"
-            "Your earlier questions were rejected for the reasons below. "
-            "Do NOT repeat these mistakes. Fix the issues and produce valid questions.\n"
+            "\n\n## Context from earlier attempts\n"
+            "Below are either questions already accepted into this exam (which you "
+            "must NOT repeat or reword) or reasons earlier output was rejected. "
+            "Do NOT repeat these mistakes; produce only NEW, distinct questions.\n"
             f"{feedback}"
         )
     client = LMStudioClient()

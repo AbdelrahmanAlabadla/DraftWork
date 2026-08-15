@@ -108,6 +108,56 @@ _DIAGRAM_FRAGMENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A figure/table/equation caption whose body follows the marker with a caption
+# separator (":" or "."): e.g. "Figure 2.1: The layered architecture ...". These
+# are long captions the short _CAPTION_RE word cap would otherwise keep.
+_CAPTION_SEPARATOR_RE = re.compile(
+    r"^\s*(figure|fig\.?|table|tab\.?|equation|eq\.?|exhibit|diagram|plate)"
+    r"\b\s*\d+(?:[-.]\d+)*\s*([:.])",
+    re.IGNORECASE,
+)
+# A real prose reference to a figure ("Figure 2.1 shows / illustrates ...") is
+# body text, NOT a caption; it must be preserved.
+_CAPTION_REFERENCE_RE = re.compile(
+    r"^\s*(figure|fig\.?|table|tab\.?|equation|eq\.?|exhibit|diagram|plate)"
+    r"\b\s*\d+(?:[-.]\d+)*\s+(?:shows?|show|illustrates?|illustrate|depicts?|"
+    r"depict|represents?|represent|presents?|present|provides?|provide|"
+    r"lists?|list|summarizes?|summarize|gives?|give|displays?|display|"
+    r"compares?|compare|demonstrates?|demonstrate)\b",
+    re.IGNORECASE,
+)
+
+# Standalone credit / source attribution line ("Source: ...", "Image courtesy
+# of ...", "Reproduced with permission ..."). Only a short, leading attribution.
+_CREDIT_SOURCE_RE = re.compile(
+    r"^\s*(?:source|data source|credit|credits|image credit|photo credit|"
+    r"courtesy(?: of)?|photo by|image by|adapted from|reprinted(?: from)?|"
+    r"reproduced(?:\s+with\s+permission)?|data from|with permission(?: from)?|"
+    r"this image is)\b[.:]?\s+",
+    re.IGNORECASE,
+)
+
+# Bare or dominant URL (http(s)://... or www....).
+_URL_RE = re.compile(r"https?://[^\s]+|www\.[^\s]+", re.IGNORECASE)
+_URL_ONLY_RE = re.compile(
+    r"^\s*(?:(?:https?://[^\s]+|www\.[^\s]+)[\s.,;:!?\u2019\"']*)+$",
+    re.IGNORECASE,
+)
+
+# Mojibake / extraction artifacts: U+FFFD replacement chars and stray control
+# bytes that survive LlamaParse (e.g. "I�" cut off mid-character).
+_REPLACEMENT_CHAR_RE = re.compile(r"[\uFFFD\uFFFE\uFFFF]")
+_CONTROL_GARBAGE_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+# Multiple-Choice question answer-option markers (inline) and an explicit answer.
+_MCQ_OPTION_INLINE_RE = re.compile(
+    r"\b(?:[A-Ea-e]\s*[.)]|\([A-Ea-e]\s*\))\s+\S"
+)
+_MCQ_ANSWER_RE = re.compile(
+    r"\b(?:(?:correct\s+)?answer|ans)\s*[:=]?\s*[A-Ea-e](?=[\s.,;)]|$)",
+    re.IGNORECASE,
+)
+
 # Categories used for the cleaning report.
 CATEGORY_TINY = "tiny_fragment"
 CATEGORY_EMPTY = "empty"
@@ -123,6 +173,9 @@ CATEGORY_FOOTNOTE = "footnote"
 CATEGORY_TOC = "toc"
 CATEGORY_BIBLIOGRAPHY = "bibliography"
 CATEGORY_OCR = "ocr_garbage"
+CATEGORY_CREDIT = "credit_source"
+CATEGORY_URL = "url"
+CATEGORY_MCQ = "mcq"
 CATEGORY_DUPLICATE = "duplicate"
 
 
@@ -205,6 +258,53 @@ def strip_inline_footnotes(text: str) -> tuple[str, int]:
     text, n2 = _FOOTNOTE_ATTACHED_RE.subn("", text)
     text, n3 = _FOOTNOTE_GLUED_RE.subn("", text)
     return text, n1 + n2 + n3
+
+
+def strip_inline_garbage(text: str) -> tuple[str, int]:
+    """Remove extraction artifacts embedded inside a kept paragraph.
+
+    Drops U+FFFD replacement characters, stray control bytes and bare URLs.
+    Returns the cleaned text and how many artifact markers were removed so the
+    caller can decide whether the paragraph is too damaged to keep.
+    """
+    repl = len(_REPLACEMENT_CHAR_RE.findall(text))
+    text = _REPLACEMENT_CHAR_RE.sub("", text)
+    text = _CONTROL_GARBAGE_RE.sub("", text)
+    text = _URL_RE.sub(" ", text)
+    text = _MULTISPACE_RE.sub(" ", text)
+    return text.strip(), repl
+
+
+def strip_mcq_suffix(text: str) -> tuple[str, bool]:
+    """Remove a multiple-choice answer block attached to a normal paragraph.
+
+    When a paragraph carries several answer options (``A) ...`` / ``(A) ...``)
+    or an explicit ``Answer: X`` line, the MCQ tail is garbage for retrieval.
+    If a real prose sentence leads the block it is preserved and only the MCQ
+    tail is stripped; otherwise the caller removes the whole paragraph.
+
+    Returns ``(kept_text, removed)`` where ``removed=True`` means an MCQ block
+    was present. ``kept_text`` is ``""`` when the paragraph is nothing but MCQ.
+    """
+    if not text:
+        return text, False
+    markers = list(_MCQ_OPTION_INLINE_RE.finditer(text))
+    has_answer = _MCQ_ANSWER_RE.search(text)
+    has_mcq = len(markers) >= 3 or (len(markers) >= 2 and has_answer)
+    if not has_mcq:
+        return text, False
+
+    first = markers[0].start() if markers else 0
+    if has_answer and markers:
+        first = min(markers[0].start(), has_answer.start())
+    leading = text[:first].strip()
+
+    # A real sentence leads the MCQ block: keep the prose, drop the MCQ tail.
+    if count_alpha_words(leading) >= 3 and _SENTENCE_END_RE.search(leading):
+        return leading, True
+
+    # Nothing but the MCQ block (or a hopelessly short lead): drop all of it.
+    return "", True
 
 
 def _should_preserve_break(previous: str, current: str) -> bool:
@@ -307,6 +407,14 @@ def _classify_paragraph(text: str, repeated_keys: set[str]) -> str | None:
     if _CAPTION_RE.match(stripped) and count_alpha_words(stripped) <= 14:
         return CATEGORY_FIGURE_CAPTION
 
+    # Long caption: marker + separator (":"/".") whose body does not explain a
+    # figure in prose (e.g. "Figure 2.1: The layered architecture ...").
+    if (
+        _CAPTION_SEPARATOR_RE.match(stripped)
+        and not _CAPTION_REFERENCE_RE.match(stripped)
+    ):
+        return CATEGORY_FIGURE_CAPTION
+
     # Running chapter/section head that carries a page number.
     if (
         _RUNNING_HEAD_LEADING_RE.match(stripped)
@@ -325,6 +433,15 @@ def _classify_paragraph(text: str, repeated_keys: set[str]) -> str | None:
     # Reference / bibliography headings are not retrieval content.
     if _BIBLIO_HEADING_RE.match(stripped):
         return CATEGORY_BIBLIOGRAPHY
+
+    # Standalone credit / source attribution ("Source: ACME Corp"). Only when
+    # short so a real sentence that merely begins with "Source" is preserved.
+    if _CREDIT_SOURCE_RE.match(stripped) and count_alpha_words(stripped) <= 25:
+        return CATEGORY_CREDIT
+
+    # A paragraph that is nothing but a URL (or a run of URLs).
+    if _URL_ONLY_RE.match(stripped):
+        return CATEGORY_URL
 
     # Clear, exact-shaped diagram label fragments (very specific; safe).
     if _DIAGRAM_FRAGMENT_RE.match(stripped):
@@ -392,7 +509,28 @@ def clean_pages_with_stats(
                 stats.by_category[category] += 1
                 continue
 
-            stripped, n_foot = strip_inline_footnotes(base)
+            # Multiple-choice answer block attached to a paragraph: strip its
+            # tail (or drop the whole block when there is no leading prose).
+            stripped, was_mcq = strip_mcq_suffix(base)
+            if was_mcq:
+                stats.paragraphs_removed += 1
+                stats.by_category[CATEGORY_MCQ] += 1
+                continue
+
+            # Inline extraction artifacts (replacement chars, control bytes,
+            # bare URLs).
+            stripped, repl_n = strip_inline_garbage(stripped)
+            if not stripped:
+                stats.paragraphs_removed += 1
+                stats.by_category[CATEGORY_EMPTY] += 1
+                continue
+            # Paragraph too damaged by mojibake (e.g. "I� APAr") to be useful.
+            if repl_n >= 1 and count_alpha_words(stripped) < 6:
+                stats.paragraphs_removed += 1
+                stats.by_category[CATEGORY_OCR] += 1
+                continue
+
+            stripped, n_foot = strip_inline_footnotes(stripped)
             if n_foot:
                 stats.inline_footnotes_removed += n_foot
                 stripped = stripped.strip()

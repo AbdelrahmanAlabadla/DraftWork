@@ -20,17 +20,22 @@ from app.config import (
     SIMILARITY_THRESHOLD,
     SIMILARITY_THRESHOLD_CHILD,
     TITLE_BATCH_SIZE,
+    TITLE_CONTEXT_RECENT,
     TITLE_PARALLELISM,
     WORDS_PER_TOKEN,
     FALLBACK_SECTION_MAX_WORDS,
     FALLBACK_SUBSECTION_MAX_WORDS,
 )
 from app.logging_conf import get_logger
-from app.offline.embeddings import cosine_sim, dense_vector
+from app.offline.embeddings import cosine_sim, dense_vector, device_name
 from app.offline.parser_items import item_text, page_items, page_number
 from app.offline.title_generator import (
     generate_batch_titles,
+    generate_family_batch_titles,
+    is_acceptable_title,
     make_titles_unique,
+    make_title_client,
+    regenerate_title,
     review_titles,
 )
 
@@ -537,16 +542,32 @@ _KEEP_STRUCTURAL_NUMBER_WORDS = frozenset(
 # "Section 2.1") and year-like numbers ("in 2020.") are protected.
 _LIST_MARKER_RE = re.compile(r"(?<!\d)(\d{1,2})\s*[.)]\s+")
 
+# Plain bullet/list markers ("- X", "• X", "– X", "— X", "* X") that carry no
+# meaning and should be dropped while keeping the list content that follows.
+# A bullet must stand on its own as a leading marker (preceded by text start or
+# whitespace, followed by whitespace then non-space) so intra-word hyphens in
+# "state-of-the-art" and spaced dashes used inside ordinary prose remain unless
+# they clearly separate a list item. Captures the leading boundary so the
+# preceding whitespace/paren is preserved, not the bullet symbol.
+_BULLET_MARKER_RE = re.compile(r"(^|[\s(])([-•–—*])(?:\s+)(?=\S)")
+
 
 def strip_list_markers(text: str) -> str:
-    """Remove plain numbered-list markers (``1. `` / ``2) ````).
+    """Remove plain numbered-list markers (``1. `` / ``2) ``) and leading bullets.
 
-    A marker is removed only when its number is small (1-2 digits), is NOT a
-    structural number ("Chapter 3", "Section 2.1", ...), and is not a year-like
-    larger number. The marker's number is dropped but the copied text remains.
+    A numbered marker is removed only when its number is small (1-2 digits), is
+    NOT a structural number ("Chapter 3", "Section 2.1", ...), and is not a
+    year-like larger number. The marker's number is dropped but the copied text
+    remains. A leading bullet symbol (``-``, ``•``, ``–``, ``—``, ``*``) is
+    removed while its content stays.
     """
     if not text:
         return text
+
+    # Strip leading bullet markers, preserving the content and the leading
+    # boundary (start of text or the preceding whitespace/paren).
+    text = _BULLET_MARKER_RE.sub(lambda m: m.group(1), text)
+
     # Guard against decimals/versions like "2.1" and "3.5" by requiring the
     # marker not be preceded by a digit or a ".", and not be part of a larger
     # number the structural token list protects.
@@ -583,30 +604,77 @@ def _is_question_sentence(sent: str) -> bool:
     return stripped.rstrip().endswith("?")
 
 
-def _apply_min_floor(groups: list[str]) -> list[str]:
+# Short-but-meaningful units that must never be silently dropped: definitions,
+# call-outs, structural headers and questions.
+_MEANINGFUL_LABEL_RE = re.compile(
+    r"^\s*(?:definition|note|example|key\s+point|important|remember|warning|"
+    r"tip|exercise|class\s+exercise|definition\s*\d*)\b[:\-]?",
+    re.IGNORECASE,
+)
+_MEANINGFUL_HEADING_RE = re.compile(
+    r"^(chapter|section|part|appendix|module|lesson|unit)\b|\d+(\.\d+)*\s+\S",
+    re.IGNORECASE,
+)
+
+
+def _meaningful_fragment(text: str) -> bool:
+    """True when a short text carries standalone meaning and should be kept.
+
+    Used to protect legitimate meaningful chunks from the drop/merge floor:
+    a definition, call-out, structural heading or question is preserved (merged
+    into a neighbour) rather than thrown away as a tiny fragment.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if stripped.rstrip().endswith("?"):
+        return True
+    if _MEANINGFUL_HEADING_RE.match(stripped):
+        return True
+    if _MEANINGFUL_LABEL_RE.match(stripped):
+        return True
+    return len(_content_words(stripped)) >= 2
+
+
+def _apply_min_floor(
+    groups: list[str], max_child_words: int
+) -> list[str]:
     """Enforce the minimum child size on already-packed groups.
 
-    - at or below CHILD_MIN_TOKENS_DROP   -> drop the group entirely
-    - between DROP and CHILD_MIN_TOKENS_MERGE -> merge into one/two chunk before
+    - at or below CHILD_MIN_TOKENS_DROP   -> drop the group entirely, UNLESS it
+      is a legitimate meaningful fragment (definition / question / heading),
+      which is preserved (merged into the next chunk) instead of discarded;
+    - between DROP and CHILD_MIN_TOKENS_MERGE -> merge into the previous (or
+      leading) chunk only when the merged chunk stays within ``max_child_words``;
+      otherwise the fragment keeps its own chunk so the size cap is never
+      exceeded by a merge.
     Returns the filtered, still ordered list of chunk strings.
     """
     if not groups:
         return []
     out: list[str] = []
     for g in groups:
-        # fold into previous
         tk = count_tokens(g)
-        # Add to the previous group if small
-        if tk <= CHILD_MIN_TOKENS_DROP and out:
-            # drop
+        # Genuine junk at or below the drop floor is discarded; meaningful
+        # fragments (definitions / questions / headings) always survive.
+        if tk <= CHILD_MIN_TOKENS_DROP and not _meaningful_fragment(g):
             continue
-        if tk <= CHILD_MIN_TOKENS_MERGE and out:
-            # merge with previous group
+        # Anything else under the merge floor is folded into the previous chunk,
+        # but never past the size ceiling.
+        if (
+            tk <= CHILD_MIN_TOKENS_MERGE
+            and out
+            and count_words(out[-1]) + count_words(g) <= max_child_words
+        ):
             out[-1] = f"{out[-1]} {g}".strip()
             continue
         out.append(g)
-    # Leading tiny single group under the merge floor: fold into next if any.
-    if len(out) >= 2 and count_tokens(out[0]) <= CHILD_MIN_TOKENS_MERGE:
+    # Leading tiny single group under the merge floor: fold into next if it fits.
+    if (
+        len(out) >= 2
+        and count_tokens(out[0]) <= CHILD_MIN_TOKENS_MERGE
+        and count_words(out[0]) + count_words(out[1]) <= max_child_words
+    ):
         out[1] = f"{out[0]} {out[1]}".strip()
         out.pop(0)
     return out
@@ -642,23 +710,78 @@ def _dispatch_pages(
     return out
 
 
-def build_children(parent: ParentChunk) -> list[ChildChunk]:
+def _prepare_child_sentences(text: str) -> list[str]:
+    """Return the exact sentence stream ``build_children`` will pack.
+
+    Applies the same cleaning the child splitter uses: strips plain numbered-list
+    markers, drops junk/broken fragments, and removes sentence duplicates. This is
+    factored out so the whole book's sentences can be embedded exactly once,
+    up-front, and then aligned to each parent's children by index.
+    """
+    combined = strip_list_markers(text)
+    if not combined:
+        return []
+    selected: list[str] = []
+    for s in split_sentences(combined):
+        if _is_junk_sentence(s):
+            continue
+        norm = _normalize_sentence(s)
+        if selected and _normalize_sentence(selected[-1]) == norm:
+            continue
+        selected.append(s.strip())
+    return selected
+
+
+def preembed_sentences(parents: list[ParentChunk]) -> dict[str, list[list[float]]]:
+    """Embed every child sentence of the whole book in one batched pass.
+
+    Returns ``{parent_id: [sentence_vec, ...]}`` aligned to the sentence order
+    produced by ``_prepare_child_sentences`` for that parent. This replaces the
+    per-sentence model calls in ``build_children`` with a single, batched
+    forward pass, then the child splitter compares precomputed vectors only.
+    """
+    pairs: list[tuple[str, str]] = []
+    for p in parents:
+        if _is_question_parent(p.content):
+            continue
+        for s in _prepare_child_sentences(p.content):
+            pairs.append((p.parent_id, s))
+    if not pairs:
+        return {}
+    texts = [s for _, s in pairs]
+    t0 = time.perf_counter()
+    vecs = dense_vector(texts)
+    elapsed = time.perf_counter() - t0
+    logger.info(
+        "Sentence pre-embed | sentences=%d | vectors=%d | time=%.2fs | model=%s",
+        len(texts),
+        len(vecs),
+        elapsed,
+        device_name(),
+    )
+    result: dict[str, list[list[float]]] = {}
+    for (pid, _), vec in zip(pairs, vecs):
+        result.setdefault(pid, []).append(vec)
+    return result
+
+
+def build_children(
+    parent: ParentChunk, sentence_vecs: list[list[float]] | None = None
+) -> list[ChildChunk]:
     """Split one parent's content into focused child chunks (sentence packing).
 
     The sentence stream is walked in order, building a single current chunk.
     Before any merge the candidate (current chunk + next sentence) is checked
     against the size ceiling; if it exceeds the cap the current chunk is
-    finalized and the next sentence starts a new chunk. Otherwise the complete
-    current chunk text is re-embedded and compared against the next sentence:
-    it joins while ``cosine_sim(embed(current), embed(next)) >=
+    finalized and the next sentence starts a new chunk. Otherwise the similarity
+    between the current chunk's running sentence centroid and the next sentence
+    is compared: it joins while ``cosine_sim(centroid, vec(next)) >=
     SIMILARITY_THRESHOLD_CHILD``; otherwise the current chunk is finalized and
-    the next sentence starts a new chunk. No running centroid or average of
-    sentence embeddings is used -- the similarity comparison is always against
-    the embedding of the actual accumulated chunk text, re-embedded after every
-    successful merge. ``CHILD_MAX_SIZE`` remains a hard ceiling that closes the
-    chunk on size regardless of similarity. A child is always cut at a sentence
-    boundary, and between any two adjacent children exactly the last sentence
-    of the previous child is carried forward as overlap.
+    the next sentence starts a new chunk. ``CHILD_MAX_SIZE`` remains a hard
+    ceiling that closes the chunk on size regardless of similarity. A child is
+    always cut at a sentence boundary, and between any two adjacent children
+    exactly the last sentence of the previous child is carried forward as
+    overlap.
     """
     text = parent.content
     if not text:
@@ -683,22 +806,7 @@ def build_children(parent: ParentChunk) -> list[ChildChunk]:
             )
         ]
 
-    # Strip plain numbered-list markers so "1. " / "2) " don't pollute the
-    # embedding. Structural numbers (Chapter 3, Section 2.1) are preserved.
-    combined = strip_list_markers(text)
-    if not combined:
-        return []
-
-    # Drop stray diagram labels, broken fragments, and repeated sentences so a
-    # chunk never carries OCR noise that would pollute its title/embedding.
-    selected: list[str] = []
-    for s in split_sentences(combined):
-        if _is_junk_sentence(s):
-            continue
-        norm = _normalize_sentence(s)
-        if selected and _normalize_sentence(selected[-1]) == norm:
-            continue
-        selected.append(s.strip())
+    selected = _prepare_child_sentences(text)
     if not selected:
         return []
 
@@ -709,16 +817,31 @@ def build_children(parent: ParentChunk) -> list[ChildChunk]:
     groups: list[str] = []
 
     enc = time.perf_counter()
-    for next_sent in child_sents[1:]:
+    vecs = sentence_vecs if sentence_vecs is not None else None
+    if vecs is not None and len(vecs) == len(child_sents):
+        centroid = list(vecs[0])
+        count_in_chunk = 1
+    else:
+        vecs = None
+        centroid = None
+        count_in_chunk = 0
+    for i, next_sent in enumerate(child_sents[1:]):
         candidate = f"{current_chunk} {next_sent.text}"
         if count_words(candidate) > max_child_words:
             groups.append(current_chunk)
             current_chunk = next_sent.text
+            if vecs is not None:
+                centroid = list(vecs[i + 1])
+                count_in_chunk = 1
             continue
 
-        current_embedding = dense_vector([current_chunk])[0]
-        next_embedding = dense_vector([next_sent.text])[0]
-        sim = cosine_sim(current_embedding, next_embedding)
+        if vecs is not None:
+            next_embedding = vecs[i + 1]
+            sim = cosine_sim(centroid, next_embedding)
+        else:
+            current_embedding = dense_vector([current_chunk])[0]
+            next_embedding = dense_vector([next_sent.text])[0]
+            sim = cosine_sim(current_embedding, next_embedding)
 
         logger.info(
             "Child boundary | parent_id=%s | sim=%.3f | threshold=%.2f | action=%s | reason=%s",
@@ -730,30 +853,56 @@ def build_children(parent: ParentChunk) -> list[ChildChunk]:
         )
         if sim >= SIMILARITY_THRESHOLD_CHILD:
             current_chunk = candidate
+            if vecs is not None:
+                c0, c1 = count_in_chunk, count_in_chunk + 1
+                centroid = [
+                    (a * c0 + b) / c1 for a, b in zip(centroid, next_embedding)
+                ]
+                count_in_chunk = c1
         else:
             groups.append(current_chunk)
             current_chunk = next_sent.text
+            if vecs is not None:
+                centroid = list(vecs[i + 1])
+                count_in_chunk = 1
 
     encode_ms = (time.perf_counter() - enc) * 1000
     groups.append(current_chunk)
 
+    # Enforce the minimum child size FIRST: drop / merge tiny fragments while
+    # groups are still disjoint. Doing this before the overlap step prevents a
+    # carried-forward sentence from being duplicated when a fragment is folded
+    # into a chunk that already received it as overlap.
+    floored = _apply_min_floor(groups, max_child_words)
+
     # Overlap: carry exactly the last sentence of the previous child forward
-    # into the next child (adds continuity for retrieval).
+    # into the next child (adds continuity for retrieval). The cap stays strict:
+    # if the carried sentence would push the next child over ``max_child_words``
+    # it is dropped from the overlap (it still lives in its own chunk), so no
+    # chunk is ever created above the size limit.
     overlapped: list[str] = []
     previous_body: str | None = None
-    for body in groups:
+    for body in floored:
         body = body.strip()
         if not body:
             continue
         if previous_body:
             last_sent = _last_sentence_of(previous_body)
             if last_sent and last_sent not in body:
-                body = f"{last_sent} {body}".strip()
+                candidate = f"{last_sent} {body}".strip()
+                if count_words(candidate) <= max_child_words:
+                    body = candidate
+                else:
+                    logger.warning(
+                        "Child overlap skipped | parent_id=%s | would exceed "
+                        "max_child_words=%d",
+                        parent.parent_id,
+                        max_child_words,
+                    )
         overlapped.append(body)
         previous_body = body
 
-    # Enforce the minimum child size: drop / merge tiny fragments.
-    filtered = _apply_min_floor(overlapped)
+    filtered = overlapped
 
     logger.debug(
         "Child split | parent_id=%s | sentences=%d | children=%d | embed_time=%.0fms | max_words=%d",
@@ -864,6 +1013,70 @@ def verify_chunk_invariants(chunks: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+def _label_families(
+    parents: list[ParentChunk], children: list[ChildChunk], client=None
+) -> None:
+    """Label sections and their subsections, one LLM call per batch of families.
+
+    Families are processed in document order, ``TITLE_BATCH_SIZE`` parents per
+    call. Each family entry is the parent SECTION immediately followed by its
+    own SUBSECTION children, so parent/child headers are written together and
+    stay consistent (a child header never generalizes its section header). The
+    most recent accepted headers are threaded across batches so headers stay
+    distinct document-wide; any title that fails the format / blocklist /
+    exact-dup checks receives exactly one regeneration call. Children whose
+    title is ``None`` are single-child subsections that simply mirror their
+    parent -- they are never labeled.
+    """
+    if not parents:
+        return
+    by_parent: dict[str, list[ChildChunk]] = {p.parent_id: [] for p in parents}
+    child_counts = Counter(c.parent_id for c in children)
+    for c in children:
+        if child_counts[c.parent_id] > 1:
+            by_parent.setdefault(c.parent_id, []).append(c)
+
+    client = client or make_title_client()
+    used: set[str] = set()
+    recent: list[str] = []
+
+    for start in range(0, len(parents), TITLE_BATCH_SIZE):
+        batch = parents[start : start + TITLE_BATCH_SIZE]
+        entries: list[tuple[str, str]] = []
+        owners: list[tuple[str, ParentChunk | ChildChunk]] = []
+        for p in batch:
+            entries.append(("section", p.content))
+            owners.append(("section", p))
+            for c in by_parent.get(p.parent_id, []):
+                entries.append(("subsection", c.content))
+                owners.append(("subsection", c))
+
+        titles = generate_family_batch_titles(
+            entries, client=client, before=recent[-TITLE_CONTEXT_RECENT:]
+        )
+        for (level, item), title in zip(owners, titles):
+            if not (title and is_acceptable_title(title, item.content, level, used)):
+                title = regenerate_title(
+                    client=client,
+                    content=item.content,
+                    level=level,
+                    reject=[title] if title else [],
+                    used_titles=used,
+                )
+            if title and is_acceptable_title(title, item.content, level, used):
+                item.title = title
+                used.add(title)
+                recent.append(title)
+                cid = getattr(item, "child_id", getattr(item, "parent_id", ""))
+                logger.info(
+                    "%s title | id=%s | words=%d | title=%s",
+                    level.title(),
+                    cid,
+                    count_words(item.content),
+                    title,
+                )
+
+
 def build_semantic_structure(
     pages: list[dict[str, Any]], document_id: str
 ) -> dict[str, list[dict[str, Any]]]:
@@ -875,23 +1088,25 @@ def build_semantic_structure(
     t0 = time.perf_counter()
     logger.info("Semantic chunking started | document_id=%s", document_id)
 
+    # PHASE 1 - chunking only (no LLM). Parents are built first, then each
+    # parent is immediately chunked into its child units, in document order.
     parents = build_parents(split_parents(pages), document_id)
     logger.info("Parents generated | count=%d", len(parents))
 
-    if parents:
-        generate_section_titles(parents)
+    # Embed every sentence of the whole book ONCE, then split each parent's
+    # children by comparing the precomputed vectors (no per-sentence model calls).
+    sentence_vecs = preembed_sentences(parents)
 
     children: list[ChildChunk] = []
     for parent in parents:
-        children.extend(build_children(parent))
+        children.extend(
+            build_children(parent, sentence_vecs=sentence_vecs.get(parent.parent_id))
+        )
 
-    # A subsection that is the ONLY child of its section just mirrors the
-    # parent; suppress its heading so only the parent is shown.
     child_counts = Counter(c.parent_id for c in children)
     for c in children:
         if child_counts[c.parent_id] == 1:
             c.title = None
-    titled_children = [c for c in children if child_counts[c.parent_id] > 1]
 
     logger.info(
         "CHUNK COUNTS | document_id=%s | parent_chunks=%d | child_chunks=%d",
@@ -900,19 +1115,8 @@ def build_semantic_structure(
         len(children),
     )
 
-    if titled_children:
-        generate_subsection_titles(titled_children)
-
-    # One document-wide uniqueness pass across sections and subsections.
-    _dedupe_across_levels(parents, children)
-
-    # Reviewer pass: score every header against its own passage and replace the
-    # bad ones. Runs after dedup so it reviews the final, unique titles.
-    review_titles(parents, children)
-
-    # Review replacements may collide with a surviving title; a final uniqueness
-    # pass keeps every displayed header distinct.
-    _dedupe_across_levels(parents, children)
+    # PHASE 2 - titles only (LLM): one call per batch of parent families.
+    _label_families(parents, children)
 
     elapsed = time.perf_counter() - t0
     logger.info(
@@ -922,12 +1126,26 @@ def build_semantic_structure(
         elapsed,
     )
 
+    # Metadata gathers for parent/child persistence. Children are appended in
+    # document order inside each parent, so a per-parent running counter yields a
+    # stable child_order and the accumulated subsection titles stay aligned with
+    # the child order.
+    parent_titles = {p.parent_id: p.title for p in parents}
+    parent_subtitles: dict[str, list] = {}
+    child_order_map: dict[str, int] = {}
+    for c in children:
+        parent_subtitles.setdefault(c.parent_id, []).append(c.title)
+        child_order_map[c.child_id] = len(parent_subtitles[c.parent_id]) - 1
+
     return {
         "parents": [
             {
                 "parent_id": p.parent_id,
                 "document_id": p.document_id,
                 "title": p.title,
+                "parent_title": p.title,
+                "chunk_type": "parent",
+                "subsection_titles": parent_subtitles.get(p.parent_id, []),
                 "page_start": p.page_start,
                 "page_end": p.page_end,
                 "content": p.content,
@@ -937,10 +1155,15 @@ def build_semantic_structure(
         "children": [
             {
                 "child_id": c.child_id,
+                "chunk_id": c.child_id,
                 "parent_id": c.parent_id,
                 "document_id": c.document_id,
                 "title": c.title,
                 "heading": c.title,
+                "chunk_title": c.title,
+                "parent_title": parent_titles.get(c.parent_id),
+                "chunk_type": "child",
+                "child_order": child_order_map[c.child_id],
                 "page_start": c.page_start,
                 "page_end": c.page_end,
                 "content": c.content,

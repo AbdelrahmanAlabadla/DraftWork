@@ -33,6 +33,18 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
         parent_children = [
             c for c in children if c["parent_id"] == parent["parent_id"]
         ]
+        child_ids = [c["child_id"] for c in parent_children]
+        child_count = len(child_ids)
+        assert child_count == len(child_ids), (
+            f"child_count must equal len(child_ids) for parent "
+            f"{parent['parent_id']}"
+        )
+        assert all(child_ids), (
+            f"empty child_id found for parent {parent['parent_id']}"
+        )
+        assert len(set(child_ids)) == len(child_ids), (
+            f"duplicate child_ids for parent {parent['parent_id']}"
+        )
         # Single-child subsections are suppressed (title is None): they only
         # mirror the parent, so do not render a separate row for them.
         shown = [c for c in parent_children if c.get("title")]
@@ -49,9 +61,15 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
         sections.append(
             {
                 "parent_id": parent["parent_id"],
+                "document_id": document_id,
+                "chunk_type": "parent",
                 "title": parent.get("title"),
-                "child_ids": [c["child_id"] for c in parent_children],
-                "child_count": len(subsections),
+                "parent_title": parent.get("parent_title", parent.get("title")),
+                "subsection_titles": [
+                    c.get("title") for c in parent_children
+                ],
+                "child_ids": child_ids,
+                "child_count": child_count,
                 "page_start": parent.get("page_start"),
                 "page_end": parent.get("page_end"),
                 "subsections": subsections,

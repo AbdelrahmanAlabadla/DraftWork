@@ -37,6 +37,15 @@ def _get_nlp():
     return _NLP or None
 
 
+def warmup() -> bool:
+    """Preload the spaCy model once at server startup.
+
+    Returns True when the model is available; warmup failures are logged by
+    ``_get_nlp`` (best-effort helper), so this never raises.
+    """
+    return _get_nlp() is not None
+
+
 def is_noun_phrase(title: str) -> bool:
     """True when ``title`` is grammatically a noun phrase, not a fragment.
 

@@ -53,3 +53,24 @@ def test_save_and_load_persists_subsection_titles(monkeypatch, tmp_path):
 def test_load_missing_document_returns_empty(monkeypatch, tmp_path):
     monkeypatch.setattr(structure_store, "STRUCTURES_DIR", str(tmp_path))
     assert structure_store.load_structure("nope") == {}
+
+
+def test_child_count_counts_all_children_not_just_displayed_rows(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(structure_store, "STRUCTURES_DIR", str(tmp_path))
+    structure = {
+        "parents": [
+            {"parent_id": "p1", "title": "Section", "page_start": 1, "page_end": 3}
+        ],
+        "children": [
+            {"child_id": "c1", "parent_id": "p1", "title": "Titled", "page_start": 1, "page_end": 2},
+            {"child_id": "c2", "parent_id": "p1", "title": None, "page_start": 2, "page_end": 3},
+        ],
+    }
+    path = structure_store.save_structure("doc-2", structure)
+    loaded = structure_store.load_structure("doc-2")
+    section = loaded["sections"][0]
+    assert section["child_ids"] == ["c1", "c2"]
+    assert section["child_count"] == len(section["child_ids"]) == 2
+    assert [s["title"] for s in section["subsections"]] == ["Titled"]

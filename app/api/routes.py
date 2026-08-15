@@ -14,7 +14,7 @@ from app.config import UPLOAD_DIR
 from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
 from app.offline.structure_store import load_structure
-from app.online.exam_builder import assemble_exam, generate_exam
+from app.online.exam_builder import generate_exams
 
 logger = get_logger("API")
 
@@ -27,7 +27,11 @@ _SUPPORTED_COUNTS = {
     "why": "short_answer",
 }
 # Sent by the frontend but out of scope for V1 (accepted, ignored).
-_IGNORED_FIELDS = {"fitb_count", "essay_count", "num_models", "difficulty"}
+_IGNORED_FIELDS = {"fitb_count", "essay_count"}
+
+_VALID_DIFFICULTIES = frozenset({"easy", "medium", "hard", "mix"})
+_NUM_MODELS_MIN = 1
+_NUM_MODELS_MAX = 4
 
 
 class GenerateRequest(BaseModel):
@@ -148,10 +152,10 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     if not registry.get_document(document_id):
         raise HTTPException(status_code=404, detail=f"Unknown document_id: {document_id}")
 
-    if body.child_ids is not None and not body.child_ids:
+    if not body.child_ids:
         raise HTTPException(
             status_code=400,
-            detail="Please select at least one subsection to include in the exam.",
+            detail="Please choose at least one section topic to generate the exam.",
         )
 
     set_request_id(document_id)
@@ -180,29 +184,57 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
             detail="No supported question types requested. V1 supports MCQ, True/False, and Short Answer.",
         )
 
+    num_models = body.num_models if body.num_models is not None else 1
+    if not isinstance(num_models, int) or not (
+        _NUM_MODELS_MIN <= num_models <= _NUM_MODELS_MAX
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"num_models must be an integer between {_NUM_MODELS_MIN} and "
+                f"{_NUM_MODELS_MAX}."
+            ),
+        )
+
+    difficulty = body.difficulty or "easy"
+    difficulty = difficulty.lower() if isinstance(difficulty, str) else difficulty
+    if difficulty not in _VALID_DIFFICULTIES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported difficulty '{difficulty}'. Supported: "
+                f"{sorted(_VALID_DIFFICULTIES)}"
+            ),
+        )
+
     t_total = time.perf_counter()
-    result = generate_exam(document_id, tasks, body.child_ids)
-    all_questions = result["questions"]
+    result = generate_exams(
+        document_id, tasks, num_models, body.child_ids, difficulty
+    )
+    exams = result["exams"]
     warnings = result["warnings"]
 
-    exam_markdown = assemble_exam(all_questions)
     total_elapsed = time.perf_counter() - t_total
 
-    if not exam_markdown:
+    if not any(exam["questions"] for exam in exams):
         detail = "; ".join(warnings) or "No questions could be generated."
         raise HTTPException(status_code=500, detail=detail)
 
     logger.info(
-        "Exam generation completed | document_id=%s | types=%s | total_questions=%d | total_time=%.2fs | success=True",
+        "Exam generation completed | document_id=%s | models=%d | difficulty=%s | types=%s | "
+        "total_questions=%d | total_time=%.2fs | success=True",
         document_id,
-        list(all_questions.keys()),
-        sum(len(q) for q in all_questions.values()),
+        num_models,
+        difficulty,
+        list(exams[0]["questions"].keys()),
+        sum(len(q) for e in exams for q in e["questions"].values()),
         total_elapsed,
     )
 
     return {
-        "exam": exam_markdown,
         "document_id": document_id,
-        "questions": all_questions,
+        "num_models": num_models,
+        "difficulty": difficulty,
+        "exams": exams,
         "warnings": warnings,
     }

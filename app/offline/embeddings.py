@@ -21,9 +21,30 @@ _model_lock = threading.Lock()
 # Cap for paragraph/sentence embedding batches in one call to the embedder.
 _DENSE_BATCH_MAX = 512
 
+# Batch size for GPU embedding passes (parents, sentences and stored children).
+_EMBED_BATCH_SIZE = 64
+
 
 def device_name() -> str:
     return _DEVICE
+
+
+def warmup() -> None:
+    """Preload the embedding model and warm the tokenizer/GPU kernels.
+
+    Called from the API startup so the first pipeline request does not pay
+    model download / load time. Runs a single tiny encode to force tokenizer
+    and CUDA kernel initialization inside the already-loaded model.
+    """
+    model = get_model()
+    _ = model.encode(
+        ["The quick brown fox jumps over the lazy dog"],
+        batch_size=1,
+        max_length=512,
+        return_dense=True,
+        return_sparse=True,
+        return_colbert_vecs=False,
+    )
 
 
 def dense_vector(texts: list[str], max_length: int = 512) -> list[list[float]]:
@@ -31,15 +52,40 @@ def dense_vector(texts: list[str], max_length: int = 512) -> list[list[float]]:
 
     Embeds in ``_DENSE_BATCH_MAX`` chunks so a large document (thousands of
     paragraphs) is never passed to the model as one giant batch, which can trip
-    tokenizer padding on some inputs.
+    tokenizer padding on some inputs. Only the dense vectors are returned
+    because the chunker just compares cosine similarity.
     """
     if not texts:
         return []
     out: list[list[float]] = []
     for start in range(0, len(texts), _DENSE_BATCH_MAX):
         chunk = texts[start : start + _DENSE_BATCH_MAX]
-        out.extend(v["dense"] for v in embed_texts(chunk, batch_size=len(chunk), max_length=max_length))
+        out.extend(embed_dense(chunk, batch_size=_EMBED_BATCH_SIZE, max_length=max_length))
     return out
+
+
+def embed_dense(
+    texts: list[str], batch_size: int = _EMBED_BATCH_SIZE, max_length: int = 8192
+) -> list[list[float]]:
+    """Dense-only embeddings of ``texts`` -> ``[vec, ...]``.
+
+    Used by the chunker for cosine-similarity decisions (parents and sentence
+    splits). Sparse (lexical) vectors are skipped here since they are not needed
+    for similarity and are only persisted for stored children.
+    """
+    if not texts:
+        return []
+    model = get_model()
+    out = model.encode(
+        texts,
+        batch_size=batch_size,
+        max_length=max_length,
+        return_dense=True,
+        return_sparse=False,
+        return_colbert_vecs=False,
+    )
+    dense = out["dense_vecs"]
+    return [dense[i].tolist() for i in range(len(texts))]
 
 
 def cosine_sim(a: list[float], b: list[float]) -> float:
@@ -81,7 +127,7 @@ def get_model() -> Any:
 
 
 def embed_texts(
-    texts: list[str], batch_size: int = 16, max_length: int = 8192
+    texts: list[str], batch_size: int = _EMBED_BATCH_SIZE, max_length: int = 8192
 ) -> list[dict[str, Any]]:
     """Embed a list of texts -> [{"dense": [...], "sparse": {token_id: weight}}]."""
     if not texts:

@@ -312,6 +312,113 @@ def test_make_titles_unique_advances_triple_suffix():
     assert out == ["Data Mining", "Data Mining II", "Data Mining III"]
 
 
+def test_blocklisted_rejects_fill_headers_only():
+    assert tg._blocklisted("Overview") is True
+    assert tg._blocklisted("Introduction to Data") is True
+    assert tg._blocklisted("Key Concepts") is True
+    # A full, real heading that merely borrows a blocklist word stays valid.
+    assert tg._blocklisted("Data Overview") is False
+    assert tg._blocklisted("Regression Analysis") is False
+    assert tg._blocklisted("") is True
+
+
+def test_is_acceptable_title_checks_format_blocklist_and_dup(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    used = {"Linear Regression"}
+    assert tg.is_acceptable_title("Linear Regression", "x", "section", set()) is True
+    assert tg.is_acceptable_title("Linear Regression", "x", "section", used) is False
+    assert tg.is_acceptable_title("Overview", "x", "section", set()) is False
+    assert tg.is_acceptable_title("What Is It?", "x", "section", set()) is False
+    assert tg.is_acceptable_title("  ", "x", "section", set()) is False
+
+
+def test_generate_family_batch_titles_one_call_mixed_levels():
+    client = _FakeClient(
+        lambda p: "1. Data Preprocessing\n2. Handling Missing Values\n"
+        "3. Outlier Detection\n4. Machine Learning Applications"
+    )
+    entries = [
+        ("section", "a" * 60),
+        ("subsection", "b" * 60),
+        ("subsection", "c" * 60),
+        ("section", "d" * 60),
+    ]
+    titles = tg.generate_family_batch_titles(entries, client)
+    assert titles == [
+        "Data Preprocessing",
+        "Handling Missing Values",
+        "Outlier Detection",
+        "Machine Learning Applications",
+    ]
+    assert len(client.calls) == 1
+    assert "[SECTION]" in client.calls[0]
+    assert "[SUBSECTION]" in client.calls[0]
+
+
+def test_generate_family_batch_titles_blank_on_invalid(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    client = _FakeClient(
+        lambda p: "1. Data Preprocessing\n2. What Is It?\n3. Outlier Detection"
+    )
+    titles = tg.generate_family_batch_titles(
+        [("section", "a" * 60), ("subsection", "b" * 60), ("subsection", "c" * 60)],
+        client,
+    )
+    assert titles[0] == "Data Preprocessing"
+    assert titles[1] == ""  # question form rejected -> left for regeneration
+    assert titles[2] == "Outlier Detection"
+
+
+def test_family_batch_strips_echoed_level_tag():
+    client = _FakeClient(
+        lambda p: "1. [SECTION] Data Preprocessing\n"
+        "2. [SUBSECTION] Handling Missing Values\n"
+        "3. [SECTION] Machine Learning Applications"
+    )
+    titles = tg.generate_family_batch_titles(
+        [("section", "a" * 60), ("subsection", "b" * 60), ("section", "c" * 60)],
+        client,
+    )
+    assert titles == [
+        "Data Preprocessing",
+        "Handling Missing Values",
+        "Machine Learning Applications",
+    ]
+
+
+def test_clean_title_removes_level_tag_prefix():
+    assert tg.clean_title("[SECTION] Data Preprocessing") == "Data Preprocessing"
+    assert tg.clean_title("1. [SUBSECTION] Outlier Detection") == "Outlier Detection"
+    assert tg.clean_title("Data Preprocessing") == "Data Preprocessing"
+
+
+def test_regenerate_title_single_call_then_fallback(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    client = _FakeClient(lambda p: "Robust Regression")
+    out = tg.regenerate_title(
+        client,
+        content="A robust regression resists outliers in the data.",
+        level="section",
+        reject=["Stepping"],
+    )
+    assert out == "Robust Regression"
+    assert len(client.calls) == 1
+
+
+def test_regenerate_title_avoids_used_title(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    monkeypatch.setattr(tg, "_safe_fallback", lambda content, max_words: "Outlier Handling")
+    client = _FakeClient(lambda p: "Robust Regression")
+    out = tg.regenerate_title(
+        client,
+        content="A robust regression resists outliers in the data.",
+        level="section",
+        reject=["Robust Regression"],
+        used_titles={"Robust Regression"},
+    )
+    assert out == "Outlier Handling"
+
+
 def test_safe_fallback_rejects_single_word_stub():
     # "option" is a real noun but too thin to be a navigation header; the fallback
     # must widen it to a phrase instead of emitting a bare stub.

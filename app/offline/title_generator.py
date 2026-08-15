@@ -14,6 +14,8 @@ from app.config import (
     TITLE_MAX_ATTEMPTS,
     TITLE_MAX_TOKENS,
     TITLE_MODEL,
+    TITLE_BLOCKLIST,
+    TITLE_CONTEXT_RECENT,
     TITLE_REVIEW_CONTEXT_WORDS,
     TITLE_REVIEW_ENABLED,
     TITLE_REVIEW_GOOD_SCORE,
@@ -210,6 +212,60 @@ _BATCH_SELF_CHECK = (
     "Return ONLY the numbered list of headers."
 )
 
+# Mixed-family batch: a parent SECTION and its SUBSECTION children are labeled
+# in the SAME numbered list, so the section header can be written broader than
+# (and consistent with) its own subsections in one call.
+_FAMILY_BATCH_RULE = (
+    "You are still writing the same short headers, but now each numbered entry "
+    "is tagged with its level. A SECTION is a group of related subsections; "
+    "its header must name the broader theme unifying them. A SUBSECTION is a "
+    "single focused lesson inside a section; its header must name that ONE "
+    "specific concept and must stay NARROWER than its own SECTION header.\n"
+    "\n"
+    "CRITICAL REQUIREMENTS:\n"
+    "- Produce EXACTLY one header for EVERY numbered passage.\n"
+    "- Every header must be DIFFERENT from every other header.\n"
+    "- A SUBSECTION header must never equal or generalize its SECTION header.\n"
+    "- Base each header only on the content of its own numbered passage.\n"
+    "- If a passage already contains a meaningful textbook heading, REUSE it "
+    "(cleaned up) as that passage's header; only write a new header when the "
+    "heading is missing, garbage, or unrelated.\n"
+    "\n"
+    'Output format (strict): a numbered list, one header per line, keeping '
+    "the same order as the numbered passages. Example:\n"
+    "1. [SECTION] Data Preprocessing\n"
+    "2. [SUBSECTION] Handling Missing Values\n"
+    "3. [SUBSECTION] Outlier Detection\n"
+    "4. [SECTION] Machine Learning Applications\n"
+)
+
+_FAMILY_BATCH_SELF_CHECK = (
+    "Before returning, verify:\n"
+    "1. Every numbered passage received exactly one header.\n"
+    "2. All headers are distinct from each other.\n"
+    "3. SUBSECTION headers are narrower than their SECTION header.\n"
+    "4. Each header is 2 to 6 words, Title Case, one concept, ToC-style.\n"
+    "5. Headers appear in the same order as the numbered passages.\n"
+    "\n"
+    "Return ONLY the numbered list of headers."
+)
+
+# One-shot regeneration call: fixes a single rejected header (one LLM call),
+# explicitly warned against replicating the rejected header or the recent ones.
+_REGENERATE_PROMPT = (
+    "A passage in a university textbook needs a short Table-of-Contents style "
+    "header. The previous attempt ({header!r}) was rejected and must not be "
+    "reused.\n"
+    "Rules:\n"
+    "- 2 to {max_words} words, Title Case, one concept, a noun heading.\n"
+    "- No commas, no lists, no numbering, no question marks, no explanation.\n"
+    "- Avoid starting with Introduction to, Overview of, A Comprehensive, "
+    "Analysis of, or Summary of.\n"
+    "- Do NOT use any of these already-taken headers: {reject}\n"
+    "- Return ONLY the header.\n\n"
+    "## Content\n{content}"
+)
+
 # Stricter prompt used on the second (validation-fallback) attempt. Told to
 # output the single most important concept and nothing else.
 _FALLBACK_PROMPT = (
@@ -311,6 +367,9 @@ def clean_title(raw: str, max_words: int = 0) -> str:
     title = re.sub(r"^\s*[-*•]\s+", "", title).strip()
     # Strip leading numbering like "1. " / "3.1 " / "001: ".
     title = re.sub(r"^\s*\d+(?:[.:-]\d+)*(?:[.:-]\s*)?", "", title).strip()
+    # Strip the level tag the model echoes from the family-batch prompt format
+    # (e.g. "1. [SECTION] Data Preprocessing" -> "Data Preprocessing").
+    title = re.sub(r"^\s*\[(?:SECTION|SUBSECTION)\]\s*", "", title).strip()
     # Remove surrounding quote characters.
     title = title.strip('"').strip("'").strip()
     # Trim trailing sentence-like final punctuation (keep intra-title like
@@ -372,6 +431,10 @@ def validate_title(title: str, min_words: int, max_words: int) -> bool:
         return False
     n = _word_count(title)
     if n < min_words or n > max_words:
+        return False
+    # Reject immediately repeated words ("Proteins Proteins", "Cell Cell"), so
+    # the caller regenerates instead of shipping a duplicated header.
+    if re.search(r"\b(\w+)\s+\1\b", title, re.IGNORECASE):
         return False
     # Reject verb/adverb-headed or sentence-fragment titles ("Fortunately",
     # "Stepping Back", "Learning Algorithm Would") via part-of-speech tagging.
@@ -745,6 +808,214 @@ def generate_batch_titles(
         titles[i] = label
 
     return make_titles_unique(titles, contents, fallback_max_words)
+
+
+def make_title_client() -> LMStudioClient:
+    """Public factory for the title-generation LLM client."""
+    return _make_client()
+
+
+def _level_params(level: str) -> tuple[int, int, int, int]:
+    """(preview_words, min_words, max_words, fallback_max) for a title level."""
+    if level == "section":
+        return (
+            SECTION_TITLE_CONTEXT_WORDS,
+            SECTION_TITLE_MIN_WORDS,
+            SECTION_TITLE_MAX_WORDS,
+            FALLBACK_SECTION_MAX_WORDS,
+        )
+    return (
+        SUBSECTION_TITLE_CONTEXT_WORDS,
+        SUBSECTION_TITLE_MIN_WORDS,
+        SUBSECTION_TITLE_MAX_WORDS,
+        FALLBACK_SUBSECTION_MAX_WORDS,
+    )
+
+
+# Generic heading openers that are never a real concept ("Introduction to X",
+# "Overview of X") -- separate from TITLE_BLOCKLIST's exact-filler matches.
+_FILLER_PREFIXES: tuple[str, ...] = (
+    "introduction to",
+    "overview of",
+    "analysis of",
+    "summary of",
+    "a comprehensive",
+    "comprehensive",
+    "definitions of",
+    "key concepts",
+    "key terms",
+    "study of",
+    "guide to",
+)
+
+
+def _blocklisted(title: str) -> bool:
+    """True when a title is a bare filler heading or starts with a filler prefix."""
+    if not title:
+        return True
+    low = re.sub(r"\s+", " ", title.lower().strip())
+    if low in TITLE_BLOCKLIST:
+        return True
+    for prefix in _FILLER_PREFIXES:
+        if low.startswith(prefix):
+            return True
+    return False
+
+
+def is_acceptable_title(
+    title: str, content: str, level: str, used_titles: set[str]
+) -> bool:
+    """A title is acceptable when it passes format, blocklist, and exact-dup checks.
+
+    ``content`` is the passage the title labels; used by callers that also want
+    to run deeper checks (e.g. that the header is not lifted verbatim).
+    """
+    if not title or not title.strip():
+        return False
+    _, min_words, max_words, _ = _level_params(level)
+    if not validate_title(title, min_words, max_words):
+        return False
+    if _blocklisted(title):
+        return False
+    if title in used_titles:
+        return False
+    return True
+
+
+def _build_family_prompt(entries: list[tuple[str, str]], before: list[str]) -> str:
+    """Assemble a single-label prompt for a mixed batch of parents + children.
+
+    ``entries`` is a list of ``(level, preview)`` in document order where each
+    parent entry is immediately followed by its own children's entries. Every
+    entry is tagged [SECTION] / [SUBSECTION] so the model can keep subsection
+    headers narrower than their section header.
+    """
+    passages = "\n\n".join(
+        f"{i}. [{level.upper()}] {preview}"
+        for i, (level, preview) in enumerate(entries, 1)
+    )
+    seen = "\n".join(f"- {t}" for t in before if t) or "(none yet)"
+    return (
+        _TITLE_CORE
+        + "\n\n"
+        + _SECTION_LEVEL_BLOCK
+        + "\n\n"
+        + _SUBSECTION_LEVEL_BLOCK
+        + "\n\n"
+        + _STYLE_RULES
+        + "\n\n"
+        + _ABSTRACTION_RULE
+        + "\n\n"
+        + "Headers already used by neighboring passages (do NOT reuse any of "
+        "these):\n"
+        + seen
+        + "\n\n"
+        + _FAMILY_BATCH_RULE
+        + "\n\n"
+        + _FAMILY_BATCH_SELF_CHECK
+        + "\n\n## Passages\n"
+        + passages
+    )
+
+
+def generate_family_batch_titles(
+    entries: list[tuple[str, str]],
+    client=None,
+    *,
+    before: list[str] | None = None,
+) -> list[str]:
+    """Label a mixed batch of parent + child passages in ONE LLM call.
+
+    ``entries`` is a flat list of ``(level, content)`` in document order, where
+    each parent's entry is immediately followed by its children's entries. The
+    model sees the whole batch together (section + its subsections tagged) so
+    sibling and parent/child headers stay consistent and distinct. Returns one
+    title per entry; entries the model missed or invalidly titled come back as
+    ``""`` so the caller can regenerate them individually.
+    """
+    if not entries:
+        return []
+    previews = [
+        _first_n_words(content, _level_params(level)[0])
+        for level, content in entries
+    ]
+    tagged = [(level, preview) for (level, _), preview in zip(entries, previews)]
+
+    client = client or _make_client()
+    prompt = _build_family_prompt(tagged, before or [])
+    try:
+        raw = client.chat(
+            prompt,
+            system_prompt=None,
+            temperature=TITLE_TEMPERATURE,
+            max_tokens=max(600, len(entries) * 60),
+            timeout=1800,
+        )
+    except Exception as exc:  # noqa: BLE001 - title failure must not break pipeline
+        logger.warning("Family batch title error: %s: %s", type(exc).__name__, exc)
+        raw = ""
+
+    headers = _parse_title_list(raw)
+    titles: list[str] = [""] * len(entries)
+    for i, header in enumerate(headers[: len(entries)]):
+        level = entries[i][0]
+        _, min_words, max_words, _ = _level_params(level)
+        cleaned = clean_title(header, max_words)
+        if validate_title(cleaned, min_words, max_words):
+            titles[i] = _finalize(cleaned)
+    return titles
+
+
+def regenerate_title(
+    client=None,
+    content: str = "",
+    level: str = "section",
+    reject: list[str] | None = None,
+    used_titles: set[str] | None = None,
+) -> str:
+    """Fix one rejected header with ONE extra LLM call, then a deterministic fallback.
+
+    The model is told the rejected header and the most recent already-taken
+    headers so it does not regenerate a duplicate. If the single attempt still
+    fails the format / blocklist / exact-dup checks, a deterministic noun-phrase
+    label is returned.
+    """
+    client = client or _make_client()
+    preview = _first_n_words(content, _level_params(level)[0])
+    _, min_words, max_words, fallback_max = _level_params(level)
+    reject = list(dict.fromkeys(t for t in (reject or []) if t))
+    used = used_titles or set()
+    recent = list(dict.fromkeys(reject + sorted(used)))[: TITLE_CONTEXT_RECENT]
+    reject_str = ", ".join(f"{t!r}" for t in recent) or "(none)"
+    header = reject[0] if reject else "the previous attempt"
+
+    try:
+        raw = client.chat(
+            _REGENERATE_PROMPT.format(
+                header=header, max_words=max_words, reject=reject_str, content=preview
+            ),
+            system_prompt=None,
+            temperature=TITLE_TEMPERATURE,
+            max_tokens=max(200, int(max_words * 14)),
+            timeout=300,
+        )
+    except Exception as exc:  # noqa: BLE001 - regeneration must not break pipeline
+        logger.warning("Title regeneration error: %s: %s", type(exc).__name__, exc)
+        raw = ""
+
+    cleaned = clean_title(raw, max_words)
+    acceptable = (
+        cleaned
+        and validate_title(cleaned, min_words, max_words)
+        and not _blocklisted(cleaned)
+        and cleaned not in used
+    )
+    if acceptable:
+        return _finalize(cleaned)
+    label = _safe_fallback(content, fallback_max)
+    if label and label not in used:
+        return label
+    return cleaned
 
 
 def _attempt(client, prompt: str, min_words: int, max_words: int) -> str:

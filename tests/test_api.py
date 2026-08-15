@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+
 from fastapi.testclient import TestClient
 
 from app.logging_conf import configure_logging
@@ -11,55 +14,134 @@ from app.llm.json_utils import extract_json  # noqa: E402
 
 client = TestClient(app)
 
+_COUNT_RE = re.compile(r"Create exactly (\d+)")
+_PLANNER_MODELS_RE = re.compile(r"Plan exam questions for (\d+)")
+_PLANNER_COUNT_RE = re.compile(r"^\s*-\s*(\d+)\s+(mcq|true_false|short_answer)\s*$", re.M)
+_MODEL_RE = re.compile(r"Exam Model #(\d+)")
 
-def _install_fakes(monkeypatch, document_id: str = "doc-x") -> None:
-    # Registry fakes (avoid writing data/documents.json).
-    monkeypatch.setattr("app.api.storage.get_current_document", lambda: document_id)
-    monkeypatch.setattr(
-        "app.api.storage.get_document",
-        lambda doc_id: {"document_id": doc_id, "filename": "x.pdf"},
+
+def _model_number(prompt: str) -> int:
+    m = _MODEL_RE.search(prompt)
+    return int(m.group(1)) if m else 1
+
+
+_stem_counter = [0]
+
+
+def _distinct_stem(type_name: str, model: int, idx: int) -> str:
+    """Return a lexically-unique stem for model>1.
+
+    Unique hex tokens carry the content; every surrounding word is a stopword the
+    near-duplicate filter strips, so surviving vocabulary (the hex tokens + model
+    number) barely overlaps between any two stems.
+    """
+    c = _stem_counter[0] + 1 + model * 1000 + idx * 53
+    _stem_counter[0] = c
+    return (
+        f"the {c:x} and {c * 3:b} of {c * 7:x} with {model} which are "
+        f"{c * 5:d} and {c * 11:o}"
     )
 
-    # Embeddings fake.
-    monkeypatch.setattr(
-        "app.online.retrieval.embed_texts",
-        lambda texts, batch_size=16: [
-            {"dense": [0.1, 0.2, 0.3, 0.4], "sparse": {1: 0.5}} for _ in texts
-        ],
-    )
 
-    # Vector store fake.
-    class FakeStore:
-        def hybrid_search(self, dense, sparse, document_id, top_k=6, selected_child_ids=None):
-            return [
-                {
-                    "child_id": f"c{i}",
-                    "parent_id": "p1",
-                    "page": 1,
-                    "heading": "Heading",
-                    "content": f"Context paragraph number {i} with useful facts.",
-                    "score": 1.0,
-                }
-                for i in range(top_k)
-            ]
+def _fake_planner(prompt: str, num_models: int) -> object:
+    """Return a valid, cross-model-distinct plan for every model/type count."""
+    counts = {qtype: int(n) for n, qtype in _PLANNER_COUNT_RE.findall(prompt)}
+    if not counts:
+        counts = {"mcq": 1}
+    # Distinct topical vocabulary per model so cross-model concept-overlap is low.
+    model_topic = {
+        1: "cell metabolism",
+        2: "electron transport",
+        3: "gene expression",
+    }
+    exams = []
+    for m in range(1, num_models + 1):
+        topic = model_topic.get(m, f"domain {m}")
+        questions = [{"question_type": qtype, "topic": topic, "concept_to_test": f"distinct {qtype} concept {m}-{idx}"} for qtype, count in counts.items() for idx in range(count)]
+        exams.append({"model_number": m, "questions": questions})
+    return {"exams": exams}
 
-    monkeypatch.setattr("app.online.retrieval.VectorStore", FakeStore)
 
-    # LLM fake: return JSON based on the requested type in the prompt, with
-    # unique question text per call so the dedup layer never collapses them.
-    counter = {"n": 0}
+def _make_fake_llm(captured_prompts: list[str] | None = None):
+    """Return a FakeLLM serving BOTH roles parsed from the prompt.
+
+    Planner prompts (containing "concept_to_test") return a valid concept plan
+    covering every model/type; generator prompts return the requested count of
+    distinct questions (count parsed from "Create exactly N ..."). ``captured_prompts``
+    (optional) receives the raw text of every non-repair LLM call.
+    """
+    mcq_pool = [
+        "carbohydrate monomers link via glycosidic bonds",
+        "analysing a histogram reveals skewed distributions",
+        "the Krebs cycle occurs within mitochondria matrix",
+        "Newton's third law pairs equal opposing forces",
+        "a certificate validates a public key owner",
+        "osmosis transports water across a semipermeable membrane",
+        "the heap stores dynamically allocated objects",
+        "a ciphertext is produced through cipher operations",
+        "drought reduces agricultural crop yields",
+        "an interrupt triggers immediate processor handling",
+    ]
+    tf_pool = [
+        "glucagon elevates hepatic glucose output",
+        "fiscal stimulus expands aggregate demand",
+        "entropy measures system disorder",
+        "magnets possess paired poles",
+        "convection transfers heat through fluid",
+    ]
+    sa_pool = [
+        ("justify refrigeration reducing bacterial growth", "cooler slows division"),
+        ("explain corrosion requiring oxygen plus moisture", "oxidation degrades metals"),
+        ("describe absorption occurring along gut walls", "nutrients enter bloodstream"),
+    ]
 
     def fake_chat(self, prompt, system_prompt=None, temperature=0.7, max_tokens=4096, timeout=600):
-        counter["n"] += 1
-        if "Multiple Choice" in prompt:
-            return (
-                f'{{"questions":[{{"question":"Which layer collects data? (v{counter["n"]})",'
-                f'"options":{{"A":"Perception","B":"Network","C":"Application","D":"Middleware"}},'
-                f'"correct_answer":"A"}}]}}'
+        if captured_prompts is not None:
+            captured_prompts.append(prompt)
+
+        if "Plan exam questions for" in prompt:
+            num_models_m = _PLANNER_MODELS_RE.search(prompt)
+            num_models = int(num_models_m.group(1)) if num_models_m else 1
+            return _fake_planner(prompt, num_models)
+
+        m = _COUNT_RE.search(prompt)
+        count = int(m.group(1)) if m else 1
+        model = _model_number(prompt)
+        options = {"A": "Perception", "B": "Network", "C": "Application", "D": "Middleware"}
+
+        if "Multiple Choice (MCQ) exam question" in prompt:
+            texts = (
+                mcq_pool
+                if model == 1
+                else [_distinct_stem("mcq", model, i) for i in range(count)]
             )
-        if "True/False" in prompt:
-            return f'{{"questions":[{{"statement":"MQTT is a network protocol. (v{counter["n"]})","answer":"True"}}]}}'
-        return f'{{"questions":[{{"question":"Why is load balancing used? (v{counter["n"]})","reference_answer":"To avoid overload."}}]}}'
+            return {"questions": [
+                {"question": texts[i], "options": options, "correct_answer": "A"}
+                for i in range(min(count, len(texts)))
+            ]}
+        if "True/False exam question" in prompt:
+            texts = (
+                tf_pool
+                if model == 1
+                else [_distinct_stem("true_false", model, i) for i in range(count)]
+            )
+            return {"questions": [
+                {"statement": texts[i], "answer": "True"}
+                for i in range(min(count, len(texts)))
+            ]}
+        if model == 1:
+            return {"questions": [
+                {"question": text, "reference_answer": ref}
+                for text, ref in sa_pool[:count]
+            ]}
+        stems = [_distinct_stem("short_answer", model, i) for i in range(count)]
+        return {"questions": [
+            {
+                "question": stems[i],
+                "reference_answer": f"this is the {i} outcome {model}",
+            }
+            for i in range(count)
+        ]}
 
     class FakeLLM:
         def chat(self, prompt, system_prompt=None, temperature=0.7, max_tokens=4096, timeout=600):
@@ -70,25 +152,61 @@ def _install_fakes(monkeypatch, document_id: str = "doc-x") -> None:
 
         def chat_json(self, prompt, system_prompt=None, temperature=0.7, max_tokens=4096,
                       timeout=600, max_repair_attempts=2):
-            raw = fake_chat(
+            return fake_chat(
                 self, prompt, system_prompt=system_prompt, temperature=temperature,
                 max_tokens=max_tokens, timeout=timeout,
             )
-            return extract_json(raw)
 
-    monkeypatch.setattr("app.online.generator.LMStudioClient", FakeLLM)
+    return FakeLLM
+
+
+def _install_registry_and_store(monkeypatch, document_id: str = "doc-x") -> None:
+    # Registry fakes (avoid writing data/documents.json).
+    monkeypatch.setattr("app.api.storage.get_current_document", lambda: document_id)
+    monkeypatch.setattr(
+        "app.api.storage.get_document",
+        lambda doc_id: {"document_id": doc_id, "filename": "x.pdf"},
+    )
+
+    # Vector store fake.
+    class FakeStore:
+        def get_by_child_ids(self, document_id, child_ids):
+            return [
+                {
+                    "child_id": cid,
+                    "parent_id": "p1",
+                    "parent_title": "Parent",
+                    "chunk_title": f"Sub {i}",
+                    "page": 1,
+                    "content": f"Context paragraph number {i} with useful facts.",
+                }
+                for i, cid in enumerate(child_ids)
+            ]
+
+    monkeypatch.setattr("app.online.retrieval.VectorStore", FakeStore)
+
+
+def _install_fakes(monkeypatch, document_id: str = "doc-x") -> None:
+    _install_registry_and_store(monkeypatch, document_id)
+    # LLM fake: serves both the planner role and the generator role.
+    fake = _make_fake_llm()
+    monkeypatch.setattr("app.online.planner.LMStudioClient", fake)
+    monkeypatch.setattr("app.llm.client.LMStudioClient", fake)
 
 
 def test_generate_single_type_mcq(monkeypatch):
     _install_fakes(monkeypatch)
     resp = client.post(
-        "/generate", json={"document_id": "doc-x", "mcq_count": 1}
+        "/generate", json={"document_id": "doc-x", "mcq_count": 1, "child_ids": ["c1"]}
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert "Multiple Choice" in data["exam"]
-    assert "Answer: A" in data["exam"]
-    assert data["questions"]["mcq"][0]["correct_answer"] == "A"
+    assert len(data["exams"]) == 1
+    exam = data["exams"][0]
+    assert exam["model_number"] == 1
+    assert "Multiple Choice" in exam["markdown"]
+    assert "Answer: A" in exam["markdown"]
+    assert exam["questions"]["mcq"][0]["correct_answer"] == "A"
 
 
 def test_generate_html_payload_multiple_types(monkeypatch):
@@ -101,25 +219,114 @@ def test_generate_html_payload_multiple_types(monkeypatch):
             "why_count": 1,
             "fitb_count": 3,  # ignored in V1
             "essay_count": 2,  # ignored in V1
-            "num_models": 2,   # ignored in V1
-            "difficulty": "hard",  # ignored in V1
+            "num_models": 2,
+            "difficulty": "hard",
+            "child_ids": ["c1", "c2"],
         },
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert set(data["questions"].keys()) == {"mcq", "true_false", "short_answer"}
-    assert "Multiple Choice" in data["exam"]
-    assert "True / False" in data["exam"]
-    assert "Short Answer" in data["exam"]
+    assert data["num_models"] == 2
+    assert data["difficulty"] == "hard"
+    assert len(data["exams"]) == 2
+    for exam in data["exams"]:
+        assert set(exam["questions"].keys()) == {"mcq", "true_false", "short_answer"}
+        assert "Multiple Choice" in exam["markdown"]
+        assert "True / False" in exam["markdown"]
+        assert "Short Answer" in exam["markdown"]
+
+
+def test_generate_num_models_returns_separate_full_exams(monkeypatch):
+    # The specific requirement: 3 models, each with its own full 10/5/3 counts.
+    _install_fakes(monkeypatch)
+    resp = client.post(
+        "/generate",
+        json={
+            "document_id": "doc-x",
+            "mcq_count": 10,
+            "tf_count": 5,
+            "why_count": 3,
+            "num_models": 3,
+            "difficulty": "medium",
+            "child_ids": ["c1"],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["num_models"] == 3
+    assert len(data["exams"]) == 3
+    for exam in data["exams"]:
+        assert len(exam["questions"]["mcq"]) == 10
+        assert len(exam["questions"]["true_false"]) == 5
+        assert len(exam["questions"]["short_answer"]) == 3
+
+
+def test_difficulty_directive_in_prompt(monkeypatch):
+    expected = {
+        "easy": "Generate EASY questions",
+        "medium": "Generate MEDIUM questions",
+        "hard": "Generate HARD questions",
+        "mix": "EASY, MEDIUM, and HARD",
+    }
+    for difficulty, needle in expected.items():
+        captured: list[str] = []
+        _install_registry_and_store(monkeypatch)
+        fake = _make_fake_llm(captured)
+        monkeypatch.setattr("app.online.planner.LMStudioClient", fake)
+        monkeypatch.setattr("app.llm.client.LMStudioClient", fake)
+        resp = client.post(
+            "/generate",
+            json={
+                "document_id": "doc-x",
+                "mcq_count": 1,
+                "difficulty": difficulty,
+                "child_ids": ["c1"],
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["difficulty"] == difficulty
+        assert captured, f"no prompts captured for difficulty={difficulty}"
+        # The difficulty directive lives in the generator prompt, not the planner.
+        gen_prompts = [p for p in captured if "Create exactly" in p]
+        assert gen_prompts, "no generator prompt captured"
+        assert needle in gen_prompts[0]
+
+
+def test_generate_invalid_num_models_returns_400(monkeypatch):
+    _install_fakes(monkeypatch)
+    for bad in (0, 5, 7):
+        resp = client.post(
+            "/generate",
+            json={"document_id": "doc-x", "mcq_count": 1, "num_models": bad, "child_ids": ["c1"]},
+        )
+        assert resp.status_code == 400
+        assert "num_models" in resp.json()["detail"]
+
+
+def test_generate_invalid_difficulty_returns_400(monkeypatch):
+    _install_fakes(monkeypatch)
+    resp = client.post(
+        "/generate",
+        json={"document_id": "doc-x", "mcq_count": 1, "difficulty": "ultra", "child_ids": ["c1"]},
+    )
+    assert resp.status_code == 400
+    assert "difficulty" in resp.json()["detail"]
 
 
 def test_generate_no_supported_types_returns_400(monkeypatch):
     _install_fakes(monkeypatch)
     resp = client.post(
-        "/generate", json={"fitb_count": 3, "essay_count": 2}
+        "/generate", json={"fitb_count": 3, "essay_count": 2, "child_ids": ["c1"]}
     )
     assert resp.status_code == 400
     assert "No supported question types" in resp.json()["detail"]
+
+
+def test_generate_no_selection_returns_400(monkeypatch):
+    _install_fakes(monkeypatch)
+    resp = client.post("/generate", json={"document_id": "doc-x", "mcq_count": 1})
+    assert resp.status_code == 400
+    assert "choose at least one section" in resp.json()["detail"]
 
 
 def test_generate_unknown_document_returns_404(monkeypatch):
@@ -134,19 +341,19 @@ def test_generate_unknown_document_returns_404(monkeypatch):
 
 
 def test_generate_fills_requested_counts_via_retry(monkeypatch):
-    # The fake LLM returns exactly 1 question per call; requesting 2 must retry
-    # until the count is met, then render continuously-numbered sections.
+    # The fake LLM returns exactly the requested number per call; requesting 2
+    # must fill the count and render continuously-numbered sections.
     _install_fakes(monkeypatch)
     resp = client.post(
-        "/generate", json={"document_id": "doc-x", "mcq_count": 2, "tf_count": 2}
+        "/generate", json={"document_id": "doc-x", "mcq_count": 2, "tf_count": 2, "child_ids": ["c1"]}
     )
     assert resp.status_code == 200
     data = resp.json()
-    assert len(data["questions"]["mcq"]) == 2
-    assert len(data["questions"]["true_false"]) == 2
-    md = data["exam"]
-    assert md.index("1. Which layer collects data?") < md.index("2. Which layer collects data?")
-    assert md.index("## True / False") > md.index("2. Which layer collects data?")
+    exam = data["exams"][0]
+    assert len(exam["questions"]["mcq"]) == 2
+    assert len(exam["questions"]["true_false"]) == 2
+    md = exam["markdown"]
+    assert md.index("1. carbohydrate monomers link via glycosidic bonds") < md.index("## True / False")
 
 
 def test_generate_repairs_malformed_json(monkeypatch):
@@ -158,6 +365,8 @@ def test_generate_repairs_malformed_json(monkeypatch):
 
     def fake_chat(self, prompt, system_prompt=None, temperature=0.7, max_tokens=4096, timeout=600):
         calls["n"] += 1
+        if "Plan exam questions for" in prompt:
+            return json.dumps(_fake_planner(prompt, 1))  # valid planner output as JSON text
         if system_prompt == REPAIR_SYSTEM_PROMPT:
             return (
                 '{"questions":[{"question":"Repaired question? (v%d)",'
@@ -196,30 +405,25 @@ def test_generate_repairs_malformed_json(monkeypatch):
         "app.api.storage.get_document",
         lambda doc_id: {"document_id": doc_id, "filename": "x.pdf"},
     )
-    monkeypatch.setattr(
-        "app.online.retrieval.embed_texts",
-        lambda texts, batch_size=16: [
-            {"dense": [0.1, 0.2, 0.3, 0.4], "sparse": {1: 0.5}} for _ in texts
-        ],
-    )
 
     class FakeStore:
-        def hybrid_search(self, dense, sparse, document_id, top_k=6, selected_child_ids=None):
+        def get_by_child_ids(self, document_id, child_ids):
             return [
                 {
-                    "child_id": f"c{i}", "parent_id": "p1", "page": 1,
-                    "heading": "Heading", "content": f"Context {i}.", "score": 1.0,
+                    "child_id": cid, "parent_id": "p1", "parent_title": "P",
+                    "chunk_title": "Sub", "page": 1, "content": f"Context {i}.",
                 }
-                for i in range(top_k)
+                for i, cid in enumerate(child_ids)
             ]
 
     monkeypatch.setattr("app.online.retrieval.VectorStore", FakeStore)
-    monkeypatch.setattr("app.online.generator.LMStudioClient", FakeLLM)
+    monkeypatch.setattr("app.online.planner.LMStudioClient", FakeLLM)
+    monkeypatch.setattr("app.llm.client.LMStudioClient", FakeLLM)
 
-    resp = client.post("/generate", json={"document_id": "doc-x", "mcq_count": 1})
+    resp = client.post("/generate", json={"document_id": "doc-x", "mcq_count": 1, "child_ids": ["c1"]})
     assert resp.status_code == 200
     data = resp.json()
-    assert data["questions"]["mcq"][0]["question"].startswith("Repaired question?")
+    assert data["exams"][0]["questions"]["mcq"][0]["question"].startswith("Repaired question?")
 
 
 def test_generate_empty_selection_returns_400(monkeypatch):
@@ -228,7 +432,7 @@ def test_generate_empty_selection_returns_400(monkeypatch):
         "/generate", json={"document_id": "doc-x", "mcq_count": 1, "child_ids": []}
     )
     assert resp.status_code == 400
-    assert "select at least one subsection" in resp.json()["detail"]
+    assert "choose at least one section topic" in resp.json()["detail"]
 
 
 def test_generate_passes_child_ids_to_retrieval(monkeypatch):
@@ -237,18 +441,18 @@ def test_generate_passes_child_ids_to_retrieval(monkeypatch):
     captured = {}
 
     class CapturingStore:
-        def hybrid_search(self, dense, sparse, document_id, top_k=6, selected_child_ids=None):
-            captured["child_ids"] = selected_child_ids
+        def get_by_child_ids(self, document_id, child_ids):
+            captured["child_ids"] = child_ids
             return [
                 {
                     "child_id": cid,
                     "parent_id": "p1",
+                    "parent_title": "Parent",
+                    "chunk_title": "Sub",
                     "page": 1,
-                    "heading": "Heading",
                     "content": f"Selected context for {cid}.",
-                    "score": 1.0,
                 }
-                for cid in selected_child_ids
+                for cid in child_ids
             ]
 
     monkeypatch.setattr("app.online.retrieval.VectorStore", CapturingStore)

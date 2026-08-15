@@ -40,18 +40,22 @@ def _heading(text: str) -> dict:
 
 
 def _patch_titles(monkeypatch):
+    # The family-batch flow labels sections+subsections in one call per batch;
+    # keep it deterministic and LLM-free in tests.
+    monkeypatch.setattr("app.offline.semantic_chunker.make_title_client", lambda: object())
     monkeypatch.setattr(
-        "app.offline.semantic_chunker.generate_section_titles",
-        lambda parents: [setattr(p, "title", "ST") for p in parents],
+        "app.offline.semantic_chunker.generate_family_batch_titles",
+        lambda entries, client=None, *, before=None: [
+            "ST" if level == "section" else "CT" for level, _ in entries
+        ],
     )
     monkeypatch.setattr(
-        "app.offline.semantic_chunker.generate_subsection_titles",
-        lambda children: [setattr(c, "title", "CT") for c in children],
+        "app.offline.semantic_chunker.is_acceptable_title",
+        lambda title, content, level, used_titles: bool(title),
     )
-    # Review runs a real LLM call per section; tests keep it inert.
     monkeypatch.setattr(
-        "app.offline.semantic_chunker.review_titles",
-        lambda parents, children, client=None: None,
+        "app.offline.semantic_chunker.regenerate_title",
+        lambda client=None, content="", level="section", reject=None, used_titles=None: "RT",
     )
 
 
@@ -328,6 +332,38 @@ def test_build_children_splits_on_similarity_break_with_full_chunk(monkeypatch, 
     assert any("action=split" in m and "reason=similarity_break" in m for m in child_logs)
 
 
+def test_build_children_min_floor_before_overlap_no_duplicate(monkeypatch):
+    # Regression: the min-size floor must run BEFORE the overlap step. When a
+    # tiny trailing group is folded into the previous chunk, running overlap
+    # first used to inject the previous child's last sentence into that small
+    # group and then fold it back into the same chunk -> the sentence appeared
+    # twice. NOW the floor runs first, so no duplication occurs.
+    def fake_dense(texts):
+        out = []
+        for t in texts:
+            low = t.lower()
+            out.append(list(E) if "alpha" in low else list(F))
+        return out
+
+    A1 = "Alpha supervised learning uses labeled examples."
+    A2 = "Alpha classification predicts discrete categories."
+    B = "Beta gradient descent optimizes parameters."
+    monkeypatch.setattr(sc, "dense_vector", fake_dense)
+    monkeypatch.setattr(sc, "CHILD_MIN_TOKENS_DROP", 0)
+    monkeypatch.setattr(sc, "CHILD_MIN_TOKENS_MERGE", 100)
+    monkeypatch.setattr(sc, "WORDS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(sc, "CHILD_MAX_SIZE", 700)
+    parent = ParentChunk(
+        parent_id="p1", document_id="d", title=None, page_start=1, page_end=1,
+        content=f"{A1} {A2} {B}",
+    )
+    children = build_children(parent)
+    assert len(children) == 1
+    assert children[0].content == f"{A1} {A2} {B}"
+    # the boundary sentence is present exactly once, never duplicated
+    assert children[0].content.count(A2) == 1
+
+
 # ---------------------------------------------------------------------------
 # end-to-end
 # ---------------------------------------------------------------------------
@@ -358,6 +394,48 @@ def test_build_semantic_structure_shape(monkeypatch):
         assert p["title"] == "ST"
 
 
+def test_label_families_titles_multi_child_children(monkeypatch):
+    # A parent with two children must have both labeled; a single-child parent's
+    # child stays suppressed (title None) and is not sent to the LLM.
+    calls = []
+
+    def fake_batch(entries, client=None, *, before=None):
+        calls.append([level for level, _ in entries])
+        return ["ST", "CT", "CT", "ST"]
+
+    parents = [
+        ParentChunk("p1", "d1", None, 1, 1, "Alpha phrase one."),
+        ParentChunk("p2", "d1", None, 2, 2, "Beta phrase one."),
+    ]
+    children = [
+        ChildChunk("c1", "p1", "d1", None, 1, 1, "Alpha child one."),
+        ChildChunk("c2", "p1", "d1", None, 1, 1, "Alpha child two."),
+        ChildChunk("c3", "p2", "d1", None, 2, 2, "Beta child one."),
+    ]
+    monkeypatch.setattr("app.offline.semantic_chunker.make_title_client", lambda: object())
+    monkeypatch.setattr(
+        "app.offline.semantic_chunker.generate_family_batch_titles", fake_batch
+    )
+    monkeypatch.setattr(
+        "app.offline.semantic_chunker.is_acceptable_title",
+        lambda title, content, level, used_titles: bool(title),
+    )
+    monkeypatch.setattr(
+        "app.offline.semantic_chunker.regenerate_title",
+        lambda client=None, content="", level="section", reject=None, used_titles=None: "RT",
+    )
+
+    sc._label_families(parents, children)
+
+    assert calls == [["section", "subsection", "subsection", "section"]]
+    assert parents[0].title == "ST"
+    assert children[0].title == "CT"
+    assert children[1].title == "CT"
+    # single-child parent's child is not labeled
+    assert children[2].title is None
+    assert parents[1].title == "ST"
+
+
 def test_generate_section_titles_parallel_preserves_order(monkeypatch):
     def fake(contents, *, level="section", before=None):
         return [f"Title {c.split()[0]}" for c in contents]
@@ -373,3 +451,81 @@ def test_generate_section_titles_parallel_preserves_order(monkeypatch):
     sc.generate_section_titles(parents)
     assert [p.parent_id for p in parents] == [f"p{i}" for i in range(6)]
     assert [p.title for p in parents] == [f"Title Alpha{i}" for i in range(6)]
+
+
+# ---------------------------------------------------------------------------
+# strict chunk-size enforcement
+# ---------------------------------------------------------------------------
+
+def _words(prefix: str, n: int) -> str:
+    """A single sentence of ``n`` distinct words (plus a trailing period)."""
+    toks = [f"{prefix.capitalize()}{i}" for i in range(n)]
+    toks[-1] += "Z"  # end on a letter so "N." is not read as a list marker
+    return " ".join(toks) + "."
+
+
+def test_apply_min_floor_merge_respects_child_cap(monkeypatch):
+    # Fragment below the merge floor folds into the previous chunk as long as
+    # the result stays within the cap...
+    monkeypatch.setattr(sc, "WORDS_PER_TOKEN", 1.0)
+    near_cap = _words("a", 10)
+    groups = [_words("n", 660), _words("f", 35)]
+    floored = sc._apply_min_floor(groups, max_child_words=700)
+    assert [g for g in floored] == [_words("n", 660) + " " + _words("f", 35)]
+
+    # ...but when the merge would exceed the cap, the fragment keeps its own
+    # chunk instead of silently overflowing.
+    groups = [_words("n", 690), _words("f", 35)]
+    floored = sc._apply_min_floor(groups, max_child_words=700)
+    assert floored == [_words("n", 690), _words("f", 35)]
+
+
+def test_build_children_strict_cap_no_truncation_no_drops(monkeypatch):
+    monkeypatch.setattr(sc, "WORDS_PER_TOKEN", 1.0)
+    monkeypatch.setattr(sc, "CHILD_MAX_SIZE", 700)
+    monkeypatch.setattr(sc, "CHILD_MIN_TOKENS_DROP", 0)
+
+    head = [_words(f"x{i}", 10) for i in range(6)]
+    head.append(_words("x6", 40))  # 100 words total, all concept E
+    big = _words("big", 690)  # single 690-word sentence, concept E
+    frag_a = _words("small", 5)  # 5 words, concept F
+    frag_b = _words("tail", 30)  # 30 words, concept F
+
+    content = " ".join(head + [big, frag_a, frag_b])
+
+    prepared = sc._prepare_child_sentences(content)
+    assert len(prepared) == 10
+
+    def fake_vecs(texts):
+        return [
+            list(F) if t == frag_a or t == frag_b else list(E) for t in texts
+        ]
+
+    vecs = fake_vecs(prepared)
+    parent = ParentChunk(
+        parent_id="p1", document_id="d", title=None,
+        page_start=1, page_end=1, content=content,
+    )
+    children = build_children(parent, sentence_vecs=vecs)
+
+    # No child exceeds the cap.
+    assert all(len(c.content.split()) <= 700 for c in children)
+
+    # Every prepared sentence survives exactly once across children (the packer
+    # never truncates or drops content to fit the cap).
+    flat = " ".join(c.content for c in children)
+    for s in prepared:
+        assert flat.count(s) >= 1
+
+    # Packing is greedy: the 100-word head closes when BIG would overflow it;
+    # the 5+30-word fragment cannot merge into the 690-word chunk (725 > 700),
+    # so it must keep its own third chunk rather than overflow.
+    assert [len(c.content.split()) for c in children] == [100, 690, 35]
+
+    # The overlap step is also cap-bounded: carrying the head's 40-word last
+    # sentence into the 690-word chunk (and BIG's sentence into the fragment)
+    # would exceed the cap, so both overlaps are skipped and no chunk is
+    # duplicated or pushed over the limit.
+    assert children[0].content == " ".join(head)
+    assert children[1].content == big
+    assert children[2].content == f"{frag_a} {frag_b}"

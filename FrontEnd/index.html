@@ -678,6 +678,29 @@
       display: flex;
     }
 
+    .sections-toolbar {
+      margin-bottom: 8px;
+      text-align: right;
+    }
+
+    .select-all-btn {
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 6px 12px;
+      background: transparent;
+      border: 1px solid var(--border2);
+      border-radius: 6px;
+      color: var(--muted2);
+      cursor: pointer;
+      transition: all 0.15s;
+      letter-spacing: 0.05em;
+    }
+
+    .select-all-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
     .sections-tree {
       margin-top: 4px;
     }
@@ -808,6 +831,9 @@
           id="sectionsCount"></span></div>
       <div class="sections-loading" id="sectionsLoading">
         <div class="gen-spinner"></div><span>Generating sections, your titles will appear in a few seconds...</span>
+      </div>
+      <div class="sections-toolbar">
+        <button class="select-all-btn" id="selectAllBtn" onclick="selectAllSections()">Select All Titles</button>
       </div>
       <div class="sections-tree" id="sectionsTree"></div>
     </div>
@@ -1013,6 +1039,9 @@
       selectedChildren.clear();
 
       const sections = data.sections || [];
+      const selectAllBtn = document.getElementById("selectAllBtn");
+      if (selectAllBtn) selectAllBtn.style.display = sections.length ? "" : "none";
+
       if (!sections.length) {
         hideSectionsLoading();
         return;
@@ -1031,6 +1060,7 @@
         sbox.className = "section-check";
         sbox.dataset.section = String(si);
         sbox.checked = false;
+        sbox.dataset.childIds = (section.child_ids || []).join(",");
         srow.appendChild(sbox);
         const stitle = document.createElement("span");
         stitle.className = "section-title";
@@ -1064,11 +1094,20 @@
       tree.querySelectorAll(".section-check").forEach(box => {
         box.addEventListener("change", () => {
           const si = box.dataset.section;
-          tree.querySelectorAll(`.child-check[data-section="${si}"]`).forEach(cb => {
-            cb.checked = box.checked;
-            if (box.checked) selectedChildren.add(cb.dataset.child);
-            else selectedChildren.delete(cb.dataset.child);
-          });
+          const cbs = tree.querySelectorAll(`.child-check[data-section="${si}"]`);
+          if (cbs.length) {
+            cbs.forEach(cb => {
+              cb.checked = box.checked;
+              if (box.checked) selectedChildren.add(cb.dataset.child);
+              else selectedChildren.delete(cb.dataset.child);
+            });
+          } else if (box.dataset.childIds) {
+            box.dataset.childIds.split(",").forEach(id => {
+              if (!id) return;
+              if (box.checked) selectedChildren.add(id);
+              else selectedChildren.delete(id);
+            });
+          }
           refreshSectionState(tree, si);
           updateSectionsCount();
         });
@@ -1090,9 +1129,29 @@
     function refreshSectionState(tree, si) {
       const sbox = tree.querySelector(`.section-check[data-section="${si}"]`);
       const cbs = tree.querySelectorAll(`.child-check[data-section="${si}"]`);
+      // Sections that have no visible subsections are selected directly via
+      // their child_ids; leave their checkbox toggle as the user set it.
+      if (!cbs.length) return;
       const checked = [...cbs].filter(cb => cb.checked).length;
       sbox.checked = cbs.length > 0 && checked === cbs.length;
       sbox.indeterminate = checked > 0 && checked < cbs.length;
+    }
+
+    function selectAllSections() {
+      const tree = document.getElementById("sectionsTree");
+      if (!tree || !tree.children.length) return;
+      tree.querySelectorAll(".child-check").forEach(cb => {
+        cb.checked = true;
+        selectedChildren.add(cb.dataset.child);
+      });
+      tree.querySelectorAll(".section-check").forEach(sbox => {
+        sbox.checked = true;
+        (sbox.dataset.childIds || "").split(",").forEach(id => {
+          if (id) selectedChildren.add(id);
+        });
+        refreshSectionState(tree, sbox.dataset.section);
+      });
+      updateSectionsCount();
     }
 
     function updateSectionsCount() {
@@ -1149,8 +1208,13 @@
         });
         const data = await res.json();
         if (res.ok) {
-          rawExam = data.exam;
-          document.getElementById("examContent").innerHTML = marked.parse(data.exam);
+          rawExam = data.exams.map(ex =>
+            `## Exam Model ${ex.model_number}\n\n${ex.markdown}`
+          ).join("\n\n---\n\n");
+          const html = data.exams.map(ex =>
+            `<div class="exam-model"><h3>Exam Model ${ex.model_number}</h3>${marked.parse(ex.markdown)}</div>`
+          ).join("<hr />");
+          document.getElementById("examContent").innerHTML = html;
           examOutput.classList.add("show");
         } else {
           alert(`Generation failed: ${data.detail}`);
