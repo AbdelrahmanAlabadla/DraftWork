@@ -20,6 +20,10 @@ QDRANT_COLLECTION: str = _env("QDRANT_COLLECTION", "genexam") or "genexam"
 
 LMS_URL: str = _env("LMS_URL", "http://127.0.0.1:1234") or "http://127.0.0.1:1234"
 LMS_MODEL: str = _env("LMS_MODEL", "google/gemma-4-e2b") or "google/gemma-4-e2b"
+# Reasoning setting for chat calls ("off"|"low"|"medium"|"high"|"on"). We default
+# to "off" so reasoning-capable models don't burn output tokens on hidden
+# reasoning content that this pipeline discards anyway.
+LMS_REASONING: str = _env("LMS_REASONING", "off") or "off"
 TITLE_MODEL: str = _env("TITLE_MODEL", "mistralai/mistral-7b-instruct-v0.3") or "mistralai/mistral-7b-instruct-v0.3"
 
 EMBEDDING_MODEL: str = _env("EMBEDDING_MODEL", "BAAI/bge-m3") or "BAAI/bge-m3"
@@ -37,6 +41,20 @@ LOG_LEVEL: str = _env("LOG_LEVEL", "INFO") or "INFO"
 # never writes the question. Actual question generation keeps using the FULL
 # selected child-chunk content.
 PLANNER_SNIPPET_TOKENS: int = int(_env("PLANNER_SNIPPET_TOKENS", "100") or "100")
+
+# Total cap on the whole planner context (all section/chunk titles + snippets) in
+# TOKENS. The planner request must stay inside the model context window; without
+# this cap many chunks quickly overflow it and the server returns a 500.
+PLANNER_CONTEXT_TOKENS: int = int(
+    _env("PLANNER_CONTEXT_TOKENS", "4000") or "4000"
+)
+
+# Cap on the FULL generation context (selected child content) in TOKENS. The
+# question generator receives this whole context, so keeping it bounded prevents
+# oversized prompts that overflow the model's context window (500s).
+GENERATION_CONTEXT_TOKENS: int = int(
+    _env("GENERATION_CONTEXT_TOKENS", "3000") or "3000"
+)
 
 # --- Semantic structure generation (offline) ------------------------------
 STRUCTURES_DIR: str = _env("STRUCTURES_DIR", "data/structures") or "data/structures"

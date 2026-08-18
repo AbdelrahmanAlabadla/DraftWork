@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from typing import Any
 
 SYSTEM_PROMPT = (
@@ -227,6 +229,121 @@ SHORT_ANSWER_EXAMPLE = (
     '}'
 )
 
+ESSAY_RULES = (
+    "- Ask an open-ended question that requires a structured, multi-sentence answer.\n"
+    '- Provide a "reference_answer" (a model essay outline of several sentences) that is fully '
+    "grounded in the context.\n"
+    '- Provide a "key_points" array (3-6 short bullet expectations) that a good answer should '
+    "cover, in order of importance.\n"
+    "- The question must be answerable from the provided context and must not require external "
+    "knowledge.\n"
+)
+
+ESSAY_SCHEMA = (
+    '{\n'
+    '  "questions": [\n'
+    '    {\n'
+    '      "question": "the essay question text",\n'
+    '      "reference_answer": "a model reference answer of several sentences",\n'
+    '      "key_points": ["point 1", "point 2", "point 3"]\n'
+    '    }\n'
+    '  ]\n'
+    '}'
+)
+
+ESSAY_EXAMPLE = (
+    '{\n'
+    '  "questions": [\n'
+    '    {\n'
+    '      "question": "Compare how precision and recall behave as the decision threshold '
+    'changes, and explain the trade-off.",\n'
+    '      "reference_answer": "Raising the threshold makes the classifier more selective: '
+    'fewer items are predicted positive, which raises precision but drops recall. Lowering '
+    'the threshold captures more positives, raising recall but pulling down precision. The '
+    'trade-off means no single threshold optimizes both unless the classifier is perfect.",\n'
+    '      "key_points": ["threshold controls selectivity", "higher threshold raises '
+    'precision", "lower threshold raises recall", "the two cannot both be maximized on '
+    'imperfect models"]\n'
+    '    }\n'
+    '  ]\n'
+    '}'
+)
+
+FILL_IN_THE_BLANK_BANK_RULES = (
+    "- Choose exactly {count} distinct correct answer TERMS from the source content, one per "
+    "numbered blank item by default.\n"
+    "- Every term must be a single word or a short phrase that appears in or is directly "
+    "supported by the source content.\n"
+    "- Prefer unique, non-repeating terms so the Word Bank is useful and not redundant.\n"
+    "- Also choose EXACTLY 2 distractor words: plausible and related to the source, believable "
+    "as answers, but that are NOT correct for any blank.\n"
+    "- Do not invent unrelated terms merely to create distractors; they must be grounded in the "
+    "source.\n"
+    "- Distractors must never be a valid answer for one of the blank sentences.\n"
+    '- Return a "correct_terms" array and a "distractors" array with exactly 2 entries.\n'
+)
+
+FILL_IN_THE_BLANK_BANK_SCHEMA = (
+    '{\n'
+    '  "correct_terms": ["term 1", "term 2", "term 3"],\n'
+    '  "distractors": ["distractor 1", "distractor 2"]\n'
+    '}'
+)
+
+FILL_IN_THE_BLANK_BANK_EXAMPLE = (
+    '{\n'
+    '  "correct_terms": ["area", "perimeter", "length", "width", "diagonal"],\n'
+    '  "distractors": ["square", "triangle"]\n'
+    '}'
+)
+
+FILL_IN_THE_BLANK_ITEMS_RULES = (
+    "- Write exactly {count} numbered fill-in-the-blank items.\n"
+    "- Use ONE blank per item by default, marked with the underscore sequence: ________.\n"
+    "- A blank may be marked with a single run of underscores (do not add extra markers).\n"
+    "- An item may contain TWO blanks only when it genuinely improves the question; never force "
+    "two blanks.\n"
+    "- NEVER use more than 2 blanks in an item.\n"
+    '- Each item must include an "answers" array with the exact Word Bank terms that fill the '
+    "blank(s), in left-to-right order.\n"
+    "- Every answer MUST be one of the provided Word Bank entries.\n"
+    "- Do not introduce any term that is not in the Word Bank.\n"
+    "- Use every correct term from the Word Bank in at least one blank; the 2 distractors must "
+    "never be used.\n"
+    "- Questions must be self-contained and grounded only in the selected source content.\n"
+)
+
+FILL_IN_THE_BLANK_ITEMS_SCHEMA = (
+    '{\n'
+    '  "items": [\n'
+    '    {\n'
+    '      "question": "sentence with ________ for a blank",\n'
+    '      "answers": ["term"]\n'
+    '    },\n'
+    '    {\n'
+    '      "question": "sentence with ________ and ________ for two blanks",\n'
+    '      "answers": ["term a", "term b"]\n'
+    '    }\n'
+    '  ]\n'
+    '}'
+)
+
+FILL_IN_THE_BLANK_ITEMS_EXAMPLE = (
+    '{\n'
+    '  "items": [\n'
+    '    {\n'
+    '      "question": "To calculate the ________ of a rectangle, multiply its length by its "'
+    'width.",\n'
+    '      "answers": ["area"]\n'
+    '    },\n'
+    '    {\n'
+    '      "question": "The ________ and ________ of a rectangle are used to compute its area.",\n'
+    '      "answers": ["length", "width"]\n'
+    '    }\n'
+    '  ]\n'
+    '}'
+)
+
 # --- Exam planning prompts --------------------------------------------------
 
 PLANNER_SYSTEM_PROMPT = (
@@ -234,7 +351,7 @@ PLANNER_SYSTEM_PROMPT = (
     "Your ONLY job is to decide WHAT each exam question should test.\n\n"
     "You do NOT write actual questions, answers, options, or reference answers. "
     "You only choose, for each planned question:\n"
-    "  - question_type   (mcq | true_false | short_answer)\n"
+    "  - question_type   (mcq | true_false | fill_in_the_blank | short_answer | essay)\n"
     "  - topic           (the source section the question belongs to)\n"
     "  - concept_to_test (the specific concept the question will assess)\n\n"
     "The exam will later be generated by a separate question-generation model.\n\n"
@@ -318,7 +435,8 @@ def build_planner_prompt(
         f"## Required JSON format (use exactly these field names)\n{PLANNER_SCHEMA_EXAMPLE}"
         f"\n\nThe 'exams' array must contain exactly {num_models} entries, one per "
         f"exam model, each with non-empty question_type / topic / concept_to_test. "
-        f"question_type must be one of: mcq, true_false, short_answer.\n"
+        f"question_type must be one of: mcq, true_false, fill_in_the_blank, "
+        f"short_answer, essay.\n"
         f"{PLANNER_OUTPUT_DIRECTIVE}"
     )
     return PLANNER_SYSTEM_PROMPT, user_prompt
@@ -370,6 +488,9 @@ def build_prompt(
     elif question_type == "true_false":
         rules, schema, example = TRUE_FALSE_RULES, TRUE_FALSE_SCHEMA, TRUE_FALSE_EXAMPLE
         type_name = "True/False"
+    elif question_type == "essay":
+        rules, schema, example = ESSAY_RULES, ESSAY_SCHEMA, ESSAY_EXAMPLE
+        type_name = "Essay"
     else:
         rules, schema, example = SHORT_ANSWER_RULES, SHORT_ANSWER_SCHEMA, SHORT_ANSWER_EXAMPLE
         type_name = "Short Answer"
@@ -412,6 +533,339 @@ def build_prompt(
 
         f"## Task\nGenerate exactly {count} {type_name} exam question(s) following "
         f"the rules and the required JSON format above.\n\n"
+
+        f"{_OUTPUT_DIRECTIVE}"
+    )
+    return SYSTEM_PROMPT, user_prompt
+
+
+def _plan_block(planned_items: list[dict[str, Any]] | None) -> str:
+    if not planned_items:
+        return ""
+    plan_lines = "\n".join(
+        f"{i}. topic={it.get('topic', '')} | concept_to_test={it.get('concept_to_test', '')}"
+        for i, it in enumerate(planned_items, start=1)
+    )
+    return (
+        f"## Question Plan\n"
+        f"The concepts below guide which terms and ideas to use. Select answer terms that "
+        f"test these concepts. Do not introduce concepts unrelated to the plan.\n{plan_lines}\n\n"
+    )
+
+
+def build_fitb_bank_prompt(
+    count: int,
+    context: str,
+    difficulty: str = "mix",
+    model_number: int = 1,
+    planned_items: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Stage 1: choose the correct answer terms + exactly 2 distractors."""
+    rules = FILL_IN_THE_BLANK_BANK_RULES.format(count=count)
+    user_prompt = (
+        f"Create exactly {count} correct answer terms for a Fill-in-the-Blank section.\n\n"
+        "Read the full selected source content below FIRST. It is the ONLY knowledge source "
+        "for the terms. Choose terms that are grounded in the source.\n\n"
+
+        f"## Selected Source Content\n{context}\n\n"
+
+        f"{_plan_block(planned_items)}"
+
+        f"## Word Bank Rules\n{rules}\n\n"
+
+        f"## Required JSON Format (use exactly these field names)\n"
+        f"{FILL_IN_THE_BLANK_BANK_SCHEMA}\n\n"
+
+        f"## Example of a valid output\n{FILL_IN_THE_BLANK_BANK_EXAMPLE}\n\n"
+
+        f"{_difficulty_block(difficulty)}\n\n"
+
+        f"## Exam Version\n{_version_note(model_number)}\n\n"
+
+        f"## Task\nCreate exactly {count} correct terms plus exactly 2 distractors.\n\n"
+
+        f"{_OUTPUT_DIRECTIVE}"
+    )
+    return SYSTEM_PROMPT, user_prompt
+
+
+def build_fitb_items_prompt(
+    count: int,
+    word_bank: list[str],
+    context: str,
+    difficulty: str = "mix",
+    model_number: int = 1,
+) -> tuple[str, str]:
+    """Stage 2: write numbered items using ONLY the fixed, already-shuffled Word Bank."""
+    rules = FILL_IN_THE_BLANK_ITEMS_RULES.format(count=count)
+    bank_line = " · ".join(word_bank)
+    user_prompt = (
+        f"Create exactly {count} numbered Fill-in-the-Blank items.\n\n"
+        "Read the full selected source content below FIRST. It is the ONLY knowledge source "
+        "for the questions.\n\n"
+
+        f"## Selected Source Content\n{context}\n\n"
+
+        f"## Fixed Word Bank (use ONLY these entries)\n{bank_line}\n\n"
+        "- Every answer must be one of these entries.\n"
+        "- Use every entry except the two distractors in at least one blank.\n"
+        "- Never introduce a term that is not in the Word Bank.\n\n"
+
+        f"## Item Rules\n{rules}\n\n"
+
+        f"## Required JSON Format (use exactly these field names)\n"
+        f"{FILL_IN_THE_BLANK_ITEMS_SCHEMA}\n\n"
+
+        f"## Example of a valid output\n{FILL_IN_THE_BLANK_ITEMS_EXAMPLE}\n\n"
+
+        f"{_difficulty_block(difficulty)}\n\n"
+
+        f"## Exam Version\n{_version_note(model_number)}\n\n"
+
+        f"## Task\nGenerate exactly {count} numbered items using only the fixed Word Bank.\n\n"
+
+        f"{_OUTPUT_DIRECTIVE}"
+    )
+    return SYSTEM_PROMPT, user_prompt
+
+
+FILL_IN_THE_BLANK_SINGLE_SCHEMA = (
+    '{\n'
+    '  "word_bank": ["term 1", "term 2", "term 3", "distractor 1", "distractor 2"],\n'
+    '  "items": [\n'
+    '    {"question": "sentence with ________ for a blank", "answers": ["term 1"]},\n'
+    '    {"question": "sentence with ________ and ________ for two blanks", '
+    '"answers": ["term 2", "term 3"]}\n'
+    '  ]\n'
+    '}'
+)
+
+FILL_IN_THE_BLANK_SINGLE_EXAMPLE = (
+    '{\n'
+    '  "word_bank": ["area", "perimeter", "length", "width", "square"],\n'
+    '  "items": [\n'
+    '    {"question": "To calculate the ________ of a rectangle, multiply its length by its '
+    'width.", "answers": ["area"]},\n'
+    '    {"question": "The ________ and ________ of a rectangle are used to compute its area.", '
+    '"answers": ["length", "width"]}\n'
+    '  ]\n'
+    '}'
+)
+
+
+def build_fitb_single_prompt(
+    count: int,
+    context: str,
+    difficulty: str = "mix",
+    model_number: int = 1,
+    planned_items: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Single call: choose the Word Bank terms AND write the numbered items together."""
+    bank_rules = FILL_IN_THE_BLANK_BANK_RULES.format(count=count)
+    items_rules = FILL_IN_THE_BLANK_ITEMS_RULES.format(count=count)
+    user_prompt = (
+        f"Create exactly {count} Fill-in-the-Blank items together with their shared Word Bank.\n\n"
+        "Read the full selected source content below FIRST. It is the ONLY knowledge source "
+        "for the terms and the questions.\n\n"
+
+        f"## Selected Source Content\n{context}\n\n"
+
+        f"{_plan_block(planned_items)}"
+
+        f"## Word Bank Rules\n{bank_rules}\n\n"
+
+        "After choosing the terms, write exactly the numbered items. You must output BOTH in one "
+        "response:\n"
+        f"## Item Rules\n{items_rules}\n\n"
+
+        f"## Required JSON Format (use exactly these field names)\n"
+        f"{FILL_IN_THE_BLANK_SINGLE_SCHEMA}\n\n"
+
+        f"## Example of a valid output\n{FILL_IN_THE_BLANK_SINGLE_EXAMPLE}\n\n"
+
+        f"{_difficulty_block(difficulty)}\n\n"
+
+        f"## Exam Version\n{_version_note(model_number)}\n\n"
+
+        f"## Task\nReturn one JSON object containing the 'word_bank' (exactly {count} correct "
+        f"terms plus exactly 2 distractors) and 'items' (exactly {count} numbered items, each "
+        f"blank answered only with a Word Bank term, distractors never used).\n\n"
+
+        f"{_OUTPUT_DIRECTIVE}"
+    )
+    return SYSTEM_PROMPT, user_prompt
+
+
+OBJ_BUNDLED_SCHEMA = (
+    '{\n'
+    '  "mcq": {\n'
+    '    "questions": [\n'
+    '      {"question": "the MCQ question", "options": {"A": "...", "B": "...", '
+    '"C": "...", "D": "..."}, "correct_answer": "B"}\n'
+    '    ]\n'
+    '  },\n'
+    '  "true_false": {\n'
+    '    "questions": [\n'
+    '      {"statement": "the factual statement", "answer": "True"}\n'
+    '    ]\n'
+    '  },\n'
+    '  "fill_in_the_blank": {\n'
+    '    "word_bank": ["term 1", "term 2", "term 3", "distractor 1", "distractor 2"],\n'
+    '    "items": [\n'
+    '      {"question": "sentence with ________ for a blank", "answers": ["term 1"]}\n'
+    '    ]\n'
+    '  }\n'
+    '}'
+)
+
+OBJ_BUNDLED_EXAMPLE = (
+    '{\n'
+    '  "mcq": {\n'
+    '    "questions": [\n'
+    '      {"question": "Which metric is the harmonic mean of precision and recall?", '
+    '       "options": {"A": "Accuracy", "B": "F1 Score", "C": "Specificity", "D": "Log Loss"}, '
+    '       "correct_answer": "B"}\n'
+    '    ]\n'
+    '  },\n'
+    '  "true_false": {\n'
+    '    "questions": [\n'
+    '      {"statement": "A confusion matrix can be used to evaluate a classifier.", '
+    '"answer": "True"}\n'
+    '    ]\n'
+    '  },\n'
+    '  "fill_in_the_blank": {\n'
+    '    "word_bank": ["area", "perimeter", "length", "width", "square"],\n'
+    '    "items": [\n'
+    '      {"question": "To calculate the ________ of a rectangle, multiply its length by its '
+    'width.", "answers": ["area"]}\n'
+    '    ]\n'
+    '  }\n'
+    '}'
+)
+
+
+def build_obj_bundled_prompt(
+    planned: dict[str, list[dict[str, Any]]],
+    context: str,
+    difficulty: str = "mix",
+    model_number: int = 1,
+    feedback: str = "",
+) -> tuple[str, str]:
+    """Build ONE prompt that returns MCQ + True/False + Fill-in-the-Blank together.
+
+    ``planned`` maps qtype -> list of {topic, concept_to_test} plan items for the
+    three objective types (the still-missing items on a retry). The FITB count is
+    derived from its own plan list; the Word Bank must hold that many correct
+    terms plus exactly 2 distractors. ``feedback`` lists already-accepted
+    questions the model must not repeat.
+    """
+    mcq_planned = planned.get("mcq") or []
+    tf_planned = planned.get("true_false") or []
+    fitb_planned = planned.get("fill_in_the_blank") or []
+    mcq_count = len(mcq_planned)
+    tf_count = len(tf_planned)
+    fitb_count = len(fitb_planned)
+
+    plan_lines = []
+    for qtype, label in (
+        ("mcq", "Multiple Choice"),
+        ("true_false", "True/False"),
+        ("fill_in_the_blank", "Fill-in-the-Blank"),
+    ):
+        items = planned.get(qtype) or []
+        if not items:
+            continue
+        block = f"### {label} ({len(items)} items)\n" + "\n".join(
+            f"{i}. topic={it.get('topic', '')} | concept_to_test={it.get('concept_to_test', '')}"
+            for i, it in enumerate(items, start=1)
+        )
+        plan_lines.append(block)
+    plan_block = (
+        "## Question Plan\nGenerate EXACTLY the planned counts below in their "
+        "respective sections. Test ONLY the stated topics and concepts; do not "
+        "introduce unplanned concepts.\n\n"
+        + "\n\n".join(plan_lines)
+        if plan_lines
+        else ""
+    )
+
+    bank_rules = FILL_IN_THE_BLANK_BANK_RULES.format(count=fitb_count)
+    items_rules = FILL_IN_THE_BLANK_ITEMS_RULES.format(count=fitb_count)
+
+    user_prompt = (
+        "Create the objective sections of an exam in ONE response: Multiple "
+        f"Choice ({mcq_count}), True/False ({tf_count}), and Fill-in-the-Blank "
+        f"({fitb_count} items with a shared Word Bank).\n\n"
+        "Read the full selected source content below FIRST. It is the ONLY knowledge "
+        "source for every question, answer, option, True/False decision, and FITB term. "
+        "Do not copy its wording and do not refer to it inside the questions.\n\n"
+
+        f"## Selected Source Content\n{context}\n\n"
+
+        f"{plan_block}\n\n"
+
+        f"## Multiple Choice Rules\n{MCQ_RULES}\n\n"
+        f"## True/False Rules\n{TRUE_FALSE_RULES}\n\n"
+        f"## Word Bank Rules\n{bank_rules}\n\n"
+        f"## Fill-in-the-Blank Item Rules\n{items_rules}\n\n"
+
+        f"## Required JSON Format (use exactly these field names)\n"
+        f"{OBJ_BUNDLED_SCHEMA}\n\n"
+
+        f"## Example of a valid output\n{OBJ_BUNDLED_EXAMPLE}\n\n"
+
+        f"{_difficulty_block(difficulty)}\n\n"
+
+        f"## Exam Version\n{_version_note(model_number)}\n\n"
+
+        f"## Task\nReturn one JSON object with three keys: 'mcq' ({mcq_count} questions), "
+        f"'true_false' ({tf_count} statements), and 'fill_in_the_blank' (a 'word_bank' of "
+        f"exactly {fitb_count} correct terms plus 2 distractors, and {fitb_count} numbered "
+        f"'items' answered ONLY from that Word Bank, distractors never used).\n\n"
+
+        f"{feedback}"
+
+        f"{_OUTPUT_DIRECTIVE}"
+    )
+    return SYSTEM_PROMPT, user_prompt
+
+
+def build_validation_repair_prompt(
+    expected_label: str,
+    rejected_items: list[Any],
+    schema: str,
+    context: str,
+    difficulty: str = "mix",
+    model_number: int = 1,
+) -> tuple[str, str]:
+    """Repair ONLY the structurally-invalid pieces of rejected JSON.
+
+    The rejected output is sent back unchanged plus the expected schema and rules;
+    the model must fix the invalid fields/structure, not invent a new question.
+    """
+    rejected_block = "\n".join(
+        (json.dumps(item, ensure_ascii=False) if isinstance(item, (dict, list)) else str(item))
+        for item in rejected_items
+    )
+    user_prompt = (
+        "Repair the following rejected JSON element(s) so they match the expected schema.\n\n"
+        "IMPORTANT:\n"
+        "- Do NOT generate a new question.\n"
+        "- Do NOT change valid fields unless strictly required to fix the schema error.\n"
+        "- Keep each question's content identical; only fix fields/types/structure that are "
+        "invalid.\n"
+        "- Return the SAME number of elements as provided.\n\n"
+
+        f"## Selected Source Content\n{context}\n\n"
+
+        f"## Rejected JSON to repair\n{rejected_block}\n\n"
+
+        f"## Expected schema (register of what must be valid)\n{schema}\n\n"
+
+        f"## Exam Version\n{_version_note(model_number)}\n\n"
+
+        f"## Task\nReturn ONLY the repaired JSON array matching the expected schema, "
+        f"preserving all valid content.\n\n"
 
         f"{_OUTPUT_DIRECTIVE}"
     )

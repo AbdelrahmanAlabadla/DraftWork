@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import requests
 
-from app.config import LMS_MODEL, LMS_URL
+from app.config import LMS_MODEL, LMS_REASONING, LMS_URL
 from app.llm.json_utils import (
     JSONExtractionError,
     REPAIR_SYSTEM_PROMPT,
@@ -25,9 +25,10 @@ class LMStudioClient:
     ) -> None:
         self.url = (url or LMS_URL).rstrip("/")
         self.model = model or LMS_MODEL
-        # Optional reasoning override: "off"|"low"|"medium"|"high"|"on".
-        # Only sent when set, so non-reasoning models never error.
-        self.reasoning = reasoning
+        # Reasoning override: "off"|"low"|"medium"|"high"|"on". Defaults to the
+        # configured value (LMS_REASONING, normally "off"). Sent only when set,
+        # so non-reasoning models never error.
+        self.reasoning = reasoning if reasoning is not None else LMS_REASONING
 
     def chat(
         self,

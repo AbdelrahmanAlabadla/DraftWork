@@ -20,14 +20,15 @@ logger = get_logger("API")
 
 router = APIRouter()
 
-# Question types supported in V1.
+# Question types supported.
 _SUPPORTED_COUNTS = {
     "mcq": "mcq",
     "tf": "true_false",
+    "fitb": "fill_in_the_blank",
     "why": "short_answer",
+    "essay": "essay",
 }
-# Sent by the frontend but out of scope for V1 (accepted, ignored).
-_IGNORED_FIELDS = {"fitb_count", "essay_count"}
+_VALID_QTYPES = frozenset(_SUPPORTED_COUNTS.values())
 
 _VALID_DIFFICULTIES = frozenset({"easy", "medium", "hard", "mix"})
 _NUM_MODELS_MIN = 1
@@ -164,10 +165,13 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     if body.question_type is not None:
         qtype = body.question_type
         count = body.number_of_questions
-        if qtype not in {"mcq", "true_false", "short_answer"}:
+        if qtype not in _VALID_QTYPES:
             raise HTTPException(
                 status_code=400,
-                detail=f"Unsupported question_type '{qtype}'. Supported: mcq, true_false, short_answer",
+                detail=(
+                    f"Unsupported question_type '{qtype}'. Supported: "
+                    f"{', '.join(sorted(_VALID_QTYPES))}"
+                ),
             )
         if not count:
             raise HTTPException(status_code=400, detail="number_of_questions is required with question_type")
@@ -181,7 +185,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     if not tasks:
         raise HTTPException(
             status_code=400,
-            detail="No supported question types requested. V1 supports MCQ, True/False, and Short Answer.",
+            detail="No supported question types requested. Supported: MCQ, True/False, Fill in the Blank, Short Answer, and Essay.",
         )
 
     num_models = body.num_models if body.num_models is not None else 1

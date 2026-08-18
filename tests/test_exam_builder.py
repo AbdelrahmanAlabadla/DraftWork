@@ -228,3 +228,90 @@ def test_is_near_duplicate_detects_reworded_duplicates():
     distinct = _distinct_mcq()
     assert exam_builder._is_near_duplicate("mcq", twin, [base]) is True
     assert exam_builder._is_near_duplicate("mcq", distinct, [base]) is False
+
+
+def test_assemble_exam_fitb_section_and_essay():
+    questions = {
+        "mcq": [_mcq("mcq1")],
+        "true_false": [{"statement": "tf1", "answer": "True"}],
+        "fill_in_the_blank": {
+            "word_bank": ["area", "perimeter", "length", "width", "diagonal"],
+            "items": [
+                {"question": "To calculate the ________ multiply length and width.", "answers": ["area"]},
+                {"question": "A rectangle's ________ is its total distance around.", "answers": ["perimeter"]},
+            ],
+        },
+        "short_answer": [{"question": "sa1", "reference_answer": "ans"}],
+        "essay": [{"question": "es1", "reference_answer": "ref", "key_points": ["kp1", "kp2"]}],
+    }
+    md = exam_builder.assemble_exam(questions)
+    order = [
+        md.index("## Multiple Choice"),
+        md.index("## True / False"),
+        md.index("## Fill in the Blank"),
+        md.index("## Short Answer"),
+        md.index("## Essay"),
+    ]
+    assert order == sorted(order)
+    assert 'class="word-bank"' in md
+    assert "area · perimeter · length · width · diagonal" in md
+    assert "1. mcq1" in md and "2. tf1" in md
+    assert "3. To calculate the ________" in md and "4. A rectangle's ________" in md
+    assert "5. sa1" in md and "6. es1" in md
+    assert "**Reference answer:** ref" in md
+    assert "kp1" in md and "kp2" in md
+
+
+def test_parse_questions_essay():
+    raw = (
+        '{"questions":[{"question":"q","reference_answer":"ref",'
+        '"key_points":["a","b","c"]}]}'
+    )
+    parsed = parse_questions("essay", raw)
+    assert len(parsed) == 1
+    assert parsed[0]["question"] == "q"
+    assert parsed[0]["key_points"] == ["a", "b", "c"]
+
+
+def test_fitb_validation_enforces_word_bank_membership_and_distractors():
+    good = {
+        "word_bank": ["area", "perimeter", "dist1", "dist2"],
+        "items": [
+            {"question": "blank one ________ here.", "answers": ["area"]},
+            {"question": "blank two ________ here.", "answers": ["perimeter"]},
+        ],
+    }
+    assert exam_builder._fitb_errors(good, count=2, within_model=[], previous_exams=[]) == []
+
+    # Answer not in the Word Bank.
+    bad = {
+        "word_bank": ["area", "perimeter", "length", "width", "dist1", "dist2"],
+        "items": [
+            {"question": "blank one ________ here.", "answers": ["notinbank"]},
+            {"question": "blank two ________ here.", "answers": ["perimeter"]},
+        ],
+    }
+    errors = exam_builder._fitb_errors(bad, count=2, within_model=[], previous_exams=[])
+    assert any("not in Word Bank" in e for e in errors)
+
+    # More than 2 blanks in an item.
+    too_many = {
+        "word_bank": ["area", "perimeter", "length", "width", "dist1", "dist2"],
+        "items": [
+            {"question": "a ________ b ________ c ________ here.", "answers": ["area", "perimeter", "length"]},
+            {"question": "blank two ________ here.", "answers": ["width"]},
+        ],
+    }
+    errors = exam_builder._fitb_errors(too_many, count=2, within_model=[], previous_exams=[])
+    assert any("must be 1-2" in e for e in errors)
+
+    # Exactly two distractors required.
+    wrong_d = {
+        "word_bank": ["area", "perimeter", "length", "width", "diagonal"],
+        "items": [
+            {"question": "blank one ________ here.", "answers": ["area"]},
+            {"question": "blank two ________ here.", "answers": ["perimeter"]},
+        ],
+    }
+    errors = exam_builder._fitb_errors(wrong_d, count=2, within_model=[], previous_exams=[])
+    assert any("exactly 2 Word Bank distractors" in e for e in errors)

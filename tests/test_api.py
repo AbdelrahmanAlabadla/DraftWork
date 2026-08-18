@@ -16,13 +16,23 @@ client = TestClient(app)
 
 _COUNT_RE = re.compile(r"Create exactly (\d+)")
 _PLANNER_MODELS_RE = re.compile(r"Plan exam questions for (\d+)")
-_PLANNER_COUNT_RE = re.compile(r"^\s*-\s*(\d+)\s+(mcq|true_false|short_answer)\s*$", re.M)
+_PLANNER_COUNT_RE = re.compile(
+    r"^\s*-\s*(\d+)\s+(mcq|true_false|fill_in_the_blank|short_answer|essay)\s*$", re.M
+)
 _MODEL_RE = re.compile(r"Exam Model #(\d+)")
 
 
 def _model_number(prompt: str) -> int:
     m = _MODEL_RE.search(prompt)
     return int(m.group(1)) if m else 1
+
+
+_fitb_counter = [0]
+
+
+def _fitb_terms(model: int, count: int) -> list[str]:
+    """Return `count` lexically-unique answer terms for a FITB section."""
+    return [f"term-{model}-{i}" for i in range(count)]
 
 
 _stem_counter = [0]
@@ -109,6 +119,27 @@ def _make_fake_llm(captured_prompts: list[str] | None = None):
         model = _model_number(prompt)
         options = {"A": "Perception", "B": "Network", "C": "Application", "D": "Middleware"}
 
+        if "correct answer terms for a Fill-in-the-Blank" in prompt:
+            return {
+                "correct_terms": _fitb_terms(model, count),
+                "distractors": [f"distractor {model} a", f"distractor {model} b"],
+            }
+        if "numbered Fill-in-the-Blank items" in prompt:
+            terms = _fitb_terms(model, count)
+            return {"items": [
+                {"question": _distinct_stem("fitb", model, i), "answers": [terms[i]]}
+                for i in range(count)
+            ]}
+        if "Essay exam question" in prompt:
+            stems = [_distinct_stem("essay", model, i) for i in range(count)]
+            return {"questions": [
+                {
+                    "question": stems[i],
+                    "reference_answer": f"reference for {i} in {model}",
+                    "key_points": [f"point {i}a", f"point {i}b"],
+                }
+                for i in range(count)
+            ]}
         if "Multiple Choice (MCQ) exam question" in prompt:
             texts = (
                 mcq_pool
@@ -216,9 +247,9 @@ def test_generate_html_payload_multiple_types(monkeypatch):
         json={
             "mcq_count": 1,
             "tf_count": 1,
+            "fitb_count": 3,
             "why_count": 1,
-            "fitb_count": 3,  # ignored in V1
-            "essay_count": 2,  # ignored in V1
+            "essay_count": 2,
             "num_models": 2,
             "difficulty": "hard",
             "child_ids": ["c1", "c2"],
@@ -230,10 +261,19 @@ def test_generate_html_payload_multiple_types(monkeypatch):
     assert data["difficulty"] == "hard"
     assert len(data["exams"]) == 2
     for exam in data["exams"]:
-        assert set(exam["questions"].keys()) == {"mcq", "true_false", "short_answer"}
+        assert set(exam["questions"].keys()) == {
+            "mcq", "true_false", "fill_in_the_blank", "short_answer", "essay",
+        }
         assert "Multiple Choice" in exam["markdown"]
         assert "True / False" in exam["markdown"]
+        assert "Fill in the Blank" in exam["markdown"]
         assert "Short Answer" in exam["markdown"]
+        assert "Essay" in exam["markdown"]
+        # FITB: one shared Word Bank + exactly the requested number of items.
+        fitb = exam["questions"]["fill_in_the_blank"]
+        assert len(fitb["items"]) == 3
+        assert len(fitb["word_bank"]) == 3 + 2  # 3 correct + exactly 2 distractors
+        assert any("Word Bank" in exam["markdown"] for _ in [0])
 
 
 def test_generate_num_models_returns_separate_full_exams(monkeypatch):
@@ -316,7 +356,15 @@ def test_generate_invalid_difficulty_returns_400(monkeypatch):
 def test_generate_no_supported_types_returns_400(monkeypatch):
     _install_fakes(monkeypatch)
     resp = client.post(
-        "/generate", json={"fitb_count": 3, "essay_count": 2, "child_ids": ["c1"]}
+        "/generate",
+        json={
+            "mcq_count": 0,
+            "tf_count": 0,
+            "fitb_count": 0,
+            "why_count": 0,
+            "essay_count": 0,
+            "child_ids": ["c1"],
+        },
     )
     assert resp.status_code == 400
     assert "No supported question types" in resp.json()["detail"]

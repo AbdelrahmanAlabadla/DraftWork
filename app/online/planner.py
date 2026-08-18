@@ -19,7 +19,7 @@ logger = get_logger("PLANNER")
 MAX_PLAN_ATTEMPTS = 3
 _TARGETED_FILL_ATTEMPTS = 2
 
-VALID_TYPES = {"mcq", "true_false", "short_answer"}
+VALID_TYPES = {"mcq", "true_false", "fill_in_the_blank", "short_answer", "essay"}
 
 # Token-overlap above which two planned concepts (topic + concept_to_test) are
 # treated as the same concept across exam models. This is the planner-level

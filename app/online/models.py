@@ -12,10 +12,12 @@ logger = get_logger("GENERATOR")
 TYPE_LABELS = {
     "mcq": "Multiple Choice",
     "true_false": "True / False",
+    "fill_in_the_blank": "Fill in the Blank",
     "short_answer": "Short Answer",
+    "essay": "Essay",
 }
 
-TYPE_ORDER = ["mcq", "true_false", "short_answer"]
+TYPE_ORDER = ["mcq", "true_false", "fill_in_the_blank", "short_answer", "essay"]
 
 # Phrases that reference the source of information; questions containing any of
 # these are treated as invalid and re-generated.
@@ -113,10 +115,48 @@ def _normalize_short_answer(item: dict[str, Any]) -> dict[str, Any] | None:
     return {"question": question, "reference_answer": reference}
 
 
+def _normalize_essay(item: dict[str, Any]) -> dict[str, Any] | None:
+    question = _clean_str(item.get("question") or item.get("question_text"))
+    reference = _clean_str(
+        item.get("reference_answer") or item.get("model_answer") or item.get("answer")
+    )
+    if not question or not reference:
+        return None
+    key_points_raw = item.get("key_points")
+    if key_points_raw is not None and not isinstance(key_points_raw, list):
+        # Schema violation: key_points must be an array. Reject so the caller can
+        # send this item back for targeted structural repair instead of silently
+        # dropping the key_points.
+        return None
+    key_points: list[str] = []
+    if isinstance(key_points_raw, list):
+        key_points = [_clean_str(k) for k in key_points_raw if _clean_str(k)]
+    return {"question": question, "reference_answer": reference, "key_points": key_points}
+
+
+def normalize_fitb_item(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize a single fill-in-the-blank item (1 or 2 ordered blanks)."""
+    question = _clean_str(item.get("question") or item.get("question_text"))
+    if not question:
+        return None
+    raw_answers = item.get("answers")
+    if raw_answers is None:
+        raw_answers = item.get("answer")
+    if isinstance(raw_answers, str):
+        raw_answers = [raw_answers]
+    answers: list[str] = []
+    if isinstance(raw_answers, list):
+        answers = [_clean_str(a) for a in raw_answers if _clean_str(a)]
+    if not (1 <= len(answers) <= 2):
+        return None
+    return {"question": question, "answers": answers}
+
+
 _NORMALIZERS = {
     "mcq": _normalize_mcq,
     "true_false": _normalize_true_false,
     "short_answer": _normalize_short_answer,
+    "essay": _normalize_essay,
 }
 
 
@@ -141,11 +181,58 @@ def parse_questions_obj(question_type: str, parsed: object) -> list[dict[str, An
     return _parse_obj(question_type, parsed)
 
 
+def split_valid_invalid(
+    question_type: str, raw: object
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split raw items into (valid normalized, raw items that failed schema validation).
+
+    The invalid raw items are returned unchanged so a caller can hand them back
+    to the model for targeted structural repair (preserving valid content) rather
+    than discarding them and regenerating from scratch.
+    """
+    normalizer = _NORMALIZERS[question_type]
+    valid: list[dict[str, Any]] = []
+    invalid: list[dict[str, Any]] = []
+    for item in _questions_from(raw):
+        normalized = normalizer(item)
+        if normalized is not None:
+            valid.append(normalized)
+        else:
+            invalid.append(item)
+    return valid, invalid
+
+
+def _render_fitb(section: dict[str, Any], start_index: int = 1) -> str:
+    """Render the FITB section: boxed Word Bank followed by numbered items."""
+    lines: list[str] = [f"## {TYPE_LABELS['fill_in_the_blank']}", ""]
+    word_bank = [_clean_str(w) for w in (section.get("word_bank") or []) if _clean_str(w)]
+    if word_bank:
+        box = (
+            '<div class="word-bank"><strong>Word Bank</strong><br>'
+            + " · ".join(word_bank)
+            + "</div>"
+        )
+        lines.append(box)
+        lines.append("")
+    for offset, item in enumerate(section.get("items") or [], start=start_index):
+        answers = [_clean_str(a) for a in (item.get("answers") or []) if _clean_str(a)]
+        lines.append(f"{offset}. {_clean_str(item.get('question'))}")
+        lines.append(f"   **Answer:** {', '.join(answers)}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def render_markdown(
-    question_type: str, questions: list[dict[str, Any]], start_index: int = 1
+    question_type: str, questions: list[dict[str, Any]] | dict[str, Any], start_index: int = 1
 ) -> str:
     label = TYPE_LABELS.get(question_type, question_type)
     lines: list[str] = [f"## {label}", ""]
+
+    if question_type == "fill_in_the_blank":
+        return _render_fitb(questions, start_index=start_index)
+
+    if not isinstance(questions, list):
+        return "\n".join(lines).strip()
 
     for offset, q in enumerate(questions, start=start_index):
         if question_type == "mcq":
@@ -156,6 +243,12 @@ def render_markdown(
         elif question_type == "true_false":
             lines.append(f"{offset}. {q['statement']}")
             lines.append(f"   **Answer: {q['answer']}**")
+        elif question_type == "essay":
+            lines.append(f"{offset}. {q['question']}")
+            lines.append(f"   **Reference answer:** {q['reference_answer']}")
+            key_points = q.get("key_points") or []
+            for kp in key_points:
+                lines.append(f"   - {kp}")
         else:
             lines.append(f"{offset}. {q['question']}")
             lines.append(f"   **Answer:** {q['reference_answer']}")

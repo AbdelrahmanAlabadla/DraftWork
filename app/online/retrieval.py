@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import time
 
-from app.config import PLANNER_SNIPPET_TOKENS
+from app.config import (
+    GENERATION_CONTEXT_TOKENS,
+    PLANNER_CONTEXT_TOKENS,
+    PLANNER_SNIPPET_TOKENS,
+)
 from app.logging_conf import get_logger
 from app.offline.vector_store import VectorStore
 from app.online.graph import ExamState
@@ -74,7 +78,8 @@ def build_planner_context(
             lines.append(snippet)
         parts.append("\n".join(lines))
 
-    return "\n\n".join(parts)
+    joined = "\n\n".join(parts)
+    return _first_tokens(joined, PLANNER_CONTEXT_TOKENS)
 
 
 def retrieve_selected(
@@ -105,7 +110,7 @@ def retrieve_selected(
             ),
         }
 
-    context = _build_tree_context(children)
+    context = _first_tokens(_build_tree_context(children), GENERATION_CONTEXT_TOKENS)
     planner_context = build_planner_context(children)
     elapsed = time.perf_counter() - t0
     logger.info(
