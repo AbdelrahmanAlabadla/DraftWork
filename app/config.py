@@ -18,8 +18,11 @@ LLAMA_PARSE_API: str | None = _env("LLAMA_PARSE_API")
 QDRANT_URL: str = _env("QDRANT_URL", "http://localhost:6333") or "http://localhost:6333"
 QDRANT_COLLECTION: str = _env("QDRANT_COLLECTION", "genexam") or "genexam"
 
-LMS_URL: str = _env("LMS_URL", "http://127.0.0.1:1234") or "http://127.0.0.1:1234"
-LMS_MODEL: str = _env("LMS_MODEL", "google/gemma-4-e2b") or "google/gemma-4-e2b"
+LMS_URL: str = _env("LMS_URL", "https://opencode.ai/zen/v1") or "https://opencode.ai/zen/v1"
+LMS_MODEL: str = _env("LMS_MODEL", "mimo-v2.5-free") or "mimo-v2.5-free"
+# Bearer token sent as Authorization header for OpenAI-compatible endpoints
+# (OpenCode Zen). Empty means no auth header (local servers).
+LMS_API_KEY: str | None = _env("LMS_API_KEY") or None
 # Reasoning setting for chat calls ("off"|"low"|"medium"|"high"|"on"). We default
 # to "off" so reasoning-capable models don't burn output tokens on hidden
 # reasoning content that this pipeline discards anyway.

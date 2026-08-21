@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import requests
 
-from app.config import LMS_MODEL, LMS_REASONING, LMS_URL
+from app.config import LMS_API_KEY, LMS_MODEL, LMS_REASONING, LMS_URL
 from app.llm.json_utils import (
     JSONExtractionError,
     REPAIR_SYSTEM_PROMPT,
@@ -15,7 +15,13 @@ logger = get_logger("LLM")
 
 
 class LMStudioClient:
-    """Client for LM Studio's /api/v1/chat endpoint (stateless)."""
+    """Client for any OpenAI-compatible /chat/completions endpoint.
+
+    Currently pointed at OpenCode Zen (https://opencode.ai/zen/v1) but works
+    with LM Studio's OpenAI-compatible server too. Stateless; one call per
+    request. The ``reasoning`` constructor argument is accepted for backward
+    compatibility with existing call sites but is not sent on the wire.
+    """
 
     def __init__(
         self,
@@ -25,10 +31,8 @@ class LMStudioClient:
     ) -> None:
         self.url = (url or LMS_URL).rstrip("/")
         self.model = model or LMS_MODEL
-        # Reasoning override: "off"|"low"|"medium"|"high"|"on". Defaults to the
-        # configured value (LMS_REASONING, normally "off"). Sent only when set,
-        # so non-reasoning models never error.
         self.reasoning = reasoning if reasoning is not None else LMS_REASONING
+        self.api_key = LMS_API_KEY
 
     def chat(
         self,
@@ -38,48 +42,52 @@ class LMStudioClient:
         max_tokens: int = 4096,
         timeout: int = 600,
     ) -> str:
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt})
+
         payload: dict = {
             "model": self.model,
-            "input": prompt,
+            "messages": messages,
             "temperature": temperature,
-            "max_output_tokens": max_tokens,
+            "max_tokens": max_tokens,
             "stream": False,
-            "store": False,
         }
-        if getattr(self, "reasoning", None):
-            payload["reasoning"] = self.reasoning
-        if system_prompt:
-            payload["system_prompt"] = system_prompt
+
+        headers: dict = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
         logger.info(
-            "LLM call | model=%s | prompt_chars=%d | max_tokens=%d",
+            "LLM call | model=%s | url=%s | prompt_chars=%d | max_tokens=%d",
             self.model,
+            self.url,
             len(prompt),
             max_tokens,
         )
 
         response = requests.post(
-            f"{self.url}/api/v1/chat",
+            f"{self.url}/chat/completions",
             json=payload,
+            headers=headers,
             timeout=timeout,
         )
         response.raise_for_status()
         data = response.json()
 
-        output = data.get("output") or []
-        text_parts = [
-            item.get("content", "")
-            for item in output
-            if isinstance(item, dict) and item.get("type") == "message"
-        ]
-        text = "".join(text_parts).strip()
+        choices = data.get("choices") or []
+        text = ""
+        if choices:
+            message = choices[0].get("message") or {}
+            text = str(message.get("content") or "").strip()
 
-        stats = data.get("stats") or {}
+        usage = data.get("usage") or {}
         logger.info(
             "LLM response | output_chars=%d | in_tokens=%s | out_tokens=%s",
             len(text),
-            stats.get("input_tokens"),
-            stats.get("total_output_tokens"),
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
         )
         return text
 
