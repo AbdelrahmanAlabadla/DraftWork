@@ -28,6 +28,10 @@ LMS_API_KEY: str | None = _env("LMS_API_KEY") or None
 # reasoning content that this pipeline discards anyway.
 LMS_REASONING: str = _env("LMS_REASONING", "off") or "off"
 TITLE_MODEL: str = _env("TITLE_MODEL", "mistralai/mistral-7b-instruct-v0.3") or "mistralai/mistral-7b-instruct-v0.3"
+# Base URL used ONLY by the title-generation client (section/subsection
+# naming). Defaults to the local LM Studio OpenAI-compatible endpoint so
+# titles can use a different served model than the main pipeline.
+TITLE_LMS_URL: str = _env("TITLE_LMS_URL", "http://127.0.0.1:1234/v1") or "http://127.0.0.1:1234/v1"
 
 EMBEDDING_MODEL: str = _env("EMBEDDING_MODEL", "BAAI/bge-m3") or "BAAI/bge-m3"
 EMBEDDING_DIM: int = int(_env("EMBEDDING_DIM", "1024") or "1024")

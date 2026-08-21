@@ -13,6 +13,7 @@ from app.config import (
     SUBSECTION_TITLE_MIN_WORDS,
     TITLE_MAX_ATTEMPTS,
     TITLE_MAX_TOKENS,
+    TITLE_LMS_URL,
     TITLE_MODEL,
     TITLE_BLOCKLIST,
     TITLE_CONTEXT_RECENT,
@@ -24,7 +25,7 @@ from app.config import (
     TITLE_REVIEW_RETRIES,
     TITLE_TEMPERATURE,
 )
-from app.llm.client import LMStudioClient
+from app.llm.client import LMStudioNativeClient
 from app.logging_conf import get_logger
 from app.offline.title_nlp import first_noun_chunk, is_noun_phrase, title_appears_in_text
 
@@ -596,10 +597,11 @@ def _safe_fallback(content: str, max_words: int, min_words: int = 2) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _make_client() -> LMStudioClient:
-    # qwen3-class models default to "thinking" mode in LM Studio, which pads each
-    # reply with a reasoning block; turn it off so titles come back directly.
-    return LMStudioClient(model=TITLE_MODEL, reasoning="off")
+def _make_client() -> LMStudioNativeClient:
+    # Titles go through LM Studio's native /api/v1/chat with reasoning forced
+    # off: qwen3-class models otherwise burn the small title token budget on
+    # thinking and return an empty message.
+    return LMStudioNativeClient(url=TITLE_LMS_URL, model=TITLE_MODEL)
 
 
 def generate_section_title(client=None, content: str = "") -> str:
