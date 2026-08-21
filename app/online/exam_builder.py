@@ -47,6 +47,47 @@ _STOPWORDS = frozenset(
 # Jaccard token-overlap above which two questions are treated as near-duplicates.
 _NEAR_DUP_THRESHOLD = 0.35
 
+# Stable internal question IDs are stamped by the code in the form
+# `model{N}_{type}_{seq}` and never requested from the LLM. They uniquely
+# identify the exam model, the question type, and the individual question.
+_TYPE_ID_SLUGS = {
+    "mcq": "mcq",
+    "true_false": "true_false",
+    "fill_in_the_blank": "fill_in_the_blank",
+    "short_answer": "short_answer",
+    "essay": "essay",
+}
+
+
+def _section_items(section: Any) -> list[dict[str, Any]]:
+    """Return the flat question list of a section (FITB unwraps its items)."""
+    if isinstance(section, dict):
+        return list(section.get("items") or [])
+    return list(section or [])
+
+
+def _assign_ids(model_number: int, qtype: str, section: Any) -> None:
+    """Stamp a stable `question_id` on every question missing one, in place.
+
+    The per-type sequence continues from the highest existing ID so repair or
+    shortfall-fill that appends questions never collides or resets numbering.
+    """
+    slug = _TYPE_ID_SLUGS.get(qtype, qtype)
+    prefix = f"model{model_number}_{slug}_"
+    max_seq = 0
+    for q in _section_items(section):
+        qid = q.get("question_id")
+        if qid and str(qid).startswith(prefix):
+            try:
+                max_seq = max(max_seq, int(str(qid)[len(prefix):]))
+            except ValueError:
+                pass
+    nxt = max_seq + 1
+    for q in _section_items(section):
+        if not q.get("question_id"):
+            q["question_id"] = f"{prefix}{nxt}"
+            nxt += 1
+
 
 def _is_duplicate(qtype: str, question: dict[str, Any], seen: set[tuple[str, str]]) -> bool:
     key = (qtype, " ".join(normalize_text(question_text(qtype, question))))
@@ -821,6 +862,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 if not section_val:
                     continue
                 questions[section_key] = section_val
+                _assign_ids(model_number, section_key, section_val)
                 if section_key == "fill_in_the_blank":
                     within_model.extend(section_val.get("items") or [])
                 else:
@@ -843,6 +885,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 within_model,
                 previous_questions,
             )
+            _assign_ids(model_number, qtype, questions[qtype])
             model_warnings.extend(type_warnings)
             within_model.extend(questions[qtype])
 
@@ -860,6 +903,8 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             previous_questions,
         )
         model_warnings.extend(repair_warnings)
+        for section_key, section_val in questions.items():
+            _assign_ids(model_number, section_key, section_val)
 
         elapsed = time.perf_counter() - t0
         total = sum(
@@ -926,6 +971,9 @@ def generate_exams(
         "plan_attempts": 0,
         "generated_exams": [],
         "rejection_feedback": None,
+        "validation_reports": [],
+        "validated_models": [],
+        "question_repair_attempts": {},
         "warnings": [],
         "error": None,
     }
