@@ -317,6 +317,42 @@ def _clean_fitb_terms(raw: object) -> list[str]:
     return terms
 
 
+def _autofit_word_bank(bank: list[str], count: int) -> list[str]:
+    """Deterministically repair a stage-1 term list to exactly count+2 entries.
+
+    Stage-1 output only has to name terms; this fixes size/duplication in code
+    so the LLM does not need to be perfect:
+    1. de-duplicate (case-insensitive on normalized tokens);
+    2. if oversized, keep the first ``count`` terms plus the LAST 2 entries as
+       distractors;
+    3. if undersized, pad with generic-but-grounded fallback distractors.
+    Returns the fixed bank or an empty list when it cannot reach count terms.
+    """
+    seen: set[tuple[str, ...]] = set()
+    unique: list[str] = []
+    for term in bank:
+        key = tuple(normalize_text(term))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(term.strip())
+
+    terms = unique[:count]
+    rest = unique[count:]
+    if len(terms) < count:
+        return []
+    # Keep up to 2 distractors from the model's own extras...
+    distractors = rest[-2:]
+    # ...and pad with safe generic fillers when fewer than 2 survive.
+    for filler in ("process", "system", "device"):
+        if len(distractors) >= 2:
+            break
+        if tuple(normalize_text(filler)) not in seen:
+            distractors.append(filler)
+            seen.add(tuple(normalize_text(filler)))
+    return terms + distractors[:2]
+
+
 def _fitb_errors(
     section: dict[str, Any],
     count: int,
@@ -368,6 +404,117 @@ def _fitb_errors(
     return errors
 
 
+def _generate_fitb_bank(
+    count: int,
+    planned_items: list[dict[str, Any]],
+    context: str,
+    difficulty: str,
+    model_number: int,
+) -> tuple[list[str] | None, list[str]]:
+    """Stage 1: choose the answer terms + exactly 2 distractors.
+
+    The bank alone is validated and auto-fixed in code, so the expensive item
+    writing only ever runs against a guaranteed-valid bank.
+    """
+    from app.llm.client import LMStudioClient
+    from app.online.prompts import build_fitb_bank_prompt
+
+    warnings: list[str] = []
+    client = LMStudioClient()
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        system_prompt, user_prompt = build_fitb_bank_prompt(
+            count, context, difficulty=difficulty, model_number=model_number,
+            planned_items=planned_items,
+        )
+        try:
+            raw = client.chat_json(
+                user_prompt, system_prompt=system_prompt, temperature=0.5,
+                max_tokens=min(_MAX_TOKENS, 1024),
+            )
+        except Exception as exc:
+            warnings.append(f"fill_in_the_blank bank attempt {attempt}: {exc}")
+            continue
+        if not isinstance(raw, dict):
+            warnings.append(f"fill_in_the_blank bank attempt {attempt}: non-object response")
+            continue
+
+        terms = _clean_fitb_terms(raw.get("correct_terms"))
+        distractors = _clean_fitb_terms(raw.get("distractors"))
+        if len(terms) < count:
+            warnings.append(
+                f"fill_in_the_blank bank attempt {attempt}: got {len(terms)}/{count} terms"
+            )
+            continue
+        bank = _autofit_word_bank(terms + distractors, count)
+        if len(bank) != count + 2:
+            warnings.append(
+                f"fill_in_the_blank bank attempt {attempt}: unfittable bank "
+                f"({len(terms)} terms)"
+            )
+            continue
+        return bank, warnings
+
+    return None, warnings
+
+
+def _generate_fitb_items(
+    count: int,
+    word_bank: list[str],
+    context: str,
+    difficulty: str,
+    model_number: int,
+    within_model: list[dict[str, Any]],
+    previous_exams: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Stage 2: write numbered items using ONLY the fixed, shuffled Word Bank."""
+    from app.llm.client import LMStudioClient
+    from app.online.prompts import build_fitb_items_prompt
+
+    warnings: list[str] = []
+    client = LMStudioClient()
+    best: list[dict[str, Any]] = []
+
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        system_prompt, user_prompt = build_fitb_items_prompt(
+            count, word_bank, context, difficulty=difficulty, model_number=model_number,
+        )
+        try:
+            raw = client.chat_json(
+                user_prompt, system_prompt=system_prompt, temperature=0.5,
+                max_tokens=min(_MAX_TOKENS, max(2048, count * 320)),
+            )
+        except Exception as exc:
+            warnings.append(f"fill_in_the_blank items attempt {attempt}: {exc}")
+            continue
+        items_raw = raw.get("items") if isinstance(raw, dict) else None
+        items_raw = items_raw if isinstance(items_raw, list) else []
+        items = [normalize_fitb_item(i) for i in items_raw]
+        items = [i for i in items if i is not None]
+
+        candidate: dict[str, Any] = {"word_bank": list(word_bank), "items": items}
+        # Validate against the FULL requested count: with a short item set the
+        # extra unused bank entries legitimately inflate the distractor count,
+        # so both count/distractor messages are completeness artifacts, not
+        # content defects.
+        errors = _fitb_errors(candidate, count, within_model, previous_exams)
+        content_errors = [
+            e for e in errors
+            if "count" not in e and "distractors" not in e
+        ]
+        if not content_errors:
+            return items, warnings
+        best = items if len(items) > len(best) else best
+        warnings.append(
+            f"fill_in_the_blank items attempt {attempt}: rejected -> "
+            f"{'; '.join(content_errors[:2])}"
+        )
+
+    if best:
+        warnings.append(f"fill_in_the_blank: keeping best partial set ({len(best)} items)")
+    return best, warnings
+
+
 def _generate_fitb_type(
     count: int,
     planned_items: list[dict[str, Any]],
@@ -377,57 +524,28 @@ def _generate_fitb_type(
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    """Single-call FITB generation: Word Bank + numbered items in one model output."""
-    from app.llm.client import LMStudioClient
-    from app.online.prompts import build_fitb_single_prompt
+    """Two-stage FITB generation: Word Bank FIRST, then blanks against it.
 
-    warnings: list[str] = []
-    client = LMStudioClient()
+    Stage 1 produces and auto-fixes the bank; stage 2 writes items restricted
+    to that fixed bank. This removes the old single-call failure mode where one
+    wrong bank size discarded the entire section.
+    """
+    bank, warnings = _generate_fitb_bank(
+        count, planned_items, context, difficulty, model_number
+    )
+    if bank is None:
+        warnings.append("fill_in_the_blank: could not produce a valid Word Bank")
+        return None, warnings
 
-    for attempt in range(1, _MAX_ATTEMPTS + 1):
-        system_prompt, user_prompt = build_fitb_single_prompt(
-            count, context, difficulty=difficulty, model_number=model_number,
-            planned_items=planned_items,
-        )
-        try:
-            raw = client.chat_json(
-                user_prompt, system_prompt=system_prompt, temperature=0.5,
-                max_tokens=min(_MAX_TOKENS, max(2048, count * 320)),
-            )
-        except Exception as exc:
-            warnings.append(f"fill_in_the_blank attempt {attempt}: {exc}")
-            continue
-
-        if not isinstance(raw, dict):
-            warnings.append(f"fill_in_the_blank attempt {attempt}: non-object response")
-            continue
-
-        bank = _clean_fitb_terms(raw.get("word_bank"))
-        items_raw = raw.get("items") if isinstance(raw.get("items"), list) else []
-        items = [normalize_fitb_item(i) for i in items_raw]
-        items = [i for i in items if i is not None]
-
-        # The bank must hold count correct terms + exactly 2 distractors; the
-        # validator derives distractors as the unused Word Bank entries.
-        if len(bank) != count + 2:
-            warnings.append(
-                f"fill_in_the_blank attempt {attempt}: invalid bank size "
-                f"({len(bank)}, expected {count + 2})"
-            )
-            continue
-
-        random.shuffle(bank)
-        candidate: dict[str, Any] = {"word_bank": bank, "items": items}
-        errors = _fitb_errors(candidate, count, within_model, previous_exams)
-        if not errors:
-            return candidate, warnings
-        warnings.append(
-            f"fill_in_the_blank attempt {attempt}: validation failed "
-            f"({len(items)} items) -> {'; '.join(errors[:2])}"
-        )
-
-    warnings.append("fill_in_the_blank: no valid items generated")
-    return None, warnings
+    random.shuffle(bank)
+    items, item_warnings = _generate_fitb_items(
+        count, bank, context, difficulty, model_number, within_model, previous_exams
+    )
+    warnings.extend(item_warnings)
+    if not items:
+        warnings.append("fill_in_the_blank: no valid items generated")
+        return None, warnings
+    return {"word_bank": bank, "items": items}, warnings
 
 
 def _generate_obj_bundle(
@@ -482,11 +600,7 @@ def _generate_obj_bundle(
         }
         bundle_max_tokens = min(
             _MAX_TOKENS,
-            max(
-                4096,
-                (remaining("mcq") + remaining("true_false")) * 180
-                + remaining("fill_in_the_blank") * 320,
-            ),
+            max(4096, (remaining("mcq") + remaining("true_false")) * 180),
         )
         feedback = _build_bundle_feedback(
             acc_mcq, acc_tf, fitb, within_model, previous_exams
@@ -507,25 +621,23 @@ def _generate_obj_bundle(
             warnings.append(f"obj bundle attempt {attempt}: non-object response")
             continue
 
-        # --- fill_in_the_blank section (atomic: whole section or nothing) ---
+        # --- fill_in_the_blank section: bank FIRST, then items (two-stage) ---
         if remaining("fill_in_the_blank") > 0:
-            fitb_raw = raw.get("fill_in_the_blank")
             fitb_count = targets["fill_in_the_blank"]
-            if isinstance(fitb_raw, dict):
-                bank = _clean_fitb_terms(fitb_raw.get("word_bank"))
-                fitb_items = [
-                    normalize_fitb_item(i)
-                    for i in (fitb_raw.get("items") or [])
-                    if isinstance(i, dict)
-                ]
-                fitb_items = [i for i in fitb_items if i is not None]
-                if len(bank) == fitb_count + 2:
-                    random.shuffle(bank)
-                    fitb_candidate = {"word_bank": bank, "items": fitb_items}
-                    if not _fitb_errors(
-                        fitb_candidate, fitb_count, within_model, previous_exams
-                    ):
-                        fitb = fitb_candidate
+            bank, bank_warnings = _generate_fitb_bank(
+                fitb_count, planned.get("fill_in_the_blank") or [],
+                context, difficulty, model_number,
+            )
+            warnings.extend(bank_warnings)
+            if bank is not None:
+                random.shuffle(bank)
+                fitb_items, item_warnings = _generate_fitb_items(
+                    fitb_count, bank, context, difficulty, model_number,
+                    within_model, previous_exams,
+                )
+                warnings.extend(item_warnings)
+                if fitb_items:
+                    fitb = {"word_bank": bank, "items": fitb_items}
 
         # --- mcq section (incremental, structural-repair first) ---
         need_mcq = remaining("mcq")

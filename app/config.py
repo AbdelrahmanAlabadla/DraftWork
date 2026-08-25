@@ -18,8 +18,10 @@ LLAMA_PARSE_API: str | None = _env("LLAMA_PARSE_API")
 QDRANT_URL: str = _env("QDRANT_URL", "http://localhost:6333") or "http://localhost:6333"
 QDRANT_COLLECTION: str = _env("QDRANT_COLLECTION", "genexam") or "genexam"
 
-LMS_URL: str = _env("LMS_URL", "https://opencode.ai/zen/v1") or "https://opencode.ai/zen/v1"
-LMS_MODEL: str = _env("LMS_MODEL", "mimo-v2.5-free") or "mimo-v2.5-free"
+# Base URL of the LM Studio server (native REST API /api/v1/chat is used).
+# A trailing /v1 (OpenAI-compatible form) is tolerated and stripped.
+LMS_URL: str = _env("LMS_URL", "http://127.0.0.1:1234") or "http://127.0.0.1:1234"
+LMS_MODEL: str = _env("LMS_MODEL", "qwen/qwen3-8b") or "qwen/qwen3-8b"
 # Bearer token sent as Authorization header for OpenAI-compatible endpoints
 # (OpenCode Zen). Empty means no auth header (local servers).
 LMS_API_KEY: str | None = _env("LMS_API_KEY") or None
