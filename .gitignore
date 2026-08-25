@@ -6,3 +6,9 @@ data/
 .pytest_cache/
 *.log
 .idea/
+
+# Google OAuth credentials — never commit
+token.json
+oauth_client*.json
+service_account*.json
+data/google_forms/

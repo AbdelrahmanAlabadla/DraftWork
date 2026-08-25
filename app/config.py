@@ -41,6 +41,57 @@ REGISTRY_FILE: str = _env("REGISTRY_FILE", "data/documents.json") or "data/docum
 
 LOG_LEVEL: str = _env("LOG_LEVEL", "INFO") or "INFO"
 
+# --- Google Forms export (optional, downstream of generation) ---------------
+# Master switch; when false/absent the export endpoints return 503.
+GOOGLE_FORMS_ENABLED: bool = str(_env("GOOGLE_FORMS_ENABLED", "false")).lower() in (
+    "1", "true", "yes", "on"
+)
+# OAuth desktop-client secrets file (NEVER committed) and cached user token.
+# Both live under gitignored data/ by default.
+GOOGLE_OAUTH_CLIENT_FILE: str = _env(
+    "GOOGLE_OAUTH_CLIENT_FILE", "data/google_forms/oauth_client.json"
+) or "data/google_forms/oauth_client.json"
+GOOGLE_OAUTH_TOKEN_FILE: str = _env(
+    "GOOGLE_OAUTH_TOKEN_FILE", "data/google_forms/token.json"
+) or "data/google_forms/token.json"
+# 0 disables page breaks inside a question-type section.
+GOOGLE_FORMS_QUESTIONS_PER_PAGE: int = int(
+    _env("GOOGLE_FORMS_QUESTIONS_PER_PAGE", "0") or "0"
+)
+# Points assigned to each auto-graded question in Google Forms quizzes.
+GOOGLE_FORMS_POINTS: int = int(_env("GOOGLE_FORMS_POINTS", "1") or "1")
+
+# --- Google Forms ownership mode --------------------------------------------
+# teacher: Forms are created with the signed-in teacher's OAuth credentials
+#          (teacher owns them). Requires the Web OAuth client config below.
+# central: legacy fallback — Forms created under the desktop-client account,
+#          shared as writer with one explicit email. Never automatic.
+# disabled: Google Forms export fully off.
+GOOGLE_FORMS_MODE: str = (_env("GOOGLE_FORMS_MODE", "teacher") or "teacher").lower()
+if GOOGLE_FORMS_MODE not in ("teacher", "central", "disabled"):
+    GOOGLE_FORMS_MODE = "teacher"
+
+# Web application OAuth client (teacher sign-in + teacher-owned Forms).
+GOOGLE_WEB_OAUTH_CLIENT_ID: str | None = _env("GOOGLE_WEB_OAUTH_CLIENT_ID")
+GOOGLE_WEB_OAUTH_CLIENT_SECRET: str | None = _env("GOOGLE_WEB_OAUTH_CLIENT_SECRET")
+GOOGLE_WEB_OAUTH_REDIRECT_URI: str = _env(
+    "GOOGLE_WEB_OAUTH_REDIRECT_URI", "http://127.0.0.1:8000/auth/google/callback"
+) or "http://127.0.0.1:8000/auth/google/callback"
+
+# Server-side signing key for the session cookie. If unset, a random key is
+# generated PER BOOT: every server restart invalidates all sessions (and, in
+# teacher mode, connections are lost too). Set it for stable sessions.
+SESSION_SECRET: str | None = _env("SESSION_SECRET")
+SESSION_MAX_AGE_SECONDS: int = int(_env("SESSION_MAX_AGE_SECONDS", "604800") or "604800")
+
+
+def web_oauth_configured() -> bool:
+    return bool(
+        GOOGLE_WEB_OAUTH_CLIENT_ID
+        and GOOGLE_WEB_OAUTH_CLIENT_SECRET
+        and GOOGLE_WEB_OAUTH_REDIRECT_URI
+    )
+
 # --- Online exam planning --------------------------------------------------
 # The planner LLM receives a LIGHTWEIGHT context per selected child chunk:
 # the chunk title plus only this many leading tokens of its text. It decides

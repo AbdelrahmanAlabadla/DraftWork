@@ -10,6 +10,7 @@ from app.logging_conf import configure_logging
 configure_logging("WARNING")
 
 from app.api.main import app  # noqa: E402
+from app.api import exam_store  # noqa: E402
 from app.llm.json_utils import extract_json  # noqa: E402
 
 client = TestClient(app)
@@ -238,6 +239,29 @@ def test_generate_single_type_mcq(monkeypatch):
     assert "Multiple Choice" in exam["markdown"]
     assert "Answer: A" in exam["markdown"]
     assert exam["questions"]["mcq"][0]["correct_answer"] == "A"
+
+
+def test_generate_stores_print_metadata(monkeypatch):
+    _install_fakes(monkeypatch)
+    resp = client.post(
+        "/generate",
+        json={
+            "document_id": "doc-x",
+            "mcq_count": 1,
+            "child_ids": ["c1"],
+            "exam_title": "Biology Examination",
+            "class_name": "12B",
+            "duration": "75 minutes",
+            "exam_date": "2026-08-25",
+            "teacher_name": "Dr Test",
+            "footer_message": "Good luck!",
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["metadata"]["exam_title"] == "Biology Examination"
+    stored = exam_store.get_exam(data["exam_id"])
+    assert stored["metadata"]["class_name"] == "12B"
 
 
 def test_generate_html_payload_multiple_types(monkeypatch):

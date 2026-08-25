@@ -10,6 +10,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.api import storage as registry
+from app.api import exam_store
 from app.config import UPLOAD_DIR
 from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
@@ -45,6 +46,15 @@ class GenerateRequest(BaseModel):
     why_count: Optional[int] = Field(default=None, ge=0)
     fitb_count: Optional[int] = Field(default=None, ge=0)
     essay_count: Optional[int] = Field(default=None, ge=0)
+    # --- Optional print/export metadata ----------------------------------
+    exam_title: Optional[str] = Field(default=None, max_length=120)
+    class_name: Optional[str] = Field(default=None, max_length=80)
+    duration: Optional[str] = Field(default=None, max_length=40)
+    exam_date: Optional[str] = Field(default=None, max_length=40)
+    teacher_name: Optional[str] = Field(default=None, max_length=100)
+    footer_message: Optional[str] = Field(default=None, max_length=120)
+    left_logo_data: Optional[str] = Field(default=None, max_length=3_500_000)
+    right_logo_data: Optional[str] = Field(default=None, max_length=3_500_000)
     # --- V1 single-type payload -------------------------------------------
     question_type: Optional[str] = None
     number_of_questions: Optional[int] = Field(default=None, ge=1, le=100)
@@ -224,10 +234,32 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         detail = "; ".join(warnings) or "No questions could be generated."
         raise HTTPException(status_code=500, detail=detail)
 
+    metadata = {
+        key: value.strip() if isinstance(value, str) else value
+        for key, value in {
+            "exam_title": body.exam_title,
+            "class_name": body.class_name,
+            "duration": body.duration,
+            "exam_date": body.exam_date,
+            "teacher_name": body.teacher_name,
+            "footer_message": body.footer_message,
+            "left_logo_data": body.left_logo_data,
+            "right_logo_data": body.right_logo_data,
+        }.items()
+        if value
+    }
+    exam_id = exam_store.save_exam(
+        exams,
+        warnings,
+        document_id=document_id,
+        metadata=metadata,
+    )
+
     logger.info(
-        "Exam generation completed | document_id=%s | models=%d | difficulty=%s | types=%s | "
+        "Exam generation completed | document_id=%s | exam_id=%s | models=%d | difficulty=%s | types=%s | "
         "total_questions=%d | total_time=%.2fs | success=True",
         document_id,
+        exam_id,
         num_models,
         difficulty,
         list(exams[0]["questions"].keys()),
@@ -236,9 +268,11 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     )
 
     return {
+        "exam_id": exam_id,
         "document_id": document_id,
         "num_models": num_models,
         "difficulty": difficulty,
+        "metadata": metadata,
         "exams": exams,
         "warnings": warnings,
     }

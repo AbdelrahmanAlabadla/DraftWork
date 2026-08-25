@@ -6,788 +6,19 @@
   <link
     href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap"
     rel="stylesheet" />
-  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-  <style>
-    *,
-    *::before,
-    *::after {
-      box-sizing: border-box;
-      margin: 0;
-      padding: 0;
-    }
-
-    :root {
-      --bg: #000000;
-      --surface: #010203;
-      --surface2: #16213a;
-      --border: #f5f5f5;
-      --border2: #edf0f5;
-
-      --accent: #f36e15;
-      --accent-dim: rgba(79, 140, 255, 0.10);
-      --accent-dim2: rgba(231, 236, 245, 0.18);
-
-      --text: #eaf0ff;
-      --muted: #e5e6e9;
-      --muted2: #9aa7bf;
-
-      --danger: #ff4d4d;
-      --success: #22c55e;
-
-      --mono: 'JetBrains Mono', monospace;
-      --sans: 'Inter', sans-serif;
-    }
-
-    body {
-      font-family: var(--sans);
-      background: var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-      padding: 48px 24px 80px;
-    }
-
-    .page {
-      max-width: 760px;
-      margin: 0 auto;
-    }
-
-    .header {
-      margin-bottom: 56px;
-      display: flex;
-      align-items: baseline;
-      gap: 16px;
-    }
-
-    .header h1 {
-      font-size: 28px;
-      font-weight: 700;
-      letter-spacing: -0.5px;
-    }
-
-    .header h1 span {
-      color: var(--accent);
-    }
-
-    .header .tag {
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted2);
-      border: 1px solid var(--border2);
-      padding: 3px 8px;
-      border-radius: 4px;
-      letter-spacing: 0.05em;
-    }
-
-    .section-label {
-      font-family: var(--mono);
-      font-size: 11px;
-      letter-spacing: 0.12em;
-      color: var(--muted);
-      text-transform: uppercase;
-      margin-bottom: 14px;
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-
-    .section-label::after {
-      content: '';
-      flex: 1;
-      height: 1px;
-      background: var(--border);
-    }
-
-    .upload-zone {
-      border: 1.5px dashed var(--border2);
-      border-radius: 12px;
-      padding: 48px 32px;
-      text-align: center;
-      cursor: pointer;
-      transition: border-color 0.2s, background 0.2s;
-      position: relative;
-      margin-bottom: 16px;
-    }
-
-    .upload-zone:hover,
-    .upload-zone.drag {
-      border-color: var(--accent);
-      background: var(--accent-dim);
-    }
-
-    .upload-zone input[type="file"] {
-      display: none;
-    }
-
-    .upload-icon {
-      width: 48px;
-      height: 48px;
-      border: 1.5px solid var(--border2);
-      border-radius: 10px;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      margin: 0 auto 16px;
-      font-size: 22px;
-    }
-
-    .upload-zone h2 {
-      font-size: 17px;
-      font-weight: 600;
-      margin-bottom: 6px;
-    }
-
-    .upload-zone p {
-      font-size: 13px;
-      color: var(--muted2);
-      line-height: 1.6;
-    }
-
-    .upload-zone .formats {
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--accent);
-      margin-top: 12px;
-      letter-spacing: 0.05em;
-    }
-
-    .file-pill {
-      display: none;
-      align-items: center;
-      gap: 10px;
-      background: var(--surface2);
-      border: 1px solid var(--border2);
-      border-radius: 8px;
-      padding: 10px 14px;
-      margin-bottom: 8px;
-      font-size: 13px;
-    }
-
-    .file-pill.show {
-      display: flex;
-    }
-
-    .file-pill .fname {
-      flex: 1;
-      font-family: var(--mono);
-      font-size: 12px;
-      color: var(--accent);
-    }
-
-    .file-pill .remove {
-      cursor: pointer;
-      color: var(--muted);
-      font-size: 18px;
-      line-height: 1;
-      padding: 0 4px;
-      transition: color 0.15s;
-    }
-
-    .file-pill .remove:hover {
-      color: var(--danger);
-    }
-
-    .status-bar {
-      display: none;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 8px;
-      font-family: var(--mono);
-    }
-
-    .status-bar.show {
-      display: flex;
-    }
-
-    .status-bar.loading {
-      background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
-      color: var(--accent);
-    }
-
-    .status-bar.success {
-      background: rgba(0, 204, 102, 0.08);
-      border: 1px solid rgba(0, 204, 102, 0.2);
-      color: var(--success);
-    }
-
-    .status-bar.error {
-      background: rgba(255, 68, 68, 0.08);
-      border: 1px solid rgba(255, 68, 68, 0.2);
-      color: var(--danger);
-    }
-
-    .spinner {
-      width: 14px;
-      height: 14px;
-      border: 2px solid rgba(212, 255, 0, 0.2);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-      flex-shrink: 0;
-    }
-
-    @keyframes spin {
-      to {
-        transform: rotate(360deg);
-      }
-    }
-
-    .settings-block {
-      margin-bottom: 40px;
-    }
-
-    .settings-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-bottom: 12px;
-    }
-
-    .setting-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px 18px;
-    }
-
-    .setting-card label {
-      display: block;
-      font-size: 11px;
-      color: var(--muted2);
-      font-family: var(--mono);
-      letter-spacing: 0.06em;
-      margin-bottom: 10px;
-    }
-
-    .model-btns {
-      display: flex;
-      gap: 6px;
-    }
-
-    .model-btn {
-      flex: 1;
-      padding: 7px 0;
-      font-family: var(--mono);
-      font-size: 12px;
-      background: transparent;
-      border: 1px solid var(--border2);
-      border-radius: 6px;
-      color: var(--muted2);
-      cursor: pointer;
-      transition: all 0.15s;
-    }
-
-    .model-btn:hover {
-      border-color: var(--accent);
-      color: var(--accent);
-    }
-
-    .model-btn.active {
-      background: var(--accent);
-      color: #000;
-      border-color: var(--accent);
-      font-weight: 600;
-    }
-
-    .diff-btns {
-      display: flex;
-      gap: 6px;
-    }
-
-    .diff-btn {
-      flex: 1;
-      padding: 7px 0;
-      font-family: var(--mono);
-      font-size: 11px;
-      background: transparent;
-      border: 1px solid var(--border2);
-      border-radius: 6px;
-      color: var(--muted2);
-      cursor: pointer;
-      transition: all 0.15s;
-      letter-spacing: 0.04em;
-    }
-
-    .diff-btn:hover {
-      border-color: var(--accent);
-      color: var(--accent);
-    }
-
-    .diff-btn.active {
-      background: var(--accent);
-      color: #000;
-      border-color: var(--accent);
-      font-weight: 600;
-    }
-
-    .page-range-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px 18px;
-      margin-bottom: 12px;
-    }
-
-    .page-range-card label {
-      display: block;
-      font-size: 11px;
-      color: var(--muted2);
-      font-family: var(--mono);
-      letter-spacing: 0.06em;
-      margin-bottom: 10px;
-    }
-
-    .page-range-inputs {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-    }
-
-    .page-range-inputs input {
-      width: 80px;
-      background: var(--surface2);
-      border: 1px solid var(--border2);
-      border-radius: 6px;
-      padding: 7px 10px;
-      font-family: var(--mono);
-      font-size: 13px;
-      color: var(--text);
-      outline: none;
-      transition: border-color 0.15s;
-    }
-
-    .page-range-inputs input:focus {
-      border-color: var(--accent);
-    }
-
-    .page-range-inputs input::placeholder {
-      color: var(--muted);
-    }
-
-    .page-range-inputs span {
-      color: var(--muted);
-      font-size: 13px;
-    }
-
-    .qtypes-block {
-      margin-bottom: 40px;
-    }
-
-    .qtypes-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 14px;
-    }
-
-    .qtotal {
-      font-family: var(--mono);
-      font-size: 12px;
-      color: var(--accent);
-      background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
-      padding: 4px 10px;
-      border-radius: 20px;
-    }
-
-    .qtype-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px 18px;
-      margin-bottom: 8px;
-      transition: border-color 0.2s, opacity 0.2s;
-      display: grid;
-      grid-template-columns: 1fr auto;
-      align-items: center;
-      gap: 16px;
-    }
-
-    .qtype-card.disabled {
-      opacity: 0.4;
-    }
-
-    .qtype-info {
-      display: flex;
-      align-items: center;
-      gap: 14px;
-    }
-
-    .qtype-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--accent);
-      flex-shrink: 0;
-      transition: background 0.2s;
-    }
-
-    .qtype-card.disabled .qtype-dot {
-      background: var(--muted);
-    }
-
-    .qtype-name {
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 2px;
-    }
-
-    .qtype-desc {
-      font-size: 12px;
-      color: var(--muted2);
-      font-family: var(--mono);
-    }
-
-    .qtype-controls {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-    }
-
-    .toggle {
-      width: 36px;
-      height: 20px;
-      border-radius: 20px;
-      background: var(--border2);
-      cursor: pointer;
-      position: relative;
-      transition: background 0.2s;
-      flex-shrink: 0;
-      border: none;
-      outline: none;
-    }
-
-    .toggle::after {
-      content: '';
-      position: absolute;
-      width: 14px;
-      height: 14px;
-      border-radius: 50%;
-      background: var(--muted2);
-      top: 3px;
-      left: 3px;
-      transition: transform 0.2s, background 0.2s;
-    }
-
-    .toggle.on {
-      background: var(--accent-dim2);
-      border: 1px solid rgba(212, 255, 0, 0.3);
-    }
-
-    .toggle.on::after {
-      transform: translateX(16px);
-      background: var(--accent);
-    }
-
-    .stepper {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .stepper button {
-      width: 28px;
-      height: 28px;
-      border-radius: 6px;
-      border: 1px solid var(--border2);
-      background: transparent;
-      color: var(--text);
-      font-size: 16px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      transition: all 0.15s;
-      line-height: 1;
-      font-family: var(--mono);
-    }
-
-    .stepper button:hover {
-      border-color: var(--accent);
-      color: var(--accent);
-    }
-
-    .stepper .count {
-      font-family: var(--mono);
-      font-size: 14px;
-      min-width: 24px;
-      text-align: center;
-      font-weight: 500;
-    }
-
-    .generate-btn {
-      width: 100%;
-      padding: 16px;
-      background: var(--accent);
-      color: #000;
-      border: none;
-      border-radius: 10px;
-      font-family: var(--sans);
-      font-size: 15px;
-      font-weight: 700;
-      cursor: pointer;
-      letter-spacing: 0.02em;
-      transition: opacity 0.2s, transform 0.1s;
-      margin-bottom: 24px;
-    }
-
-    .generate-btn:hover {
-      opacity: 0.9;
-    }
-
-    .generate-btn:active {
-      transform: scale(0.99);
-    }
-
-    .generate-btn:disabled {
-      opacity: 0.35;
-      cursor: not-allowed;
-      transform: none;
-    }
-
-    .exam-output {
-      display: none;
-      background: var(--surface);
-      border: 1px solid var(--border2);
-      border-radius: 12px;
-      padding: 32px;
-      margin-top: 8px;
-    }
-
-    .exam-output.show {
-      display: block;
-    }
-
-    .exam-output-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      margin-bottom: 28px;
-      padding-bottom: 16px;
-      border-bottom: 1px solid var(--border);
-    }
-
-    .exam-output-header h3 {
-      font-size: 16px;
-      font-weight: 600;
-    }
-
-    .copy-btn {
-      font-family: var(--mono);
-      font-size: 11px;
-      padding: 6px 12px;
-      background: transparent;
-      border: 1px solid var(--border2);
-      border-radius: 6px;
-      color: var(--muted2);
-      cursor: pointer;
-      transition: all 0.15s;
-      letter-spacing: 0.05em;
-    }
-
-    .copy-btn:hover {
-      border-color: var(--accent);
-      color: var(--accent);
-    }
-
-    .exam-content h1,
-    .exam-content h2 {
-      font-size: 16px;
-      font-weight: 600;
-      margin: 24px 0 12px;
-      color: var(--accent);
-    }
-
-    .exam-content h2:first-child {
-      margin-top: 0;
-    }
-
-    .exam-content p {
-      font-size: 14px;
-      line-height: 1.7;
-      margin-bottom: 10px;
-    }
-
-    .exam-content ol,
-    .exam-content ul {
-      padding-left: 20px;
-      margin-bottom: 12px;
-    }
-
-    .exam-content li {
-      font-size: 14px;
-      line-height: 1.7;
-      margin-bottom: 4px;
-    }
-
-    .exam-content strong {
-      color: var(--accent);
-      font-weight: 600;
-    }
-
-    .word-bank {
-      display: inline-block;
-      border: 2px solid var(--accent);
-      border-radius: 8px;
-      padding: 12px 16px;
-      margin: 4px 0 14px;
-      background: rgba(120, 110, 255, 0.06);
-      line-height: 1.9;
-      font-size: 14px;
-    }
-    .word-bank strong {
-      display: block;
-      margin-bottom: 4px;
-    }
-
-    .gen-status {
-      display: none;
-      align-items: center;
-      gap: 12px;
-      padding: 16px 20px;
-      background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
-      border-radius: 10px;
-      margin-bottom: 16px;
-      font-family: var(--mono);
-      font-size: 13px;
-      color: var(--accent);
-    }
-
-    .gen-status.show {
-      display: flex;
-    }
-
-    .gen-spinner {
-      width: 16px;
-      height: 16px;
-      border: 2px solid rgba(212, 255, 0, 0.2);
-      border-top-color: var(--accent);
-      border-radius: 50%;
-      animation: spin 0.7s linear infinite;
-      flex-shrink: 0;
-    }
-
-    .sections-block {
-      margin: 40px 0;
-    }
-
-    .sections-loading {
-      display: none;
-      align-items: center;
-      gap: 12px;
-      padding: 16px 20px;
-      background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
-      border-radius: 10px;
-      margin-bottom: 16px;
-      font-family: var(--mono);
-      font-size: 13px;
-      color: var(--accent);
-    }
-
-    .sections-loading.show {
-      display: flex;
-    }
-
-    .sections-toolbar {
-      margin-bottom: 8px;
-      text-align: right;
-    }
-
-    .select-all-btn {
-      font-family: var(--mono);
-      font-size: 11px;
-      padding: 6px 12px;
-      background: transparent;
-      border: 1px solid var(--border2);
-      border-radius: 6px;
-      color: var(--muted2);
-      cursor: pointer;
-      transition: all 0.15s;
-      letter-spacing: 0.05em;
-    }
-
-    .select-all-btn:hover {
-      border-color: var(--accent);
-      color: var(--accent);
-    }
-
-    .sections-tree {
-      margin-top: 4px;
-    }
-
-    .section-node {
-      margin-bottom: 8px;
-    }
-
-    .section-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 12px 16px;
-      cursor: pointer;
-      transition: border-color 0.2s;
-    }
-
-    .section-row:hover {
-      border-color: var(--accent);
-    }
-
-    .section-row input[type="checkbox"],
-    .subsection-row input[type="checkbox"] {
-      accent-color: var(--accent);
-      width: 15px;
-      height: 15px;
-      flex-shrink: 0;
-      cursor: pointer;
-    }
-
-    .section-title {
-      font-size: 14px;
-      font-weight: 600;
-    }
-
-    .subsection-list {
-      margin: 6px 0 0 38px;
-      border-left: 1px solid var(--border2);
-      padding-left: 18px;
-    }
-
-    .subsection-row {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 7px 10px;
-      border-radius: 6px;
-      font-size: 13px;
-      color: var(--muted2);
-      cursor: pointer;
-      transition: color 0.15s, background 0.15s;
-    }
-
-    .subsection-row:hover {
-      color: var(--text);
-      background: var(--accent-dim);
-    }
-
-    .subsection-title {
-      line-height: 1.5;
-    }
-  </style>
+  <link rel="stylesheet" href="css/styles.css" />
 </head>
-
 <body>
   <div class="page">
     <div class="header">
       <h1>Smart<span>Exam</span> AI</h1>
       <span class="tag">RAG-POWERED</span>
+      <div class="google-auth" id="googleAuth">
+        <a href="/auth/google/login" id="connectGoogleBtn" class="copy-btn"
+           style="display:none; text-decoration:none;">Connect Google Account</a>
+        <span id="connectedInfo" style="display:none; font-family:var(--mono); font-size:11px; color:var(--success);"></span>
+        <button id="signOutBtn" class="copy-btn" style="display:none;">Sign out</button>
+      </div>
     </div>
 
     <div class="section-label">01 — Upload Document</div>
@@ -830,6 +61,40 @@
           </div>
         </div>
       </div>
+      <div class="exam-details-card">
+        <div class="exam-details-title">Printed Exam Details <span>optional</span></div>
+        <div class="exam-details-grid">
+          <label class="exam-field exam-field-wide">
+            <span>Exam title</span>
+            <input id="examTitle" type="text" maxlength="120" placeholder="Examination" />
+          </label>
+          <label class="exam-field">
+            <span>Class</span>
+            <input id="examClass" type="text" maxlength="80" placeholder="e.g. Grade 12" />
+          </label>
+          <label class="exam-field">
+            <span>Duration</span>
+            <input id="examDuration" type="text" maxlength="40" placeholder="e.g. 90 minutes" />
+          </label>
+          <label class="exam-field">
+            <span>Exam date</span>
+            <input id="examDate" type="date" />
+          </label>
+          <label class="exam-field">
+            <span>Teacher</span>
+            <input id="teacherName" type="text" maxlength="100" placeholder="Teacher name" />
+          </label>
+          <label class="exam-field logo-field">
+            <span>Left logo</span>
+            <input id="leftLogo" type="file" accept="image/png,image/jpeg,image/webp" />
+          </label>
+          <label class="exam-field logo-field">
+            <span>Right logo</span>
+            <input id="rightLogo" type="file" accept="image/png,image/jpeg,image/webp" />
+          </label>
+        </div>
+        <div class="exam-details-note">PDF and DOCX use A4 pages with 0.5-inch margins on every side. Logos must be under 2 MB.</div>
+      </div>
     </div>
 
     <div class="sections-block">
@@ -839,7 +104,7 @@
         <div class="gen-spinner"></div><span>Generating sections, your titles will appear in a few seconds...</span>
       </div>
       <div class="sections-toolbar">
-        <button class="select-all-btn" id="selectAllBtn" onclick="selectAllSections()">Select All Titles</button>
+        <button class="select-all-btn" id="selectAllBtn">Select All Titles</button>
       </div>
       <div class="sections-tree" id="sectionsTree"></div>
     </div>
@@ -856,9 +121,9 @@
           </div>
         </div>
         <div class="qtype-controls">
-          <div class="stepper"><button onclick="step('mcq',-1)">−</button><span class="count"
-              id="count-mcq">10</span><button onclick="step('mcq',1)">+</button></div>
-          <button class="toggle on" data-key="mcq" onclick="toggleType('mcq')"></button>
+          <div class="stepper"><button>−</button><span class="count"
+              id="count-mcq">10</span><button>+</button></div>
+          <button class="toggle on" data-key="mcq"></button>
         </div>
       </div>
       <div class="qtype-card" id="card-tf">
@@ -870,9 +135,9 @@
           </div>
         </div>
         <div class="qtype-controls">
-          <div class="stepper"><button onclick="step('tf',-1)">−</button><span class="count"
-              id="count-tf">5</span><button onclick="step('tf',1)">+</button></div>
-          <button class="toggle on" data-key="tf" onclick="toggleType('tf')"></button>
+          <div class="stepper"><button>−</button><span class="count"
+              id="count-tf">5</span><button>+</button></div>
+          <button class="toggle on" data-key="tf"></button>
         </div>
       </div>
       <div class="qtype-card" id="card-fitb">
@@ -884,9 +149,9 @@
           </div>
         </div>
         <div class="qtype-controls">
-          <div class="stepper"><button onclick="step('fitb',-1)">−</button><span class="count"
-              id="count-fitb">5</span><button onclick="step('fitb',1)">+</button></div>
-          <button class="toggle on" data-key="fitb" onclick="toggleType('fitb')"></button>
+          <div class="stepper"><button>−</button><span class="count"
+              id="count-fitb">5</span><button>+</button></div>
+          <button class="toggle on" data-key="fitb"></button>
         </div>
       </div>
       <div class="qtype-card" id="card-why">
@@ -898,9 +163,9 @@
           </div>
         </div>
         <div class="qtype-controls">
-          <div class="stepper"><button onclick="step('why',-1)">−</button><span class="count"
-              id="count-why">3</span><button onclick="step('why',1)">+</button></div>
-          <button class="toggle on" data-key="why" onclick="toggleType('why')"></button>
+          <div class="stepper"><button>−</button><span class="count"
+              id="count-why">3</span><button>+</button></div>
+          <button class="toggle on" data-key="why"></button>
         </div>
       </div>
       <div class="qtype-card" id="card-essay">
@@ -912,9 +177,9 @@
           </div>
         </div>
         <div class="qtype-controls">
-          <div class="stepper"><button onclick="step('essay',-1)">−</button><span class="count"
-              id="count-essay">2</span><button onclick="step('essay',1)">+</button></div>
-          <button class="toggle on" data-key="essay" onclick="toggleType('essay')"></button>
+          <div class="stepper"><button>−</button><span class="count"
+              id="count-essay">2</span><button>+</button></div>
+          <button class="toggle on" data-key="essay"></button>
         </div>
       </div>
     </div>
@@ -922,324 +187,54 @@
     <div class="gen-status" id="genStatus">
       <div class="gen-spinner"></div><span>Generating exam — this may take a moment...</span>
     </div>
-    <button class="generate-btn" id="generateBtn" onclick="generate()">Generate Exam →</button>
+    <button class="generate-btn" id="generateBtn">Generate Exam →</button>
 
     <div class="exam-output" id="examOutput">
       <div class="exam-output-header">
-        <h3>Generated Exam</h3>
-        <button class="copy-btn" onclick="copyExam()">Copy Markdown</button>
+        <h3>Exam Preview</h3>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <button class="copy-btn">Copy Markdown</button>
+          <div class="export-wrap" id="exportWrap">
+            <button class="export-btn" id="exportBtn">Export &#9662;</button>
+            <div class="export-menu">
+              <button class="export-item" data-export="pdf">PDF</button>
+              <button class="export-item" data-export="docx">DOCX</button>
+              <div class="export-share" id="shareRow">
+                <input type="text" id="shareEmails"
+                       placeholder="teacher@email.com, ..." />
+              </div>
+              <button class="export-item" data-export="google-forms">Google Forms</button>
+            </div>
+          </div>
+        </div>
       </div>
+      <div class="model-tabs" id="modelTabs" style="display:none;"></div>
+      <div class="status-bar" id="exportStatus" style="margin-top:12px;">
+        <div class="spinner" id="exportSpinner"></div>
+        <span id="exportMsg"></span>
+      </div>
+      <div class="forms-links" id="formsLinks"></div>
       <div class="exam-content" id="examContent"></div>
     </div>
   </div>
 
+  <script type="module" src="js/main.js"></script>
   <script>
-    const BASE = "http://127.0.0.1:8000";
-    const counts = { mcq: 10, tf: 5, fitb: 5, why: 3, essay: 2 };
-    const enabled = { mcq: true, tf: true, fitb: true, why: true, essay: true };
-    let numModels = 1, difficulty = "easy", uploadDone = false, rawExam = "";
-    let currentDocId = null;
-    const selectedChildren = new Set();
-
-    function updateTotal() {
-      let t = 0;
-      for (const k in counts) if (enabled[k]) t += counts[k];
-      document.getElementById("totalBadge").textContent = `Total: ${t} questions`;
-    }
-
-    function step(key, dir) {
-      if (!enabled[key]) return;
-      counts[key] = Math.max(0, counts[key] + dir);
-      document.getElementById(`count-${key}`).textContent = counts[key];
-      updateTotal();
-    }
-
-    function toggleType(key) {
-      enabled[key] = !enabled[key];
-      const btn = document.querySelector(`.toggle[data-key="${key}"]`);
-      const card = document.getElementById(`card-${key}`);
-      btn.classList.toggle("on", enabled[key]);
-      card.classList.toggle("disabled", !enabled[key]);
-      updateTotal();
-    }
-
-    document.querySelectorAll(".model-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        document.querySelectorAll(".model-btn").forEach(b => b.classList.remove("active"));
-        btn.classList.add("active");
-        numModels = parseInt(btn.dataset.val);
-      });
-    });
-
-    document.querySelectorAll(".diff-btn").forEach(btn => {
-      btn.addEventListener("click", () => {
-        document.querySelectorAll(".diff-btn").forEach(b => b.classList.remove("active"));
-        btn.classList.add("active");
-        difficulty = btn.dataset.val;
-      });
-    });
-
-    const zone = document.getElementById("uploadZone");
-    const fileInput = document.getElementById("fileInput");
-    zone.addEventListener("click", () => fileInput.click());
-    zone.addEventListener("dragover", e => { e.preventDefault(); zone.classList.add("drag"); });
-    zone.addEventListener("dragleave", () => zone.classList.remove("drag"));
-    zone.addEventListener("drop", e => { e.preventDefault(); zone.classList.remove("drag"); if (e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]); });
-    fileInput.addEventListener("change", () => { if (fileInput.files[0]) handleFile(fileInput.files[0]); });
-    document.getElementById("removeFile").addEventListener("click", () => {
-      uploadDone = false;
-      currentDocId = null;
-      selectedChildren.clear();
-      document.getElementById("sectionsTree").innerHTML = "";
-      document.getElementById("sectionsCount").textContent = "";
-      document.getElementById("sectionsLoading").classList.remove("show");
-      document.getElementById("filePill").classList.remove("show");
-      setUploadStatus("", "");
-      fileInput.value = "";
-    });
-
-    function handleFile(file) {
-      const ext = file.name.split(".").pop().toLowerCase();
-      if (!["pdf", "txt"].includes(ext)) { setUploadStatus("error", "Only .pdf and .txt files are supported."); return; }
-      document.getElementById("fileName").textContent = file.name;
-      document.getElementById("filePill").classList.add("show");
-      uploadFile(file);
-    }
-
-    async function uploadFile(file) {
-      setUploadStatus("loading", "Uploading and indexing...");
-      showSectionsLoading();
-      const formData = new FormData();
-      formData.append("file", file);
-      try {
-        const res = await fetch(`${BASE}/upload`, { method: "POST", body: formData });
-        const data = await res.json();
-        if (res.ok) {
-          setUploadStatus("success", data.message || "File indexed successfully.");
-          uploadDone = true;
-          currentDocId = data.document_id;
-          renderSectionsTree(data.structure || {});
-        } else {
-          setUploadStatus("error", data.detail || "Upload failed.");
-          hideSectionsLoading();
-        }
-      } catch (e) {
-        setUploadStatus("error", "Cannot reach server. Is FastAPI running?");
-        hideSectionsLoading();
+    // Failsafe: if the module graph didn't boot (file:// open, server down,
+    // or a JS error), tell the user instead of leaving a dead page.
+    window.addEventListener("error", function () {}, true);
+    setTimeout(function () {
+      if (!window.__dwBooted) {
+        var b = document.createElement("div");
+        b.style.cssText =
+          "position:fixed;bottom:16px;left:50%;transform:translateX(-50%);" +
+          "background:#3a1010;color:#ff9a9a;border:1px solid #ff4d4d;" +
+          "padding:12px 18px;border-radius:8px;font-family:monospace;font-size:13px;z-index:999;";
+        b.textContent =
+          "UI failed to start. Run the server (python run.py) and open http://127.0.0.1:8000/";
+        document.body.appendChild(b);
       }
-    }
-
-    function showSectionsLoading() {
-      document.getElementById("sectionsLoading").classList.add("show");
-      document.getElementById("sectionsTree").innerHTML = "";
-      document.getElementById("sectionsCount").textContent = "";
-    }
-
-    function hideSectionsLoading() {
-      document.getElementById("sectionsLoading").classList.remove("show");
-    }
-
-    function renderSectionsTree(data) {
-      const tree = document.getElementById("sectionsTree");
-      tree.innerHTML = "";
-      selectedChildren.clear();
-
-      const sections = data.sections || [];
-      const selectAllBtn = document.getElementById("selectAllBtn");
-      if (selectAllBtn) selectAllBtn.style.display = sections.length ? "" : "none";
-
-      if (!sections.length) {
-        hideSectionsLoading();
-        return;
-      }
-
-      const frag = document.createDocumentFragment();
-      sections.forEach((section, si) => {
-        const subs = section.subsections || [];
-        const node = document.createElement("div");
-        node.className = "section-node";
-
-        const srow = document.createElement("label");
-        srow.className = "section-row";
-        const sbox = document.createElement("input");
-        sbox.type = "checkbox";
-        sbox.className = "section-check";
-        sbox.dataset.section = String(si);
-        sbox.checked = false;
-        sbox.dataset.childIds = (section.child_ids || []).join(",");
-        srow.appendChild(sbox);
-        const stitle = document.createElement("span");
-        stitle.className = "section-title";
-        stitle.textContent = section.title || "Untitled";
-        srow.appendChild(stitle);
-        node.appendChild(srow);
-
-        const slist = document.createElement("div");
-        slist.className = "subsection-list";
-        subs.forEach(sub => {
-          const lrow = document.createElement("label");
-          lrow.className = "subsection-row";
-          const cbox = document.createElement("input");
-          cbox.type = "checkbox";
-          cbox.className = "child-check";
-          cbox.dataset.child = sub.child_id;
-          cbox.dataset.section = String(si);
-          cbox.checked = false;
-          lrow.appendChild(cbox);
-          const ctitle = document.createElement("span");
-          ctitle.className = "subsection-title";
-          ctitle.textContent = sub.title || "Untitled";
-          lrow.appendChild(ctitle);
-          slist.appendChild(lrow);
-        });
-        node.appendChild(slist);
-        frag.appendChild(node);
-      });
-      tree.appendChild(frag);
-
-      tree.querySelectorAll(".section-check").forEach(box => {
-        box.addEventListener("change", () => {
-          const si = box.dataset.section;
-          const cbs = tree.querySelectorAll(`.child-check[data-section="${si}"]`);
-          if (cbs.length) {
-            cbs.forEach(cb => {
-              cb.checked = box.checked;
-              if (box.checked) selectedChildren.add(cb.dataset.child);
-              else selectedChildren.delete(cb.dataset.child);
-            });
-          } else if (box.dataset.childIds) {
-            box.dataset.childIds.split(",").forEach(id => {
-              if (!id) return;
-              if (box.checked) selectedChildren.add(id);
-              else selectedChildren.delete(id);
-            });
-          }
-          refreshSectionState(tree, si);
-          updateSectionsCount();
-        });
-      });
-
-      tree.querySelectorAll(".child-check").forEach(cb => {
-        cb.addEventListener("change", () => {
-          if (cb.checked) selectedChildren.add(cb.dataset.child);
-          else selectedChildren.delete(cb.dataset.child);
-          refreshSectionState(tree, cb.dataset.section);
-          updateSectionsCount();
-        });
-      });
-
-      hideSectionsLoading();
-      updateSectionsCount();
-    }
-
-    function refreshSectionState(tree, si) {
-      const sbox = tree.querySelector(`.section-check[data-section="${si}"]`);
-      const cbs = tree.querySelectorAll(`.child-check[data-section="${si}"]`);
-      // Sections that have no visible subsections are selected directly via
-      // their child_ids; leave their checkbox toggle as the user set it.
-      if (!cbs.length) return;
-      const checked = [...cbs].filter(cb => cb.checked).length;
-      sbox.checked = cbs.length > 0 && checked === cbs.length;
-      sbox.indeterminate = checked > 0 && checked < cbs.length;
-    }
-
-    function selectAllSections() {
-      const tree = document.getElementById("sectionsTree");
-      if (!tree || !tree.children.length) return;
-      tree.querySelectorAll(".child-check").forEach(cb => {
-        cb.checked = true;
-        selectedChildren.add(cb.dataset.child);
-      });
-      tree.querySelectorAll(".section-check").forEach(sbox => {
-        sbox.checked = true;
-        (sbox.dataset.childIds || "").split(",").forEach(id => {
-          if (id) selectedChildren.add(id);
-        });
-        refreshSectionState(tree, sbox.dataset.section);
-      });
-      updateSectionsCount();
-    }
-
-    function updateSectionsCount() {
-      document.getElementById("sectionsCount").textContent =
-        `${selectedChildren.size} selected`;
-    }
-
-    function setUploadStatus(type, msg) {
-      const bar = document.getElementById("uploadStatus");
-      const spinner = document.getElementById("uploadSpinner");
-      const msgEl = document.getElementById("uploadMsg");
-      bar.className = "status-bar";
-      if (!type) return;
-      bar.classList.add("show", type);
-      spinner.style.display = type === "loading" ? "block" : "none";
-      msgEl.textContent = msg;
-    }
-
-    async function generate() {
-      if (!uploadDone) {
-        alert("Please upload and index a file first.");
-        return;
-      }
-      if (selectedChildren.size === 0) {
-        alert("Please select at least one subsection to include in the exam.");
-        return;
-      }
-
-      const btn = document.getElementById("generateBtn");
-      const genStatus = document.getElementById("genStatus");
-      const examOutput = document.getElementById("examOutput");
-
-      btn.disabled = true;
-      genStatus.classList.add("show");
-      examOutput.classList.remove("show");
-
-      const body = {
-        document_id: currentDocId,
-        num_models: numModels,
-        mcq_count: enabled.mcq ? counts.mcq : 0,
-        why_count: enabled.why ? counts.why : 0,
-        essay_count: enabled.essay ? counts.essay : 0,
-        tf_count: enabled.tf ? counts.tf : 0,
-        fitb_count: enabled.fitb ? counts.fitb : 0,
-        difficulty: difficulty,
-        child_ids: [...selectedChildren]
-      };
-
-      try {
-        const res = await fetch(`${BASE}/generate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body)
-        });
-        const data = await res.json();
-        if (res.ok) {
-          rawExam = data.exams.map(ex =>
-            `## Exam Model ${ex.model_number}\n\n${ex.markdown}`
-          ).join("\n\n---\n\n");
-          const html = data.exams.map(ex =>
-            `<div class="exam-model"><h3>Exam Model ${ex.model_number}</h3>${marked.parse(ex.markdown)}</div>`
-          ).join("<hr />");
-          document.getElementById("examContent").innerHTML = html;
-          examOutput.classList.add("show");
-        } else {
-          alert(`Generation failed: ${data.detail}`);
-        }
-      } catch (e) {
-        alert("Cannot reach server. Is FastAPI running?");
-      } finally {
-        btn.disabled = false;
-        genStatus.classList.remove("show");
-      }
-    }
-
-    function copyExam() {
-      navigator.clipboard.writeText(rawExam).then(() => {
-        const btn = document.querySelector(".copy-btn");
-        btn.textContent = "Copied!";
-        setTimeout(() => btn.textContent = "Copy Markdown", 2000);
-      });
-    }
+    }, 1500);
   </script>
 </body>
 

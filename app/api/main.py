@@ -4,12 +4,16 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 
 from app import config
+from app.api.auth_routes import router as auth_router
+from app.api.export_routes import router as export_router
 from app.api.routes import router
 from app.logging_conf import configure_logging, get_logger, set_request_id
 
@@ -50,6 +54,13 @@ app.add_middleware(
 )
 
 app.include_router(router)
+app.include_router(export_router)
+app.include_router(auth_router)
+
+# Serve the frontend (ES modules require http://, not file://).
+_FRONTEND_DIR = Path(__file__).resolve().parents[2] / "FrontEnd"
+if _FRONTEND_DIR.exists():
+    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIR), html=True), name="frontend")
 
 
 @app.middleware("http")
@@ -97,5 +108,6 @@ def root() -> dict[str, object]:
     return {
         "service": "ExamGen AI",
         "docs": "/docs",
-        "endpoints": ["POST /upload", "POST /generate", "GET /documents", "GET /health"],
+        "endpoints": ["POST /upload", "POST /generate", "GET /documents", "GET /health",
+                      "POST /exams/{exam_id}/export/{pdf|docx|google-forms}"],
     }
