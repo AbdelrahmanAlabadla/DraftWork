@@ -142,14 +142,14 @@ def title_appears_in_text(title: str, content: str) -> bool:
     """
     if not title or not content:
         return False
-    keys = [re.sub(r"[^a-z0-9]", "", w) for w in re.findall(r"\b[a-z0-9'-]+\b", title.lower())]
+    keys = [re.sub(r"[\W_]", "", w, flags=re.UNICODE) for w in re.findall(r"[\w'-]+", title.lower(), flags=re.UNICODE)]
     keys = [k for k in keys if k]
     if not keys:
         return False
-    hay = re.findall(r"\b[a-z0-9'-]+\b", content.lower())
+    hay = re.findall(r"[\w'-]+", content.lower(), flags=re.UNICODE)
     for i in range(len(hay) - len(keys) + 1):
         if all(
-            re.sub(r"[^a-z0-9]", "", hay[i + j]) == keys[j]
+            re.sub(r"[\W_]", "", hay[i + j], flags=re.UNICODE) == keys[j]
             for j in range(len(keys))
         ):
             return True

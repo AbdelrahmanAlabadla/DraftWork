@@ -497,11 +497,11 @@ def _content_words(sentence: str) -> list[str]:
 
 
 def _strip_punct_word(token: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]", "", token)
+    return re.sub(r"[\W_]+", "", token, flags=re.UNICODE)
 
 
 def _normalize_sentence(sentence: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", sentence.lower())
+    return re.sub(r"[\W_]+", "", sentence.lower(), flags=re.UNICODE)
 
 
 def _is_junk_sentence(sentence: str) -> bool:

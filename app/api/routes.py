@@ -227,6 +227,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     )
     exams = result["exams"]
     warnings = result["warnings"]
+    document_language = result.get("document_language") or "en"
 
     total_elapsed = time.perf_counter() - t_total
 
@@ -248,6 +249,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         }.items()
         if value
     }
+    metadata["document_language"] = document_language
     exam_id = exam_store.save_exam(
         exams,
         warnings,
@@ -272,6 +274,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         "document_id": document_id,
         "num_models": num_models,
         "difficulty": difficulty,
+        "document_language": document_language,
         "metadata": metadata,
         "exams": exams,
         "warnings": warnings,

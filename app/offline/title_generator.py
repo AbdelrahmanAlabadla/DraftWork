@@ -310,7 +310,7 @@ def _to_title_case(title: str) -> str:
     words = title.split()
     out = []
     for i, w in enumerate(words):
-        key = re.sub(r"[^A-Za-z0-9-]", "", w)
+        key = re.sub(r"[^\w-]", "", w, flags=re.UNICODE)
         if re.fullmatch(r"[A-Z]{2,}", key):
             out.append(w)  # acronym, unchanged
             continue
@@ -543,7 +543,7 @@ def _trim_phrase(run: list[str]) -> str:
 
 
 def _strip_punct(token: str) -> str:
-    return re.sub(r"[^A-Za-z0-9-]", "", token)
+    return re.sub(r"[^\w-]", "", token, flags=re.UNICODE)
 
 
 def _preserve_case(key: str) -> str:

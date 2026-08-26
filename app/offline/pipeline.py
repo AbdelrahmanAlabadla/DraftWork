@@ -7,6 +7,7 @@ from typing import Any
 from app.logging_conf import get_logger, set_request_id
 from app.offline.chunk_report import save_chunk_report
 from app.offline.cleaner import clean_pages
+from app.offline.dump_outputs import save_chunk_dump, save_parse_dump
 from app.offline.embeddings import embed_texts
 from app.offline.parser import LlamaParser
 from app.offline.semantic_chunker import (
@@ -40,6 +41,11 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
         t0 = time.perf_counter()
         raw_pages = LlamaParser().parse(path)
         timings["parsing"] = time.perf_counter() - t0
+
+        # --- Stage 1a: Exact raw parse dump (for inspection) -----------------
+        t0 = time.perf_counter()
+        save_parse_dump(document_id, raw_pages)
+        timings["parse_dump"] = time.perf_counter() - t0
 
         # --- Stage 2: Clean & normalize for chunk generation ------------------
         t0 = time.perf_counter()
@@ -83,6 +89,11 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
         t0 = time.perf_counter()
         chunk_report_path = save_chunk_report(document_id, chunks)
         timings["chunk_report"] = time.perf_counter() - t0
+
+        # --- Stage 3c: Chunking dump copy (for inspection) --------------------
+        t0 = time.perf_counter()
+        chunk_dump_path = save_chunk_dump(document_id, chunk_report_path)
+        timings["chunk_dump"] = time.perf_counter() - t0
 
         # --- Stage 4: Embed children only (retrieval units) ------------------
         t0 = time.perf_counter()
@@ -131,6 +142,7 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
         "vectors_stored": vectors_uploaded,
         "structure_file": str(structures_path),
         "chunk_report_file": str(chunk_report_path),
+        "chunk_dump_file": str(chunk_dump_path),
         "timings": {k: round(v, 3) for k, v in timings.items()},
         "total_time": round(total, 3),
     }

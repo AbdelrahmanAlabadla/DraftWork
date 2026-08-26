@@ -29,6 +29,49 @@ EXPORT_TYPE_LABELS = {
     "essay": "Essay",
 }
 
+EXPORT_TYPE_LABELS_BY_LANG = {
+    "en": EXPORT_TYPE_LABELS,
+    "ar": {
+        "mcq": "أسئلة الاختيار من متعدد",
+        "fill_in_the_blank": "أكمل الفراغ",
+        "true_false": "صح / خطأ",
+        "short_answer": "سؤال قصير",
+        "essay": "مقالي",
+    },
+}
+
+TRUE_FALSE_CHOICES_BY_LANG = {
+    "en": "(   ) True     (   ) False",
+    "ar": "(   ) صح     (   ) خطأ",
+}
+
+HEADER_LABELS_BY_LANG = {
+    "en": {
+        "model": "Model {n}",
+        "class": "Class",
+        "duration": "Duration",
+        "date": "Date",
+        "teacher": "Teacher",
+        "student_name": "Student Name: ",
+        "class_suffix": "Class: ",
+        "answer_key": "Answer Key - Model {n}",
+    },
+    "ar": {
+        "model": "نسخة {n}",
+        "class": "الصف",
+        "duration": "المدة",
+        "date": "التاريخ",
+        "teacher": "المعلم",
+        "student_name": "اسم الطالب: ",
+        "class_suffix": "الصف: ",
+        "answer_key": "مفتاح الإجابة - نسخة {n}",
+    },
+}
+
+
+def export_type_label(qtype: str, language: str = "en") -> str:
+    return EXPORT_TYPE_LABELS_BY_LANG.get(language, EXPORT_TYPE_LABELS).get(qtype, qtype)
+
 TEACHER_ONLY_FIELDS = ("reference_answer", "key_points", "correct_answer", "answers")
 
 # One response-space contract shared by PDF, DOCX, and the browser preview.
@@ -100,7 +143,7 @@ def flatten_exam_items(questions: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
-def group_exam_sections(questions: dict[str, Any]) -> list[dict[str, Any]]:
+def group_exam_sections(questions: dict[str, Any], language: str = "en") -> list[dict[str, Any]]:
     """Return supported questions grouped and locally numbered for printing.
 
     PDF and DOCX exams restart numbering inside each question-type section,
@@ -120,7 +163,7 @@ def group_exam_sections(questions: dict[str, Any]) -> list[dict[str, Any]]:
             items.append(local_item)
         section: dict[str, Any] = {
             "qtype": qtype,
-            "label": EXPORT_TYPE_LABELS[qtype],
+            "label": export_type_label(qtype, language),
             "items": items,
         }
         if qtype == "fill_in_the_blank":

@@ -1,5 +1,6 @@
 import { postJSON } from "./api.js";
 import { state } from "./state.js";
+import { initI18n, t } from "./i18n.js";
 import { initUpload } from "./upload.js";
 import { initSettings } from "./settings.js";
 import { initTopics } from "./topics.js";
@@ -7,6 +8,8 @@ import { step, toggleType, updateTotal } from "./qtypes.js";
 import { copyExam, renderExamOutput } from "./exam-view.js";
 import { initExport } from "./export.js";
 import { initGoogleAuth } from "./google-auth.js";
+
+initI18n();
 
 function inputValue(id) {
   return document.getElementById(id)?.value.trim() || "";
@@ -36,11 +39,11 @@ function initGenerate() {
 
   btn.addEventListener("click", async () => {
     if (!state.uploadDone) {
-      alert("Please upload and index a file first.");
+      alert(t("alert.upload_first"));
       return;
     }
     if (state.selectedChildren.size === 0) {
-      alert("Please select at least one subsection to include in the exam.");
+      alert(t("alert.select_sections"));
       return;
     }
 

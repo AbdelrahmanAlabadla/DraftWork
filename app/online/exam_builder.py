@@ -154,6 +154,7 @@ def _repair_invalid_items(
     context: str,
     difficulty: str,
     model_number: int,
+    language: str = "en",
     max_attempts: int = 2,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Send rejected raw items + the expected schema back for targeted repair.
@@ -171,7 +172,8 @@ def _repair_invalid_items(
     items = list(invalid_raw)
     for attempt in range(1, max_attempts + 1):
         system_prompt, user_prompt = build_validation_repair_prompt(
-            qtype, items, schema, context, difficulty=difficulty, model_number=model_number
+            qtype, items, schema, context, difficulty=difficulty, model_number=model_number,
+            language=language,
         )
         try:
             raw = client.chat_json(
@@ -201,6 +203,7 @@ def _generate_type_from_plan(
     seen: set[tuple[str, str]],
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
+    language: str = "en",
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Generate one question per planned item, retrying only missing concepts.
 
@@ -229,6 +232,7 @@ def _generate_type_from_plan(
             difficulty=difficulty,
             model_number=model_number,
             planned_items=remaining_plan,
+            language=language,
         )
 
         feedback = _build_feedback(qtype, accumulated, seen, within_model, previous_exams)
@@ -264,6 +268,7 @@ def _generate_type_from_plan(
                 context,
                 difficulty,
                 model_number,
+                language=language,
             )
             warnings.extend(repair_warnings)
             candidates.extend(repaired)
@@ -271,7 +276,7 @@ def _generate_type_from_plan(
         valid: list[dict[str, Any]] = []
         for q in candidates[: len(remaining_plan)]:
             text = question_text(qtype, q)
-            if contains_forbidden_phrase(text):
+            if contains_forbidden_phrase(text, language):
                 logger.warning("Rejected (forbidden phrase) | type=%s | text=%r", qtype, text[:120])
                 continue
             if _is_duplicate(qtype, q, seen):
@@ -358,6 +363,7 @@ def _fitb_errors(
     count: int,
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
+    language: str = "en",
 ) -> list[str]:
     """Validate a generated FITB section against every required invariant."""
     errors: list[str] = []
@@ -386,7 +392,7 @@ def _fitb_errors(
             if atok not in bank_tokens:
                 errors.append(f"FITB item {idx + 1}: answer '{a}' not in Word Bank")
             used.add(atok)
-        if contains_forbidden_phrase(question):
+        if contains_forbidden_phrase(question, language):
             errors.append(f"FITB item {idx + 1}: contains a forbidden phrase")
         for other in accepted:
             if _token_overlap(
@@ -410,6 +416,7 @@ def _generate_fitb_bank(
     context: str,
     difficulty: str,
     model_number: int,
+    language: str = "en",
 ) -> tuple[list[str] | None, list[str]]:
     """Stage 1: choose the answer terms + exactly 2 distractors.
 
@@ -425,7 +432,7 @@ def _generate_fitb_bank(
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         system_prompt, user_prompt = build_fitb_bank_prompt(
             count, context, difficulty=difficulty, model_number=model_number,
-            planned_items=planned_items,
+            planned_items=planned_items, language=language,
         )
         try:
             raw = client.chat_json(
@@ -466,6 +473,7 @@ def _generate_fitb_items(
     model_number: int,
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
+    language: str = "en",
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Stage 2: write numbered items using ONLY the fixed, shuffled Word Bank."""
     from app.llm.client import LMStudioClient
@@ -478,6 +486,7 @@ def _generate_fitb_items(
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         system_prompt, user_prompt = build_fitb_items_prompt(
             count, word_bank, context, difficulty=difficulty, model_number=model_number,
+            language=language,
         )
         try:
             raw = client.chat_json(
@@ -523,6 +532,7 @@ def _generate_fitb_type(
     model_number: int,
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
+    language: str = "en",
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Two-stage FITB generation: Word Bank FIRST, then blanks against it.
 
@@ -531,7 +541,7 @@ def _generate_fitb_type(
     wrong bank size discarded the entire section.
     """
     bank, warnings = _generate_fitb_bank(
-        count, planned_items, context, difficulty, model_number
+        count, planned_items, context, difficulty, model_number, language=language
     )
     if bank is None:
         warnings.append("fill_in_the_blank: could not produce a valid Word Bank")
@@ -539,7 +549,8 @@ def _generate_fitb_type(
 
     random.shuffle(bank)
     items, item_warnings = _generate_fitb_items(
-        count, bank, context, difficulty, model_number, within_model, previous_exams
+        count, bank, context, difficulty, model_number, within_model, previous_exams,
+        language=language,
     )
     warnings.extend(item_warnings)
     if not items:
@@ -556,6 +567,7 @@ def _generate_obj_bundle(
     within_model: list[dict[str, Any]],
     seen: set[tuple[str, str]],
     previous_exams: list[dict[str, Any]],
+    language: str = "en",
 ) -> tuple[dict[str, Any], list[str]]:
     """Generate MCQ + True/False + Fill-in-the-Blank in ONE LLM call.
 
@@ -607,7 +619,7 @@ def _generate_obj_bundle(
         )
         system_prompt, user_prompt = build_obj_bundled_prompt(
             rem_planned, context, difficulty=difficulty,
-            model_number=model_number, feedback=feedback,
+            model_number=model_number, feedback=feedback, language=language,
         )
         try:
             raw = client.chat_json(
@@ -626,14 +638,14 @@ def _generate_obj_bundle(
             fitb_count = targets["fill_in_the_blank"]
             bank, bank_warnings = _generate_fitb_bank(
                 fitb_count, planned.get("fill_in_the_blank") or [],
-                context, difficulty, model_number,
+                context, difficulty, model_number, language=language,
             )
             warnings.extend(bank_warnings)
             if bank is not None:
                 random.shuffle(bank)
                 fitb_items, item_warnings = _generate_fitb_items(
                     fitb_count, bank, context, difficulty, model_number,
-                    within_model, previous_exams,
+                    within_model, previous_exams, language=language,
                 )
                 warnings.extend(item_warnings)
                 if fitb_items:
@@ -646,12 +658,12 @@ def _generate_obj_bundle(
             if invalid_raw and len(candidates) < need_mcq:
                 repaired, rwarn = _repair_invalid_items(
                     "mcq", [i for i in invalid_raw if isinstance(i, dict)],
-                    context, difficulty, model_number,
+                    context, difficulty, model_number, language=language,
                 )
                 warnings.extend(rwarn)
                 candidates.extend(repaired)
             for q in candidates[:need_mcq]:
-                if _filter_one("mcq", q, [*acc_mcq, *within_model, *previous_exams], seen, warnings, attempt):
+                if _filter_one("mcq", q, [*acc_mcq, *within_model, *previous_exams], seen, warnings, attempt, language):
                     acc_mcq.append(q)
 
         # --- true_false section (incremental, structural-repair first) ---
@@ -661,12 +673,12 @@ def _generate_obj_bundle(
             if invalid_tf and len(candidates_tf) < need_tf:
                 repaired_tf, rwarn_tf = _repair_invalid_items(
                     "true_false", [i for i in invalid_tf if isinstance(i, dict)],
-                    context, difficulty, model_number,
+                    context, difficulty, model_number, language=language,
                 )
                 warnings.extend(rwarn_tf)
                 candidates_tf.extend(repaired_tf)
             for q in candidates_tf[:need_tf]:
-                if _filter_one("true_false", q, [*acc_tf, *within_model, *previous_exams], seen, warnings, attempt):
+                if _filter_one("true_false", q, [*acc_tf, *within_model, *previous_exams], seen, warnings, attempt, language):
                     acc_tf.append(q)
 
         warnings.append(
@@ -691,10 +703,11 @@ def _filter_one(
     seen: set[tuple[str, str]],
     warnings: list[str],
     attempt: int,
+    language: str = "en",
 ) -> bool:
     """Accept a question iff it passes forbid/dup/near-dup checks."""
     text = question_text(qtype, q)
-    if contains_forbidden_phrase(text):
+    if contains_forbidden_phrase(text, language):
         warnings.append(f"obj bundle {qtype} attempt {attempt}: forbidden phrase")
         return False
     if _is_duplicate(qtype, q, seen):
@@ -792,6 +805,7 @@ def _repair_shortfalls(
     seen: set[tuple[str, str]],
     within_model: list[dict[str, Any]],
     previous_questions: list[dict[str, Any]],
+    language: str = "en",
     max_passes: int = 2,
 ) -> list[str]:
     """Minimal-diff count repair of one exam's questions.
@@ -838,7 +852,7 @@ def _repair_shortfalls(
             }
             bundle, bwarn = _generate_obj_bundle(
                 obj_planned, context, difficulty, model_number,
-                within_model, seen, previous_questions,
+                within_model, seen, previous_questions, language=language,
             )
             warnings.extend(bwarn)
             for q, m in obj_missing.items():
@@ -853,7 +867,7 @@ def _repair_shortfalls(
             planned = _repair_planned_for(q, m, plan_items, context)
             new_questions, twarn = _generate_type_from_plan(
                 q, planned, context, difficulty, model_number,
-                seen, within_model, previous_questions,
+                seen, within_model, previous_questions, language=language,
             )
             warnings.extend(twarn)
             added = new_questions[:m]
@@ -932,6 +946,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     num_models = state.get("num_models") or 1
     difficulty = state.get("difficulty") or "mix"
     context = state.get("context") or ""
+    language = state.get("document_language") or "en"
     plans = state.get("plans") or []
     warnings: list[str] = list(state.get("warnings") or [])
 
@@ -967,6 +982,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 within_model,
                 seen,
                 previous_questions,
+                language=language,
             )
             model_warnings.extend(model_warnings_)
             for section_key in obj_types:
@@ -996,6 +1012,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 seen,
                 within_model,
                 previous_questions,
+                language=language,
             )
             _assign_ids(model_number, qtype, questions[qtype])
             model_warnings.extend(type_warnings)
@@ -1013,6 +1030,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             seen,
             within_model,
             previous_questions,
+            language=language,
         )
         model_warnings.extend(repair_warnings)
         for section_key, section_val in questions.items():
@@ -1046,9 +1064,11 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
 
 def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     """Render each generated exam's questions to markdown."""
+    language = state.get("document_language") or "en"
     generated_exams = state.get("generated_exams") or []
     for exam in generated_exams:
-        exam["markdown"] = assemble_exam(exam["questions"])
+        exam["markdown"] = assemble_exam(exam["questions"], language=language)
+        exam["document_language"] = language
     return {"generated_exams": generated_exams}
 
 
@@ -1075,6 +1095,7 @@ def generate_exams(
         "num_models": num_models,
         "selected_child_ids": selected_child_ids,
         "difficulty": difficulty,
+        "document_language": "en",
         "retrieved_chunks": [],
         "context": "",
         "planner_context": "",
@@ -1098,15 +1119,17 @@ def generate_exams(
 
     exams = result.get("generated_exams") or []
     warnings = result.get("warnings") or []
+    language = result.get("document_language") or "en"
     elapsed = time.perf_counter() - t0
     logger.info(
-        "Multi-exam generation | document_id=%s | models=%d | difficulty=%s | total_time=%.2fs",
+        "Multi-exam generation | document_id=%s | models=%d | difficulty=%s | language=%s | total_time=%.2fs",
         document_id,
         num_models,
         difficulty,
+        language,
         elapsed,
     )
-    return {"exams": exams, "warnings": warnings}
+    return {"exams": exams, "warnings": warnings, "document_language": language}
 
 
 def generate_exam(
@@ -1127,7 +1150,7 @@ def generate_exam(
     }
 
 
-def assemble_exam(questions: dict[str, list[dict[str, Any]]]) -> str:
+def assemble_exam(questions: dict[str, list[dict[str, Any]]], language: str = "en") -> str:
     """Render the final exam in canonical order with continuous numbering.
 
     The application owns structure: ordering, numbering, and markdown.
@@ -1138,7 +1161,7 @@ def assemble_exam(questions: dict[str, list[dict[str, Any]]]) -> str:
         qs = questions.get(qtype)
         if not qs:
             continue
-        sections.append(render_markdown(qtype, qs, start_index=counter))
+        sections.append(render_markdown(qtype, qs, start_index=counter, language=language))
         if qtype == "fill_in_the_blank":
             counter += len(qs.get("items") or [])
         else:

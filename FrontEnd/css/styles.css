@@ -1185,3 +1185,41 @@
 .forms-link-row a:hover {
   text-decoration: underline;
 }
+
+/* ===== RTL (Arabic UI) support =====
+   The document/exam language is independent of the UI language; these rules
+   only mirror the interface when <html dir="rtl"> is set. */
+html[dir="rtl"] body {
+  direction: rtl;
+  text-align: right;
+}
+
+html[dir="rtl"] .header {
+  flex-direction: row-reverse;
+}
+
+html[dir="rtl"] .settings-row,
+html[dir="rtl"] .exam-details-grid {
+  direction: rtl;
+}
+
+html[dir="rtl"] .qtype-info {
+  flex-direction: row-reverse;
+  text-align: right;
+}
+
+html[dir="rtl"] .file-pill {
+  flex-direction: row-reverse;
+}
+
+html[dir="rtl"] .exam-output-header {
+  flex-direction: row-reverse;
+}
+
+html[dir="rtl"] input[type="text"],
+html[dir="rtl"] input:not([type]) {
+  text-align: right;
+}
+
+/* Exam content itself keeps its own direction: Arabic exams generated from an
+   Arabic document are rendered by the browser bidi algorithm automatically. */

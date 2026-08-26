@@ -7,6 +7,7 @@ from app.config import (
     PLANNER_CONTEXT_TOKENS,
     PLANNER_SNIPPET_TOKENS,
 )
+from app.language import detect_language
 from app.logging_conf import get_logger
 from app.offline.vector_store import VectorStore
 from app.online.graph import ExamState
@@ -104,6 +105,7 @@ def retrieve_selected(
             "retrieved_chunks": [],
             "context": "",
             "planner_context": "",
+            "document_language": "en",
             "error": (
                 f"No stored content found for the selected sections of document "
                 f"{document_id}. Upload and index it first."
@@ -112,6 +114,7 @@ def retrieve_selected(
 
     context = _first_tokens(_build_tree_context(children), GENERATION_CONTEXT_TOKENS)
     planner_context = build_planner_context(children)
+    document_language = detect_language(context or planner_context)
     elapsed = time.perf_counter() - t0
     logger.info(
         "Selection retrieval completed | chunks=%d | selected=%d | time=%.2fs",
@@ -123,6 +126,7 @@ def retrieve_selected(
         "retrieved_chunks": children,
         "context": context,
         "planner_context": planner_context,
+        "document_language": document_language,
         "error": None,
     }
 

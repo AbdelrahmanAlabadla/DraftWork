@@ -119,6 +119,29 @@ def _difficulty_block(difficulty: str) -> str:
     return f"## Difficulty Target (follow this strictly)\n{directive}"
 
 
+_LANGUAGE_NAMES = {
+    "en": "English",
+    "ar": "Arabic",
+}
+
+
+def _language_block(language: str | None) -> str:
+    """Output-language instruction. The document context itself already carries
+    the source language; this makes the requirement explicit so scaffolding
+    (questions, answers, options, terms) matches it."""
+    if not language or language == "en":
+        return ""
+    name = _LANGUAGE_NAMES.get(language, language)
+    return (
+        f"## Output Language (follow this strictly)\n"
+        f"Write ALL generated content in {name}: every question, statement, option, "
+        f"answer, reference answer, key point, and Word Bank term must be in {name}. "
+        f"Keep the JSON field NAMES exactly as specified (they stay English), but all "
+        f"field VALUES must be written in {name}. Preserve technical terms, acronyms, "
+        f"and formulas from the source as they appear.\n\n"
+    )
+
+
 def _version_note(model_number: int) -> str:
     return (
         f"This question set is Exam Model #{model_number} "
@@ -416,14 +439,21 @@ def build_planner_prompt(
     num_models: int,
     tasks: list[tuple[str, int]],
     planner_context: str,
+    language: str = "en",
 ) -> tuple[str, str]:
     """Return (system_prompt, user_prompt) for the one planning call (all models)."""
     task_lines = "\n".join(f"  - {count} {qtype}" for qtype, count in tasks)
+    lang_block = _language_block(language).replace(
+        "ALL generated content", "the 'topic' and 'concept_to_test' values"
+    ).replace("field VALUES must be written in", "values must be written in") \
+        if language != "en" else ""
     user_prompt = (
         f"Plan exam questions for {num_models} exam model(s) generated from the same "
         f"selected source content.\n\n"
 
         f"## Requested question counts (apply EXACTLY to EVERY exam model)\n{task_lines}\n\n"
+
+        f"{lang_block}"
 
         f"## Selected source content (titles + short snippets)\n{planner_context}\n\n"
 
@@ -480,6 +510,7 @@ def build_prompt(
     difficulty: str = "mix",
     model_number: int = 1,
     planned_items: list[dict[str, Any]] | None = None,
+    language: str = "en",
 ) -> tuple[str, str]:
     """Return (system_prompt, user_prompt) for the given question type."""
     if question_type == "mcq":
@@ -529,6 +560,8 @@ def build_prompt(
 
         f"{_difficulty_block(difficulty)}\n\n"
 
+        f"{_language_block(language)}"
+
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
         f"## Task\nGenerate exactly {count} {type_name} exam question(s) following "
@@ -559,6 +592,7 @@ def build_fitb_bank_prompt(
     difficulty: str = "mix",
     model_number: int = 1,
     planned_items: list[dict[str, Any]] | None = None,
+    language: str = "en",
 ) -> tuple[str, str]:
     """Stage 1: choose the correct answer terms + exactly 2 distractors."""
     rules = FILL_IN_THE_BLANK_BANK_RULES.format(count=count)
@@ -580,6 +614,8 @@ def build_fitb_bank_prompt(
 
         f"{_difficulty_block(difficulty)}\n\n"
 
+        f"{_language_block(language)}"
+
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
         f"## Task\nCreate exactly {count} correct terms plus exactly 2 distractors.\n\n"
@@ -595,6 +631,7 @@ def build_fitb_items_prompt(
     context: str,
     difficulty: str = "mix",
     model_number: int = 1,
+    language: str = "en",
 ) -> tuple[str, str]:
     """Stage 2: write numbered items using ONLY the fixed, already-shuffled Word Bank."""
     rules = FILL_IN_THE_BLANK_ITEMS_RULES.format(count=count)
@@ -619,6 +656,8 @@ def build_fitb_items_prompt(
         f"## Example of a valid output\n{FILL_IN_THE_BLANK_ITEMS_EXAMPLE}\n\n"
 
         f"{_difficulty_block(difficulty)}\n\n"
+
+        f"{_language_block(language)}"
 
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
@@ -684,6 +723,7 @@ def build_obj_bundled_prompt(
     difficulty: str = "mix",
     model_number: int = 1,
     feedback: str = "",
+    language: str = "en",
 ) -> tuple[str, str]:
     """Build ONE prompt that returns MCQ + True/False + Fill-in-the-Blank together.
 
@@ -750,6 +790,8 @@ def build_obj_bundled_prompt(
 
         f"{_difficulty_block(difficulty)}\n\n"
 
+        f"{_language_block(language)}"
+
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
         f"## Task\nReturn one JSON object with three keys: 'mcq' ({mcq_count} questions), "
@@ -771,6 +813,7 @@ def build_validation_repair_prompt(
     context: str,
     difficulty: str = "mix",
     model_number: int = 1,
+    language: str = "en",
 ) -> tuple[str, str]:
     """Repair ONLY the structurally-invalid pieces of rejected JSON.
 
@@ -795,6 +838,8 @@ def build_validation_repair_prompt(
         f"## Rejected JSON to repair\n{rejected_block}\n\n"
 
         f"## Expected schema (register of what must be valid)\n{schema}\n\n"
+
+        f"{_language_block(language)}"
 
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 

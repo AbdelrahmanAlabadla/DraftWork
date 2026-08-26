@@ -14,6 +14,7 @@ class ExamState(TypedDict):
     num_models: int
     selected_child_ids: Optional[list[str]]
     difficulty: Optional[str]
+    document_language: str  # language detected from the uploaded content ("en" | "ar")
     # --- Retrieval (once) ----------------------------------------------
     retrieved_chunks: list[dict[str, Any]]
     context: str  # FULL selected child content (generation)

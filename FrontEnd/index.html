@@ -12,21 +12,21 @@
   <div class="page">
     <div class="header">
       <h1>Smart<span>Exam</span> AI</h1>
-      <span class="tag">RAG-POWERED</span>
+      <span class="tag" data-i18n="header.tag">RAG-POWERED</span>
       <div class="google-auth" id="googleAuth">
         <a href="/auth/google/login" id="connectGoogleBtn" class="copy-btn"
-           style="display:none; text-decoration:none;">Connect Google Account</a>
+           style="display:none; text-decoration:none;" data-i18n="auth.connect">Connect Google Account</a>
         <span id="connectedInfo" style="display:none; font-family:var(--mono); font-size:11px; color:var(--success);"></span>
-        <button id="signOutBtn" class="copy-btn" style="display:none;">Sign out</button>
+        <button id="signOutBtn" class="copy-btn" style="display:none;" data-i18n="auth.signout">Sign out</button>
       </div>
     </div>
 
-    <div class="section-label">01 — Upload Document</div>
+    <div class="section-label" data-i18n="section.upload">01 — Upload Document</div>
     <div class="upload-zone" id="uploadZone">
       <input type="file" id="fileInput" accept=".pdf,.txt" />
       <div class="upload-icon">📄</div>
-      <h2>Drop your file here</h2>
-      <p>Click to browse or drag and drop your document</p>
+      <h2 data-i18n="upload.title">Drop your file here</h2>
+      <p data-i18n="upload.hint">Click to browse or drag and drop your document</p>
       <div class="formats">.PDF &nbsp;·&nbsp; .TXT</div>
     </div>
     <div class="file-pill" id="filePill">
@@ -40,10 +40,10 @@
     </div>
 
     <div class="settings-block" style="margin-top:40px">
-      <div class="section-label">02 — Exam Settings</div>
+      <div class="section-label" data-i18n="section.settings">02 — Exam Settings</div>
       <div class="settings-row">
         <div class="setting-card">
-          <label>Number of Models</label>
+          <label data-i18n="settings.models">Number of Models</label>
           <div class="model-btns">
             <button class="model-btn active" data-val="1">1</button>
             <button class="model-btn" data-val="2">2</button>
@@ -52,72 +52,72 @@
           </div>
         </div>
         <div class="setting-card">
-          <label>Difficulty</label>
+          <label data-i18n="settings.difficulty">Difficulty</label>
           <div class="diff-btns">
-            <button class="diff-btn active" data-val="easy">Easy</button>
-            <button class="diff-btn" data-val="medium">Medium</button>
-            <button class="diff-btn" data-val="hard">Hard</button>
-            <button class="diff-btn" data-val="mix">Mix</button>
+            <button class="diff-btn active" data-val="easy" data-i18n="diff.easy">Easy</button>
+            <button class="diff-btn" data-val="medium" data-i18n="diff.medium">Medium</button>
+            <button class="diff-btn" data-val="hard" data-i18n="diff.hard">Hard</button>
+            <button class="diff-btn" data-val="mix" data-i18n="diff.mix">Mix</button>
           </div>
         </div>
       </div>
       <div class="exam-details-card">
-        <div class="exam-details-title">Printed Exam Details <span>optional</span></div>
+        <div class="exam-details-title"><span data-i18n="details.title">Printed Exam Details</span> <span data-i18n="details.optional">optional</span></div>
         <div class="exam-details-grid">
           <label class="exam-field exam-field-wide">
-            <span>Exam title</span>
-            <input id="examTitle" type="text" maxlength="120" placeholder="Examination" />
+            <span data-i18n="field.exam_title">Exam title</span>
+            <input id="examTitle" type="text" maxlength="120" data-i18n-ph="field.exam_title_ph" placeholder="Examination" />
           </label>
           <label class="exam-field">
-            <span>Class</span>
-            <input id="examClass" type="text" maxlength="80" placeholder="e.g. Grade 12" />
+            <span data-i18n="field.class">Class</span>
+            <input id="examClass" type="text" maxlength="80" data-i18n-ph="field.class_ph" placeholder="e.g. Grade 12" />
           </label>
           <label class="exam-field">
-            <span>Duration</span>
-            <input id="examDuration" type="text" maxlength="40" placeholder="e.g. 90 minutes" />
+            <span data-i18n="field.duration">Duration</span>
+            <input id="examDuration" type="text" maxlength="40" data-i18n-ph="field.duration_ph" placeholder="e.g. 90 minutes" />
           </label>
           <label class="exam-field">
-            <span>Exam date</span>
+            <span data-i18n="field.exam_date">Exam date</span>
             <input id="examDate" type="date" />
           </label>
           <label class="exam-field">
-            <span>Teacher</span>
-            <input id="teacherName" type="text" maxlength="100" placeholder="Teacher name" />
+            <span data-i18n="field.teacher">Teacher</span>
+            <input id="teacherName" type="text" maxlength="100" data-i18n-ph="field.teacher_ph" placeholder="Teacher name" />
           </label>
           <label class="exam-field logo-field">
-            <span>Left logo</span>
+            <span data-i18n="field.left_logo">Left logo</span>
             <input id="leftLogo" type="file" accept="image/png,image/jpeg,image/webp" />
           </label>
           <label class="exam-field logo-field">
-            <span>Right logo</span>
+            <span data-i18n="field.right_logo">Right logo</span>
             <input id="rightLogo" type="file" accept="image/png,image/jpeg,image/webp" />
           </label>
         </div>
-        <div class="exam-details-note">PDF and DOCX use A4 pages with 0.5-inch margins on every side. Logos must be under 2 MB.</div>
+        <div class="exam-details-note" data-i18n="details.note">PDF and DOCX use A4 pages with 0.5-inch margins on every side. Logos must be under 2 MB.</div>
       </div>
     </div>
 
     <div class="sections-block">
-      <div class="section-label">03 — Choose Sections To Include In The Exam <span class="qtotal"
+      <div class="section-label"><span data-i18n="section.sections">03 — Choose Sections To Include In The Exam</span> <span class="qtotal"
           id="sectionsCount"></span></div>
       <div class="sections-loading" id="sectionsLoading">
-        <div class="gen-spinner"></div><span>Generating sections, your titles will appear in a few seconds...</span>
+        <div class="gen-spinner"></div><span data-i18n="sections.loading">Generating sections, your titles will appear in a few seconds...</span>
       </div>
       <div class="sections-toolbar">
-        <button class="select-all-btn" id="selectAllBtn">Select All Titles</button>
+        <button class="select-all-btn" id="selectAllBtn" data-i18n="sections.select_all">Select All Titles</button>
       </div>
       <div class="sections-tree" id="sectionsTree"></div>
     </div>
 
     <div class="qtypes-block">
-      <div class="section-label">04 — Question Types <span class="qtotal" id="totalBadge">Total: 25 questions</span>
+      <div class="section-label"><span data-i18n="section.qtypes">04 — Question Types</span> <span class="qtotal" id="totalBadge">Total: 25 questions</span>
       </div>
       <div class="qtype-card" id="card-mcq">
         <div class="qtype-info">
           <div class="qtype-dot"></div>
           <div>
-            <div class="qtype-name">Multiple Choice</div>
-            <div class="qtype-desc">4 options, single answer</div>
+            <div class="qtype-name" data-i18n="qtype.mcq">Multiple Choice</div>
+            <div class="qtype-desc" data-i18n="qtype.mcq_desc">4 options, single answer</div>
           </div>
         </div>
         <div class="qtype-controls">
@@ -130,8 +130,8 @@
         <div class="qtype-info">
           <div class="qtype-dot"></div>
           <div>
-            <div class="qtype-name">True / False</div>
-            <div class="qtype-desc">Quick recall checks</div>
+            <div class="qtype-name" data-i18n="qtype.tf">True / False</div>
+            <div class="qtype-desc" data-i18n="qtype.tf_desc">Quick recall checks</div>
           </div>
         </div>
         <div class="qtype-controls">
@@ -144,8 +144,8 @@
         <div class="qtype-info">
           <div class="qtype-dot"></div>
           <div>
-            <div class="qtype-name">Fill in the Blank</div>
-            <div class="qtype-desc">Key term recall</div>
+            <div class="qtype-name" data-i18n="qtype.fitb">Fill in the Blank</div>
+            <div class="qtype-desc" data-i18n="qtype.fitb_desc">Key term recall</div>
           </div>
         </div>
         <div class="qtype-controls">
@@ -158,8 +158,8 @@
         <div class="qtype-info">
           <div class="qtype-dot"></div>
           <div>
-            <div class="qtype-name">Why Questions</div>
-            <div class="qtype-desc">Short reasoning</div>
+            <div class="qtype-name" data-i18n="qtype.why">Why Questions</div>
+            <div class="qtype-desc" data-i18n="qtype.why_desc">Short reasoning</div>
           </div>
         </div>
         <div class="qtype-controls">
@@ -172,8 +172,8 @@
         <div class="qtype-info">
           <div class="qtype-dot"></div>
           <div>
-            <div class="qtype-name">Essay</div>
-            <div class="qtype-desc">Open-ended responses</div>
+            <div class="qtype-name" data-i18n="qtype.essay">Essay</div>
+            <div class="qtype-desc" data-i18n="qtype.essay_desc">Open-ended responses</div>
           </div>
         </div>
         <div class="qtype-controls">
@@ -185,15 +185,15 @@
     </div>
 
     <div class="gen-status" id="genStatus">
-      <div class="gen-spinner"></div><span>Generating exam — this may take a moment...</span>
+      <div class="gen-spinner"></div><span data-i18n="gen.status">Generating exam — this may take a moment...</span>
     </div>
-    <button class="generate-btn" id="generateBtn">Generate Exam →</button>
+    <button class="generate-btn" id="generateBtn" data-i18n="gen.button">Generate Exam →</button>
 
     <div class="exam-output" id="examOutput">
       <div class="exam-output-header">
-        <h3>Exam Preview</h3>
+        <h3 data-i18n="preview.title">Exam Preview</h3>
         <div style="display:flex; gap:8px; align-items:center;">
-          <button class="copy-btn">Copy Markdown</button>
+          <button class="copy-btn" data-i18n="preview.copy_md">Copy Markdown</button>
           <div class="export-wrap" id="exportWrap">
             <button class="export-btn" id="exportBtn">Export &#9662;</button>
             <div class="export-menu">

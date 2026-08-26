@@ -119,6 +119,10 @@ GENERATION_CONTEXT_TOKENS: int = int(
 # --- Semantic structure generation (offline) ------------------------------
 STRUCTURES_DIR: str = _env("STRUCTURES_DIR", "data/structures") or "data/structures"
 
+# Exact dumps of the offline pipeline for inspection: the RAW LlamaParse output
+# and the chunking report are copied here for every uploaded document.
+PARSED_OUTPUT_DIR: str = _env("PARSED_OUTPUT_DIR", "data/parsed output") or "data/parsed output"
+
 # Dense cosine-similarity thresholds used by the chunking pipeline.
 # - Parent chunks: consecutive paragraphs are merged while their embedding
 #   cosine similarity stays at/above SIMILARITY_THRESHOLD.

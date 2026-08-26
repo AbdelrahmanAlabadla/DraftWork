@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import re
-import unicodedata
 from typing import Any
 
+from app.language import detect_language, normalize_text
 from app.llm.json_utils import JSONExtractionError, extract_json
 from app.logging_conf import get_logger
 
@@ -16,6 +15,33 @@ TYPE_LABELS = {
     "short_answer": "Short Answer",
     "essay": "Essay",
 }
+
+TYPE_LABELS_BY_LANG = {
+    "en": TYPE_LABELS,
+    "ar": {
+        "mcq": "اختيار من متعدد",
+        "true_false": "صح / خطأ",
+        "fill_in_the_blank": "أكمل الفراغ",
+        "short_answer": "سؤال قصير",
+        "essay": "مقالي",
+    },
+}
+
+UI_STRINGS_BY_LANG = {
+    "en": {"answer": "Answer", "reference_answer": "Reference answer", "word_bank": "Word Bank"},
+    "ar": {"answer": "الإجابة", "reference_answer": "الإجابة النموذجية", "word_bank": "بنك الكلمات"},
+}
+
+TRUE_FALSE_ANSWER_LABELS = {"en": ("True", "False"), "ar": ("صح", "خطأ")}
+
+
+def type_label(question_type: str, language: str = "en") -> str:
+    return TYPE_LABELS_BY_LANG.get(language, TYPE_LABELS).get(question_type, question_type)
+
+
+def tf_answer_label(answer: str, language: str = "en") -> str:
+    true_label, false_label = TRUE_FALSE_ANSWER_LABELS.get(language, ("True", "False"))
+    return true_label if str(answer).lower() == "true" else false_label
 
 TYPE_ORDER = ["mcq", "true_false", "fill_in_the_blank", "short_answer", "essay"]
 
@@ -38,17 +64,13 @@ FORBIDDEN_PHRASES = (
     "according to the context",
 )
 
-_PUNCT_RE = re.compile(r"[\W_]+", re.UNICODE)
-
-
-def normalize_text(text: str) -> str:
-    """Lowercase, strip diacritics/punctuation, collapse whitespace — for dedup."""
-    text = unicodedata.normalize("NFKD", str(text))
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return _PUNCT_RE.sub(" ", text).lower().split()
-
-
-def contains_forbidden_phrase(text: str) -> bool:
+def contains_forbidden_phrase(text: str, language: str | None = None) -> bool:
+    """Check for source-referencing phrases. The phrase list is English-only;
+    skip the check entirely for non-English documents."""
+    if language is None:
+        language = detect_language(text)
+    if language != "en":
+        return False
     lowered = str(text).lower()
     return any(phrase in lowered for phrase in FORBIDDEN_PHRASES)
 
@@ -202,13 +224,14 @@ def split_valid_invalid(
     return valid, invalid
 
 
-def _render_fitb(section: dict[str, Any], start_index: int = 1) -> str:
+def _render_fitb(section: dict[str, Any], start_index: int = 1, language: str = "en") -> str:
     """Render the FITB section: boxed Word Bank followed by numbered items."""
-    lines: list[str] = [f"## {TYPE_LABELS['fill_in_the_blank']}", ""]
+    strings = UI_STRINGS_BY_LANG.get(language, UI_STRINGS_BY_LANG["en"])
+    lines: list[str] = [f"## {type_label('fill_in_the_blank', language)}", ""]
     word_bank = [_clean_str(w) for w in (section.get("word_bank") or []) if _clean_str(w)]
     if word_bank:
         box = (
-            '<div class="word-bank"><strong>Word Bank</strong><br>'
+            f'<div class="word-bank"><strong>{strings["word_bank"]}</strong><br>'
             + " · ".join(word_bank)
             + "</div>"
         )
@@ -217,41 +240,45 @@ def _render_fitb(section: dict[str, Any], start_index: int = 1) -> str:
     for offset, item in enumerate(section.get("items") or [], start=start_index):
         answers = [_clean_str(a) for a in (item.get("answers") or []) if _clean_str(a)]
         lines.append(f"{offset}. {_clean_str(item.get('question'))}")
-        lines.append(f"   **Answer:** {', '.join(answers)}")
+        lines.append(f"   **{strings['answer']}:** {', '.join(answers)}")
         lines.append("")
     return "\n".join(lines).strip()
 
 
 def render_markdown(
-    question_type: str, questions: list[dict[str, Any]] | dict[str, Any], start_index: int = 1
+    question_type: str,
+    questions: list[dict[str, Any]] | dict[str, Any],
+    start_index: int = 1,
+    language: str = "en",
 ) -> str:
-    label = TYPE_LABELS.get(question_type, question_type)
+    label = type_label(question_type, language)
     lines: list[str] = [f"## {label}", ""]
 
     if question_type == "fill_in_the_blank":
-        return _render_fitb(questions, start_index=start_index)
+        return _render_fitb(questions, start_index=start_index, language=language)
 
     if not isinstance(questions, list):
         return "\n".join(lines).strip()
 
+    strings = UI_STRINGS_BY_LANG.get(language, UI_STRINGS_BY_LANG["en"])
     for offset, q in enumerate(questions, start=start_index):
         if question_type == "mcq":
             lines.append(f"{offset}. {q['question']}")
             for letter in sorted(q["options"], key=lambda k: ("ABCDEF".index(k) if k in "ABCDEF" else 99, k)):
                 lines.append(f"   {letter}. {q['options'][letter]}")
-            lines.append(f"   **Answer: {q['correct_answer']}**")
+            lines.append(f"   **{strings['answer']}: {q['correct_answer']}**")
         elif question_type == "true_false":
             lines.append(f"{offset}. {q['statement']}")
-            lines.append(f"   **Answer: {q['answer']}**")
+            lines.append(f"   **{strings['answer']}: {tf_answer_label(q['answer'], language)}**")
         elif question_type == "essay":
             lines.append(f"{offset}. {q['question']}")
-            lines.append(f"   **Reference answer:** {q['reference_answer']}")
+            lines.append(f"   **{strings['reference_answer']}:** {q['reference_answer']}")
             key_points = q.get("key_points") or []
             for kp in key_points:
                 lines.append(f"   - {kp}")
         else:
             lines.append(f"{offset}. {q['question']}")
-            lines.append(f"   **Answer:** {q['reference_answer']}")
+            lines.append(f"   **{strings['answer']}:** {q['reference_answer']}")
         lines.append("")
 
     return "\n".join(lines).strip()

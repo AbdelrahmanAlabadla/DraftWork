@@ -209,6 +209,7 @@ def plan_exams(state: ExamState) -> dict[str, Any]:
     num_models = state.get("num_models") or 1
     planner_context = state.get("planner_context") or ""
     difficulty = state.get("difficulty") or "mix"
+    language = state.get("document_language") or "en"
 
     logger.info(
         "Planning started | document_id=%s | models=%d | tasks=%s | attempt=1",
@@ -218,7 +219,7 @@ def plan_exams(state: ExamState) -> dict[str, Any]:
     )
     try:
         system_prompt, user_prompt = build_planner_prompt(
-            num_models, tasks, planner_context
+            num_models, tasks, planner_context, language=language
         )
         raw = _call_planner(user_prompt)
     except Exception as exc:
