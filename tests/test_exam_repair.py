@@ -57,10 +57,15 @@ def test_missing_fills_exact_amount(monkeypatch):
     questions = {"short_answer": [{"question": "orig sa", "reference_answer": "ans"}]}
     tasks = [("short_answer", 2)]
     plan_items = {"short_answer": [{"topic": "x", "concept_to_test": "c"}]}
-    eb._repair_shortfalls(questions, tasks, plan_items, "", "easy", 1, set(), [], [], max_passes=2)
+    appended = {}
+    eb._repair_shortfalls(
+        questions, tasks, plan_items, "", "easy", 1, set(), [], [],
+        max_passes=2, appended_by_type=appended,
+    )
     assert len(questions["short_answer"]) == 2
     assert questions["short_answer"][0]["question"] == "orig sa"  # original preserved
     assert calls == [("short_answer", 1)]  # ONLY 1 generated
+    assert appended == {"short_answer": 1}
 
 
 def test_grounded_fallback_not_blank(monkeypatch):

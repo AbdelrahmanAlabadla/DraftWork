@@ -5,6 +5,14 @@ import time
 from typing import Any
 
 from app.logging_conf import get_logger
+from app.online.eval_stats import (
+    create_pipeline_eval,
+    finalize_pipeline_eval,
+    public_eval,
+    record_generation_rejection,
+    record_initial_generation,
+    record_shortfall_result,
+)
 from app.online.graph import get_exam_graph
 from app.online.models import (
     TYPE_ORDER,
@@ -204,6 +212,7 @@ def _generate_type_from_plan(
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
     language: str = "en",
+    eval_stats: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Generate one question per planned item, retrying only missing concepts.
 
@@ -259,6 +268,9 @@ def _generate_type_from_plan(
 
         # Split valid vs structurally-invalid raw items.
         candidates, invalid_raw = split_valid_invalid(qtype, raw_obj)
+        record_generation_rejection(
+            eval_stats, model_number, qtype, "invalid_structure", len(invalid_raw)
+        )
         # Structural fix FIRST: send rejected output + schema back, repair only
         # the broken fields (never regenerate a fresh random question).
         if invalid_raw and len(candidates) < len(remaining_plan):
@@ -278,14 +290,23 @@ def _generate_type_from_plan(
             text = question_text(qtype, q)
             if contains_forbidden_phrase(text, language):
                 logger.warning("Rejected (forbidden phrase) | type=%s | text=%r", qtype, text[:120])
+                record_generation_rejection(
+                    eval_stats, model_number, qtype, "forbidden_content"
+                )
                 continue
             if _is_duplicate(qtype, q, seen):
                 logger.warning("Rejected (duplicate) | type=%s | text=%r", qtype, text[:120])
+                record_generation_rejection(
+                    eval_stats, model_number, qtype, "duplicate"
+                )
                 continue
             if _is_near_duplicate(
                 qtype, q, [*valid, *accumulated, *within_model, *previous_exams]
             ):
                 logger.warning("Rejected (near-duplicate) | type=%s | text=%r", qtype, text[:120])
+                record_generation_rejection(
+                    eval_stats, model_number, qtype, "near_duplicate"
+                )
                 continue
             valid.append(q)
 
@@ -474,6 +495,7 @@ def _generate_fitb_items(
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
     language: str = "en",
+    eval_stats: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Stage 2: write numbered items using ONLY the fixed, shuffled Word Bank."""
     from app.llm.client import LMStudioClient
@@ -500,6 +522,13 @@ def _generate_fitb_items(
         items_raw = items_raw if isinstance(items_raw, list) else []
         items = [normalize_fitb_item(i) for i in items_raw]
         items = [i for i in items if i is not None]
+        record_generation_rejection(
+            eval_stats,
+            model_number,
+            "fill_in_the_blank",
+            "invalid_structure",
+            len(items_raw) - len(items),
+        )
 
         candidate: dict[str, Any] = {"word_bank": list(word_bank), "items": items}
         # Validate against the FULL requested count: with a short item set the
@@ -513,6 +542,26 @@ def _generate_fitb_items(
         ]
         if not content_errors:
             return items, warnings
+        # Count only the concrete bad FITB items, assigning one stable reason
+        # per raw candidate. Completeness-only errors are shortfalls, not
+        # rejected questions.
+        rejected_items: dict[str, str] = {}
+        for error in content_errors:
+            prefix, _, detail = error.partition(":")
+            if not prefix.startswith("FITB item "):
+                continue
+            category = (
+                "forbidden_content"
+                if "forbidden phrase" in detail
+                else "near_duplicate"
+                if "near-duplicate" in detail
+                else "invalid_structure"
+            )
+            rejected_items.setdefault(prefix, category)
+        for category in rejected_items.values():
+            record_generation_rejection(
+                eval_stats, model_number, "fill_in_the_blank", category
+            )
         best = items if len(items) > len(best) else best
         warnings.append(
             f"fill_in_the_blank items attempt {attempt}: rejected -> "
@@ -568,6 +617,7 @@ def _generate_obj_bundle(
     seen: set[tuple[str, str]],
     previous_exams: list[dict[str, Any]],
     language: str = "en",
+    eval_stats: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Generate MCQ + True/False + Fill-in-the-Blank in ONE LLM call.
 
@@ -646,6 +696,7 @@ def _generate_obj_bundle(
                 fitb_items, item_warnings = _generate_fitb_items(
                     fitb_count, bank, context, difficulty, model_number,
                     within_model, previous_exams, language=language,
+                    eval_stats=eval_stats,
                 )
                 warnings.extend(item_warnings)
                 if fitb_items:
@@ -655,6 +706,9 @@ def _generate_obj_bundle(
         need_mcq = remaining("mcq")
         if need_mcq > 0:
             candidates, invalid_raw = split_valid_invalid("mcq", raw.get("mcq"))
+            record_generation_rejection(
+                eval_stats, model_number, "mcq", "invalid_structure", len(invalid_raw)
+            )
             if invalid_raw and len(candidates) < need_mcq:
                 repaired, rwarn = _repair_invalid_items(
                     "mcq", [i for i in invalid_raw if isinstance(i, dict)],
@@ -663,13 +717,19 @@ def _generate_obj_bundle(
                 warnings.extend(rwarn)
                 candidates.extend(repaired)
             for q in candidates[:need_mcq]:
-                if _filter_one("mcq", q, [*acc_mcq, *within_model, *previous_exams], seen, warnings, attempt, language):
+                if _filter_one(
+                    "mcq", q, [*acc_mcq, *within_model, *previous_exams],
+                    seen, warnings, attempt, language, eval_stats, model_number,
+                ):
                     acc_mcq.append(q)
 
         # --- true_false section (incremental, structural-repair first) ---
         need_tf = remaining("true_false")
         if need_tf > 0:
             candidates_tf, invalid_tf = split_valid_invalid("true_false", raw.get("true_false"))
+            record_generation_rejection(
+                eval_stats, model_number, "true_false", "invalid_structure", len(invalid_tf)
+            )
             if invalid_tf and len(candidates_tf) < need_tf:
                 repaired_tf, rwarn_tf = _repair_invalid_items(
                     "true_false", [i for i in invalid_tf if isinstance(i, dict)],
@@ -678,7 +738,10 @@ def _generate_obj_bundle(
                 warnings.extend(rwarn_tf)
                 candidates_tf.extend(repaired_tf)
             for q in candidates_tf[:need_tf]:
-                if _filter_one("true_false", q, [*acc_tf, *within_model, *previous_exams], seen, warnings, attempt, language):
+                if _filter_one(
+                    "true_false", q, [*acc_tf, *within_model, *previous_exams],
+                    seen, warnings, attempt, language, eval_stats, model_number,
+                ):
                     acc_tf.append(q)
 
         warnings.append(
@@ -704,17 +767,24 @@ def _filter_one(
     warnings: list[str],
     attempt: int,
     language: str = "en",
+    eval_stats: dict[str, Any] | None = None,
+    model_number: int = 0,
 ) -> bool:
     """Accept a question iff it passes forbid/dup/near-dup checks."""
     text = question_text(qtype, q)
     if contains_forbidden_phrase(text, language):
         warnings.append(f"obj bundle {qtype} attempt {attempt}: forbidden phrase")
+        record_generation_rejection(
+            eval_stats, model_number, qtype, "forbidden_content"
+        )
         return False
     if _is_duplicate(qtype, q, seen):
         warnings.append(f"obj bundle {qtype} attempt {attempt}: duplicate")
+        record_generation_rejection(eval_stats, model_number, qtype, "duplicate")
         return False
     if _is_near_duplicate(qtype, q, accepted):
         warnings.append(f"obj bundle {qtype} attempt {attempt}: near-duplicate")
+        record_generation_rejection(eval_stats, model_number, qtype, "near_duplicate")
         return False
     return True
 
@@ -807,6 +877,7 @@ def _repair_shortfalls(
     previous_questions: list[dict[str, Any]],
     language: str = "en",
     max_passes: int = 2,
+    appended_by_type: dict[str, int] | None = None,
 ) -> list[str]:
     """Minimal-diff count repair of one exam's questions.
 
@@ -859,8 +930,13 @@ def _repair_shortfalls(
                 section = bundle.get(q)
                 if not section:
                     continue
+                before = _section_count(q, questions.get(q))
                 new_section = _append_section(questions.get(q), q, section)
                 questions[q] = new_section
+                if appended_by_type is not None:
+                    appended_by_type[q] = appended_by_type.get(q, 0) + max(
+                        _section_count(q, new_section) - before, 0
+                    )
             within_model[:] = _reindex_within(questions)
 
         for q, m in [(qt, mo) for qt, mo in deficits if qt in free_types]:
@@ -873,6 +949,8 @@ def _repair_shortfalls(
             added = new_questions[:m]
             questions.setdefault(q, [])
             questions[q] = list(questions[q]) + added
+            if appended_by_type is not None:
+                appended_by_type[q] = appended_by_type.get(q, 0) + len(added)
             within_model[:] = _reindex_within(questions)
 
     # Final report for any persistent shortfall.
@@ -949,6 +1027,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     language = state.get("document_language") or "en"
     plans = state.get("plans") or []
     warnings: list[str] = list(state.get("warnings") or [])
+    eval_stats = state.get("eval_stats")
 
     # Never free-fill during generation: first repair any remaining plan shortfall.
     if not state.get("plan_errors"):
@@ -983,6 +1062,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 seen,
                 previous_questions,
                 language=language,
+                eval_stats=eval_stats,
             )
             model_warnings.extend(model_warnings_)
             for section_key in obj_types:
@@ -1013,13 +1093,20 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 within_model,
                 previous_questions,
                 language=language,
+                eval_stats=eval_stats,
             )
             _assign_ids(model_number, qtype, questions[qtype])
             model_warnings.extend(type_warnings)
             within_model.extend(questions[qtype])
 
+        # Snapshot accepted output from the original generation calls before
+        # count trimming/filling. Shortfall generation must not improve this.
+        if eval_stats is not None:
+            record_initial_generation(eval_stats, model_number, questions)
+
         # Minimal-diff repair: missing -> generate only the missing amount,
         # extra -> remove only the extra amount, correct -> untouched.
+        shortfall_appended = {qtype: 0 for qtype, _count in tasks}
         repair_warnings = _repair_shortfalls(
             questions,
             tasks,
@@ -1031,10 +1118,15 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             within_model,
             previous_questions,
             language=language,
+            appended_by_type=shortfall_appended,
         )
         model_warnings.extend(repair_warnings)
         for section_key, section_val in questions.items():
             _assign_ids(model_number, section_key, section_val)
+        if eval_stats is not None:
+            record_shortfall_result(
+                eval_stats, model_number, questions, shortfall_appended
+            )
 
         elapsed = time.perf_counter() - t0
         total = sum(
@@ -1059,7 +1151,11 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
         previous_questions.extend(within_model)
 
     warnings.extend(generated_exams[-1]["warnings"] if generated_exams else [])
-    return {"generated_exams": generated_exams, "warnings": warnings}
+    return {
+        "generated_exams": generated_exams,
+        "warnings": warnings,
+        "eval_stats": eval_stats,
+    }
 
 
 def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -1069,7 +1165,12 @@ def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     for exam in generated_exams:
         exam["markdown"] = assemble_exam(exam["questions"], language=language)
         exam["document_language"] = language
-    return {"generated_exams": generated_exams}
+    eval_stats = state.get("eval_stats")
+    if eval_stats is not None:
+        finalize_pipeline_eval(
+            eval_stats, generated_exams, state.get("validation_reports") or []
+        )
+    return {"generated_exams": generated_exams, "eval_stats": eval_stats}
 
 
 # --------------------------------------------------------------------------
@@ -1086,7 +1187,7 @@ def generate_exams(
 
     Runs the two-phase LangGraph workflow ONCE: retrieval, planning (one call for
     all models), then plan-driven generation per model x question type. Returns
-    {"exams": [{"model_number", "questions", "markdown", "warnings"}], "warnings"}.
+    exams, warnings, detected language, and the JSON-safe pipeline eval summary.
     """
     t0 = time.perf_counter()
     initial = {
@@ -1107,6 +1208,7 @@ def generate_exams(
         "validation_reports": [],
         "validated_models": [],
         "question_repair_attempts": {},
+        "eval_stats": create_pipeline_eval(tasks, num_models),
         "warnings": [],
         "error": None,
     }
@@ -1115,7 +1217,11 @@ def generate_exams(
     error = result.get("error")
     if error:
         logger.warning("Exam workflow error | document_id=%s | error=%s", document_id, error)
-        return {"exams": [], "warnings": [str(error)]}
+        return {
+            "exams": [],
+            "warnings": [str(error)],
+            "eval": public_eval(result.get("eval_stats")),
+        }
 
     exams = result.get("generated_exams") or []
     warnings = result.get("warnings") or []
@@ -1129,7 +1235,12 @@ def generate_exams(
         language,
         elapsed,
     )
-    return {"exams": exams, "warnings": warnings, "document_language": language}
+    return {
+        "exams": exams,
+        "warnings": warnings,
+        "document_language": language,
+        "eval": public_eval(result.get("eval_stats")),
+    }
 
 
 def generate_exam(

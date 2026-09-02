@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+from app.config import VALIDATOR_BATCH_SIZE
 from app.llm.client import LMStudioClient
 from app.logging_conf import get_logger
+from app.online.eval_stats import record_first_validation, record_repair_outcome
 from app.online.models import (
     _normalize_essay,
     _normalize_mcq,
@@ -19,6 +21,9 @@ logger = get_logger("VALIDATOR")
 # repair stage. ``PASS`` means the question is left byte-identical.
 ACTIONS = frozenset(
     {"PASS", "FIX_QUESTION", "FIX_ANSWER", "FIX_OPTIONS", "FIX_QUESTION_AND_ANSWER"}
+)
+REPAIR_ACTIONS = frozenset(
+    {"FIX_QUESTION", "FIX_ANSWER", "FIX_OPTIONS", "FIX_QUESTION_AND_ANSWER"}
 )
 
 MAX_QUESTION_REPAIR_ATTEMPTS = 2
@@ -432,11 +437,15 @@ def _sanitize_verdict(raw: Any, known: Set[str]) -> Optional[Dict[str, Any]]:
     qid = str(raw.get("question_id") or "").strip()
     if not qid or qid not in known:
         return None
-    qv = bool(raw.get("question_valid", True))
-    av = bool(raw.get("answer_valid", True))
+    if not isinstance(raw.get("question_valid"), bool) or not isinstance(
+        raw.get("answer_valid"), bool
+    ):
+        return None
+    qv = raw["question_valid"]
+    av = raw["answer_valid"]
     action = str(raw.get("action") or "").upper()
     if action not in ACTIONS:
-        action = "PASS"
+        return None
     fields = raw.get("fields_to_fix")
     if not isinstance(fields, list):
         fields = []
@@ -468,11 +477,11 @@ def _sanitize_verdict(raw: Any, known: Set[str]) -> Optional[Dict[str, Any]]:
 def validate_exam(
         exam: Dict[str, Any], client: Optional[Any] = None
 ) -> Dict[str, Any]:
-    """Validate every question of one exam model with ONE LLM call.
+    """Validate every question in bounded batches, retrying missing IDs once.
 
-    Returns ``{"model_number", "all_pass", "verdicts", "warnings"}`` where each
-    verdict is keyed by the question's stable ``question_id``. Verdicts for
-    questions without a recorded ID are treated as PASS (with a warning).
+    Every question with an ID receives either an actual validator/local verdict
+    or an ``UNVALIDATED`` operational status. Missing coverage is never converted
+    into a content defect.
     """
     model_number = exam.get("model_number") or 1
     questions = exam.get("questions") or {}
@@ -497,58 +506,117 @@ def validate_exam(
         entries.append({"question_id": str(qid), "question_type": qtype, "question": payload})
 
     verdicts: Dict[str, Dict[str, Any]] = dict(local_verdicts)
-    known_ids = {str(item.get("question_id")) for _, _, item in _iter_questions(questions)}
-    known_ids.discard("")
+    coverage: List[Dict[str, Any]] = []
     if entries:
         llm = client or LMStudioClient(reasoning=VALIDATOR_REASONING)
-        user_prompt = build_validator_prompt(entries)
-        try:
-            raw = llm.chat_json(
-                user_prompt,
-                system_prompt=VALIDATOR_SYSTEM_PROMPT,
-                temperature=VALIDATOR_TEMPERATURE,
-                max_tokens=VALIDATOR_MAX_TOKENS,
-            )
-        except Exception as exc:
-            warnings.append(f"validate: validator LLM call failed ({exc}); no verdicts received")
-            raw = []
-        results = raw if isinstance(raw, list) else (raw.get("verdicts") if isinstance(raw, dict) else None)
-        if not isinstance(results, list):
-            warnings.append("validate: validator returned no usable verdict array; questions will be retried/failed")
-            results = []
-        for r in results:
-            v = _sanitize_verdict(r, known_ids)
-            if v is None:
-                warnings.append(f"validate: verdict with unknown/missing question_id rejected")
-                continue
-            verdicts[v["question_id"]] = v
+        for offset in range(0, len(entries), VALIDATOR_BATCH_SIZE):
+            batch = entries[offset: offset + VALIDATOR_BATCH_SIZE]
+            sent_ids = [entry["question_id"] for entry in batch]
+            known_ids = set(sent_ids)
+            returned_ids: List[str] = []
+            unexpected_ids: List[str] = []
+            duplicate_ids: List[str] = []
 
-        # The validator must not silently clear a question. Give the model one
-        # focused retry for the questions it omitted; if they are still missing
-        # they fail (non-PASS) into the repair flow instead of being accepted.
-        missing = [e for e in entries if e["question_id"] not in verdicts]
-        if missing:
-            warnings.append(f"validate: {len(missing)} question(s) had no verdict; retrying once")
+            def consume(
+                raw_result: Any,
+                allowed_ids: Set[str],
+                *,
+                retry: bool = False,
+            ) -> None:
+                results = (
+                    raw_result
+                    if isinstance(raw_result, list)
+                    else raw_result.get("verdicts")
+                    if isinstance(raw_result, dict)
+                    else None
+                )
+                if not isinstance(results, list):
+                    warnings.append(
+                        "validate: retry returned no usable verdict array"
+                        if retry
+                        else "validate: validator returned no usable verdict array"
+                    )
+                    return
+                seen_in_response: Set[str] = set()
+                for raw_verdict in results:
+                    raw_id = (
+                        str(raw_verdict.get("question_id") or "").strip()
+                        if isinstance(raw_verdict, dict)
+                        else ""
+                    )
+                    returned_ids.append(raw_id)
+                    if raw_id in seen_in_response:
+                        if raw_id and raw_id not in duplicate_ids:
+                            duplicate_ids.append(raw_id)
+                        warnings.append(
+                            f"validate: duplicate verdict for {raw_id} ignored"
+                        )
+                        continue
+                    seen_in_response.add(raw_id)
+                    if not raw_id or raw_id not in allowed_ids:
+                        if raw_id and raw_id not in unexpected_ids:
+                            unexpected_ids.append(raw_id)
+                        warnings.append(
+                            "validate: verdict with unknown/missing question_id rejected"
+                        )
+                        continue
+                    v = _sanitize_verdict(raw_verdict, allowed_ids)
+                    if v is None:
+                        warnings.append(
+                            "validate: verdict with unknown/missing question_id rejected"
+                        )
+                        continue
+                    # A retry never overwrites a verdict already accepted from
+                    # the original batch response.
+                    if v["question_id"] not in verdicts:
+                        verdicts[v["question_id"]] = v
+
             try:
-                raw2 = llm.chat_json(
-                    build_validator_prompt(missing),
-                    system_prompt=VALIDATOR_RETRY_SYSTEM_PROMPT,
+                raw = llm.chat_json(
+                    build_validator_prompt(batch),
+                    system_prompt=VALIDATOR_SYSTEM_PROMPT,
                     temperature=VALIDATOR_TEMPERATURE,
                     max_tokens=VALIDATOR_MAX_TOKENS,
                 )
             except Exception as exc:
-                warnings.append(f"validate: validator retry failed ({exc})")
-                raw2 = []
-            results2 = raw2 if isinstance(raw2, list) else (raw2.get("verdicts") if isinstance(raw2, dict) else None)
-            if not isinstance(results2, list):
-                warnings.append("validate: retry returned no usable verdict array")
-                results2 = []
-            for r in results2:
-                v = _sanitize_verdict(r, known_ids)
-                if v is None:
-                    warnings.append(f"validate: retry verdict with unknown/missing question_id rejected")
-                    continue
-                verdicts[v["question_id"]] = v
+                warnings.append(
+                    f"validate: validator LLM call failed ({exc}); no verdicts received"
+                )
+                raw = []
+            consume(raw, known_ids)
+
+            missing = [entry for entry in batch if entry["question_id"] not in verdicts]
+            if missing:
+                warnings.append(
+                    f"validate: {len(missing)} question(s) had no verdict; retrying once"
+                )
+                try:
+                    raw2 = llm.chat_json(
+                        build_validator_prompt(missing),
+                        system_prompt=VALIDATOR_RETRY_SYSTEM_PROMPT,
+                        temperature=VALIDATOR_TEMPERATURE,
+                        max_tokens=VALIDATOR_MAX_TOKENS,
+                    )
+                except Exception as exc:
+                    warnings.append(f"validate: validator retry failed ({exc})")
+                    raw2 = []
+                consume(
+                    raw2,
+                    {entry["question_id"] for entry in missing},
+                    retry=True,
+                )
+
+            final_missing = [qid for qid in sent_ids if qid not in verdicts]
+            coverage.append(
+                {
+                    "sent_ids": sent_ids,
+                    "returned_ids": returned_ids,
+                    "matched_ids": [qid for qid in sent_ids if qid in verdicts],
+                    "missing_ids": final_missing,
+                    "unexpected_ids": unexpected_ids,
+                    "duplicate_returned_ids": duplicate_ids,
+                }
+            )
 
     all_pass = True
     ordered: List[Dict[str, Any]] = []
@@ -558,27 +626,36 @@ def validate_exam(
             continue
         v = verdicts.get(qid)
         if v is None:
-            warnings.append(f"validate: no verdict returned for {qid} after retry; marked failed")
+            warnings.append(
+                f"validate: no verdict returned for {qid} after retry; marked unvalidated"
+            )
             v = {
                 "question_id": qid,
-                "question_valid": False,
-                "answer_valid": False,
-                "action": "FIX_QUESTION_AND_ANSWER",
-                "fields_to_fix": ["question", "answer"],
+                "question_valid": None,
+                "answer_valid": None,
+                "action": "UNVALIDATED",
+                "fields_to_fix": [],
                 "reason": "No validator verdict was returned after retry.",
-                "expected_fix": "Review the question fully and fix the question and/or answer.",
+                "expected_fix": "Retry validation; do not modify the question.",
             }
         if v["action"] != "PASS":
             all_pass = False
         ordered.append(v)
 
     logger.info(
-        "Exam validated | model=%d | questions=%d | invalid=%d",
+        "Exam validated | model=%d | questions=%d | invalid=%d | unvalidated=%d",
         model_number,
         len(ordered),
-        sum(1 for v in ordered if v["action"] != "PASS"),
+        sum(1 for v in ordered if v["action"] in REPAIR_ACTIONS),
+        sum(1 for v in ordered if v["action"] == "UNVALIDATED"),
     )
-    return {"model_number": model_number, "all_pass": all_pass, "verdicts": ordered, "warnings": warnings}
+    return {
+        "model_number": model_number,
+        "all_pass": all_pass,
+        "verdicts": ordered,
+        "warnings": warnings,
+        "coverage": coverage,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -617,9 +694,14 @@ def repair_exam(
     """
     warnings: List[str] = []
     questions = exam.get("questions") or {}
-    invalid = [v for v in verdicts if v.get("action") != "PASS"]
+    invalid = [v for v in verdicts if v.get("action") in REPAIR_ACTIONS]
     if not invalid:
-        return {"warnings": warnings, "repaired_ids": [], "failed_ids": []}
+        return {
+            "warnings": warnings,
+            "sent_ids": [],
+            "repaired_ids": [],
+            "failed_ids": [],
+        }
 
     by_id = _build_by_id(questions)
     verdict_by_id = {str(v.get("question_id")): v for v in invalid}
@@ -649,9 +731,12 @@ def repair_exam(
     if not payload:
         return {
             "warnings": warnings,
+            "sent_ids": [],
             "repaired_ids": [],
             "failed_ids": [str(v.get("question_id")) for v in invalid],
         }
+
+    sent_ids = [item["question_id"] for item in payload]
 
     llm = client or LMStudioClient(reasoning=REPAIR_REASONING)
     user_prompt = build_repair_prompt(payload)
@@ -666,6 +751,7 @@ def repair_exam(
         warnings.append(f"repair: batched repair LLM call failed ({exc})")
         return {
             "warnings": warnings,
+            "sent_ids": sent_ids,
             "repaired_ids": [],
             "failed_ids": [str(v.get("question_id")) for v in invalid],
         }
@@ -675,6 +761,7 @@ def repair_exam(
         warnings.append("repair: LLM returned no usable repair array")
         return {
             "warnings": warnings,
+            "sent_ids": sent_ids,
             "repaired_ids": [],
             "failed_ids": [str(v.get("question_id")) for v in invalid],
         }
@@ -754,6 +841,7 @@ def repair_exam(
         warnings.append(f"repair: {len(failed)} question(s) not repaired: {sorted(failed)}")
     return {
         "warnings": warnings,
+        "sent_ids": sent_ids,
         "repaired_ids": sorted(accepted),
         "failed_ids": failed,
     }
@@ -768,14 +856,22 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     validated = list(state.get("validated_models") or [])
     attempts = state.get("question_repair_attempts") or {}
     warnings = list(state.get("warnings") or [])
-    reports: List[Dict[str, Any]] = []
+    # Preserve one latest report per model. Earlier passing models are skipped
+    # by validation but their reports remain available for final telemetry.
+    reports_by_model: Dict[Any, Dict[str, Any]] = {
+        report.get("model_number"): report
+        for report in (state.get("validation_reports") or [])
+    }
+    eval_stats = state.get("eval_stats")
 
     for exam in generated:
         mn = exam.get("model_number")
         if mn in validated:
             continue
         report = validate_exam(exam)
-        reports.append(report)
+        reports_by_model[mn] = report
+        if eval_stats is not None:
+            record_first_validation(eval_stats, exam, report)
         if report["all_pass"]:
             validated.append(mn)
         elif (attempts.get(mn) or 0) >= MAX_QUESTION_REPAIR_ATTEMPTS:
@@ -786,9 +882,10 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             validated.append(mn)
 
     return {
-        "validation_reports": reports,
+        "validation_reports": list(reports_by_model.values()),
         "validated_models": validated,
         "warnings": warnings,
+        "eval_stats": eval_stats,
     }
 
 
@@ -799,11 +896,17 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     attempts = dict(state.get("question_repair_attempts") or {})
     validated = list(state.get("validated_models") or [])
     warnings = list(state.get("warnings") or [])
+    eval_stats = state.get("eval_stats")
     exam_by_model = {e.get("model_number"): e for e in generated}
 
     for r in reports:
         mn = r.get("model_number")
         if r.get("all_pass"):
+            continue
+        if not any(
+            verdict.get("action") in REPAIR_ACTIONS
+            for verdict in (r.get("verdicts") or [])
+        ):
             continue
         if (attempts.get(mn) or 0) >= MAX_QUESTION_REPAIR_ATTEMPTS:
             continue
@@ -813,6 +916,15 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         attempt = (attempts.get(mn) or 0) + 1
         logger.info("Question repair pass | model=%d | attempt=%d/%d", mn, attempt, MAX_QUESTION_REPAIR_ATTEMPTS)
         outcome = repair_exam(exam, r.get("verdicts") or [])
+        if eval_stats is not None:
+            record_repair_outcome(
+                eval_stats,
+                exam,
+                r,
+                outcome.get("repaired_ids") or [],
+                outcome.get("failed_ids") or [],
+                outcome.get("sent_ids") or [],
+            )
         attempts[mn] = attempt
         warnings.extend(outcome["warnings"])
         if mn in validated:
@@ -822,4 +934,5 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         "question_repair_attempts": attempts,
         "validated_models": validated,
         "warnings": warnings,
+        "eval_stats": eval_stats,
     }

@@ -34,4 +34,6 @@ def _kill_existing_server() -> None:
 if __name__ == "__main__":
     _kill_existing_server()
     # Re-check the port is now free; start the server regardless.
-    uvicorn.run("app.api.main:app", host=HOST, port=PORT, reload=False)
+    # This is the local development entry point. Reloading ensures generation
+    # requests never keep using stale telemetry code after a source edit.
+    uvicorn.run("app.api.main:app", host=HOST, port=PORT, reload=True)

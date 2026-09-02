@@ -11,6 +11,7 @@ The LLM is mocked (FakeClient), so no server call is made. Focus:
 from __future__ import annotations
 
 import copy
+import json
 
 import app.online.exam_builder as eb
 from app.online import validator as val
@@ -24,6 +25,7 @@ from app.online.validator import (
     VALIDATOR_SYSTEM_PROMPT,
     VALIDATOR_RETRY_SYSTEM_PROMPT,
 )
+from app.online.graph import _route_after_validation
 
 
 class FakeClient:
@@ -53,6 +55,32 @@ class FakeClient:
             self.last_repair_prompt = prompt
             return self.repair_result
         raise AssertionError(f"unexpected system prompt: {system_prompt!r}")
+
+
+def _validator_entries(prompt):
+    block = prompt.split("## Questions to review\n", 1)[1].split(
+        "\n\n## Verdict object format", 1
+    )[0]
+    return json.loads(block)
+
+
+class EchoValidatorClient:
+    """Return PASS for every ID and retain exact per-call batch membership."""
+
+    def __init__(self):
+        self.primary_batches = []
+        self.retry_batches = []
+
+    def chat_json(self, prompt, system_prompt=None, **kwargs):
+        entries = _validator_entries(prompt)
+        ids = [entry["question_id"] for entry in entries]
+        if system_prompt == VALIDATOR_SYSTEM_PROMPT:
+            self.primary_batches.append(ids)
+        elif system_prompt == VALIDATOR_RETRY_SYSTEM_PROMPT:
+            self.retry_batches.append(ids)
+        else:
+            raise AssertionError(f"unexpected system prompt: {system_prompt!r}")
+        return [_pass_verdict(qid) for qid in ids]
 
 
 def _mcq(qid, question="Which metric is the harmonic mean of precision and recall?",
@@ -416,7 +444,7 @@ def test_question_answer_mismatch_flagged_by_llm():
 
 
 # ---------------------------------------------------------------------------
-# Missing verdicts: retry once, then FAIL (never silently accepted)
+# Missing verdicts: retry once, then remain operationally unvalidated
 # ---------------------------------------------------------------------------
 def test_missing_verdict_retried_once():
     exam = _exam({"mcq": [_mcq("model1_mcq_1", answer="B")]})
@@ -436,9 +464,68 @@ def test_missing_verdict_never_passed():
     assert fake.retry_calls == 1
     assert not report["all_pass"]
     v = {x["question_id"]: x for x in report["verdicts"]}["model1_mcq_1"]
-    assert v["action"] == "FIX_QUESTION_AND_ANSWER"
-    assert v["fields_to_fix"] == ["question", "answer"]
+    assert v["action"] == "UNVALIDATED"
+    assert v["fields_to_fix"] == []
     assert "no validator verdict" in v["reason"].lower()
+
+
+def test_validator_splits_large_input_into_configured_exact_id_batches(monkeypatch):
+    monkeypatch.setattr(val, "VALIDATOR_BATCH_SIZE", 8)
+    ids = [f"model1_mcq_{i}" for i in range(1, 35)]
+    exam = _exam({"mcq": [_mcq(qid, question=f"Question {qid}?") for qid in ids]})
+    fake = EchoValidatorClient()
+
+    report = validate_exam(exam, client=fake)
+
+    assert [len(batch) for batch in fake.primary_batches] == [8, 8, 8, 8, 2]
+    assert [qid for batch in fake.primary_batches for qid in batch] == ids
+    assert fake.retry_batches == []
+    assert [v["question_id"] for v in report["verdicts"]] == ids
+    assert all(v["action"] == "PASS" for v in report["verdicts"])
+
+
+def test_batch_coverage_retries_only_missing_and_tracks_protocol_issues(monkeypatch):
+    monkeypatch.setattr(val, "VALIDATOR_BATCH_SIZE", 3)
+    ids = ["model1_mcq_1", "model1_mcq_2", "model1_mcq_3"]
+    exam = _exam({"mcq": [_mcq(qid, question=f"Question {qid}?") for qid in ids]})
+
+    class PartialClient:
+        def __init__(self):
+            self.retry_ids = []
+
+        def chat_json(self, prompt, system_prompt=None, **kwargs):
+            sent = [entry["question_id"] for entry in _validator_entries(prompt)]
+            if system_prompt == VALIDATOR_SYSTEM_PROMPT:
+                first = _pass_verdict(sent[0])
+                return [first, dict(first), _pass_verdict("unexpected_id")]
+            self.retry_ids.append(sent)
+            return [_pass_verdict(sent[0])]
+
+    fake = PartialClient()
+    report = validate_exam(exam, client=fake)
+    actions = {v["question_id"]: v["action"] for v in report["verdicts"]}
+
+    assert fake.retry_ids == [["model1_mcq_2", "model1_mcq_3"]]
+    assert actions == {
+        "model1_mcq_1": "PASS",
+        "model1_mcq_2": "PASS",
+        "model1_mcq_3": "UNVALIDATED",
+    }
+    assert report["coverage"] == [
+        {
+            "sent_ids": ids,
+            "returned_ids": [
+                "model1_mcq_1",
+                "model1_mcq_1",
+                "unexpected_id",
+                "model1_mcq_2",
+            ],
+            "matched_ids": ["model1_mcq_1", "model1_mcq_2"],
+            "missing_ids": ["model1_mcq_3"],
+            "unexpected_ids": ["unexpected_id"],
+            "duplicate_returned_ids": ["model1_mcq_1"],
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +545,61 @@ def test_repair_batches_only_invalid_questions():
     assert "model1_mcq_1" in ids  # the invalid question IS batched
     assert "model1_mcq_2" not in ids  # valid questions excluded
     assert "model1_true_false_1" not in ids
+
+
+def test_unvalidated_is_never_sent_to_repair():
+    exam = _exam({"mcq": [_mcq("missing"), _mcq("bad")]})
+    fake = FakeClient(repair_result=[])
+    repair_exam(
+        exam,
+        [
+            _verdict("missing", "UNVALIDATED", qv=False, av=False),
+            _verdict("bad", "FIX_ANSWER", av=False, fields=["answer"]),
+        ],
+        client=fake,
+    )
+    ids = json_ids(fake.last_repair_prompt)
+    assert "missing" not in ids
+    assert "bad" in ids
+
+
+def test_unvalidated_only_report_does_not_enter_repair_node(monkeypatch):
+    def should_not_run(*args, **kwargs):
+        raise AssertionError("repair_exam must not run for UNVALIDATED")
+
+    monkeypatch.setattr(val, "repair_exam", should_not_run)
+    state = {
+        "generated_exams": [_exam({"mcq": [_mcq("missing")]})],
+        "validation_reports": [
+            {
+                "model_number": 1,
+                "all_pass": False,
+                "verdicts": [_verdict("missing", "UNVALIDATED", qv=False, av=False)],
+                "warnings": [],
+            }
+        ],
+        "validated_models": [],
+        "question_repair_attempts": {},
+        "warnings": [],
+    }
+
+    out = repair_invalid_questions(state)
+    assert out["question_repair_attempts"] == {}
+    assert _route_after_validation(state) == "assemble_exams"
+
+
+def test_real_content_failure_still_routes_to_repair():
+    state = {
+        "validation_reports": [
+            {
+                "model_number": 1,
+                "all_pass": False,
+                "verdicts": [_verdict("bad", "FIX_ANSWER", av=False)],
+            }
+        ],
+        "question_repair_attempts": {},
+    }
+    assert _route_after_validation(state) == "repair_invalid_questions"
 
 
 def test_missing_id_in_repair_response_rejected():
@@ -527,6 +669,17 @@ def test_sanitize_preserves_explicit_fix_options():
     v = val._sanitize_verdict(raw, {"model1_mcq_2"})
     assert v["action"] == "FIX_OPTIONS"
     assert v["fields_to_fix"] == ["options", "answer"]
+
+
+def test_sanitize_rejects_unknown_action_instead_of_turning_it_into_pass():
+    raw = {
+        "question_id": "model1_mcq_2",
+        "question_valid": True,
+        "answer_valid": True,
+        "action": "NO_ACTION",
+        "fields_to_fix": [],
+    }
+    assert val._sanitize_verdict(raw, {"model1_mcq_2"}) is None
 
 
 def test_mcq_ambiguous_options_repair_accepted():
@@ -728,6 +881,39 @@ def test_validated_model_not_revalidated(monkeypatch):
     out = validate_generated_questions(state)
     assert 1 in out["validated_models"]
     assert fake.validate_calls == 1
+
+
+def test_latest_report_for_already_passed_model_is_preserved(monkeypatch):
+    old_report = {
+        "model_number": 1,
+        "all_pass": True,
+        "verdicts": [_pass_verdict("model1_mcq_1")],
+        "warnings": [],
+    }
+
+    monkeypatch.setattr(
+        val,
+        "validate_exam",
+        lambda exam: {
+            "model_number": 2,
+            "all_pass": True,
+            "verdicts": [_pass_verdict("model2_mcq_1")],
+            "warnings": [],
+        },
+    )
+    state = {
+        "generated_exams": [
+            _exam({"mcq": [_mcq("model1_mcq_1")]}, model_number=1),
+            _exam({"mcq": [_mcq("model2_mcq_1")]}, model_number=2),
+        ],
+        "validation_reports": [old_report],
+        "validated_models": [1],
+        "question_repair_attempts": {},
+        "warnings": [],
+    }
+    out = validate_generated_questions(state)
+    assert {report["model_number"] for report in out["validation_reports"]} == {1, 2}
+    assert out["validation_reports"][0] is old_report
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,7 @@ from app.online.models import (  # noqa: E402
     normalize_text,
     parse_questions,
 )
+from app.online.eval_stats import create_pipeline_eval, public_eval
 
 
 def _mcq(text: str, correct: str = "A") -> dict:
@@ -138,6 +139,147 @@ def test_forbidden_phrase_rejected(monkeypatch):
         "mcq", planned, "ctx", "mix", 1, set(), [], []
     )
     assert questions == []
+
+
+def test_generation_rejection_hook_counts_existing_filter(monkeypatch):
+    planned = [
+        {"topic": "T", "concept_to_test": "a"},
+        {"topic": "T", "concept_to_test": "b"},
+    ]
+    client = SequencedClient([
+        [_mcq("What is AI?"), _mcq("What is AI?")],
+        [_mcq("What is ML?")],
+    ])
+    _patch_client(monkeypatch, client)
+    stats = create_pipeline_eval([("mcq", 2)], 1)
+    questions, _ = exam_builder._generate_type_from_plan(
+        "mcq", planned, "ctx", "mix", 1, set(), [], [], eval_stats=stats
+    )
+    assert len(questions) == 2
+    model = public_eval(stats)["models"]["1"]
+    assert model["generation_rejected"] == 1
+    assert model["generation_rejection_reasons"] == {"duplicate": 1}
+
+
+def test_generation_node_snapshots_before_shortfall(monkeypatch):
+    monkeypatch.setattr(
+        "app.online.planner.fill_missing_concepts", lambda plans, tasks, context: (plans, [])
+    )
+
+    def fake_bundle(*args, **kwargs):
+        return {"mcq": [_mcq("initial")], "true_false": [], "fill_in_the_blank": None}, []
+
+    def fake_shortfall(questions, *args, **kwargs):
+        questions["mcq"].append(_mcq("shortfall"))
+        kwargs["appended_by_type"]["mcq"] += 1
+        return []
+
+    monkeypatch.setattr(exam_builder, "_generate_obj_bundle", fake_bundle)
+    monkeypatch.setattr(exam_builder, "_repair_shortfalls", fake_shortfall)
+    stats = create_pipeline_eval([("mcq", 2)], 1)
+    out = exam_builder.generate_exams_node(
+        {
+            "document_id": "doc",
+            "tasks": [("mcq", 2)],
+            "num_models": 1,
+            "difficulty": "easy",
+            "context": "ctx",
+            "planner_context": "ctx",
+            "document_language": "en",
+            "plans": [{"model_number": 1, "items": {"mcq": [{}, {}]}}],
+            "plan_errors": [],
+            "warnings": [],
+            "eval_stats": stats,
+        }
+    )
+    model = public_eval(out["eval_stats"])["models"]["1"]
+    assert model["generated_first"] == 1
+    assert model["missing_first"] == 1
+    assert model["shortfall_generated"] == 1
+    assert model["shortfall_still_missing"] == 0
+
+
+def test_generation_node_records_complete_twenty_question_mixed_shape(monkeypatch):
+    """The live 10/3/3/3/1 shape is counted before shortfall repair."""
+    monkeypatch.setattr(
+        "app.online.planner.fill_missing_concepts",
+        lambda plans, tasks, context: (plans, []),
+    )
+    calls = {"bundle": 0, "free": []}
+
+    def fake_bundle(*args, **kwargs):
+        calls["bundle"] += 1
+        return {
+            "mcq": [_mcq(f"MCQ {i}") for i in range(1, 11)],
+            "true_false": [
+                {"statement": f"Statement {i}", "answer": "True"}
+                for i in range(1, 4)
+            ],
+            "fill_in_the_blank": {
+                "word_bank": ["one", "two", "three", "four", "five"],
+                "items": [
+                    {"question": f"Complete ________ {i}", "answers": ["one"]}
+                    for i in range(1, 4)
+                ],
+            },
+        }, []
+
+    def fake_free(qtype, planned, *args, **kwargs):
+        calls["free"].append((qtype, len(planned)))
+        if qtype == "essay":
+            return [
+                {
+                    "question": "Essay question",
+                    "reference_answer": "Essay answer",
+                    "key_points": ["point"],
+                }
+            ], []
+        return [
+            {"question": f"Short answer {i}", "reference_answer": "Answer"}
+            for i in range(1, len(planned) + 1)
+        ], []
+
+    monkeypatch.setattr(exam_builder, "_generate_obj_bundle", fake_bundle)
+    monkeypatch.setattr(exam_builder, "_generate_type_from_plan", fake_free)
+
+    tasks = [
+        ("mcq", 10),
+        ("true_false", 3),
+        ("fill_in_the_blank", 3),
+        ("short_answer", 3),
+        ("essay", 1),
+    ]
+    plan_items = {
+        qtype: [{"topic": "T", "concept_to_test": str(i)} for i in range(count)]
+        for qtype, count in tasks
+    }
+    stats = create_pipeline_eval(tasks, 1)
+    out = exam_builder.generate_exams_node(
+        {
+            "document_id": "doc",
+            "tasks": tasks,
+            "num_models": 1,
+            "difficulty": "easy",
+            "context": "ctx",
+            "planner_context": "ctx",
+            "document_language": "en",
+            "plans": [{"model_number": 1, "items": plan_items}],
+            "plan_errors": [],
+            "warnings": [],
+            "eval_stats": stats,
+        }
+    )
+
+    model = public_eval(out["eval_stats"])["models"]["1"]
+    assert calls == {
+        "bundle": 1,
+        "free": [("short_answer", 3), ("essay", 1)],
+    }
+    assert model["requested_questions"] == 20
+    assert model["generated_first"] == 20
+    assert model["missing_first"] == 0
+    assert model["shortfall_generated"] == 0
+    assert model["shortfall_still_missing"] == 0
 
 
 def test_assemble_exam_continuous_numbering():

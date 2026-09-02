@@ -29,6 +29,11 @@ LMS_API_KEY: str | None = _env("LMS_API_KEY") or None
 # to "off" so reasoning-capable models don't burn output tokens on hidden
 # reasoning content that this pipeline discards anyway.
 LMS_REASONING: str = _env("LMS_REASONING", "off") or "off"
+# Keep validator requests small enough that local models reliably return one
+# verdict per question.  Missing IDs are retried once in an even smaller request.
+VALIDATOR_BATCH_SIZE: int = max(
+    1, int(_env("VALIDATOR_BATCH_SIZE", "8") or "8")
+)
 TITLE_MODEL: str = _env("TITLE_MODEL", "mistralai/mistral-7b-instruct-v0.3") or "mistralai/mistral-7b-instruct-v0.3"
 # Base URL used ONLY by the title-generation client (section/subsection
 # naming). Defaults to the local LM Studio OpenAI-compatible endpoint so

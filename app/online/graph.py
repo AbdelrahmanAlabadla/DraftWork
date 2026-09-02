@@ -4,7 +4,8 @@ from typing import Any, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 
-from app.online.validator import MAX_QUESTION_REPAIR_ATTEMPTS
+from app.online.validator import MAX_QUESTION_REPAIR_ATTEMPTS, REPAIR_ACTIONS
+from app.online.eval_stats import PipelineEvalStats
 
 
 class ExamState(TypedDict):
@@ -30,6 +31,7 @@ class ExamState(TypedDict):
     validation_reports: list[dict[str, Any]]  # one report per validated model
     validated_models: list[int]  # models that fully passed (skip re-validation)
     question_repair_attempts: dict[int, int]  # per-model repair budget already used
+    eval_stats: PipelineEvalStats  # JSON-safe V1 pipeline telemetry
     # --- Warnings / Result ----------------------------------------------
     warnings: list[str]
     error: Optional[str]
@@ -101,6 +103,11 @@ def _route_after_validation(state: ExamState) -> str:
     attempts = state.get("question_repair_attempts") or {}
     for report in reports:
         if report.get("all_pass"):
+            continue
+        if not any(
+            verdict.get("action") in REPAIR_ACTIONS
+            for verdict in (report.get("verdicts") or [])
+        ):
             continue
         model_number = report.get("model_number")
         if (attempts.get(model_number) or 0) < MAX_QUESTION_REPAIR_ATTEMPTS:
