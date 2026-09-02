@@ -1,8 +1,14 @@
 # AI Exam Generator
-
+![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
+![LLM](https://img.shields.io/badge/LLM-Powered-purple)
+![LangGraph](https://img.shields.io/badge/LangGraph-Agentic_Workflow-black)
+![FastAPI](https://img.shields.io/badge/FastAPI-Backend-009688?logo=fastapi)
+![Qdrant](https://img.shields.io/badge/Qdrant-Vector_DB-red)
+![Document AI](https://img.shields.io/badge/Document_AI-PDF_Processing-blueviolet)
+![AI Agents](https://img.shields.io/badge/AI_Agents-Validation_%26_Repair-orange)
 An AI-powered exam generation system that transforms educational PDF documents into structured, configurable exams.
 
-The system combines document parsing, semantic chunking, embeddings, vector retrieval, LLM-based planning, question generation, validation, and targeted repair to keep questions grounded in the selected source material.
+The system combines document parsing, semantic chunking, embeddings, selected content loading, LLM-based planning, question generation, validation, and targeted repair to keep questions grounded in the selected source material.
 
 ## Features
 
@@ -18,7 +24,7 @@ The system combines document parsing, semantic chunking, embeddings, vector retr
   * Fill in the Blank
   * Why Questions
   * Essay
-* Retrieve only selected child chunks for generation
+* Load only selected child chunks for generation
 * Automatically validate generated questions
 * Repair only invalid questions instead of regenerating the entire exam
 
@@ -102,7 +108,7 @@ flowchart TD
     C --> D[Embeddings]
     D --> E[(Qdrant Vector Store)]
 
-    E --> F[Selected Child Chunk Retrieval]
+    E --> F[Selected Child Chunk Loading]
     F --> G[Exam Planner]
     G --> H[Question Generation]
     H --> I[Validation]
@@ -223,7 +229,7 @@ The tests cover core components including:
 
 * document processing
 * semantic chunking
-* retrieval
+* selected content loading
 * exam generation
 * validation and repair
 * API behavior
