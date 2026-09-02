@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8" />
   <link
-    href="https://fonts.googleapis.com/css2?family=Syne:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap"
+    href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&family=Tajawal:wght@400;500;600;700&display=swap"
     rel="stylesheet" />
   <link rel="stylesheet" href="css/styles.css" />
 </head>
@@ -17,7 +17,7 @@
       <div class="google-auth" id="googleAuth">
         <a href="/auth/google/login" id="connectGoogleBtn" class="copy-btn"
            style="display:none; text-decoration:none;" data-i18n="auth.connect">Connect Google Account</a>
-        <span id="connectedInfo" style="display:none; font-family:var(--mono); font-size:11px; color:var(--success);"></span>
+        <span id="connectedInfo" style="display:none; font-size:13px; color:var(--success);"></span>
         <button id="signOutBtn" class="copy-btn" style="display:none;" data-i18n="auth.signout">Sign out</button>
       </div>
     </div>
@@ -196,7 +196,7 @@
         <div style="display:flex; gap:8px; align-items:center;">
           <button class="copy-btn" data-i18n="preview.copy_md">Copy Markdown</button>
           <div class="export-wrap" id="exportWrap">
-            <button class="export-btn" id="exportBtn">Export &#9662;</button>
+            <button class="export-btn" id="exportBtn" data-i18n="preview.export">Export &#9662;</button>
             <div class="export-menu">
               <button class="export-item" data-export="pdf">PDF</button>
               <button class="export-item" data-export="docx">DOCX</button>

@@ -98,7 +98,7 @@ const STRINGS = {
     "qtype.essay": "مقالي",
     "qtype.essay_desc": "إجابات مفتوحة",
     "gen.status": "جارٍ إنشاء الامتحان — قد يستغرق بعض الوقت...",
-    "gen.button": "إنشاء الامتحان →",
+    "gen.button": "إنشاء الامتحان ←",
     "preview.title": "معاينة الامتحان",
     "preview.copy_md": "نسخ Markdown",
     "preview.export": "تصدير ▾",

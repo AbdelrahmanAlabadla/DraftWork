@@ -8,29 +8,33 @@
     }
 
     :root {
-      --bg: #000000;
-      --surface: #010203;
-      --surface2: #16213a;
-      --border: #f5f5f5;
-      --border2: #edf0f5;
+      --bg: #151719;
+      --surface: #1c1f22;
+      --surface2: #23272b;
+      --border: #34383d;
+      --border2: #42474e;
 
       --accent: #f36e15;
-      --accent-dim: rgba(79, 140, 255, 0.10);
-      --accent-dim2: rgba(231, 236, 245, 0.18);
+      --accent-dim: rgba(243, 110, 21, 0.10);
+      --accent-dim2: rgba(243, 110, 21, 0.18);
 
-      --text: #eaf0ff;
-      --muted: #e5e6e9;
-      --muted2: #9aa7bf;
+      --text: #f3f4f6;
+      --muted: #c0c4ca;
+      --muted2: #969ca5;
 
-      --danger: #ff4d4d;
-      --success: #22c55e;
+      --danger: #dc6262;
+      --success: #4fae75;
+      --warning: #d99a32;
 
-      --mono: 'JetBrains Mono', monospace;
-      --sans: 'Inter', sans-serif;
+      --sans: "Inter", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --arabic: "Tajawal", "Segoe UI", Arial, sans-serif;
+      --mono: var(--sans);
+      --code: "DM Mono", "SFMono-Regular", Consolas, monospace;
     }
 
     body {
       font-family: var(--sans);
+      font-size: 15px;
       background: var(--bg);
       color: var(--text);
       min-height: 100vh;
@@ -67,6 +71,19 @@
       padding: 3px 8px;
       border-radius: 4px;
       letter-spacing: 0.05em;
+    }
+
+    .header-link {
+      color: var(--muted2);
+      font-family: var(--mono);
+      font-size: 11px;
+      text-decoration: none;
+      letter-spacing: 0.04em;
+      transition: color 0.15s;
+    }
+
+    .header-link:hover {
+      color: var(--accent);
     }
 
     .section-label {
@@ -194,7 +211,7 @@
 
     .status-bar.loading {
       background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
+      border: 1px solid rgba(243, 110, 21, 0.25);
       color: var(--accent);
     }
 
@@ -213,7 +230,7 @@
     .spinner {
       width: 14px;
       height: 14px;
-      border: 2px solid rgba(212, 255, 0, 0.2);
+      border: 2px solid rgba(243, 110, 21, 0.22);
       border-top-color: var(--accent);
       border-radius: 50%;
       animation: spin 0.7s linear infinite;
@@ -268,7 +285,7 @@
     }
 
     .exam-details-title span {
-      margin-left: 7px;
+      margin-inline-start: 7px;
       color: var(--muted2);
       font-family: var(--mono);
       font-size: 10px;
@@ -472,7 +489,7 @@
       font-size: 12px;
       color: var(--accent);
       background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
+      border: 1px solid rgba(243, 110, 21, 0.25);
       padding: 4px 10px;
       border-radius: 20px;
     }
@@ -552,13 +569,13 @@
       border-radius: 50%;
       background: var(--muted2);
       top: 3px;
-      left: 3px;
+      inset-inline-start: 3px;
       transition: transform 0.2s, background 0.2s;
     }
 
     .toggle.on {
       background: var(--accent-dim2);
-      border: 1px solid rgba(212, 255, 0, 0.3);
+      border: 1px solid rgba(243, 110, 21, 0.35);
     }
 
     .toggle.on::after {
@@ -897,7 +914,7 @@
       gap: 12px;
       padding: 16px 20px;
       background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
+      border: 1px solid rgba(243, 110, 21, 0.25);
       border-radius: 10px;
       margin-bottom: 16px;
       font-family: var(--mono);
@@ -912,7 +929,7 @@
     .gen-spinner {
       width: 16px;
       height: 16px;
-      border: 2px solid rgba(212, 255, 0, 0.2);
+      border: 2px solid rgba(243, 110, 21, 0.22);
       border-top-color: var(--accent);
       border-radius: 50%;
       animation: spin 0.7s linear infinite;
@@ -929,7 +946,7 @@
       gap: 12px;
       padding: 16px 20px;
       background: var(--accent-dim);
-      border: 1px solid rgba(212, 255, 0, 0.2);
+      border: 1px solid rgba(243, 110, 21, 0.25);
       border-radius: 10px;
       margin-bottom: 16px;
       font-family: var(--mono);
@@ -943,7 +960,7 @@
 
     .sections-toolbar {
       margin-bottom: 8px;
-      text-align: right;
+      text-align: end;
     }
 
     .select-all-btn {
@@ -1003,9 +1020,10 @@
     }
 
     .subsection-list {
-      margin: 6px 0 0 38px;
-      border-left: 1px solid var(--border2);
-      padding-left: 18px;
+      margin-block-start: 6px;
+      margin-inline-start: 38px;
+      border-inline-start: 1px solid var(--border2);
+      padding-inline-start: 18px;
     }
 
     .subsection-row {
@@ -1096,7 +1114,7 @@
 .export-menu {
   display: none;
   position: absolute;
-  right: 0;
+  inset-inline-end: 0;
   top: calc(100% + 6px);
   min-width: 160px;
   background: var(--surface);
@@ -1114,7 +1132,7 @@
 .export-item {
   display: block;
   width: 100%;
-  text-align: left;
+  text-align: start;
   font-family: var(--mono);
   font-size: 12px;
   padding: 10px 14px;
@@ -1186,40 +1204,146 @@
   text-decoration: underline;
 }
 
+/* Readable shared UI type scale. The exam-paper preview keeps its print scale. */
+.header .tag,
+.header-link,
+.upload-zone .formats,
+.file-pill .fname,
+.setting-card label,
+.exam-field span,
+.page-range-card label,
+.qtotal,
+.copy-btn,
+.select-all-btn,
+.export-btn {
+  font-size: 13px;
+}
+
+.section-label,
+.status-bar,
+.exam-field input,
+.model-btn,
+.diff-btn,
+.qtype-name,
+.qtype-desc,
+.stepper .count,
+.model-tab,
+.export-item,
+.export-share input,
+.forms-link-row,
+.gen-status,
+.sections-loading,
+.section-title,
+.subsection-row {
+  font-size: 14px;
+}
+
+.exam-details-title {
+  font-size: 15px;
+}
+
+.exam-details-title > span:first-child {
+  margin-inline-start: 0;
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.exam-details-title > span:last-child {
+  font-size: 13px;
+}
+
+.exam-details-note {
+  font-size: 13px;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+.status-bar.success {
+  background: rgba(79, 174, 117, 0.09);
+  border-color: rgba(79, 174, 117, 0.28);
+}
+
+.status-bar.error {
+  background: rgba(220, 98, 98, 0.09);
+  border-color: rgba(220, 98, 98, 0.28);
+}
+
 /* ===== RTL (Arabic UI) support =====
-   The document/exam language is independent of the UI language; these rules
-   only mirror the interface when <html dir="rtl"> is set. */
+   UI direction follows the selected interface language. Exam preview content
+   remains independent because its language comes from the source document. */
+html[dir="rtl"] {
+  --sans: var(--arabic);
+  --mono: var(--arabic);
+}
+
 html[dir="rtl"] body {
   direction: rtl;
-  text-align: right;
+  text-align: start;
+  font-family: var(--arabic);
+  font-size: 16px;
 }
 
-html[dir="rtl"] .header {
-  flex-direction: row-reverse;
-}
-
-html[dir="rtl"] .settings-row,
-html[dir="rtl"] .exam-details-grid {
-  direction: rtl;
-}
-
-html[dir="rtl"] .qtype-info {
-  flex-direction: row-reverse;
-  text-align: right;
-}
-
-html[dir="rtl"] .file-pill {
-  flex-direction: row-reverse;
-}
-
+html[dir="rtl"] .header,
+html[dir="rtl"] .qtype-info,
+html[dir="rtl"] .file-pill,
 html[dir="rtl"] .exam-output-header {
-  flex-direction: row-reverse;
+  flex-direction: row;
+}
+
+html[dir="rtl"] .header h1,
+html[dir="rtl"] .formats,
+html[dir="rtl"] .stepper,
+html[dir="rtl"] .count,
+html[dir="rtl"] input[type="date"],
+html[dir="rtl"] .exam-content {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+html[dir="rtl"] .section-label,
+html[dir="rtl"] .setting-card,
+html[dir="rtl"] .exam-details-card,
+html[dir="rtl"] .exam-field,
+html[dir="rtl"] .section-row,
+html[dir="rtl"] .subsection-row,
+html[dir="rtl"] .qtype-card,
+html[dir="rtl"] .qtype-info,
+html[dir="rtl"] .exam-output-header,
+html[dir="rtl"] .export-item {
+  text-align: start;
 }
 
 html[dir="rtl"] input[type="text"],
-html[dir="rtl"] input:not([type]) {
-  text-align: right;
+html[dir="rtl"] input:not([type]),
+html[dir="rtl"] textarea,
+html[dir="rtl"] select {
+  direction: rtl;
+  text-align: start;
 }
 
-/* Exam content itself keeps its own direction: Arabic exams generated from an
-   Arabic document are rendered by the browser bidi algorithm automatically. */
+html[dir="rtl"] input[type="date"] {
+  text-align: left;
+}
+
+html[dir="rtl"] .toggle.on::after {
+  transform: translateX(-16px);
+}
+
+html[dir="rtl"] .section-label,
+html[dir="rtl"] .setting-card label,
+html[dir="rtl"] .exam-field span,
+html[dir="rtl"] .qtype-desc,
+html[dir="rtl"] .subsection-row,
+html[dir="rtl"] .copy-btn,
+html[dir="rtl"] .select-all-btn,
+html[dir="rtl"] .export-btn {
+  font-size: 15px;
+}
