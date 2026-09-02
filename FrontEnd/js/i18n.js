@@ -3,6 +3,7 @@
 const STRINGS = {
   en: {
     "header.tag": "RAG-POWERED",
+    "nav.eval": "Eval Dashboard",
     "auth.connect": "Connect Google Account",
     "auth.signout": "Sign out",
     "section.upload": "01 — Upload Document",
@@ -54,6 +55,7 @@ const STRINGS = {
   },
   ar: {
     "header.tag": "مدعوم بالاسترجاع الذكي",
+    "nav.eval": "لوحة التقييم",
     "auth.connect": "ربط حساب Google",
     "auth.signout": "تسجيل الخروج",
     "section.upload": "٠١ — رفع المستند",

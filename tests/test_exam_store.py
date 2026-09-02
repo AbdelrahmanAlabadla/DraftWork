@@ -28,17 +28,20 @@ def _exam(model: int = 1) -> dict:
 
 
 def test_save_and_get_roundtrip():
+    eval_stats = {"overall": {"requested_questions": 1}, "models": {"1": {}}}
     exam_id = exam_store.save_exam(
         [_exam()],
         warnings=["w1"],
         document_id="doc1",
         metadata={"exam_title": "Final Examination", "class_name": "12A"},
+        eval_stats=eval_stats,
     )
     assert exam_id.startswith("exam_")
     record = exam_store.get_exam(exam_id)
     assert record["document_id"] == "doc1"
     assert record["warnings"] == ["w1"]
     assert record["metadata"] == {"exam_title": "Final Examination", "class_name": "12A"}
+    assert record["eval"] == eval_stats
     assert record["exams"][0]["questions"]["mcq"][0]["correct_answer"] == "B"
 
 

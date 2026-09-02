@@ -16,6 +16,11 @@ from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
 from app.offline.structure_store import load_structure
 from app.online.exam_builder import generate_exams
+from app.online.eval_stats import (
+    add_derived_rates,
+    aggregate_persisted_evals,
+    derived_rates,
+)
 
 logger = get_logger("API")
 
@@ -34,6 +39,57 @@ _VALID_QTYPES = frozenset(_SUPPORTED_COUNTS.values())
 _VALID_DIFFICULTIES = frozenset({"easy", "medium", "hard", "mix"})
 _NUM_MODELS_MIN = 1
 _NUM_MODELS_MAX = 4
+
+
+@router.get("/api/eval-summary")
+def eval_summary() -> dict[str, Any]:
+    """Return a read-only aggregate of all currently stored exam telemetry."""
+    records = exam_store.list_exams()
+    aggregated = aggregate_persisted_evals(
+        record.get("eval") or {} for record in records
+    )
+    overall = add_derived_rates(aggregated["overall"])
+    models = {
+        str(model_number): add_derived_rates(model)
+        for model_number, model in aggregated["models"].items()
+    }
+
+    recent: list[dict[str, Any]] = []
+    for record in records[:20]:
+        bucket = (record.get("eval") or {}).get("overall") or {}
+        rates = derived_rates(bucket)
+        final_missing = int(bucket.get("final_missing_or_invalid", 0) or 0)
+        recent.append(
+            {
+                "exam_id": record.get("exam_id"),
+                "generated_at": datetime.fromtimestamp(
+                    float(record.get("created_at", 0)), tz=timezone.utc
+                ).isoformat(),
+                "requested": int(bucket.get("requested_questions", 0) or 0),
+                "first_pass_rate": rates["first_validation_pass_rate"],
+                "repairs_sent": int(bucket.get("repair_sent", 0) or 0),
+                "final_success_rate": rates["final_success_rate"],
+                "status": (
+                    "Healthy"
+                    if bucket and final_missing == 0
+                    else "Needs attention"
+                    if bucket
+                    else "No telemetry"
+                ),
+            }
+        )
+
+    return {
+        "total_exam_runs": len(records),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "overall": overall,
+        "rates": overall["rates"],
+        "generation_rejection_reasons": overall["generation_rejection_reasons"],
+        "validation_failure_reasons": overall["validation_failure_reasons"],
+        "validator_failure_reasons": overall["validator_failure_reasons"],
+        "models": models,
+        "recent_exam_runs": recent,
+    }
 
 
 class GenerateRequest(BaseModel):
@@ -227,6 +283,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     )
     exams = result["exams"]
     warnings = result["warnings"]
+    eval_stats = result.get("eval") or {}
     document_language = result.get("document_language") or "en"
 
     total_elapsed = time.perf_counter() - t_total
@@ -255,6 +312,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         warnings,
         document_id=document_id,
         metadata=metadata,
+        eval_stats=eval_stats,
     )
 
     logger.info(
@@ -278,4 +336,5 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         "metadata": metadata,
         "exams": exams,
         "warnings": warnings,
+        "eval": eval_stats,
     }

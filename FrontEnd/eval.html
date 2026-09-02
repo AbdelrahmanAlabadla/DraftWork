@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Eval Dashboard — SmartExam AI</title>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&family=Tajawal:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="css/styles.css" />
+  <link rel="stylesheet" href="css/eval.css" />
+</head>
+
+<body class="eval-body">
+  <main class="page eval-page">
+    <header class="eval-header">
+      <div class="eval-brand-row">
+        <a class="eval-brand" href="/">Smart<span>Exam</span> AI</a>
+        <span class="tag">RAG-POWERED</span>
+        <a class="header-link" href="/">← Generator</a>
+      </div>
+      <div class="eval-title-row">
+        <div>
+          <div class="section-label">05 — Telemetry</div>
+          <h1>Eval Dashboard</h1>
+          <p>Real-time overview of exam generation quality</p>
+        </div>
+        <div class="eval-actions">
+          <div class="live-status"><span class="live-dot"></span><span>Live</span></div>
+          <span class="updated" id="updatedAt">Waiting for data</span>
+          <button class="copy-btn refresh-btn" id="refreshBtn" type="button">Refresh ↻</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="eval-state" id="evalState" role="status"></div>
+
+    <section class="kpi-grid" aria-label="Key performance indicators">
+      <article class="metric-card metric-generation">
+        <div class="metric-label">Initial Generation Completion</div>
+        <div class="metric-value" id="generationRate">—</div>
+        <div class="metric-detail" id="generationRaw">— / — questions</div>
+      </article>
+      <article class="metric-card metric-validation">
+        <div class="metric-label">First Validation Pass Rate</div>
+        <div class="metric-value" id="validationRate">—</div>
+        <div class="metric-detail" id="validationRaw">— / — questions</div>
+      </article>
+      <article class="metric-card metric-repair">
+        <div class="metric-label">Repair Success Rate</div>
+        <div class="metric-value" id="repairRate">—</div>
+        <div class="metric-detail" id="repairRaw">— / — repairs</div>
+      </article>
+      <article class="metric-card metric-final">
+        <div class="metric-label">Final Success Rate</div>
+        <div class="metric-value" id="finalRate">—</div>
+        <div class="metric-detail" id="finalRaw">— / — questions</div>
+      </article>
+    </section>
+
+    <section class="summary-grid" aria-label="Summary numbers">
+      <article class="summary-card"><span>Exam Runs</span><strong id="examRuns">—</strong></article>
+      <article class="summary-card"><span>Questions Requested</span><strong id="requestedTotal">—</strong></article>
+      <article class="summary-card summary-success"><span>Final Valid</span><strong id="finalValidTotal">—</strong></article>
+      <article class="summary-card summary-error"><span>Final Invalid</span><strong id="finalInvalidTotal">—</strong></article>
+      <article class="summary-card summary-warning"><span>Final Unvalidated</span><strong id="finalUnvalidatedTotal">—</strong></article>
+      <article class="summary-card summary-error"><span>Final Missing</span><strong id="finalMissingTotal">—</strong></article>
+      <article class="summary-card summary-error"><span>Total Non-valid</span><strong id="missingTotal">—</strong></article>
+    </section>
+
+    <section class="dashboard-section pipeline-section">
+      <div class="section-label">Pipeline Overview</div>
+      <div class="pipeline-card" id="pipelineStages"></div>
+    </section>
+
+    <section class="reason-grid">
+      <article class="dashboard-panel">
+        <div class="panel-heading"><div class="section-label">Generation Rejection Reasons</div><span class="panel-total" id="generationRejectTotal">0</span></div>
+        <div class="reason-list" id="generationReasons"></div>
+      </article>
+      <article class="dashboard-panel">
+        <div class="panel-heading"><div class="section-label">Validation Failure Reasons</div><span class="panel-total" id="validationFailTotal">0</span></div>
+        <div class="reason-list" id="validationReasons"></div>
+      </article>
+      <article class="dashboard-panel">
+        <div class="panel-heading"><div class="section-label">Validator Operational Failures</div><span class="panel-total" id="validatorFailTotal">0</span></div>
+        <div class="reason-list" id="validatorReasons"></div>
+      </article>
+    </section>
+
+    <section class="dashboard-section">
+      <div class="section-label">Model Performance</div>
+      <div class="dashboard-panel table-panel">
+        <div class="table-wrap">
+          <table class="eval-table" id="modelTable">
+            <thead><tr><th>Model</th><th>Initial Gen</th><th>First Validation</th><th>Repair</th><th>Final</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="empty-state" id="modelEmpty">No model telemetry yet.</div>
+      </div>
+    </section>
+
+    <section class="dashboard-section recent-section">
+      <div class="section-label">Recent Exam Runs</div>
+      <div class="dashboard-panel table-panel">
+        <div class="table-wrap">
+          <table class="eval-table recent-table" id="recentTable">
+            <thead><tr><th>Exam ID</th><th>Generated At</th><th>Requested</th><th>First Pass</th><th>Repairs Sent</th><th>Final Success</th><th>Status</th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="empty-state" id="recentEmpty">No stored exam runs yet. Generate an exam to start collecting telemetry.</div>
+      </div>
+    </section>
+
+    <footer class="eval-footer">Telemetry is read-only and reflects the exams currently held in memory.</footer>
+  </main>
+  <script type="module" src="js/eval.js"></script>
+</body>
+
+</html>

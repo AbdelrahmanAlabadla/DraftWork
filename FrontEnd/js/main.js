@@ -89,6 +89,13 @@ function initGenerate() {
       if (ok && data.exams?.length) {
         state.examId = data.exam_id || null;
         renderExamOutput(data.exams, data.metadata || {});
+        // Let an already-open Eval Dashboard refresh immediately. The
+        // dashboard still polls independently, so this is only a fast path.
+        try {
+          localStorage.setItem("dw:last-generation", String(Date.now()));
+        } catch (_) {
+          // Storage can be unavailable in private/restricted browser contexts.
+        }
       } else {
         alert(`Generation failed: ${data.detail}`);
       }

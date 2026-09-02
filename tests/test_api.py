@@ -120,6 +120,37 @@ def _make_fake_llm(captured_prompts: list[str] | None = None):
         model = _model_number(prompt)
         options = {"A": "Perception", "B": "Network", "C": "Application", "D": "Middleware"}
 
+        if "objective sections of an exam in ONE response" in prompt:
+            counts_match = re.search(
+                r"Multiple Choice \((\d+)\), True/False \((\d+)\), and "
+                r"Fill-in-the-Blank \((\d+) items",
+                prompt,
+            )
+            mcq_count, tf_count, _ = (
+                (int(value) for value in counts_match.groups())
+                if counts_match
+                else (0, 0, 0)
+            )
+            mcq_texts = (
+                mcq_pool[:mcq_count]
+                if model == 1
+                else [_distinct_stem("mcq", model, i) for i in range(mcq_count)]
+            )
+            tf_texts = (
+                tf_pool[:tf_count]
+                if model == 1
+                else [_distinct_stem("true_false", model, i) for i in range(tf_count)]
+            )
+            return {
+                "mcq": [
+                    {"question": text, "options": options, "correct_answer": "A"}
+                    for text in mcq_texts
+                ],
+                "true_false": [
+                    {"statement": text, "answer": "True"} for text in tf_texts
+                ],
+            }
+
         if "correct answer terms for a Fill-in-the-Blank" in prompt:
             return {
                 "correct_terms": _fitb_terms(model, count),
@@ -218,12 +249,39 @@ def _install_registry_and_store(monkeypatch, document_id: str = "doc-x") -> None
     monkeypatch.setattr("app.online.retrieval.VectorStore", FakeStore)
 
 
+def _pass_validate_exam(exam):
+    verdicts = []
+    for section in (exam.get("questions") or {}).values():
+        items = (section.get("items") or []) if isinstance(section, dict) else (section or [])
+        for item in items:
+            verdicts.append({
+                "question_id": item["question_id"],
+                "question_valid": True,
+                "answer_valid": True,
+                "action": "PASS",
+                "fields_to_fix": [],
+                "reason": "",
+                "expected_fix": "",
+            })
+    return {
+        "model_number": exam.get("model_number"),
+        "all_pass": True,
+        "verdicts": verdicts,
+        "warnings": [],
+    }
+
+
 def _install_fakes(monkeypatch, document_id: str = "doc-x") -> None:
     _install_registry_and_store(monkeypatch, document_id)
     # LLM fake: serves both the planner role and the generator role.
     fake = _make_fake_llm()
     monkeypatch.setattr("app.online.planner.LMStudioClient", fake)
     monkeypatch.setattr("app.llm.client.LMStudioClient", fake)
+
+    # API tests exercise orchestration/serialization, not validator quality.
+    # Return deterministic PASS verdicts so the suite never contacts a live
+    # validator model.
+    monkeypatch.setattr("app.online.validator.validate_exam", _pass_validate_exam)
 
 
 def test_generate_single_type_mcq(monkeypatch):
@@ -262,6 +320,42 @@ def test_generate_stores_print_metadata(monkeypatch):
     assert data["metadata"]["exam_title"] == "Biology Examination"
     stored = exam_store.get_exam(data["exam_id"])
     assert stored["metadata"]["class_name"] == "12B"
+
+
+def test_generate_returns_same_eval_that_is_stored(monkeypatch):
+    _install_registry_and_store(monkeypatch)
+    eval_stats = {
+        "overall": {"requested_questions": 1, "final_valid": 1},
+        "models": {"1": {"requested_questions": 1, "final_valid": 1}},
+    }
+    exams = [{
+        "model_number": 1,
+        "questions": {"mcq": [{
+            "question_id": "model1_mcq_1",
+            "question": "Q?",
+            "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+            "correct_answer": "A",
+        }]},
+        "markdown": "## Multiple Choice",
+        "warnings": [],
+    }]
+    monkeypatch.setattr(
+        "app.api.routes.generate_exams",
+        lambda *args, **kwargs: {
+            "exams": exams,
+            "warnings": [],
+            "document_language": "en",
+            "eval": eval_stats,
+        },
+    )
+    resp = client.post(
+        "/generate", json={"document_id": "doc-x", "mcq_count": 1, "child_ids": ["c1"]}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    stored = exam_store.get_exam(data["exam_id"])
+    assert data["eval"] == eval_stats
+    assert stored["eval"] == eval_stats
 
 
 def test_generate_html_payload_multiple_types(monkeypatch):
@@ -338,6 +432,7 @@ def test_difficulty_directive_in_prompt(monkeypatch):
         fake = _make_fake_llm(captured)
         monkeypatch.setattr("app.online.planner.LMStudioClient", fake)
         monkeypatch.setattr("app.llm.client.LMStudioClient", fake)
+        monkeypatch.setattr("app.online.validator.validate_exam", _pass_validate_exam)
         resp = client.post(
             "/generate",
             json={
@@ -351,7 +446,10 @@ def test_difficulty_directive_in_prompt(monkeypatch):
         assert resp.json()["difficulty"] == difficulty
         assert captured, f"no prompts captured for difficulty={difficulty}"
         # The difficulty directive lives in the generator prompt, not the planner.
-        gen_prompts = [p for p in captured if "Create exactly" in p]
+        gen_prompts = [
+            p for p in captured
+            if "Create exactly" in p or "objective sections of an exam in ONE response" in p
+        ]
         assert gen_prompts, "no generator prompt captured"
         assert needle in gen_prompts[0]
 
@@ -441,7 +539,7 @@ def test_generate_repairs_malformed_json(monkeypatch):
             return json.dumps(_fake_planner(prompt, 1))  # valid planner output as JSON text
         if system_prompt == REPAIR_SYSTEM_PROMPT:
             return (
-                '{"questions":[{"question":"Repaired question? (v%d)",'
+                '{"mcq":[{"question":"Repaired question? (v%d)",'
                 '"options":{"A":"a","B":"b","C":"c","D":"d"},"correct_answer":"B"}]}' % calls["n"]
             )
         return '{"questions":[{"question": "broken",}'  # malformed JSON
@@ -491,6 +589,20 @@ def test_generate_repairs_malformed_json(monkeypatch):
     monkeypatch.setattr("app.online.retrieval.VectorStore", FakeStore)
     monkeypatch.setattr("app.online.planner.LMStudioClient", FakeLLM)
     monkeypatch.setattr("app.llm.client.LMStudioClient", FakeLLM)
+    monkeypatch.setattr(
+        "app.online.validator.validate_exam",
+        lambda exam: {
+            "model_number": exam.get("model_number"),
+            "all_pass": True,
+            "verdicts": [{
+                "question_id": item["question_id"],
+                "action": "PASS",
+                "reason": "",
+                "fields_to_fix": [],
+            } for item in (exam.get("questions") or {}).get("mcq", [])],
+            "warnings": [],
+        },
+    )
 
     resp = client.post("/generate", json={"document_id": "doc-x", "mcq_count": 1, "child_ids": ["c1"]})
     assert resp.status_code == 200
