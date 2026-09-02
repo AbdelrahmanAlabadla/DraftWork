@@ -1,14 +1,14 @@
-# AI Exam Generator
+# DraftWork — AI Exam Generator
 ![Python](https://img.shields.io/badge/Python-3.11-blue?logo=python)
 ![LLM](https://img.shields.io/badge/LLM-Powered-purple)
 ![LangGraph](https://img.shields.io/badge/LangGraph-Agentic_Workflow-black)
 ![FastAPI](https://img.shields.io/badge/FastAPI-Backend-009688?logo=fastapi)
 ![Qdrant](https://img.shields.io/badge/Qdrant-Vector_DB-red)
 ![Document AI](https://img.shields.io/badge/Document_AI-PDF_Processing-blueviolet)
-![AI Agents](https://img.shields.io/badge/AI_Agents-Validation_%26_Repair-orange)
+![Reliability](https://img.shields.io/badge/Reliability-Validation_%26_Repair-orange)
 An AI-powered exam generation system that transforms educational PDF documents into structured, configurable exams.
 
-The system combines document parsing, semantic chunking, embeddings, selected content loading, LLM-based planning, question generation, validation, and targeted repair to keep questions grounded in the selected source material.
+The system combines document parsing, semantic chunking, embeddings, selected-section loading, LLM-based planning, question generation, validation, and targeted repair to keep questions grounded in the selected source material.
 
 ## Features
 
@@ -27,6 +27,9 @@ The system combines document parsing, semantic chunking, embeddings, selected co
 * Load only selected child chunks for generation
 * Automatically validate generated questions
 * Repair only invalid questions instead of regenerating the entire exam
+* Track generation, validation, repair, and final outcome telemetry
+* Review overall and per-model performance in a read-only Eval Dashboard
+* Separate question-quality failures from validator operational failures
 
 ## Application
 
@@ -73,6 +76,47 @@ Supported question types include:
 | Why Questions     | Short reasoning questions            |
 | Essay             | Open-ended responses                 |
 
+### 05 — Eval Dashboard
+
+![Eval Dashboard](doc/images/eval_dashboard.png)
+
+DraftWork includes a read-only Eval Dashboard for monitoring the quality and behavior of the exam-generation pipeline.
+
+The dashboard tracks:
+
+* questions requested
+* questions generated on the first attempt
+* missing questions and shortfall recovery
+* first-pass validation results
+* validation failure reasons
+* validator operational failures such as missing verdicts
+* questions sent to repair
+* repair success and failure
+* final valid, invalid, unvalidated, and missing questions
+* overall and per-model performance
+* recent exam runs
+
+This makes it easier to see where the pipeline is spending time and where failures occur.
+
+A final exam can have a high success rate while still requiring retries, extra validation calls, or repair steps. The telemetry helps show whether the main bottleneck is generation, validation, repair, or model reliability.
+
+It also helps compare whether the model used for generation, validation, or repair is actually performing well for that task or relying heavily on retries and repair.
+
+Open the dashboard at:
+
+```text
+http://localhost:8000/eval.html
+```
+
+Telemetry is also available through:
+
+```text
+GET /api/eval-summary
+```
+
+The dashboard refreshes automatically every 30 seconds and can also be refreshed manually.
+
+> Telemetry is currently stored in application memory. Restarting the server clears the recorded exam-run history.
 
 ## Sample Generated Exam
 
@@ -99,6 +143,7 @@ The sample exam was generated from:
 **Paul Long, Sarah Lawrey, and Victoria Ellis. _Cambridge International AS and A Level IT Coursebook_. Cambridge University Press, 2016. ISBN: 978-1-107-57724-4.**
 
 The source textbook is used only as input material to demonstrate DraftWork's document-processing and exam-generation workflow. The textbook itself is not included in this repository.
+
 ## Architecture
 
 ```mermaid id="mz5m42"
@@ -122,6 +167,12 @@ flowchart TD
 ## Validation & Repair
 
 Generated questions are validated before they are accepted as final output.
+
+Validation is processed in configurable batches, and each verdict is matched to the stable question ID supplied to the validator.
+
+If the validator does not return a verdict after the allowed retry, the question is marked as `UNVALIDATED`. An unvalidated question is treated as a validator failure, not a question-quality failure, and is not sent to repair.
+
+Only questions with an identified content defect are eligible for targeted repair.
 
 The validator checks for issues such as:
 
@@ -233,6 +284,9 @@ The tests cover core components including:
 * exam generation
 * validation and repair
 * API behavior
+* evaluation telemetry and aggregation
+* validator batching and verdict coverage
+* Eval Dashboard API and frontend behavior
 
 ## Author
 
