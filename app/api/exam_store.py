@@ -15,7 +15,6 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from copy import deepcopy
 from typing import Any
 
 # How long a stored exam stays retrievable (seconds).
@@ -43,8 +42,7 @@ def _evict_expired(now: float) -> None:
 
 def save_exam(exams: list[dict[str, Any]], warnings: list[str] | None = None,
               document_id: str | None = None,
-              metadata: dict[str, Any] | None = None,
-              eval_stats: dict[str, Any] | None = None) -> str:
+              metadata: dict[str, Any] | None = None) -> str:
     """Store a final validated exam result and return its new exam_id."""
     exam_id = f"exam_{uuid.uuid4().hex[:12]}"
     with _lock:
@@ -60,7 +58,6 @@ def save_exam(exams: list[dict[str, Any]], warnings: list[str] | None = None,
             "exams": exams,
             "warnings": list(warnings or []),
             "metadata": dict(metadata or {}),
-            "eval": deepcopy(eval_stats or {}),
         }
     return exam_id
 
@@ -73,14 +70,6 @@ def get_exam(exam_id: str) -> dict[str, Any]:
     if entry is None:
         raise ExamNotFound(f"Unknown or expired exam_id: {exam_id}")
     return entry
-
-
-def list_exams() -> list[dict[str, Any]]:
-    """Return detached stored exam records, newest first, for read-only summaries."""
-    with _lock:
-        _evict_expired(time.time())
-        entries = sorted(_exams.values(), key=lambda entry: entry["created_at"], reverse=True)
-        return deepcopy(entries)
 
 
 def clear() -> None:

@@ -46,6 +46,10 @@ EMBEDDING_DIM: int = int(_env("EMBEDDING_DIM", "1024") or "1024")
 UPLOAD_DIR: str = _env("UPLOAD_DIR", "data/uploads") or "data/uploads"
 REGISTRY_FILE: str = _env("REGISTRY_FILE", "data/documents.json") or "data/documents.json"
 
+# PostgreSQL is the durable source for evaluation history.  It is optional at
+# runtime so a telemetry outage never prevents the core exam-generation flow.
+DATABASE_URL: str | None = _env("DATABASE_URL")
+
 LOG_LEVEL: str = _env("LOG_LEVEL", "INFO") or "INFO"
 
 # --- Google Forms export (optional, downstream of generation) ---------------

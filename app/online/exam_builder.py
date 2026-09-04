@@ -878,6 +878,7 @@ def _repair_shortfalls(
     language: str = "en",
     max_passes: int = 2,
     appended_by_type: dict[str, int] | None = None,
+    eval_stats: dict[str, Any] | None = None,
 ) -> list[str]:
     """Minimal-diff count repair of one exam's questions.
 
@@ -924,6 +925,7 @@ def _repair_shortfalls(
             bundle, bwarn = _generate_obj_bundle(
                 obj_planned, context, difficulty, model_number,
                 within_model, seen, previous_questions, language=language,
+                eval_stats=eval_stats,
             )
             warnings.extend(bwarn)
             for q, m in obj_missing.items():
@@ -944,6 +946,7 @@ def _repair_shortfalls(
             new_questions, twarn = _generate_type_from_plan(
                 q, planned, context, difficulty, model_number,
                 seen, within_model, previous_questions, language=language,
+                eval_stats=eval_stats,
             )
             warnings.extend(twarn)
             added = new_questions[:m]
@@ -1119,6 +1122,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             previous_questions,
             language=language,
             appended_by_type=shortfall_appended,
+            eval_stats=eval_stats,
         )
         model_warnings.extend(repair_warnings)
         for section_key, section_val in questions.items():

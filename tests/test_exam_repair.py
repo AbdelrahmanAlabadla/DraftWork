@@ -6,6 +6,14 @@ missing amount, extra -> remove only the extra amount, correct -> untouched.
 from __future__ import annotations
 
 import app.online.exam_builder as eb
+from app.api.evaluation_store import evaluation_row
+from app.online.eval_stats import (
+    create_pipeline_eval,
+    public_eval,
+    record_generation_rejection,
+    record_initial_generation_counts,
+    record_shortfall_result,
+)
 
 
 def _mcq(text: str = "M?") -> dict:
@@ -68,6 +76,65 @@ def test_missing_fills_exact_amount(monkeypatch):
     assert appended == {"short_answer": 1}
 
 
+def test_shortfall_rejections_reach_model_overall_and_persistence(monkeypatch):
+    stats = create_pipeline_eval([("essay", 1)], 1)
+    record_initial_generation_counts(stats, 1, {"essay": 0})
+    generated = {
+        "question": "Explain static and dynamic data.",
+        "reference_answer": "Static data is fixed; dynamic data changes.",
+        "key_points": ["static", "dynamic"],
+    }
+
+    def _fake_gen(qtype, planned, *args, eval_stats=None, **kwargs):
+        assert qtype == "essay"
+        assert len(planned) == 1
+        assert eval_stats is stats
+        record_generation_rejection(
+            eval_stats, 1, qtype, "near_duplicate"
+        )
+        record_generation_rejection(
+            eval_stats, 1, qtype, "forbidden_content"
+        )
+        return [generated], []
+
+    monkeypatch.setattr(eb, "_generate_type_from_plan", _fake_gen)
+    questions = {"essay": []}
+    appended = {}
+    eb._repair_shortfalls(
+        questions,
+        [("essay", 1)],
+        {"essay": [{"topic": "data", "concept_to_test": "data types"}]},
+        "context",
+        "easy",
+        1,
+        set(),
+        [],
+        [],
+        max_passes=1,
+        appended_by_type=appended,
+        eval_stats=stats,
+    )
+    record_shortfall_result(stats, 1, questions, appended)
+
+    assert questions == {"essay": [generated]}
+    assert appended == {"essay": 1}
+    result = public_eval(stats)
+    expected_reasons = {"near_duplicate": 1, "forbidden_content": 1}
+    assert result["models"]["1"]["generation_rejected"] == 2
+    assert result["models"]["1"]["generation_rejection_reasons"] == expected_reasons
+    assert result["overall"]["generation_rejected"] == 2
+    assert result["overall"]["generation_rejection_reasons"] == expected_reasons
+
+    row = evaluation_row("exam_shortfall", result, 1, 1)
+    assert row["generation_rejected"] == 2
+    assert row["generation_rejection_reasons"] == expected_reasons
+    assert row["model_performance"]["1"]["generation_rejected"] == 2
+    assert (
+        row["question_type_performance"]["essay"]["generation_rejection_reasons"]
+        == expected_reasons
+    )
+
+
 def test_grounded_fallback_not_blank(monkeypatch):
     """When the plan is empty, the repair must NOT send a blank concept."""
     captured = {}
@@ -89,9 +156,11 @@ def test_grounded_fallback_not_blank(monkeypatch):
 
 def test_fitb_missing_regenerated_full(monkeypatch):
     captured = {}
+    stats = create_pipeline_eval([("fill_in_the_blank", 3)], 1)
 
     def _fake_bundle(planned, *a, **k):
         captured["planned"] = planned
+        captured["eval_stats"] = k.get("eval_stats")
         # produce a full valid fitb for the requested count
         return {"fill_in_the_blank": {"word_bank": [f"t{i}" for i in range(3)] + ["d1", "d2"], "items": [
             {"question": f"___ {i}", "answers": [f"t{i}"]} for i in range(3)]}, "mcq": [], "true_false": []}, []
@@ -99,9 +168,13 @@ def test_fitb_missing_regenerated_full(monkeypatch):
     monkeypatch.setattr(eb, "_generate_obj_bundle", _fake_bundle)
     questions = {}
     tasks = [("fill_in_the_blank", 3)]
-    eb._repair_shortfalls(questions, tasks, {}, "", "easy", 1, set(), [], [], max_passes=2)
+    eb._repair_shortfalls(
+        questions, tasks, {}, "", "easy", 1, set(), [], [],
+        max_passes=2, eval_stats=stats,
+    )
     assert len(questions["fill_in_the_blank"]["items"]) == 3
     assert len(questions["fill_in_the_blank"]["word_bank"]) == 5
+    assert captured["eval_stats"] is stats
 
 
 def test_persistent_shortfall_warns(monkeypatch):

@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.responses import JSONResponse
 
 from app import config
+from app import db
 from app.api.auth_routes import router as auth_router
 from app.api.export_routes import router as export_router
 from app.api.routes import router
@@ -35,7 +36,13 @@ def _preload_models() -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     threading.Thread(target=_preload_models, daemon=True).start()
-    yield
+    # Evaluation persistence is secondary to generation: connection failures
+    # are logged by the database layer and never prevent application startup.
+    db.open_pool(wait=True)
+    try:
+        yield
+    finally:
+        db.close_pool()
 
 app = FastAPI(
     title="ExamGen AI",

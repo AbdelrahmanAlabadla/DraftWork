@@ -10,17 +10,14 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 from app.api import storage as registry
-from app.api import exam_store
+from app.api import evaluation_store, exam_store
+from app import db
 from app.config import UPLOAD_DIR
 from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
 from app.offline.structure_store import load_structure
 from app.online.exam_builder import generate_exams
-from app.online.eval_stats import (
-    add_derived_rates,
-    aggregate_persisted_evals,
-    derived_rates,
-)
+from app.online.eval_stats import section_items
 
 logger = get_logger("API")
 
@@ -43,53 +40,12 @@ _NUM_MODELS_MAX = 4
 
 @router.get("/api/eval-summary")
 def eval_summary() -> dict[str, Any]:
-    """Return a read-only aggregate of all currently stored exam telemetry."""
-    records = exam_store.list_exams()
-    aggregated = aggregate_persisted_evals(
-        record.get("eval") or {} for record in records
-    )
-    overall = add_derived_rates(aggregated["overall"])
-    models = {
-        str(model_number): add_derived_rates(model)
-        for model_number, model in aggregated["models"].items()
-    }
-
-    recent: list[dict[str, Any]] = []
-    for record in records[:20]:
-        bucket = (record.get("eval") or {}).get("overall") or {}
-        rates = derived_rates(bucket)
-        final_missing = int(bucket.get("final_missing_or_invalid", 0) or 0)
-        recent.append(
-            {
-                "exam_id": record.get("exam_id"),
-                "generated_at": datetime.fromtimestamp(
-                    float(record.get("created_at", 0)), tz=timezone.utc
-                ).isoformat(),
-                "requested": int(bucket.get("requested_questions", 0) or 0),
-                "first_pass_rate": rates["first_validation_pass_rate"],
-                "repairs_sent": int(bucket.get("repair_sent", 0) or 0),
-                "final_success_rate": rates["final_success_rate"],
-                "status": (
-                    "Healthy"
-                    if bucket and final_missing == 0
-                    else "Needs attention"
-                    if bucket
-                    else "No telemetry"
-                ),
-            }
-        )
-
-    return {
-        "total_exam_runs": len(records),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-        "overall": overall,
-        "rates": overall["rates"],
-        "generation_rejection_reasons": overall["generation_rejection_reasons"],
-        "validation_failure_reasons": overall["validation_failure_reasons"],
-        "validator_failure_reasons": overall["validator_failure_reasons"],
-        "models": models,
-        "recent_exam_runs": recent,
-    }
+    """Return a read-only aggregate of persisted evaluation telemetry."""
+    try:
+        return evaluation_store.load_eval_summary()
+    except db.DatabaseUnavailable as exc:
+        logger.warning("Evaluation dashboard database unavailable | error=%s", exc)
+        raise HTTPException(status_code=503, detail="Evaluation telemetry is temporarily unavailable")
 
 
 class GenerateRequest(BaseModel):
@@ -312,8 +268,25 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         warnings,
         document_id=document_id,
         metadata=metadata,
-        eval_stats=eval_stats,
     )
+
+    # Evaluation history is deliberately best-effort.  The generated exam is
+    # already available to every export path before PostgreSQL is attempted.
+    try:
+        evaluation_store.save_evaluation(
+            exam_id=exam_id,
+            eval_stats=eval_stats,
+            models_count=num_models,
+            questions_requested_per_model=sum(count for _, count in tasks),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Evaluation telemetry was not saved | exam_id=%s | database_error=%s: %s",
+            exam_id,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
 
     logger.info(
         "Exam generation completed | document_id=%s | exam_id=%s | models=%d | difficulty=%s | types=%s | "
@@ -323,7 +296,11 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         num_models,
         difficulty,
         list(exams[0]["questions"].keys()),
-        sum(len(q) for e in exams for q in e["questions"].values()),
+        sum(
+            len(section_items(section))
+            for exam in exams
+            for section in exam["questions"].values()
+        ),
         total_elapsed,
     )
 

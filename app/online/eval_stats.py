@@ -125,7 +125,7 @@ def record_generation_rejection(
     reason: str,
     count: int = 1,
 ) -> None:
-    """Record raw initial-generation candidates rejected by existing filters."""
+    """Record raw generation candidates rejected by existing filters."""
     if stats is None or count <= 0:
         return
     counters = _type_counts(stats, model_number, qtype)
@@ -341,37 +341,6 @@ def public_eval(stats: dict[str, Any] | None) -> dict[str, Any]:
         "overall": deepcopy(stats["overall"]),
         "models": deepcopy(stats["models"]),
     }
-
-
-def _sum_bucket(target: dict[str, Any], source: dict[str, Any]) -> None:
-    for field in COUNT_FIELDS:
-        target[field] += int(source.get(field, 0) or 0)
-    for field in REASON_FIELDS:
-        for reason, count in (source.get(field) or {}).items():
-            target[field][reason] = target[field].get(reason, 0) + int(count or 0)
-
-
-def aggregate_persisted_evals(eval_objects: Iterable[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate stored public eval objects without mutating any stored record."""
-    overall = {**_empty_counts(), "question_types": {}}
-    models: dict[str, Any] = {}
-    for stats in eval_objects:
-        if not isinstance(stats, dict):
-            continue
-        source_overall = stats.get("overall") or {}
-        _sum_bucket(overall, source_overall)
-        for qtype, source in (source_overall.get("question_types") or {}).items():
-            target = overall["question_types"].setdefault(qtype, _empty_counts())
-            _sum_bucket(target, source)
-        for model_key, source_model in (stats.get("models") or {}).items():
-            model = models.setdefault(
-                str(model_key), {**_empty_counts(), "question_types": {}}
-            )
-            _sum_bucket(model, source_model)
-            for qtype, source in (source_model.get("question_types") or {}).items():
-                target = model["question_types"].setdefault(qtype, _empty_counts())
-                _sum_bucket(target, source)
-    return {"overall": overall, "models": models}
 
 
 def safe_rate(numerator: int, denominator: int) -> float | None:
