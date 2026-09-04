@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import io
 import json
+import logging
 import re
+import zipfile
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.logging_conf import configure_logging
@@ -14,6 +18,12 @@ from app.api import exam_store  # noqa: E402
 from app.llm.json_utils import extract_json  # noqa: E402
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _disable_real_eval_persistence(monkeypatch):
+    """API unit tests must not depend on the developer's PostgreSQL instance."""
+    monkeypatch.setattr("app.api.routes.evaluation_store.save_evaluation", lambda **kwargs: None)
 
 _COUNT_RE = re.compile(r"Create exactly (\d+)")
 _PLANNER_MODELS_RE = re.compile(r"Plan exam questions for (\d+)")
@@ -322,7 +332,7 @@ def test_generate_stores_print_metadata(monkeypatch):
     assert stored["metadata"]["class_name"] == "12B"
 
 
-def test_generate_returns_same_eval_that_is_stored(monkeypatch):
+def test_generate_returns_eval_without_duplicating_it_in_export_store(monkeypatch):
     _install_registry_and_store(monkeypatch)
     eval_stats = {
         "overall": {"requested_questions": 1, "final_valid": 1},
@@ -355,7 +365,137 @@ def test_generate_returns_same_eval_that_is_stored(monkeypatch):
     data = resp.json()
     stored = exam_store.get_exam(data["exam_id"])
     assert data["eval"] == eval_stats
-    assert stored["eval"] == eval_stats
+    assert "eval" not in stored
+
+
+def test_generate_log_counts_fitb_items_across_all_models(monkeypatch, caplog):
+    _install_registry_and_store(monkeypatch)
+    eval_stats = {
+        "overall": {"requested_questions": 7, "final_valid": 7},
+        "models": {
+            "1": {"requested_questions": 3, "final_valid": 3},
+            "2": {"requested_questions": 4, "final_valid": 4},
+        },
+    }
+    exams = [
+        {
+            "model_number": 1,
+            "questions": {
+                "mcq": [{"question": "M1"}],
+                "fill_in_the_blank": {
+                    "word_bank": ["a", "b", "c", "d"],
+                    "items": [{"question": "F1"}, {"question": "F2"}],
+                },
+            },
+            "markdown": "model 1",
+            "warnings": [],
+        },
+        {
+            "model_number": 2,
+            "questions": {
+                "essay": [{"question": "E1"}],
+                "fill_in_the_blank": {
+                    "word_bank": ["e", "f", "g", "h", "i"],
+                    "items": [
+                        {"question": "F3"},
+                        {"question": "F4"},
+                        {"question": "F5"},
+                    ],
+                },
+            },
+            "markdown": "model 2",
+            "warnings": [],
+        },
+    ]
+    monkeypatch.setattr(
+        "app.api.routes.generate_exams",
+        lambda *args, **kwargs: {
+            "exams": exams,
+            "warnings": [],
+            "document_language": "en",
+            "eval": eval_stats,
+        },
+    )
+
+    with caplog.at_level(logging.INFO, logger="API"):
+        response = client.post(
+            "/generate",
+            json={
+                "document_id": "doc-x",
+                "mcq_count": 1,
+                "fitb_count": 2,
+                "num_models": 2,
+                "child_ids": ["c1"],
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["exams"] == exams
+    assert exam_store.get_exam(data["exam_id"])["exams"] == exams
+    assert any(
+        "Exam generation completed" in record.message
+        and "total_questions=7" in record.message
+        for record in caplog.records
+    )
+
+
+def test_eval_insert_failure_keeps_successful_exam_available(monkeypatch, caplog):
+    _install_registry_and_store(monkeypatch)
+    eval_stats = {
+        "overall": {"requested_questions": 1, "final_valid": 1},
+        "models": {"1": {"requested_questions": 1, "final_valid": 1}},
+    }
+    exams = [{
+        "model_number": 1,
+        "questions": {"mcq": [{
+            "question_id": "model1_mcq_1", "question": "Q?",
+            "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+            "correct_answer": "A",
+        }]},
+        "markdown": "## Multiple Choice",
+        "warnings": [],
+    }]
+    monkeypatch.setattr(
+        "app.api.routes.generate_exams",
+        lambda *args, **kwargs: {
+            "exams": exams, "warnings": [], "document_language": "en", "eval": eval_stats,
+        },
+    )
+    monkeypatch.setattr(
+        "app.api.routes.evaluation_store.save_evaluation",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("database offline")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="API"):
+        response = client.post(
+            "/generate", json={"document_id": "doc-x", "mcq_count": 1, "child_ids": ["c1"]}
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["exams"] == exams
+    assert data["eval"] == eval_stats
+    assert exam_store.get_exam(data["exam_id"])["exams"] == exams
+    assert "database offline" not in response.text
+    monkeypatch.setattr(
+        "app.api.export_routes.render_exam_pdf",
+        lambda exam, metadata: b"%PDF-test",
+    )
+    monkeypatch.setattr(
+        "app.api.export_routes.render_answers_pdf",
+        lambda exam, metadata: b"%PDF-answers-test",
+    )
+    export_response = client.post(f"/exams/{data['exam_id']}/export/pdf")
+    assert export_response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(export_response.content)) as archive:
+        assert archive.namelist() == ["Exam_Model_1.pdf", "Answers_Exam_Model_1.pdf"]
+    assert any(
+        "Evaluation telemetry was not saved" in record.message
+        and data["exam_id"] in record.message
+        and "database offline" in record.message
+        for record in caplog.records
+    )
 
 
 def test_generate_html_payload_multiple_types(monkeypatch):
