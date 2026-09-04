@@ -30,6 +30,7 @@ The system combines document parsing, semantic chunking, embeddings, selected-se
 * Track generation, validation, repair, and final outcome telemetry
 * Review overall and per-model performance in a read-only Eval Dashboard
 * Separate question-quality failures from validator operational failures
+* Export each exam model and its answer key as separate PDF or DOCX files
 
 ## Application
 
@@ -84,6 +85,7 @@ DraftWork includes a read-only Eval Dashboard for monitoring the quality and beh
 
 The dashboard tracks:
 
+* exam runs, counted as the total number of generated models
 * questions requested
 * questions generated on the first attempt
 * missing questions and shortfall recovery
@@ -116,7 +118,28 @@ GET /api/eval-summary
 
 The dashboard refreshes automatically every 30 seconds and can also be refreshed manually.
 
-> Telemetry is currently stored in application memory. Restarting the server clears the recorded exam-run history.
+Evaluation history is stored persistently in PostgreSQL. Each database row represents one generation request, which may contain more than one exam model. For that reason, **Exam Runs** is the total number of generated models across all stored requests, rather than simply the number of database rows. Dashboard totals and rates are calculated from the saved raw counters.
+
+Generated exam content is handled separately. It remains in the application's temporary in-memory store for up to one hour so PDF, DOCX, and Google Forms exports can use it. Restarting the server clears this temporary exam content, but it does not clear the PostgreSQL evaluation history.
+
+Saving evaluation telemetry is best-effort. If PostgreSQL is temporarily unavailable, the generated exam is still returned to the teacher and remains available for export, but that generation run may not appear in the Eval Dashboard.
+
+### 06 — Export Exams
+
+PDF and DOCX exports are downloaded as `SmartExam_Export.zip`. Every selected model produces two separate documents: one student exam file and one teacher answer file. Answers are never appended to the exam document, and different exam models are never merged into one document.
+
+When one model was generated, DraftWork starts the export without showing a model-selection dialog and packages the exam and answer file together in the ZIP. When several models were generated, the teacher selects which models to export. The matching answer file is included automatically for every selected model.
+
+Export filenames use the **Exam Title** and **Class** entered under Printed Exam Details. For example:
+
+```text
+Biology_Midterm_Grade_10_Model_1.pdf
+Answers_Biology_Midterm_Grade_10_Model_1.pdf
+```
+
+If only one of those details is present, the filename uses that value. If neither is present, DraftWork falls back to `Exam_Model_1.pdf` and `Answers_Exam_Model_1.pdf`. The same naming rules apply to DOCX exports.
+
+Google Forms export continues to create a separate form for each exam model and is not packaged into the downloadable ZIP.
 
 ## Sample Generated Exam
 
@@ -129,9 +152,9 @@ The generated exam includes:
 * True / False questions
 * Short Answer questions
 * Essay questions
-* A complete teacher answer key
+* A separate teacher answer file
 
-You can view the generated exam in either format:
+You can view examples of the generated document formatting in either format:
 
 * [View Generated IT Exam — PDF](output/pdf/exam_exam_430306ff4a9f_matched.pdf)
 * [View Generated IT Exam — DOCX](output/docx/exam_exam_430306ff4a9f_matched.docx)
@@ -219,7 +242,8 @@ This keeps already-valid questions unchanged and reduces unnecessary LLM regener
 | Backend API            | FastAPI                      |
 | Workflow Orchestration | LangGraph                    |
 | Embeddings             | FlagEmbedding / Transformers |
-| Vector Database        | Qdrant                       |
+| Vector/Document Retrieval | Qdrant                    |
+| Evaluation History     | PostgreSQL                   |
 | ML Runtime             | PyTorch                      |
 | PDF Parsing            | LlamaParse                   |
 | Validation             | Pydantic + custom validation |
@@ -254,7 +278,17 @@ Install dependencies:
 pip install -r requirements.txt
 ```
 
-Create a `.env` file from `.env.example` and configure the required model and API settings.
+Create a `.env` file from `.env.example` and configure the required model and API settings. Set the PostgreSQL connection with your own local credentials:
+
+```text
+DATABASE_URL=postgresql://postgres:your_password@localhost:1966/draftwork
+```
+
+Create the `draftwork` database if needed, then apply the evaluation-history migration:
+
+```bash
+psql "postgresql://postgres:your_password@localhost:1966/draftwork" -f migrations/001_create_evaluation_runs.sql
+```
 
 Start Qdrant:
 
@@ -265,7 +299,7 @@ docker run -p 6333:6333 qdrant/qdrant
 Run the application:
 
 ```bash id="fb7ho3"
-python run.py
+.venv\Scripts\python.exe -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 ```
 
 ## Tests
@@ -284,9 +318,12 @@ The tests cover core components including:
 * exam generation
 * validation and repair
 * API behavior
-* evaluation telemetry and aggregation
+* PostgreSQL evaluation persistence and aggregation
+* best-effort telemetry failure handling
 * validator batching and verdict coverage
 * Eval Dashboard API and frontend behavior
+* per-model ZIP exports with separate exam and answer files
+* export model selection and safe metadata-based filenames
 
 ## Author
 
