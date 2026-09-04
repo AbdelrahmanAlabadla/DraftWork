@@ -219,6 +219,25 @@
     </div>
   </div>
 
+  <dialog class="export-model-dialog" id="exportModelDialog" aria-labelledby="exportModelTitle">
+    <form method="dialog" class="export-model-card">
+      <div class="export-model-heading">
+        <div>
+          <div class="section-label">Export</div>
+          <h3 id="exportModelTitle">Select models to export</h3>
+        </div>
+        <button class="export-model-close" value="cancel" aria-label="Close">&times;</button>
+      </div>
+      <div class="export-model-list" id="exportModelList"></div>
+      <div class="export-model-error" id="exportModelError" role="alert"></div>
+      <p class="export-model-note">An answer file is automatically included with every selected model.</p>
+      <div class="export-model-actions">
+        <button class="copy-btn" value="cancel">Cancel</button>
+        <button class="generate-btn export-model-confirm" id="exportModelConfirm" type="button">Export selected</button>
+      </div>
+    </form>
+  </dialog>
+
   <script type="module" src="js/main.js"></script>
   <script>
     // Failsafe: if the module graph didn't boot (file:// open, server down,

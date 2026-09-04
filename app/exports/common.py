@@ -6,6 +6,7 @@ not the markdown rendering — is the single source of truth for exports.
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.online.models import TYPE_LABELS, TYPE_ORDER
@@ -80,10 +81,47 @@ SHORT_ANSWER_RESPONSE_LINES = 3
 ESSAY_RESPONSE_LINES = 22
 RESPONSE_LINE_TEXT = "_" * 92
 
+_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_FILENAME_WHITESPACE = re.compile(r"\s+")
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{number}" for number in range(1, 10)),
+    *(f"LPT{number}" for number in range(1, 10)),
+}
+
 
 def response_line_count(qtype: str) -> int:
     """Return the fixed number of student writing lines for an open question."""
     return SHORT_ANSWER_RESPONSE_LINES if qtype == "short_answer" else ESSAY_RESPONSE_LINES
+
+
+def safe_filename_part(value: object, *, max_length: int = 80) -> str:
+    """Return a readable filename component safe on Windows, macOS, and Linux."""
+    text = _UNSAFE_FILENAME_CHARS.sub("", str(value or "").strip())
+    text = _FILENAME_WHITESPACE.sub("_", text)
+    text = re.sub(r"_+", "_", text).strip(" ._")
+    text = text[:max_length].rstrip(" ._")
+    if text.upper() in _WINDOWS_RESERVED_NAMES:
+        text += "_"
+    return text
+
+
+def document_export_filenames(
+    metadata: dict[str, Any], model_number: int, extension: str
+) -> tuple[str, str]:
+    """Build matching student/answer filenames from printed exam metadata."""
+    parts = [
+        part
+        for part in (
+            safe_filename_part(metadata.get("exam_title")),
+            safe_filename_part(metadata.get("class_name")),
+        )
+        if part
+    ]
+    prefix = "_".join(parts) if parts else "Exam"
+    ext = extension.lower().lstrip(".")
+    base = f"{prefix}_Model_{int(model_number)}"
+    return f"{base}.{ext}", f"Answers_{base}.{ext}"
 
 
 def flatten_exam_items(questions: dict[str, Any]) -> list[dict[str, Any]]:

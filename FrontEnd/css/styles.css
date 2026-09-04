@@ -1180,6 +1180,106 @@
   color: var(--muted2);
 }
 
+/* ---- Downloadable export model selection ---- */
+.export-model-dialog {
+  width: min(440px, calc(100vw - 32px));
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+}
+
+.export-model-dialog::backdrop {
+  background: rgba(3, 7, 18, 0.78);
+  backdrop-filter: blur(3px);
+}
+
+.export-model-card {
+  padding: 22px;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 12px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+}
+
+.export-model-heading,
+.export-model-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.export-model-heading h3 {
+  margin: 4px 0 0;
+  font-size: 19px;
+}
+
+.export-model-close {
+  padding: 2px 8px;
+  color: var(--muted2);
+  background: transparent;
+  border: 0;
+  font-size: 26px;
+  cursor: pointer;
+}
+
+.export-model-list {
+  display: grid;
+  gap: 8px;
+  margin: 20px 0 10px;
+}
+
+.export-model-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 11px 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.export-model-option:has(input:checked) {
+  border-color: var(--accent);
+  background: var(--accent-dim);
+}
+
+.export-model-option input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.export-model-note,
+.export-model-error {
+  margin: 10px 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--muted2);
+}
+
+.export-model-error {
+  min-height: 1.5em;
+  color: var(--danger);
+}
+
+.export-model-actions {
+  justify-content: flex-end;
+  margin-top: 18px;
+}
+
+.export-model-confirm {
+  width: auto;
+  margin: 0;
+  padding: 9px 16px;
+  font-size: 12px;
+}
+
 /* ---- Forms links + export status inside exam output ---- */
 .forms-links {
   margin-top: 14px;

@@ -458,10 +458,12 @@ def _draw_answer_key(
             pdf.ln(1.5)
 
 
-def render_exam_pdf(stored_record: dict[str, Any]) -> bytes:
-    """Render all stored exam models to a compact student PDF + teacher key."""
+def _render_model_pdf(
+    exam: dict[str, Any], metadata: dict[str, Any], *, answers: bool
+) -> bytes:
+    """Render one model as either a student exam or a standalone answer key."""
     global _UNICODE_OUTPUT, BODY_FONT
-    metadata = dict(stored_record.get("metadata") or {})
+    metadata = dict(metadata or {})
     language = str(metadata.get("document_language") or "en")
     has_unicode = _register_arabic_font()
     try:
@@ -481,13 +483,26 @@ def render_exam_pdf(stored_record: dict[str, Any]) -> bytes:
             BODY_FONT = "helvetica"
             _UNICODE_OUTPUT = False
 
-        for exam in stored_record.get("exams") or []:
-            if not exam.get("questions"):
-                continue
+        if exam.get("questions"):
             model_number = int(exam.get("model_number") or 1)
-            sections = _draw_student_exam(pdf, exam, metadata)
-            _draw_answer_key(pdf, sections, metadata, model_number)
+            if answers:
+                sections = group_exam_sections(
+                    exam.get("questions") or {}, language=language
+                )
+                _draw_answer_key(pdf, sections, metadata, model_number)
+            else:
+                _draw_student_exam(pdf, exam, metadata)
 
         return bytes(pdf.output())
     finally:
         _UNICODE_OUTPUT = False
+
+
+def render_exam_pdf(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
+    """Render one model's student exam without any answer-key pages."""
+    return _render_model_pdf(exam, metadata, answers=False)
+
+
+def render_answers_pdf(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
+    """Render one model's answer key as a separate PDF."""
+    return _render_model_pdf(exam, metadata, answers=True)

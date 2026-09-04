@@ -2,6 +2,8 @@ import { postJSON } from "./api.js";
 import { state } from "./state.js";
 
 const FORMS_LABEL = "Google Forms";
+const EXPORT_ARCHIVE_NAME = "SmartExam_Export.zip";
+let pendingDocumentKind = null;
 
 function setStatus(type, msg) {
   const bar = document.getElementById("exportStatus");
@@ -35,31 +37,71 @@ export function initExport() {
         return;
       }
       const kind = item.dataset.export;
-      if (kind === "pdf") exportPdf();
-      else if (kind === "docx") exportDocx();
+      if (kind === "pdf" || kind === "docx") beginDocumentExport(kind);
       else if (kind === "google-forms") exportForms();
     });
   });
+
+  document.getElementById("exportModelConfirm").addEventListener("click", () => {
+    const selected = [...document.querySelectorAll(
+      "#exportModelList input[type='checkbox']:checked"
+    )].map((input) => Number(input.value));
+    if (!selected.length) {
+      document.getElementById("exportModelError").textContent =
+        "Select at least one model.";
+      return;
+    }
+    const kind = pendingDocumentKind;
+    document.getElementById("exportModelDialog").close();
+    if (kind) exportDocumentArchive(kind, selected);
+  });
 }
 
-async function exportPdf() {
-  setStatus("loading", "Creating PDF...");
-  try {
-    await triggerDownload(`/exams/${state.examId}/export/pdf`, `exam_${state.examId}.pdf`);
-    setStatus("success", "PDF downloaded.");
-  } catch (e) {
-    setStatus("error", e.message);
+function availableModelNumbers() {
+  return (state.exams || []).map((exam, index) =>
+    Number(exam.model_number || index + 1)
+  );
+}
+
+function beginDocumentExport(kind) {
+  const models = availableModelNumbers();
+  if (!models.length) {
+    setStatus("error", "Generate an exam before exporting.");
+    return;
   }
+  if (models.length === 1) {
+    exportDocumentArchive(kind, models);
+    return;
+  }
+
+  pendingDocumentKind = kind;
+  document.getElementById("exportModelError").textContent = "";
+  document.getElementById("exportModelList").replaceChildren(
+    ...models.map((modelNumber) => {
+      const label = document.createElement("label");
+      label.className = "export-model-option";
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = String(modelNumber);
+      const text = document.createElement("span");
+      text.textContent = `Model ${modelNumber}`;
+      label.append(checkbox, text);
+      return label;
+    })
+  );
+  document.getElementById("exportModelDialog").showModal();
 }
 
-async function exportDocx() {
-  setStatus("loading", "Creating DOCX...");
+async function exportDocumentArchive(kind, modelNumbers) {
+  const label = kind.toUpperCase();
+  setStatus("loading", `Creating ${label} export...`);
   try {
     await triggerDownload(
-      `/exams/${state.examId}/export/docx`,
-      `exam_${state.examId}.docx`
+      `/exams/${state.examId}/export/${kind}`,
+      EXPORT_ARCHIVE_NAME,
+      { model_numbers: modelNumbers }
     );
-    setStatus("success", "DOCX downloaded.");
+    setStatus("success", `${label} ZIP downloaded.`);
   } catch (e) {
     setStatus("error", e.message);
   }
@@ -106,8 +148,13 @@ async function exportForms() {
   }
 }
 
-async function triggerDownload(path, filename) {
-  const res = await fetch(`http://127.0.0.1:8000${path}`, { method: "POST" });
+async function triggerDownload(path, filename, body = null) {
+  const options = { method: "POST" };
+  if (body !== null) {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
+  }
+  const res = await fetch(`http://127.0.0.1:8000${path}`, options);
   if (!res.ok) {
     let detail = `Export failed (HTTP ${res.status}).`;
     try {

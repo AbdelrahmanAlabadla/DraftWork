@@ -3,8 +3,8 @@ import io
 
 from app.api import exam_store
 from app.exports.common import flatten_exam_items
-from app.exports.pdf_exporter import render_exam_pdf
-from app.exports.docx_exporter import render_exam_docx
+from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
+from app.exports.docx_exporter import render_answers_docx, render_exam_docx
 from app.integrations.google_forms import client
 from app.integrations.google_forms.exporter import export_exam
 
@@ -38,16 +38,24 @@ assert loaded["exams"][0]["model_number"] == 1
 print("store OK ->", eid)
 
 # 2. PDF
-pdf = render_exam_pdf(loaded)
+stored_model = loaded["exams"][0]
+stored_metadata = loaded.get("metadata") or {}
+pdf = render_exam_pdf(stored_model, stored_metadata)
 assert pdf.startswith(b"%PDF") and len(pdf) > 1000
 open("data/smoke_exam.pdf", "wb").write(pdf)
-print(f"PDF OK ({len(pdf)} bytes)")
+pdf_answers = render_answers_pdf(stored_model, stored_metadata)
+assert pdf_answers.startswith(b"%PDF")
+open("data/smoke_answers.pdf", "wb").write(pdf_answers)
+print(f"PDF OK ({len(pdf)} + {len(pdf_answers)} bytes)")
 
 # 3. DOCX
-docx = render_exam_docx(loaded)
+docx = render_exam_docx(stored_model, stored_metadata)
 assert docx[:2] == b"PK"
 open("data/smoke_exam.docx", "wb").write(docx)
-print(f"DOCX OK ({len(docx)} bytes)")
+docx_answers = render_answers_docx(stored_model, stored_metadata)
+assert docx_answers[:2] == b"PK"
+open("data/smoke_answers.docx", "wb").write(docx_answers)
+print(f"DOCX OK ({len(docx)} + {len(docx_answers)} bytes)")
 
 # 4. Google Forms (mocked API)
 created, updated = [], {}

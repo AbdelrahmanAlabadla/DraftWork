@@ -505,10 +505,16 @@ def _render_answer_key(
     model_number: int,
     title: str,
     language: str = "en",
+    *,
+    new_section: bool = True,
 ) -> None:
     rtl = language == "ar"
     labels = _labels(language)
-    section = doc.add_section(WD_SECTION.NEW_PAGE)
+    section = (
+        doc.add_section(WD_SECTION.NEW_PAGE)
+        if new_section
+        else doc.sections[0]
+    )
     _configure_section(section, title, model_number, "Teacher answer key")
     p = doc.add_paragraph()
     p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -528,29 +534,44 @@ def _render_answer_key(
             _set_run_font(run, size=9.5)
 
 
-def render_exam_docx(stored_record: dict[str, Any]) -> bytes:
-    """Render all stored models as compact A4 student exams + teacher keys."""
+def render_exam_docx(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
+    """Render one model's student exam without an answer-key section."""
     doc = Document()
     _configure_styles(doc)
-    metadata = dict(stored_record.get("metadata") or {})
+    metadata = dict(metadata or {})
     language = str(metadata.get("document_language") or "en")
-    rendered_models = 0
-
-    for exam in stored_record.get("exams") or []:
-        if not exam.get("questions"):
-            continue
+    if exam.get("questions"):
         model_number = int(exam.get("model_number") or 1)
         title = _clean(metadata.get("exam_title") or exam.get("title"), "Examination")
-        if rendered_models:
-            section = doc.add_section(WD_SECTION.NEW_PAGE)
-        else:
-            section = doc.sections[0]
+        section = doc.sections[0]
         _configure_section(section, title, model_number, "Student copy")
         _add_exam_header(doc, metadata, model_number, language=language)
         sections = group_exam_sections(exam.get("questions") or {}, language=language)
         _render_student_sections(doc, sections, language=language)
-        _render_answer_key(doc, sections, model_number, title, language=language)
-        rendered_models += 1
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def render_answers_docx(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
+    """Render one model's answer key as a separate DOCX document."""
+    doc = Document()
+    _configure_styles(doc)
+    metadata = dict(metadata or {})
+    language = str(metadata.get("document_language") or "en")
+    if exam.get("questions"):
+        model_number = int(exam.get("model_number") or 1)
+        title = _clean(metadata.get("exam_title") or exam.get("title"), "Examination")
+        sections = group_exam_sections(exam.get("questions") or {}, language=language)
+        _render_answer_key(
+            doc,
+            sections,
+            model_number,
+            title,
+            language=language,
+            new_section=False,
+        )
 
     buf = io.BytesIO()
     doc.save(buf)

@@ -9,8 +9,8 @@ pytest.importorskip("fpdf")
 pytest.importorskip("docx")
 
 from app.exports.common import RESPONSE_LINE_TEXT, flatten_exam_items, group_exam_sections
-from app.exports.docx_exporter import render_exam_docx
-from app.exports.pdf_exporter import render_exam_pdf
+from app.exports.docx_exporter import render_answers_docx, render_exam_docx
+from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
 
 
 def _stored_record() -> dict:
@@ -91,17 +91,26 @@ def test_print_sections_follow_reference_order_and_restart_numbers():
     assert sections[1]["word_bank"] == ["CPU", "RAM", "ROM", "GPU"]
 
 
-def test_pdf_export_contains_exam_and_key():
-    pdf_bytes = render_exam_pdf(_stored_record())
-    assert pdf_bytes.startswith(b"%PDF")
-    assert len(pdf_bytes) > 1000
+def _model_and_metadata() -> tuple[dict, dict]:
+    record = _stored_record()
+    return record["exams"][0], record["metadata"]
+
+
+def test_pdf_export_produces_separate_exam_and_answer_documents():
+    exam, metadata = _model_and_metadata()
+    exam_bytes = render_exam_pdf(exam, metadata)
+    answer_bytes = render_answers_pdf(exam, metadata)
+    assert exam_bytes.startswith(b"%PDF")
+    assert answer_bytes.startswith(b"%PDF")
+    assert len(exam_bytes) > 1000
+    assert len(answer_bytes) > 500
 
 
 def test_pdf_student_copy_has_metadata_and_no_reference_answer_leak():
     pypdf = pytest.importorskip("pypdf")
-    pdf_bytes = render_exam_pdf(_stored_record())
-    text = "\n".join(page.extract_text() or "" for page in pypdf.PdfReader(io.BytesIO(pdf_bytes)).pages)
-    student, answer_key = text.split("Answer Key - Model 1", 1)
+    exam, metadata = _model_and_metadata()
+    pdf_bytes = render_exam_pdf(exam, metadata)
+    student = "\n".join(page.extract_text() or "" for page in pypdf.PdfReader(io.BytesIO(pdf_bytes)).pages)
     assert "Computer Science Final Examination" in student
     assert "Class:" in student and "12A" in student
     assert "Multiple Choice Questions" in student
@@ -109,29 +118,42 @@ def test_pdf_student_copy_has_metadata_and_no_reference_answer_leak():
     assert "True / False" in student
     assert "Short Answer" in student
     assert "Essay" in student
+    assert "Answer Key" not in student
     assert "It speeds up repeated access." not in student
     assert "Long explanation..." not in student
-    assert "It speeds up repeated access." in answer_key
-    assert "Do your best!" not in text
-    assert text.count("Computer Science Final Examination") == 1
+    assert "Do your best!" not in student
+    assert student.count("Computer Science Final Examination") == 1
     # Three short-answer lines plus 22 essay lines, exactly matching DOCX.
     assert student.count(RESPONSE_LINE_TEXT) == 25
 
 
+def test_pdf_answer_file_contains_answers_without_student_exam():
+    pypdf = pytest.importorskip("pypdf")
+    exam, metadata = _model_and_metadata()
+    pdf_bytes = render_answers_pdf(exam, metadata)
+    text = "\n".join(page.extract_text() or "" for page in pypdf.PdfReader(io.BytesIO(pdf_bytes)).pages)
+    assert "Answer Key - Model 1" in text
+    assert "It speeds up repeated access." in text
+    assert "Long explanation..." in text
+    assert RESPONSE_LINE_TEXT not in text
+
+
 def test_pdf_unknown_model_empty_questions_produces_no_pages():
-    out = render_exam_pdf({"exams": [{"model_number": 1, "questions": {}}]})
+    out = render_exam_pdf({"model_number": 1, "questions": {}}, {})
     assert isinstance(out, bytes)
 
 
 def test_docx_export_valid_zip():
-    docx_bytes = render_exam_docx(_stored_record())
+    exam, metadata = _model_and_metadata()
+    docx_bytes = render_exam_docx(exam, metadata)
     # DOCX is a ZIP container
     assert docx_bytes[:2] == b"PK"
     assert len(docx_bytes) > 500
 
 
 def test_docx_uses_a4_half_inch_margins_and_grouped_sections():
-    docx_bytes = render_exam_docx(_stored_record())
+    exam, metadata = _model_and_metadata()
+    docx_bytes = render_exam_docx(exam, metadata)
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
         document_xml = archive.read("word/document.xml").decode("utf-8")
     # A4 is 11906 x 16838 twips; 0.5 inch is 720 twips.
@@ -146,7 +168,8 @@ def test_docx_uses_a4_half_inch_margins_and_grouped_sections():
 
 
 def test_docx_has_page_number_only_and_visible_open_answer_lines():
-    docx_bytes = render_exam_docx(_stored_record())
+    exam, metadata = _model_and_metadata()
+    docx_bytes = render_exam_docx(exam, metadata)
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
         document_xml = archive.read("word/document.xml").decode("utf-8")
         header_xml = "".join(
@@ -159,22 +182,23 @@ def test_docx_has_page_number_only_and_visible_open_answer_lines():
         )
     assert "Computer Science Final Examination" not in header_xml
     assert "Student copy" not in header_xml
+    assert "Answer Key" not in document_xml
+    assert "It speeds up repeated access." not in document_xml
     assert "Do your best!" not in document_xml
     assert "PAGE" in footer_xml and "NUMPAGES" in footer_xml
     # Three short-answer lines plus 22 essay lines. FITB gets no extra rule.
     assert document_xml.count("_" * 92) == 25
 
 
-def test_docx_multi_model_isolated():
-    record = _stored_record()
-    model2 = {"model_number": 2,
-              "questions": {"mcq": [{
-                  "question_id": "model2_mcq_1", "question": "M2 only?",
-                  "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                  "correct_answer": "D"}]}, "markdown": "", "warnings": []}
-    record["exams"].append(model2)
-    docx_bytes = render_exam_docx(record)
-    assert b"word/document.xml" in docx_bytes[:2000] or docx_bytes[:2] == b"PK"
+def test_docx_answer_file_contains_answers_without_student_sections():
+    exam, metadata = _model_and_metadata()
+    docx_bytes = render_answers_docx(exam, metadata)
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    assert "Answer Key - Model 1" in document_xml
+    assert "It speeds up repeated access." in document_xml
+    assert "Long explanation..." in document_xml
+    assert RESPONSE_LINE_TEXT not in document_xml
 
 
 def test_browser_preview_uses_structured_student_and_key_layout():
