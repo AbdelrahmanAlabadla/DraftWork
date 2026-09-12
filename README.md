@@ -253,6 +253,7 @@ This keeps already-valid questions unchanged and reduces unnecessary LLM regener
 | NLP                    | spaCy                        |
 | Testing                | Pytest                       |
 | Frontend               | HTML / JavaScript            |
+| Containers             | Docker Compose               |
 
 ## Setup
 
@@ -356,6 +357,34 @@ Run the application:
 ```bash id="fb7ho3"
 .venv\Scripts\python.exe -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 ```
+
+### Docker Compose quick-start
+
+Copy the example environment file and add your own credentials:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Set `POSTGRES_PASSWORD` and `LLAMA_PARSE_API` in `.env`. Keep
+`LLM_PROVIDER=local` for LM Studio, or set `LLM_PROVIDER=deepseek` and add
+`DEEPSEEK_API_KEY` for DeepSeek. Then build and start the application, PostgreSQL,
+and Qdrant:
+
+```powershell
+docker compose up -d --build
+```
+
+Open DraftWork at `http://localhost:8000`. To follow application logs:
+
+```powershell
+docker compose logs -f app
+```
+
+The Compose configuration expects an NVIDIA-compatible Docker GPU runtime for the
+embedding model. Application data, PostgreSQL data, Qdrant data, and the
+Hugging Face cache use mounted directories or named volumes and survive an app
+container rebuild.
 
 ## Tests
 
