@@ -29,6 +29,35 @@ LMS_API_KEY: str | None = _env("LMS_API_KEY") or None
 # to "off" so reasoning-capable models don't burn output tokens on hidden
 # reasoning content that this pipeline discards anyway.
 LMS_REASONING: str = _env("LMS_REASONING", "off") or "off"
+
+# LLM backend selection. "local" preserves the existing LM Studio behavior;
+# "deepseek" uses the separate DeepSeek API client.
+LLM_PROVIDER: str = (_env("LLM_PROVIDER", "local") or "local").lower()
+if LLM_PROVIDER not in {"local", "deepseek"}:
+    raise ValueError("LLM_PROVIDER must be either 'local' or 'deepseek'")
+
+DEEPSEEK_API_KEY: str | None = _env("DEEPSEEK_API_KEY")
+DEEPSEEK_BASE_URL: str = (
+    _env("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    or "https://api.deepseek.com"
+)
+# V4.1 Flash's official API identifier is the only accepted DeepSeek model.
+DEEPSEEK_MODEL: str = _env("DEEPSEEK_MODEL", "deepseek-flash") or "deepseek-flash"
+if LLM_PROVIDER == "deepseek" and DEEPSEEK_MODEL != "deepseek-flash":
+    raise ValueError("DEEPSEEK_MODEL must be 'deepseek-flash'")
+DEEPSEEK_CONCURRENCY_LIMIT: int = max(
+    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "4") or "4")
+)
+DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: int = max(
+    1, min(3, int(_env("DEEPSEEK_MAX_STRUCTURED_ATTEMPTS", "3") or "3"))
+)
+DEEPSEEK_MAX_TRANSIENT_RETRIES: int = max(
+    0, int(_env("DEEPSEEK_MAX_TRANSIENT_RETRIES", "2") or "2")
+)
+DEEPSEEK_RETRY_BASE_SECONDS: float = max(
+    0.0, float(_env("DEEPSEEK_RETRY_BASE_SECONDS", "1.0") or "1.0")
+)
+ACTIVE_LLM_MODEL: str = DEEPSEEK_MODEL if LLM_PROVIDER == "deepseek" else LMS_MODEL
 # Keep validator requests small enough that local models reliably return one
 # verdict per question.  Missing IDs are retried once in an even smaller request.
 VALIDATOR_BATCH_SIZE: int = max(

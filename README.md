@@ -238,7 +238,7 @@ This keeps already-valid questions unchanged and reduces unnecessary LLM regener
 
 | Component              | Technology                   |
 | ---------------------- | ---------------------------- |
-| Language               | Python                       |
+| Language               | Python 3.11                  |
 | Backend API            | FastAPI                      |
 | Workflow Orchestration | LangGraph                    |
 | Embeddings             | FlagEmbedding / Transformers |
@@ -246,6 +246,9 @@ This keeps already-valid questions unchanged and reduces unnecessary LLM regener
 | Evaluation History     | PostgreSQL                   |
 | ML Runtime             | PyTorch                      |
 | PDF Parsing            | LlamaParse                   |
+| LLM Providers          | LM Studio + DeepSeek V4.1 Flash |
+| DeepSeek API Client    | OpenAI Python SDK / Responses API |
+| Structured Output      | Pydantic v2 + JSON Schema    |
 | Validation             | Pydantic + custom validation |
 | NLP                    | spaCy                        |
 | Testing                | Pytest                       |
@@ -283,6 +286,58 @@ Create a `.env` file from `.env.example` and configure the required model and AP
 ```text
 DATABASE_URL=postgresql://postgres:your_password@localhost:1966/draftwork
 ```
+
+Choose the provider with `LLM_PROVIDER`. The existing local LM Studio backend
+remains the default and does not require any DeepSeek settings:
+
+```text
+LLM_PROVIDER=local
+LMS_URL=http://127.0.0.1:1234
+LMS_MODEL=mistralai/mistral-7b-instruct-v0.3
+LMS_API_KEY=
+LMS_REASONING=off
+TITLE_LMS_URL=http://127.0.0.1:1234/v1
+TITLE_MODEL=mistralai/mistral-7b-instruct-v0.3
+```
+
+To use DeepSeek V4.1 Flash instead, store the key only in the gitignored `.env`
+file and select the DeepSeek provider:
+
+```text
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_real_deepseek_api_key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_CONCURRENCY_LIMIT=4
+DEEPSEEK_MAX_STRUCTURED_ATTEMPTS=3
+DEEPSEEK_MAX_TRANSIENT_RETRIES=2
+DEEPSEEK_RETRY_BASE_SECONDS=1.0
+```
+
+At startup, `python-dotenv` loads `.env` into the process environment. The
+DeepSeek client reads `DEEPSEEK_API_KEY` from that environment and sends it in
+the OpenAI Python SDK. The SDK sends it as a Bearer token to DeepSeek's
+Responses API. Docker Compose also reads the project `.env` file and passes
+these variables to the `app` container; the image never contains the key.
+
+Provider environment variables:
+
+| Variable | Purpose |
+| -------- | ------- |
+| `LLM_PROVIDER` | Selects `local` or `deepseek`; defaults to `local` |
+| `LMS_URL` | LM Studio server URL |
+| `LMS_MODEL` | Model served by LM Studio |
+| `LMS_API_KEY` | Optional bearer token for compatible local endpoints |
+| `LMS_REASONING` | Default local-model reasoning setting |
+| `TITLE_LMS_URL` | Optional LM Studio endpoint used for local title generation |
+| `TITLE_MODEL` | Optional local model used for title generation |
+| `DEEPSEEK_API_KEY` | DeepSeek credential; required only for the DeepSeek provider |
+| `DEEPSEEK_BASE_URL` | DeepSeek API base URL |
+| `DEEPSEEK_MODEL` | DeepSeek model identifier; currently `deepseek-flash` |
+| `DEEPSEEK_CONCURRENCY_LIMIT` | Maximum simultaneous DeepSeek requests |
+| `DEEPSEEK_MAX_STRUCTURED_ATTEMPTS` | Maximum attempts for one structured operation |
+| `DEEPSEEK_MAX_TRANSIENT_RETRIES` | Retries for rate limits, network failures, timeouts, and server errors |
+| `DEEPSEEK_RETRY_BASE_SECONDS` | Initial delay used by exponential backoff |
 
 Create the `draftwork` database if needed, then apply the evaluation-history migration:
 
