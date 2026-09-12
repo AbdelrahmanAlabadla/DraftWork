@@ -25,7 +25,7 @@ from app.config import (
     TITLE_REVIEW_RETRIES,
     TITLE_TEMPERATURE,
 )
-from app.llm.client import LMStudioClient
+from app.llm.factory import create_llm_client
 from app.logging_conf import get_logger
 from app.offline.title_nlp import first_noun_chunk, is_noun_phrase, title_appears_in_text
 
@@ -597,10 +597,14 @@ def _safe_fallback(content: str, max_words: int, min_words: int = 2) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _make_client() -> LMStudioClient:
+def _make_client():
     # Titles always run with reasoning off: qwen3-class models otherwise burn
     # the small title token budget on thinking and return an empty message.
-    return LMStudioClient(url=TITLE_LMS_URL, model=TITLE_MODEL, reasoning="off")
+    return create_llm_client(
+        local_url=TITLE_LMS_URL,
+        local_model=TITLE_MODEL,
+        local_reasoning="off",
+    )
 
 
 def generate_section_title(client=None, content: str = "") -> str:
@@ -811,7 +815,7 @@ def generate_batch_titles(
     return make_titles_unique(titles, contents, fallback_max_words)
 
 
-def make_title_client() -> LMStudioClient:
+def make_title_client():
     """Public factory for the title-generation LLM client."""
     return _make_client()
 

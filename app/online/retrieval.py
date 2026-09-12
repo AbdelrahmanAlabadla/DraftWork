@@ -2,11 +2,7 @@ from __future__ import annotations
 
 import time
 
-from app.config import (
-    GENERATION_CONTEXT_TOKENS,
-    PLANNER_CONTEXT_TOKENS,
-    PLANNER_SNIPPET_TOKENS,
-)
+from app.config import GENERATION_CONTEXT_TOKENS
 from app.language import detect_language
 from app.logging_conf import get_logger
 from app.offline.vector_store import VectorStore
@@ -47,40 +43,22 @@ def _build_tree_context(children: list[dict]) -> str:
 
         content = child.get("content", "")
         if content:
-            parts.append(content)
+            child_id = str(child.get("child_id") or "").strip()
+            marker = f"[source_chunk_id={child_id}]" if child_id else ""
+            parts.append(f"{marker}\n{content}".strip())
 
     return "\n\n".join(parts)
 
 
 def build_planner_context(
-    children: list[dict], snippet_tokens: int = PLANNER_SNIPPET_TOKENS
+    children: list[dict], snippet_tokens: int | None = None
 ) -> str:
-    """Return a LIGHTWEIGHT context for planning.
+    """Return the full selected chunk content for planning.
 
-    Per selected child chunk this is just the section title + chunk title plus a
-    short snippet of its text (``snippet_tokens`` tokens). The planner only needs
-    to know which concepts are available to distribute across models; it never
-    writes questions, so it does not need the full chunk text.
+    ``snippet_tokens`` remains accepted for compatibility but no longer truncates
+    each selected chunk.
     """
-    parts: list[str] = []
-    current_key: str | None = None
-    for child in children:
-        section_key = child.get("parent_id") or child.get("parent_title")
-        section_label = child.get("parent_title") or "Untitled"
-        subtitle = child.get("chunk_title")
-
-        if section_key is None or section_key != current_key:
-            current_key = section_key
-            parts.append(f"## {section_label}")
-
-        lines = [f"### {subtitle}"] if subtitle else []
-        snippet = _first_tokens(child.get("content", ""), snippet_tokens)
-        if snippet:
-            lines.append(snippet)
-        parts.append("\n".join(lines))
-
-    joined = "\n\n".join(parts)
-    return _first_tokens(joined, PLANNER_CONTEXT_TOKENS)
+    return _build_tree_context(children)
 
 
 def retrieve_selected(
@@ -89,8 +67,7 @@ def retrieve_selected(
 ) -> dict:
     """Pull the exact child chunks the user selected (by id, no search).
 
-    Returns both the FULL tree context (for question generation) and a lightweight
-    planner context (titles + short snippets) used only by the planning phase.
+    Returns the selected tree context for question generation and planning.
     """
     t0 = time.perf_counter()
     children = VectorStore().get_by_child_ids(document_id, selected_child_ids)

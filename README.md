@@ -22,9 +22,12 @@ The system combines document parsing, semantic chunking, embeddings, selected-se
   * Multiple Choice
   * True / False
   * Fill in the Blank
-  * Why Questions
+  * Short Answer
   * Essay
 * Load only selected child chunks for generation
+* Build a structured question plan with stable plan-slot IDs
+* Generate each question from its assigned concept, difficulty, and source chunk
+* Retry only missing plan items when generation falls short
 * Automatically validate generated questions
 * Repair only invalid questions instead of regenerating the entire exam
 * Track generation, validation, repair, and final outcome telemetry
@@ -74,7 +77,7 @@ Supported question types include:
 | Multiple Choice   | Four options with one correct answer |
 | True / False      | Quick factual recall                 |
 | Fill in the Blank | Key-term recall                      |
-| Why Questions     | Short reasoning questions            |
+| Short Answer      | Concise reasoning questions           |
 | Essay             | Open-ended responses                 |
 
 ### 05 — Eval Dashboard
@@ -177,15 +180,42 @@ flowchart TD
     D --> E[(Qdrant Vector Store)]
 
     E --> F[Selected Child Chunk Loading]
-    F --> G[Exam Planner]
-    G --> H[Question Generation]
-    H --> I[Validation]
+    F --> G[Planner: Structured Plan Items]
+    G --> H[Generator: Questions by Plan Slot]
+    H --> I[Validator: Structured Verdicts]
 
     I -->|Valid| J[Final Exam]
-    I -->|Invalid| K[Targeted Repair]
+    I -->|Invalid| K[Repairer: Targeted Fields]
 
     K --> I
+
+    G -.-> L[Shared LLM Factory]
+    H -.-> L
+    I -.-> L
+    K -.-> L
+    L --> M[LM Studio Client]
+    L --> N[DeepSeek Client]
 ```
+
+Planner, Generator, Validator, and Repairer all use the shared LLM factory. The
+factory selects LM Studio or DeepSeek from `LLM_PROVIDER`, so agent code does not
+need provider-specific branches. Agent responses are checked against Pydantic
+models before entering the pipeline. DeepSeek sends the corresponding JSON Schema
+through the Responses API for native structured output and then applies the same
+local Pydantic validation.
+
+## Planning & Generation
+
+Planner creates one structured plan item for every requested question. Each item
+has a stable plan-slot ID, a source chunk ID, a focused concept, a question type,
+and a difficulty. If a plan item fails validation, its corrective retry keeps the
+same slot ID and fixes that item instead of creating a replacement slot.
+
+Generator follows these plan items rather than choosing questions loosely from the
+combined source context. A generated question must return the expected slot ID,
+which keeps it connected to the Planner's concept and source chunk. If generation
+falls short, the next attempt receives only the missing plan items. Existing
+questions and completed slots remain unchanged.
 
 ## Validation & Repair
 
@@ -399,8 +429,10 @@ The tests cover core components including:
 * document processing
 * semantic chunking
 * selected content loading
-* exam generation
-* validation and repair
+* structured planning and plan-slot preservation
+* schema-based exam generation and targeted shortfall recovery
+* validation and targeted repair
+* DeepSeek client retries, errors, and token accounting
 * API behavior
 * PostgreSQL evaluation persistence and aggregation
 * best-effort telemetry failure handling

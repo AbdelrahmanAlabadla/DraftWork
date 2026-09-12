@@ -4,6 +4,13 @@ import random
 import time
 from typing import Any
 
+from app.llm.client import request_structured
+from app.llm.schemas import (
+    fitb_items_response_model,
+    fitb_word_bank_response_model,
+    generation_response_model,
+    objective_bundle_response_model,
+)
 from app.logging_conf import get_logger
 from app.online.eval_stats import (
     create_pipeline_eval,
@@ -11,6 +18,7 @@ from app.online.eval_stats import (
     public_eval,
     record_generation_rejection,
     record_initial_generation,
+    record_slot_accepted,
     record_shortfall_result,
 )
 from app.online.graph import get_exam_graph
@@ -52,8 +60,10 @@ _STOPWORDS = frozenset(
     ).split()
 )
 
-# Jaccard token-overlap above which two questions are treated as near-duplicates.
-_NEAR_DUP_THRESHOLD = 0.35
+# Jaccard token-overlap above which questions inside one model are treated as
+# near-duplicates. Cross-model variants share concepts by design and are checked
+# separately for exact wording only.
+_NEAR_DUP_THRESHOLD = 0.60
 
 # Stable internal question IDs are stamped by the code in the form
 # `model{N}_{type}_{seq}` and never requested from the LLM. They uniquely
@@ -65,6 +75,60 @@ _TYPE_ID_SLUGS = {
     "short_answer": "short_answer",
     "essay": "essay",
 }
+
+
+def _slot_ids(items: list[dict[str, Any]], model_number: int, qtype: str) -> list[str]:
+    return [
+        str(item.get("slot_id") or f"m{model_number}_{qtype}_{index}")
+        for index, item in enumerate(items, start=1)
+    ]
+
+
+def _record_invalid_candidates(
+    eval_stats: dict[str, Any] | None,
+    model_number: int,
+    qtype: str,
+    invalid_items: list[Any],
+) -> None:
+    """Record structural rejection against its slot whenever the ID survived."""
+    for item in invalid_items:
+        sid = str(item.get("slot_id") or "") if isinstance(item, dict) else ""
+        record_generation_rejection(
+            eval_stats,
+            model_number,
+            qtype,
+            "invalid_structure",
+            slot_id=sid or None,
+        )
+
+
+def _context_for_items(
+    items: list[dict[str, Any]], chunks: list[dict[str, Any]], fallback: str
+) -> str:
+    """Render each unique source chunk referenced by the requested slots once."""
+    wanted = {
+        str(item.get("source_chunk_id"))
+        for item in items
+        if item.get("source_chunk_id")
+    }
+    if not wanted:
+        return fallback
+    selected = [c for c in chunks if str(c.get("child_id")) in wanted]
+    if not selected:
+        return fallback
+    return "\n\n".join(
+        "\n".join(
+            part
+            for part in (
+                f"[source_chunk_id={chunk.get('child_id')}]",
+                f"## {chunk.get('parent_title') or 'Untitled'}",
+                f"### {chunk.get('chunk_title')}" if chunk.get("chunk_title") else "",
+                str(chunk.get("content") or ""),
+            )
+            if part
+        )
+        for chunk in selected
+    )
 
 
 def _section_items(section: Any) -> list[dict[str, Any]]:
@@ -99,10 +163,14 @@ def _assign_ids(model_number: int, qtype: str, section: Any) -> None:
 
 def _is_duplicate(qtype: str, question: dict[str, Any], seen: set[tuple[str, str]]) -> bool:
     key = (qtype, " ".join(normalize_text(question_text(qtype, question))))
-    if key in seen:
-        return True
+    return key in seen
+
+
+def _remember_question(
+    qtype: str, question: dict[str, Any], seen: set[tuple[str, str]]
+) -> None:
+    key = (qtype, " ".join(normalize_text(question_text(qtype, question))))
     seen.add(key)
-    return False
 
 
 def _content_tokens(qtype: str, question: dict[str, Any]) -> set[str]:
@@ -170,12 +238,12 @@ def _repair_invalid_items(
     The model fixes ONLY the invalid fields/type/structure; it must not invent a
     new question or alter valid content. Returns the newly-valid normalized items.
     """
-    from app.llm.client import LMStudioClient
+    from app.llm.factory import create_llm_client
 
     if not invalid_raw:
         return [], []
     warnings: list[str] = []
-    client = LMStudioClient()
+    client = create_llm_client()
     schema = _SCHEMAS.get(qtype, "")
     items = list(invalid_raw)
     for attempt in range(1, max_attempts + 1):
@@ -184,9 +252,24 @@ def _repair_invalid_items(
             language=language,
         )
         try:
-            raw = client.chat_json(
-                user_prompt, system_prompt=system_prompt,
-                temperature=0.3, max_tokens=min(_MAX_TOKENS, 2048),
+            repair_slot_ids = [
+                str(item.get("slot_id"))
+                for item in items
+                if isinstance(item, dict) and item.get("slot_id")
+            ]
+            raw = request_structured(
+                client,
+                user_prompt,
+                response_model=generation_response_model(qtype, repair_slot_ids),
+                schema_name=f"{qtype}_generation_repair",
+                agent="generator",
+                item_count=len(items),
+                expected_ids=repair_slot_ids or None,
+                expected_id_field="slot_id" if repair_slot_ids else None,
+                local_json=True,
+                system_prompt=system_prompt,
+                temperature=0.3,
+                max_tokens=min(_MAX_TOKENS, 2048),
             )
         except Exception as exc:
             warnings.append(f"{qtype} repair attempt {attempt}: {exc}")
@@ -214,23 +297,21 @@ def _generate_type_from_plan(
     language: str = "en",
     eval_stats: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Generate one question per planned item, retrying only missing concepts.
-
-    Every generated question maps to a planned item; the generator is NEVER asked
-    to invent unplanned concepts. If a retry still cannot fill a slot, the exam is
-    simply short for that type (a warning), rather than degrading the planning.
-    """
-    from app.llm.client import LMStudioClient
+    """Generate and retry exact stable slots instead of inferring gaps by count."""
+    from app.llm.factory import create_llm_client
     from app.online.prompts import build_prompt
 
-    count = len(planned_items)
-    accumulated: list[dict[str, Any]] = []
+    ordered_ids = _slot_ids(planned_items, model_number, qtype)
+    normalized_plan: list[dict[str, Any]] = []
+    for sid, item in zip(ordered_ids, planned_items):
+        normalized_plan.append({**item, "slot_id": sid})
+    pending = {item["slot_id"]: item for item in normalized_plan}
+    accepted_by_slot: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
-    client = LMStudioClient()
+    client = create_llm_client()
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
-        # 1:1 mapping by order: the first `len(accumulated)` plan items are done.
-        remaining_plan = planned_items[len(accumulated):]
+        remaining_plan = list(pending.values())
         if not remaining_plan:
             break
 
@@ -244,7 +325,9 @@ def _generate_type_from_plan(
             language=language,
         )
 
-        feedback = _build_feedback(qtype, accumulated, seen, within_model, previous_exams)
+        feedback = _build_feedback(
+            qtype, list(accepted_by_slot.values()), seen, within_model, []
+        )
         if feedback:
             user_prompt += (
                 "\n\n## Context from earlier attempts\n"
@@ -254,10 +337,18 @@ def _generate_type_from_plan(
             )
 
         try:
-            raw_obj = client.chat_json(
+            remaining_ids = list(pending)
+            raw_obj = request_structured(
+                client,
                 user_prompt,
+                response_model=generation_response_model(qtype, remaining_ids),
+                schema_name=f"{qtype}_questions",
+                agent="generator",
+                item_count=len(remaining_plan),
+                expected_ids=remaining_ids,
+                expected_id_field="slot_id",
                 system_prompt=system_prompt,
-                temperature=0.5,
+                temperature=0.4,
                 max_tokens=min(_MAX_TOKENS, max(2048, len(remaining_plan) * 256)),
             )
         except Exception as exc:
@@ -268,9 +359,7 @@ def _generate_type_from_plan(
 
         # Split valid vs structurally-invalid raw items.
         candidates, invalid_raw = split_valid_invalid(qtype, raw_obj)
-        record_generation_rejection(
-            eval_stats, model_number, qtype, "invalid_structure", len(invalid_raw)
-        )
+        _record_invalid_candidates(eval_stats, model_number, qtype, invalid_raw)
         # Structural fix FIRST: send rejected output + schema back, repair only
         # the broken fields (never regenerate a fresh random question).
         if invalid_raw and len(candidates) < len(remaining_plan):
@@ -285,47 +374,67 @@ def _generate_type_from_plan(
             warnings.extend(repair_warnings)
             candidates.extend(repaired)
 
-        valid: list[dict[str, Any]] = []
+        # Legacy/test clients may omit slot_id; positional assignment is safe only
+        # for those unconstrained responses. Production schemas require the IDs.
+        for index, q in enumerate(candidates[: len(remaining_plan)]):
+            if not q.get("slot_id") and index < len(remaining_plan):
+                q["slot_id"] = remaining_plan[index]["slot_id"]
+
         for q in candidates[: len(remaining_plan)]:
+            sid = str(q.get("slot_id") or "")
+            if sid not in pending or sid in accepted_by_slot:
+                warnings.append(f"{qtype} attempt {attempt}: unknown or repeated slot_id {sid!r}")
+                continue
             text = question_text(qtype, q)
             if contains_forbidden_phrase(text, language):
                 logger.warning("Rejected (forbidden phrase) | type=%s | text=%r", qtype, text[:120])
                 record_generation_rejection(
-                    eval_stats, model_number, qtype, "forbidden_content"
+                    eval_stats, model_number, qtype, "forbidden_content", slot_id=sid
                 )
                 continue
             if _is_duplicate(qtype, q, seen):
                 logger.warning("Rejected (duplicate) | type=%s | text=%r", qtype, text[:120])
                 record_generation_rejection(
-                    eval_stats, model_number, qtype, "duplicate"
+                    eval_stats, model_number, qtype, "duplicate", slot_id=sid
                 )
                 continue
             if _is_near_duplicate(
-                qtype, q, [*valid, *accumulated, *within_model, *previous_exams]
+                qtype, q, [*accepted_by_slot.values(), *within_model]
             ):
                 logger.warning("Rejected (near-duplicate) | type=%s | text=%r", qtype, text[:120])
                 record_generation_rejection(
-                    eval_stats, model_number, qtype, "near_duplicate"
+                    eval_stats, model_number, qtype, "near_duplicate", slot_id=sid
                 )
                 continue
-            valid.append(q)
-
-        accumulated.extend(valid)
+            _remember_question(qtype, q, seen)
+            accepted_by_slot[sid] = q
+            record_slot_accepted(eval_stats, model_number, qtype, sid)
+            pending.pop(sid, None)
         logger.info(
-            "Plan type attempt | type=%s | model=%d | attempt=%d/%d | planned=%d | accepted=%d/%d",
+            "Plan type attempt | type=%s | model=%d | attempt=%d/%d | slots=%d | accepted=%d/%d | pending=%s",
             qtype,
             model_number,
             attempt,
             _MAX_ATTEMPTS,
-            count,
-            len(accumulated),
-            count,
+            len(ordered_ids),
+            len(accepted_by_slot),
+            len(ordered_ids),
+            list(pending),
         )
 
-    if len(accumulated) < count:
-        warnings.append(f"{qtype}: {len(accumulated)}/{count} generated after attempts")
-        logger.warning("Plan type incomplete | type=%s | got=%d/%d", qtype, len(accumulated), count)
-    return accumulated[: count], warnings
+    if pending:
+        warnings.append(
+            f"{qtype}: {len(accepted_by_slot)}/{len(ordered_ids)} generated after attempts; "
+            f"missing slot IDs: {', '.join(pending)}"
+        )
+        logger.warning(
+            "Plan type incomplete | type=%s | accepted=%d/%d | missing_slots=%s",
+            qtype,
+            len(accepted_by_slot),
+            len(ordered_ids),
+            list(pending),
+        )
+    return [accepted_by_slot[sid] for sid in ordered_ids if sid in accepted_by_slot], warnings
 
 
 def _clean_fitb_terms(raw: object) -> list[str]:
@@ -391,7 +500,7 @@ def _fitb_errors(
     word_bank = [str(w).strip() for w in (section.get("word_bank") or []) if str(w).strip()]
     bank_tokens = {tuple(normalize_text(w)) for w in word_bank}
     items = section.get("items") or []
-    accepted = [*within_model, *previous_exams]
+    accepted = list(within_model)
 
     if len(items) != count:
         errors.append(f"FITB item count {len(items)} != requested {count}")
@@ -444,11 +553,11 @@ def _generate_fitb_bank(
     The bank alone is validated and auto-fixed in code, so the expensive item
     writing only ever runs against a guaranteed-valid bank.
     """
-    from app.llm.client import LMStudioClient
+    from app.llm.factory import create_llm_client
     from app.online.prompts import build_fitb_bank_prompt
 
     warnings: list[str] = []
-    client = LMStudioClient()
+    client = create_llm_client()
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         system_prompt, user_prompt = build_fitb_bank_prompt(
@@ -456,8 +565,16 @@ def _generate_fitb_bank(
             planned_items=planned_items, language=language,
         )
         try:
-            raw = client.chat_json(
-                user_prompt, system_prompt=system_prompt, temperature=0.5,
+            raw = request_structured(
+                client,
+                user_prompt,
+                response_model=fitb_word_bank_response_model(count),
+                schema_name="fill_in_the_blank_bank",
+                agent="generator",
+                item_count=count,
+                operation="fitb_word_bank",
+                system_prompt=system_prompt,
+                temperature=0.4,
                 max_tokens=min(_MAX_TOKENS, 1024),
             )
         except Exception as exc:
@@ -488,6 +605,7 @@ def _generate_fitb_bank(
 
 def _generate_fitb_items(
     count: int,
+    planned_items: list[dict[str, Any]],
     word_bank: list[str],
     context: str,
     difficulty: str,
@@ -497,23 +615,41 @@ def _generate_fitb_items(
     language: str = "en",
     eval_stats: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Stage 2: write numbered items using ONLY the fixed, shuffled Word Bank."""
-    from app.llm.client import LMStudioClient
+    """Stage 2: fill exact FITB slots using only the fixed Word Bank."""
+    from app.llm.factory import create_llm_client
     from app.online.prompts import build_fitb_items_prompt
 
     warnings: list[str] = []
-    client = LMStudioClient()
-    best: list[dict[str, Any]] = []
+    client = create_llm_client()
+    ids = _slot_ids(planned_items, model_number, "fill_in_the_blank")
+    normalized_plan = [
+        {**item, "slot_id": sid} for sid, item in zip(ids, planned_items)
+    ]
+    pending = {item["slot_id"]: item for item in normalized_plan}
+    accepted: dict[str, dict[str, Any]] = {}
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
+        if not pending:
+            break
+        remaining_plan = list(pending.values())
         system_prompt, user_prompt = build_fitb_items_prompt(
-            count, word_bank, context, difficulty=difficulty, model_number=model_number,
-            language=language,
+            len(remaining_plan), word_bank, context, difficulty=difficulty,
+            model_number=model_number, planned_items=remaining_plan, language=language,
         )
         try:
-            raw = client.chat_json(
-                user_prompt, system_prompt=system_prompt, temperature=0.5,
-                max_tokens=min(_MAX_TOKENS, max(2048, count * 320)),
+            raw = request_structured(
+                client,
+                user_prompt,
+                response_model=fitb_items_response_model(list(pending)),
+                schema_name="fill_in_the_blank_items",
+                agent="generator",
+                item_count=len(remaining_plan),
+                operation="fitb_items",
+                expected_ids=list(pending),
+                expected_id_field="slot_id",
+                system_prompt=system_prompt,
+                temperature=0.4,
+                max_tokens=min(_MAX_TOKENS, max(2048, len(remaining_plan) * 320)),
             )
         except Exception as exc:
             warnings.append(f"fill_in_the_blank items attempt {attempt}: {exc}")
@@ -522,55 +658,64 @@ def _generate_fitb_items(
         items_raw = items_raw if isinstance(items_raw, list) else []
         items = [normalize_fitb_item(i) for i in items_raw]
         items = [i for i in items if i is not None]
-        record_generation_rejection(
-            eval_stats,
-            model_number,
-            "fill_in_the_blank",
-            "invalid_structure",
-            len(items_raw) - len(items),
-        )
+        for index, item in enumerate(items):
+            if not item.get("slot_id") and index < len(remaining_plan):
+                item["slot_id"] = remaining_plan[index]["slot_id"]
+        rejected_count = len(items_raw) - len(items)
+        if rejected_count:
+            invalid_fitb = [
+                item for item in items_raw if normalize_fitb_item(item) is None
+            ]
+            _record_invalid_candidates(
+                eval_stats, model_number, "fill_in_the_blank", invalid_fitb
+            )
 
-        candidate: dict[str, Any] = {"word_bank": list(word_bank), "items": items}
-        # Validate against the FULL requested count: with a short item set the
-        # extra unused bank entries legitimately inflate the distractor count,
-        # so both count/distractor messages are completeness artifacts, not
-        # content defects.
-        errors = _fitb_errors(candidate, count, within_model, previous_exams)
-        content_errors = [
-            e for e in errors
-            if "count" not in e and "distractors" not in e
-        ]
-        if not content_errors:
-            return items, warnings
-        # Count only the concrete bad FITB items, assigning one stable reason
-        # per raw candidate. Completeness-only errors are shortfalls, not
-        # rejected questions.
-        rejected_items: dict[str, str] = {}
-        for error in content_errors:
-            prefix, _, detail = error.partition(":")
-            if not prefix.startswith("FITB item "):
+        for item in items[: len(remaining_plan)]:
+            sid = str(item.get("slot_id") or "")
+            if sid not in pending:
+                warnings.append(
+                    f"fill_in_the_blank attempt {attempt}: unknown or repeated slot_id {sid!r}"
+                )
                 continue
-            category = (
-                "forbidden_content"
-                if "forbidden phrase" in detail
-                else "near_duplicate"
-                if "near-duplicate" in detail
-                else "invalid_structure"
+            errors = _fitb_errors(
+                {"word_bank": list(word_bank), "items": [item]},
+                1,
+                [*within_model, *accepted.values()],
+                [],
+                language=language,
             )
-            rejected_items.setdefault(prefix, category)
-        for category in rejected_items.values():
-            record_generation_rejection(
-                eval_stats, model_number, "fill_in_the_blank", category
+            content_errors = [
+                error for error in errors
+                if "count" not in error and "distractors" not in error
+            ]
+            if content_errors:
+                detail = " ".join(content_errors)
+                reason = (
+                    "forbidden_content" if "forbidden phrase" in detail
+                    else "near_duplicate" if "near-duplicate" in detail
+                    else "invalid_structure"
+                )
+                record_generation_rejection(
+                    eval_stats, model_number, "fill_in_the_blank", reason,
+                    slot_id=sid,
+                )
+                warnings.append(
+                    f"fill_in_the_blank attempt {attempt}: slot {sid} rejected ({reason})"
+                )
+                continue
+            accepted[sid] = item
+            pending.pop(sid, None)
+            record_slot_accepted(
+                eval_stats, model_number, "fill_in_the_blank", sid
             )
-        best = items if len(items) > len(best) else best
-        warnings.append(
-            f"fill_in_the_blank items attempt {attempt}: rejected -> "
-            f"{'; '.join(content_errors[:2])}"
-        )
 
-    if best:
-        warnings.append(f"fill_in_the_blank: keeping best partial set ({len(best)} items)")
-    return best, warnings
+    if pending:
+        warnings.append(
+            "fill_in_the_blank: "
+            f"{len(accepted)}/{len(ids)} generated after attempts; missing slot IDs: "
+            f"{', '.join(pending)}"
+        )
+    return [accepted[sid] for sid in ids if sid in accepted], warnings
 
 
 def _generate_fitb_type(
@@ -582,6 +727,7 @@ def _generate_fitb_type(
     within_model: list[dict[str, Any]],
     previous_exams: list[dict[str, Any]],
     language: str = "en",
+    eval_stats: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Two-stage FITB generation: Word Bank FIRST, then blanks against it.
 
@@ -598,8 +744,8 @@ def _generate_fitb_type(
 
     random.shuffle(bank)
     items, item_warnings = _generate_fitb_items(
-        count, bank, context, difficulty, model_number, within_model, previous_exams,
-        language=language,
+        count, planned_items, bank, context, difficulty, model_number, within_model, previous_exams,
+        language=language, eval_stats=eval_stats,
     )
     warnings.extend(item_warnings)
     if not items:
@@ -619,61 +765,59 @@ def _generate_obj_bundle(
     language: str = "en",
     eval_stats: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Generate MCQ + True/False + Fill-in-the-Blank in ONE LLM call.
-
-    Returns {"mcq": [...], "true_false": [...], "fill_in_the_blank": {...}}.
-    Each section is validated with the same rules used by the single-type path.
-    On a partial failure we KEEP the sections that already validated and retry
-    ONLY the missing items on the next call, so one rejected MCQ never discards
-    the valid True/False and Fill-in-the-Blank content.
-    """
-    from app.llm.client import LMStudioClient
+    """Generate MCQ and True/False together while tracking exact pending slots."""
+    from app.llm.factory import create_llm_client
     from app.online.prompts import build_obj_bundled_prompt
 
     warnings: list[str] = []
-    client = LMStudioClient()
-    targets = {
-        "mcq": len(planned.get("mcq") or []),
-        "true_false": len(planned.get("true_false") or []),
-        "fill_in_the_blank": len(planned.get("fill_in_the_blank") or []),
-    }
-
-    acc_mcq: list[dict[str, Any]] = []
-    acc_tf: list[dict[str, Any]] = []
-    fitb: dict[str, Any] | None = None
-
-    def remaining(qtype: str) -> int:
-        if qtype == "mcq":
-            return targets["mcq"] - len(acc_mcq)
-        if qtype == "true_false":
-            return targets["true_false"] - len(acc_tf)
-        return targets["fill_in_the_blank"] if fitb is None else 0
+    client = create_llm_client()
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    pending: dict[str, dict[str, dict[str, Any]]] = {}
+    accepted: dict[str, dict[str, dict[str, Any]]] = {}
+    for qtype in ("mcq", "true_false"):
+        items = planned.get(qtype) or []
+        ids = _slot_ids(items, model_number, qtype)
+        normalized[qtype] = [{**item, "slot_id": sid} for sid, item in zip(ids, items)]
+        pending[qtype] = {item["slot_id"]: item for item in normalized[qtype]}
+        accepted[qtype] = {}
 
     def incomplete() -> bool:
-        return remaining("mcq") > 0 or remaining("true_false") > 0 or remaining("fill_in_the_blank") > 0
+        return any(pending[qtype] for qtype in ("mcq", "true_false"))
 
     attempt = 0
     while incomplete() and attempt < _MAX_ATTEMPTS:
         attempt += 1
-        # Pass only the still-missing plan items (tail) for each type.
-        rem_planned = {
-            q: (planned.get(q) or [])[-remaining(q):] if remaining(q) > 0 else []
-            for q in ("mcq", "true_false", "fill_in_the_blank")
-        }
+        rem_planned = {q: list(pending[q].values()) for q in ("mcq", "true_false")}
         bundle_max_tokens = min(
             _MAX_TOKENS,
-            max(4096, (remaining("mcq") + remaining("true_false")) * 180),
+            max(2048, sum(len(values) for values in rem_planned.values()) * 256),
         )
         feedback = _build_bundle_feedback(
-            acc_mcq, acc_tf, fitb, within_model, previous_exams
+            list(accepted["mcq"].values()),
+            list(accepted["true_false"].values()),
+            None,
+            within_model,
+            [],
         )
         system_prompt, user_prompt = build_obj_bundled_prompt(
             rem_planned, context, difficulty=difficulty,
             model_number=model_number, feedback=feedback, language=language,
         )
         try:
-            raw = client.chat_json(
-                user_prompt, system_prompt=system_prompt, temperature=0.5,
+            expected_ids = [*pending["mcq"], *pending["true_false"]]
+            raw = request_structured(
+                client,
+                user_prompt,
+                response_model=objective_bundle_response_model(
+                    list(pending["mcq"]), list(pending["true_false"])
+                ),
+                schema_name="mcq_true_false_bundle",
+                agent="generator",
+                item_count=len(expected_ids),
+                expected_ids=expected_ids,
+                expected_id_field="slot_id",
+                system_prompt=system_prompt,
+                temperature=0.4,
                 max_tokens=bundle_max_tokens,
             )
         except Exception as exc:
@@ -683,79 +827,52 @@ def _generate_obj_bundle(
             warnings.append(f"obj bundle attempt {attempt}: non-object response")
             continue
 
-        # --- fill_in_the_blank section: bank FIRST, then items (two-stage) ---
-        if remaining("fill_in_the_blank") > 0:
-            fitb_count = targets["fill_in_the_blank"]
-            bank, bank_warnings = _generate_fitb_bank(
-                fitb_count, planned.get("fill_in_the_blank") or [],
-                context, difficulty, model_number, language=language,
-            )
-            warnings.extend(bank_warnings)
-            if bank is not None:
-                random.shuffle(bank)
-                fitb_items, item_warnings = _generate_fitb_items(
-                    fitb_count, bank, context, difficulty, model_number,
-                    within_model, previous_exams, language=language,
-                    eval_stats=eval_stats,
-                )
-                warnings.extend(item_warnings)
-                if fitb_items:
-                    fitb = {"word_bank": bank, "items": fitb_items}
-
-        # --- mcq section (incremental, structural-repair first) ---
-        need_mcq = remaining("mcq")
-        if need_mcq > 0:
-            candidates, invalid_raw = split_valid_invalid("mcq", raw.get("mcq"))
-            record_generation_rejection(
-                eval_stats, model_number, "mcq", "invalid_structure", len(invalid_raw)
-            )
-            if invalid_raw and len(candidates) < need_mcq:
+        for qtype in ("mcq", "true_false"):
+            if not pending[qtype]:
+                continue
+            section_raw = raw.get(qtype) if isinstance(raw, dict) else None
+            candidates, invalid_raw = split_valid_invalid(qtype, section_raw)
+            _record_invalid_candidates(eval_stats, model_number, qtype, invalid_raw)
+            if invalid_raw and len(candidates) < len(pending[qtype]):
                 repaired, rwarn = _repair_invalid_items(
-                    "mcq", [i for i in invalid_raw if isinstance(i, dict)],
+                    qtype, [i for i in invalid_raw if isinstance(i, dict)],
                     context, difficulty, model_number, language=language,
                 )
                 warnings.extend(rwarn)
                 candidates.extend(repaired)
-            for q in candidates[:need_mcq]:
+            remaining_items = list(pending[qtype].values())
+            for index, q in enumerate(candidates[: len(remaining_items)]):
+                if not q.get("slot_id") and index < len(remaining_items):
+                    q["slot_id"] = remaining_items[index]["slot_id"]
+            for q in candidates[: len(remaining_items)]:
+                sid = str(q.get("slot_id") or "")
+                if sid not in pending[qtype]:
+                    warnings.append(
+                        f"obj bundle {qtype} attempt {attempt}: unknown slot_id {sid!r}"
+                    )
+                    continue
                 if _filter_one(
-                    "mcq", q, [*acc_mcq, *within_model, *previous_exams],
+                    qtype, q, [*accepted[qtype].values(), *within_model],
                     seen, warnings, attempt, language, eval_stats, model_number,
                 ):
-                    acc_mcq.append(q)
-
-        # --- true_false section (incremental, structural-repair first) ---
-        need_tf = remaining("true_false")
-        if need_tf > 0:
-            candidates_tf, invalid_tf = split_valid_invalid("true_false", raw.get("true_false"))
-            record_generation_rejection(
-                eval_stats, model_number, "true_false", "invalid_structure", len(invalid_tf)
-            )
-            if invalid_tf and len(candidates_tf) < need_tf:
-                repaired_tf, rwarn_tf = _repair_invalid_items(
-                    "true_false", [i for i in invalid_tf if isinstance(i, dict)],
-                    context, difficulty, model_number, language=language,
-                )
-                warnings.extend(rwarn_tf)
-                candidates_tf.extend(repaired_tf)
-            for q in candidates_tf[:need_tf]:
-                if _filter_one(
-                    "true_false", q, [*acc_tf, *within_model, *previous_exams],
-                    seen, warnings, attempt, language, eval_stats, model_number,
-                ):
-                    acc_tf.append(q)
+                    accepted[qtype][sid] = q
+                    pending[qtype].pop(sid, None)
 
         warnings.append(
-            f"obj bundle attempt {attempt}: mcq {len(acc_mcq)}/{targets['mcq']} | "
-            f"tf {len(acc_tf)}/{targets['true_false']} | "
-            f"fitb {'ok' if fitb is not None else 'pending'}"
+            f"obj bundle attempt {attempt}: mcq {len(accepted['mcq'])}/{len(normalized['mcq'])} | "
+            f"tf {len(accepted['true_false'])}/{len(normalized['true_false'])}"
         )
 
     if incomplete():
-        warnings.append("obj bundle: not fully generated after attempts")
+        missing = [sid for values in pending.values() for sid in values]
+        warnings.append(f"obj bundle missing slot IDs after attempts: {', '.join(missing)}")
     return {
-        "mcq": acc_mcq,
-        "true_false": acc_tf,
-        "fill_in_the_blank": fitb,
+        qtype: [
+            accepted[qtype][item["slot_id"]]
+            for item in normalized[qtype]
+            if item["slot_id"] in accepted[qtype]
+        ]
+        for qtype in ("mcq", "true_false")
     }, warnings
 
 
@@ -775,17 +892,28 @@ def _filter_one(
     if contains_forbidden_phrase(text, language):
         warnings.append(f"obj bundle {qtype} attempt {attempt}: forbidden phrase")
         record_generation_rejection(
-            eval_stats, model_number, qtype, "forbidden_content"
+            eval_stats, model_number, qtype, "forbidden_content",
+            slot_id=str(q.get("slot_id") or "") or None,
         )
         return False
     if _is_duplicate(qtype, q, seen):
         warnings.append(f"obj bundle {qtype} attempt {attempt}: duplicate")
-        record_generation_rejection(eval_stats, model_number, qtype, "duplicate")
+        record_generation_rejection(
+            eval_stats, model_number, qtype, "duplicate",
+            slot_id=str(q.get("slot_id") or "") or None,
+        )
         return False
     if _is_near_duplicate(qtype, q, accepted):
         warnings.append(f"obj bundle {qtype} attempt {attempt}: near-duplicate")
-        record_generation_rejection(eval_stats, model_number, qtype, "near_duplicate")
+        record_generation_rejection(
+            eval_stats, model_number, qtype, "near_duplicate",
+            slot_id=str(q.get("slot_id") or "") or None,
+        )
         return False
+    _remember_question(qtype, q, seen)
+    record_slot_accepted(
+        eval_stats, model_number, qtype, str(q.get("slot_id") or "")
+    )
     return True
 
 
@@ -798,7 +926,7 @@ def _build_bundle_feedback(
 ) -> str:
     """List accepted objective questions so a retry only fills the gap."""
     parts: list[str] = []
-    accepted = [*within_model, *previous_exams]
+    accepted = list(within_model)
     if acc_mcq:
         lines = "\n".join(f"- {question_text('mcq', q)}" for q in acc_mcq)
         parts.append("Already-accepted MCQ (do NOT repeat or reword these):\n" + lines)
@@ -879,20 +1007,36 @@ def _repair_shortfalls(
     max_passes: int = 2,
     appended_by_type: dict[str, int] | None = None,
     eval_stats: dict[str, Any] | None = None,
+    retrieved_chunks: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    """Minimal-diff count repair of one exam's questions.
-
-    missing -> generate only the missing amount for that type
-    extra   -> remove only the extra amount for that type
-    correct -> leave untouched
-
-    Never regenerates a whole exam or a whole already-correct section.
-    """
+    """Retry only the exact planned slot IDs that are still absent."""
     warnings: list[str] = []
     target = {qtype: count for qtype, count in tasks}
+    normalized_plan: dict[str, list[dict[str, Any]]] = {}
+    for qtype, count in tasks:
+        original = [dict(item) for item in (plan_items.get(qtype) or [])]
+        ids = _slot_ids(original, model_number, qtype)
+        normalized_plan[qtype] = [
+            {**item, "slot_id": sid} for sid, item in zip(ids, original[:count])
+        ]
+        existing = _section_items(questions.get(qtype))
+        for index, item in enumerate(existing):
+            if not item.get("slot_id") and index < len(ids):
+                item["slot_id"] = ids[index]
 
-    obj_types = ("mcq", "true_false", "fill_in_the_blank")
-    free_types = ("short_answer", "essay")
+    def missing_for(qtype: str) -> list[dict[str, Any]]:
+        present = {
+            str(item.get("slot_id"))
+            for item in _section_items(questions.get(qtype))
+            if item.get("slot_id")
+        }
+        return [
+            item for item in normalized_plan.get(qtype, [])
+            if item["slot_id"] not in present
+        ]
+
+    def slot_context(items: list[dict[str, Any]]) -> str:
+        return _context_for_items(items, retrieved_chunks or [], context)
 
     for _pass in range(max_passes):
         # --- Remove extras first (cheap, immediate) ---
@@ -904,34 +1048,35 @@ def _repair_shortfalls(
                 questions[qtype] = _remove_extras(qtype, questions[qtype], extras, warnings)
                 within_model[:] = _reindex_within(questions)
 
-        # --- Compute missing amounts ---
-        deficits: list[tuple[str,int]] = []
-        for qtype, want in target.items():
-            if want <= 0:
-                continue
-            got = _section_count(qtype, questions.get(qtype))
-            if got < want:
-                deficits.append((qtype, want - got))
-        if not deficits:
+        missing = {
+            qtype: missing_for(qtype)
+            for qtype, want in target.items()
+            if want > 0
+        }
+        missing = {qtype: items for qtype, items in missing.items() if items}
+        if not missing:
             break
 
-        # --- Generate ONLY the missing amount per type ---
-        obj_missing = {q: m for q, m in deficits if q in obj_types}
-        if obj_missing:
-            obj_planned = {
-                q: _repair_planned_for(q, m, plan_items, context)
-                for q, m in obj_missing.items()
-            }
+        obj_planned = {
+            qtype: missing[qtype]
+            for qtype in ("mcq", "true_false")
+            if qtype in missing
+        }
+        if obj_planned:
+            objective_items = [item for values in obj_planned.values() for item in values]
             bundle, bwarn = _generate_obj_bundle(
-                obj_planned, context, difficulty, model_number,
+                obj_planned, slot_context(objective_items), difficulty, model_number,
                 within_model, seen, previous_questions, language=language,
                 eval_stats=eval_stats,
             )
             warnings.extend(bwarn)
-            for q, m in obj_missing.items():
+            for q in obj_planned:
                 section = bundle.get(q)
                 if not section:
                     continue
+                for index, item in enumerate(_section_items(section)):
+                    if not item.get("slot_id") and index < len(obj_planned[q]):
+                        item["slot_id"] = obj_planned[q][index]["slot_id"]
                 before = _section_count(q, questions.get(q))
                 new_section = _append_section(questions.get(q), q, section)
                 questions[q] = new_section
@@ -941,29 +1086,75 @@ def _repair_shortfalls(
                     )
             within_model[:] = _reindex_within(questions)
 
-        for q, m in [(qt, mo) for qt, mo in deficits if qt in free_types]:
-            planned = _repair_planned_for(q, m, plan_items, context)
+        if "fill_in_the_blank" in missing:
+            q = "fill_in_the_blank"
+            old = questions.get(q)
+            bank = list(old.get("word_bank") or []) if isinstance(old, dict) else []
+            if bank:
+                new_items, twarn = _generate_fitb_items(
+                    len(missing[q]), missing[q], bank, slot_context(missing[q]), difficulty,
+                    model_number, within_model, previous_questions,
+                    language=language, eval_stats=eval_stats,
+                )
+                new_section = {"word_bank": bank, "items": new_items}
+            else:
+                new_section, twarn = _generate_fitb_type(
+                    len(missing[q]), missing[q], slot_context(missing[q]), difficulty, model_number,
+                    within_model, previous_questions, language=language,
+                    eval_stats=eval_stats,
+                )
+            warnings.extend(twarn)
+            if new_section:
+                before = _section_count(q, questions.get(q))
+                if isinstance(old, dict) and bank:
+                    questions[q] = {
+                        "word_bank": bank,
+                        "items": list(old.get("items") or [])
+                        + list(new_section.get("items") or []),
+                    }
+                else:
+                    questions[q] = new_section
+                if appended_by_type is not None:
+                    appended_by_type[q] = appended_by_type.get(q, 0) + max(
+                        _section_count(q, questions[q]) - before, 0
+                    )
+                within_model[:] = _reindex_within(questions)
+
+        for q in ("short_answer", "essay"):
+            if q not in missing:
+                continue
+            planned = missing[q]
             new_questions, twarn = _generate_type_from_plan(
-                q, planned, context, difficulty, model_number,
+                q, planned, slot_context(planned), difficulty, model_number,
                 seen, within_model, previous_questions, language=language,
                 eval_stats=eval_stats,
             )
             warnings.extend(twarn)
-            added = new_questions[:m]
+            added = new_questions
+            for index, item in enumerate(added):
+                if not item.get("slot_id") and index < len(planned):
+                    item["slot_id"] = planned[index]["slot_id"]
             questions.setdefault(q, [])
             questions[q] = list(questions[q]) + added
             if appended_by_type is not None:
                 appended_by_type[q] = appended_by_type.get(q, 0) + len(added)
             within_model[:] = _reindex_within(questions)
 
-    # Final report for any persistent shortfall.
     for qtype, want in target.items():
-        if want <= 0:
-            continue
-        got = _section_count(qtype, questions.get(qtype))
-        if got < want:
+        present = {
+            str(item.get("slot_id"))
+            for item in _section_items(questions.get(qtype))
+            if item.get("slot_id")
+        }
+        missing_ids = [
+            f"m{model_number}_{qtype}_{index}"
+            for index in range(1, want + 1)
+            if f"m{model_number}_{qtype}_{index}" not in present
+        ]
+        if missing_ids:
             warnings.append(
-                f"{qtype}: still short ({got}/{want}) after repair; exam will be short."
+                f"{qtype}: still short ({want - len(missing_ids)}/{want}) after repair; "
+                f"missing slot IDs: {', '.join(missing_ids)}"
             )
     return warnings
 
@@ -998,14 +1189,14 @@ def _build_feedback(
 ) -> str | None:
     """Describe accepted questions for the retry so the model only fills the gap."""
     parts: list[str] = []
-    accepted = [*accumulated, *within_model, *previous_exams]
+    accepted = [*accumulated, *within_model]
     if accepted:
         lines = "\n".join(
             f"- {question_text(qtype, q)}" for q in accepted if question_text(qtype, q)
         )
         parts.append(
-            "These questions were already accepted (in this exam or earlier models). "
-            f"Do NOT repeat or reword them; do not test the same concept:\n{lines}"
+            "These questions were already accepted in this exam. "
+            f"Do NOT repeat or reword them:\n{lines}"
         )
     return "\n\n".join(parts) if parts else None
 
@@ -1014,13 +1205,7 @@ def _build_feedback(
 # Node: generate every exam model (one call per model x type)
 # --------------------------------------------------------------------------
 def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Generate `num_models` complete, distinct exams from the shared plan.
-
-    Cross-model uniqueness is secured primarily by the planner distributing
-    distinct concepts; the near-duplicate text check runs across all previously
-    generated models as a secondary safeguard.
-    """
-    from app.online.planner import fill_missing_concepts
+    """Generate each model from grounded plans while retaining slot identity."""
 
     document_id = state.get("document_id")
     tasks = state.get("tasks") or []
@@ -1029,16 +1214,11 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     context = state.get("context") or ""
     language = state.get("document_language") or "en"
     plans = state.get("plans") or []
+    retrieved_chunks = state.get("retrieved_chunks") or []
     warnings: list[str] = list(state.get("warnings") or [])
     eval_stats = state.get("eval_stats")
 
-    # Never free-fill during generation: first repair any remaining plan shortfall.
-    if not state.get("plan_errors"):
-        plans, fill_warnings = fill_missing_concepts(
-            plans, tasks, state.get("planner_context") or ""
-        )
-        warnings.extend(fill_warnings)
-    else:
+    if state.get("plan_errors"):
         warnings.append("Planner could not produce a fully valid plan; using best effort.")
 
     generated_exams: list[dict[str, Any]] = []
@@ -1053,12 +1233,14 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
         questions: dict[str, list[dict[str, Any]]] = {}
         within_model: list[dict[str, Any]] = []
 
-        obj_types = ("mcq", "true_false", "fill_in_the_blank")
+        obj_types = ("mcq", "true_false")
         obj_planned = {q: plan_items.get(q) or [] for q in obj_types}
         if any(obj_planned[q] for q in obj_types):
+            obj_items = [item for values in obj_planned.values() for item in values]
+            obj_context = _context_for_items(obj_items, retrieved_chunks, context)
             bundle, model_warnings_ = _generate_obj_bundle(
                 obj_planned,
-                context,
+                obj_context,
                 difficulty,
                 model_number,
                 within_model,
@@ -1086,21 +1268,30 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             if not planned:
                 model_warnings.append(f"{qtype}: no planned concepts; skipped.")
                 continue
-            questions[qtype], type_warnings = _generate_type_from_plan(
-                qtype,
-                planned,
-                context,
-                difficulty,
-                model_number,
-                seen,
-                within_model,
-                previous_questions,
-                language=language,
-                eval_stats=eval_stats,
-            )
+            type_context = _context_for_items(planned, retrieved_chunks, context)
+            if qtype == "fill_in_the_blank":
+                section, type_warnings = _generate_fitb_type(
+                    len(planned), planned, type_context, difficulty, model_number,
+                    within_model, previous_questions, language=language,
+                    eval_stats=eval_stats,
+                )
+                questions[qtype] = section or {"word_bank": [], "items": []}
+            else:
+                questions[qtype], type_warnings = _generate_type_from_plan(
+                    qtype,
+                    planned,
+                    type_context,
+                    difficulty,
+                    model_number,
+                    seen,
+                    within_model,
+                    previous_questions,
+                    language=language,
+                    eval_stats=eval_stats,
+                )
             _assign_ids(model_number, qtype, questions[qtype])
             model_warnings.extend(type_warnings)
-            within_model.extend(questions[qtype])
+            within_model.extend(_section_items(questions[qtype]))
 
         # Snapshot accepted output from the original generation calls before
         # count trimming/filling. Shortfall generation must not improve this.
@@ -1110,11 +1301,16 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
         # Minimal-diff repair: missing -> generate only the missing amount,
         # extra -> remove only the extra amount, correct -> untouched.
         shortfall_appended = {qtype: 0 for qtype, _count in tasks}
+        model_context = _context_for_items(
+            [item for values in plan_items.values() for item in values],
+            retrieved_chunks,
+            context,
+        )
         repair_warnings = _repair_shortfalls(
             questions,
             tasks,
             plan_items,
-            context,
+            model_context,
             difficulty,
             model_number,
             seen,
@@ -1123,6 +1319,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             language=language,
             appended_by_type=shortfall_appended,
             eval_stats=eval_stats,
+            retrieved_chunks=retrieved_chunks,
         )
         model_warnings.extend(repair_warnings)
         for section_key, section_val in questions.items():
@@ -1180,6 +1377,29 @@ def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
 # --------------------------------------------------------------------------
 # Public entry points
 # --------------------------------------------------------------------------
+def _missing_output_slots(
+    exams: list[dict[str, Any]],
+    tasks: list[tuple[str, int]],
+    num_models: int,
+) -> list[str]:
+    """Return expected stable slot IDs absent from the final exam output."""
+    present: set[str] = set()
+    for exam in exams:
+        for section in (exam.get("questions") or {}).values():
+            present.update(
+                str(item.get("slot_id"))
+                for item in _section_items(section)
+                if item.get("slot_id")
+            )
+    expected = [
+        f"m{model_number}_{qtype}_{index}"
+        for model_number in range(1, num_models + 1)
+        for qtype, count in tasks
+        for index in range(1, count + 1)
+    ]
+    return [sid for sid in expected if sid not in present]
+
+
 def generate_exams(
     document_id: str,
     tasks: list[tuple[str, int]],
@@ -1225,10 +1445,26 @@ def generate_exams(
             "exams": [],
             "warnings": [str(error)],
             "eval": public_eval(result.get("eval_stats")),
+            "complete": False,
+            "status": "failed",
+            "missing_slot_ids": [
+                f"m{model_number}_{qtype}_{index}"
+                for model_number in range(1, num_models + 1)
+                for qtype, count in tasks
+                for index in range(1, count + 1)
+            ],
         }
 
     exams = result.get("generated_exams") or []
     warnings = result.get("warnings") or []
+    missing_slot_ids = _missing_output_slots(exams, tasks, num_models)
+    complete = not missing_slot_ids
+    if missing_slot_ids:
+        warnings = [
+            *warnings,
+            "Exam generation is partial; missing slot IDs: "
+            + ", ".join(missing_slot_ids),
+        ]
     language = result.get("document_language") or "en"
     elapsed = time.perf_counter() - t0
     logger.info(
@@ -1244,6 +1480,9 @@ def generate_exams(
         "warnings": warnings,
         "document_language": language,
         "eval": public_eval(result.get("eval_stats")),
+        "complete": complete,
+        "status": "complete" if complete else "partial",
+        "missing_slot_ids": missing_slot_ids,
     }
 
 
@@ -1262,6 +1501,9 @@ def generate_exam(
     return {
         "questions": (exam or {}).get("questions", {}),
         "warnings": result["warnings"],
+        "complete": result.get("complete", False),
+        "status": result.get("status", "failed"),
+        "missing_slot_ids": result.get("missing_slot_ids", []),
     }
 
 

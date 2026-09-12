@@ -61,7 +61,7 @@ def _qtype_client(prompt) -> str:
 
 
 def _patch_client(monkeypatch, client):
-    monkeypatch.setattr("app.llm.client.LMStudioClient", lambda *a, **k: client)
+    monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: client)
     return client
 
 
@@ -101,17 +101,16 @@ def test_missing_concepts_not_free_filled(monkeypatch):
     assert any("mcq: 0/2" in w for w in warnings)
 
 
-def test_cross_model_near_duplicate_rejected(monkeypatch):
-    # A question already accepted in an earlier model must be rejected as a
-    # near-duplicate, so nothing is accepted in the later model.
+def test_cross_model_near_duplicate_is_allowed(monkeypatch):
+    # Semantic overlap across models is allowed; the plan assigns distinct ideas.
     prior_exam = [_mcq("What is supervised learning?")]
     planned = [{"topic": "S", "concept_to_test": "supervised learning"}]
-    client = SequencedClient([[_mcq("What is supervised learning?")]])
+    client = SequencedClient([[_mcq("Which learning method uses labeled examples?")]])
     _patch_client(monkeypatch, client)
     questions, _ = exam_builder._generate_type_from_plan(
         "mcq", planned, "ctx", "mix", 2, set(), [], prior_exam
     )
-    assert questions == []
+    assert len(questions) == 1
 
 
 def test_exact_duplicate_deduped_within_batch(monkeypatch):
@@ -239,7 +238,17 @@ def test_generation_node_records_complete_twenty_question_mixed_shape(monkeypatc
             for i in range(1, len(planned) + 1)
         ], []
 
+    def fake_fitb(*args, **kwargs):
+        return {
+            "word_bank": ["one", "two", "three", "four", "five"],
+            "items": [
+                {"question": f"Complete ________ {i}", "answers": ["one"]}
+                for i in range(1, 4)
+            ],
+        }, []
+
     monkeypatch.setattr(exam_builder, "_generate_obj_bundle", fake_bundle)
+    monkeypatch.setattr(exam_builder, "_generate_fitb_type", fake_fitb)
     monkeypatch.setattr(exam_builder, "_generate_type_from_plan", fake_free)
 
     tasks = [

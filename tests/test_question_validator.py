@@ -800,7 +800,8 @@ def test_repair_flow_revalidates_repaired_model(monkeypatch):
             return [_pass_verdict("model1_mcq_1")]
         return fake.validator_result
 
-    monkeypatch.setattr(val.LMStudioClient, "chat_json", _chat_json)
+    monkeypatch.setattr(FakeClient, "chat_json", _chat_json)
+    monkeypatch.setattr(val, "create_llm_client", lambda **_kwargs: fake)
 
     state = {
         "generated_exams": [_exam({"mcq": [_mcq("model1_mcq_1", answer="B")]})],
@@ -824,7 +825,7 @@ def test_repair_attempts_bounded_per_model(monkeypatch):
                           {"question_id": "model1_tf_1", "repaired_fields": ["answer"],
                            "question": {"statement": "Stmt", "answer": "True"}}
                       ])
-    monkeypatch.setattr(val, "LMStudioClient", lambda *a, **k: fake)
+    monkeypatch.setattr(val, "create_llm_client", lambda **_kwargs: fake)
 
     state = {
         "generated_exams": [_exam({"true_false": [_tf("model1_tf_1", answer="False")]})],
@@ -851,7 +852,7 @@ def test_model_repairs_never_mix(monkeypatch):
                           "correct_answer": "A"}}
         ],
     )
-    monkeypatch.setattr(val, "LMStudioClient", lambda *a, **k: fake)
+    monkeypatch.setattr(val, "create_llm_client", lambda **_kwargs: fake)
     state = {
         "generated_exams": [_exam({"mcq": [q1]}, model_number=1),
                             _exam({"mcq": [q2]}, model_number=2)],
@@ -870,7 +871,7 @@ def test_model_repairs_never_mix(monkeypatch):
 
 def test_validated_model_not_revalidated(monkeypatch):
     fake = FakeClient(validator_result=[_pass_verdict("model1_mcq_1")])
-    monkeypatch.setattr(val, "LMStudioClient", lambda *a, **k: fake)
+    monkeypatch.setattr(val, "create_llm_client", lambda **_kwargs: fake)
     state = {
         "generated_exams": [_exam({"mcq": [_mcq("model1_mcq_1")]})],
         "validation_reports": [],

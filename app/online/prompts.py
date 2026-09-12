@@ -25,11 +25,11 @@ SYSTEM_PROMPT = (
     "- Prefer questions that test reasoning, interpretation, comparison, explanation, "
     "and understanding of concepts.\n"
     "- Avoid questions that only test memorization of an isolated sentence.\n"
-    "- Do NOT create duplicate questions that test the exact same concept, fact, "
-    "or definition. Each question must test a distinct concept.\n"
-    "- It IS allowed to create multiple questions from the same section or topic, "
-    "as long as they ask about different aspects and have different answers. "
-    "Never repeat the same question or give the same answer twice.\n"
+    "- Do NOT create duplicate questions that test the exact same fact, idea, "
+    "relationship, or angle. Broad concepts may appear more than once.\n"
+"- It IS allowed to create multiple questions from the same section or topic, "
+"as long as they ask about different aspects and have different answers. "
+"Each question must target a distinct knowledge point, angle, or skill.\n"
     "- Questions should resemble questions written by a university professor.\n"
     "- Distribute the questions across the provided sections/subsections instead "
     "of clustering them on a single topic.\n\n"
@@ -59,9 +59,11 @@ SYSTEM_PROMPT = (
     "- Avoid ambiguous questions with multiple possible correct answers.\n"
     "- Avoid overly easy questions where the answer can be guessed from the options.\n"
     "- Avoid overly specific questions about small details unless they represent an important concept.\n"
-    "- Before returning the JSON, self-check every question: it must be answerable "
-    "from the context, its answer/distractors must be correct and distinct, and no "
-    "two questions may test the same concept. Fix any question that fails before output.\n\n"
+    "- Prioritize questions that test deep understanding, reasoning, and "
+    "application over trivial recall.\n"
+    "- Self-check every question before output: it must be answerable from the "
+    "context, its answer/distractors must be correct and distinct, and no "
+    "two questions may test the same specific idea or angle. Fix any question that fails before output.\n\n"
 
     "=== OUTPUT RULES ===\n"
     "- Generate EXACTLY the requested number of questions.\n"
@@ -147,18 +149,22 @@ def _version_note(model_number: int) -> str:
         f"This question set is Exam Model #{model_number} "
         "of a set of several exam versions generated from the SAME source material. "
         "Make sure these questions are DIFFERENT from the questions produced for other "
-        "exam models: do not reuse, repeat, or reword the same questions or test the "
-        "exact same concepts that other models cover. Remain fully grounded in the "
-        "same selected source content, but vary the question topics and phrasing so "
+        "exam models: do not repeat or reword the same questions. The models may cover "
+        "the same broad concepts using different grounded facts, ideas, relationships, "
+        "examples, or angles. Remain fully grounded in the selected source content so "
         "each exam version is distinct."
     )
 
 MCQ_RULES = (
-    "- Each question has EXACTLY four options (A, B, C, D) and EXACTLY one correct answer.\n"
-    "- Distractors must be plausible but clearly wrong.\n"
-    "- Make the four options clearly distinct and mutually exclusive so exactly one is correct.\n"
-    "- Distractors must be factually wrong and clearly different from the correct answer; "
-    "do not make them near-identical rewordings, simple negations, or synonyms of one another.\n"
+    "- Each question has EXACTLY four options (A, B, C, D) and EXACTLY one correct answer. "
+    "No 'all of the above', no 'none of the above'.\n"
+    "- Distractors must be plausible and knowledge-based — they should represent "
+    "common misconceptions or related-but-incorrect concepts, not obviously wrong "
+    "or random unrelated facts.\n"
+    "- Correct answer letter (A/B/C/D) must be evenly distributed across a batch: "
+    "no single letter may appear more than 50% of the time.\n"
+    "- All four options must be approximately the same length and grammatical structure.\n"
+    "- Every option must be a complete, grammatically correct statement or question.\n"
     "- The question must be answerable from the provided context.\n"
 )
 
@@ -373,38 +379,33 @@ PLANNER_SYSTEM_PROMPT = (
     "You are an expert university exam planning assistant.\n"
     "Your ONLY job is to decide WHAT each exam question should test.\n\n"
     "You do NOT write actual questions, answers, options, or reference answers. "
-    "You only choose, for each planned question:\n"
-    "  - question_type   (mcq | true_false | fill_in_the_blank | short_answer | essay)\n"
+    "You only choose, for each planned question inside its question-type array:\n"
+    "  - source_chunk_id (the exact selected chunk that grounds the question)\n"
     "  - topic           (the source section the question belongs to)\n"
-    "  - concept_to_test (the specific concept the question will assess)\n\n"
+    "  - concept         (the broad concept shared by equivalent exam versions)\n"
+    "  - idea_to_test    (the specific fact, idea, relationship, or angle assessed)\n\n"
     "The exam will later be generated by a separate question-generation model.\n\n"
 
     "=== PLANNING GOALS ===\n"
     "- Decide what every question should test from the available source content.\n"
     "- Distribute the requested number of questions across the requested question "
     "types for EVERY exam model.\n"
-    "- Make the exam VERSIONS meaningfully different: prefer different concepts "
-    "across models rather than the same concept reworded.\n"
-    "- Reduce concept repetition between models. Try to spread different concepts "
-    "across the models when the source material has enough variety.\n"
-    "- If the source material is too limited to avoid all repetition, some overlap "
-    "is acceptable, but avoid unnecessary duplication.\n\n"
+    "- Keep exam versions equivalent by allowing the same broad concepts across models.\n"
+    "- Give different models different facts, ideas, relationships, examples, or angles "
+    "inside those concepts. A model may freely choose another grounded idea when useful.\n"
+    "- Do not assign the same specific idea to two versions of the same question type.\n\n"
 
     "=== CONCEPT DISTINCTNESS RULES ===\n"
-    "- Two plan items count as duplicates if they test basically the SAME concept, "
-    "even when worded differently. For example 'what inductive reasoning means' "
-    "and 'definition of inductive reasoning' are effectively the same concept.\n"
-    "- AVOID these across different exam models.\n"
-    "- Do not merely rename the same concept for different models.\n"
-    "- Only reuse a concept across models when the source cannot support distinct "
-    "concepts for every model.\n\n"
+    "- Reusing a broad concept across models is allowed and expected.\n"
+    "- Within that concept, select a different grounded idea or angle for each model.\n"
+    "- Do not merely rename the same idea for another model.\n\n"
 
     "=== OUTPUT RULES ===\n"
     "- Return ONLY valid JSON.\n"
     "- Do not include markdown fences.\n"
     "- Do not include text before or after the JSON.\n"
-    "- Every planned item must include non-empty question_type, topic, and "
-    "concept_to_test.\n"
+    "- Every planned item must include non-empty source_chunk_id, topic, concept, "
+    "and idea_to_test.\n"
     "- For EVERY exam model, the total number of planned items of a given "
     "question_type must exactly match the requested count for that question_type.\n"
     "- The 'exams' array must contain exactly one entry per exam model.\n\n"
@@ -417,13 +418,12 @@ PLANNER_SCHEMA_EXAMPLE = (
     '  "exams": [\n'
     '    {\n'
     '      "model_number": 1,\n'
-    '      "questions": [\n'
-    '        {\n'
-    '          "question_type": "mcq",\n'
-    '          "topic": "Malaria and blood types",\n'
-    '          "concept_to_test": "Why type O blood is less affected by severe malaria"\n'
-    '        }\n'
-    '      ]\n'
+    '      "items": {\n'
+    '        "mcq": [\n'
+    '          {"source_chunk_id": "child-id-from-source", "topic": "Blood types", '\
+    '"concept": "Malaria resistance", "idea_to_test": "How type O affects severity"}\n'
+    '        ]\n'
+    '      }\n'
     '    }\n'
     '  ]\n'
     '}'
@@ -444,7 +444,7 @@ def build_planner_prompt(
     """Return (system_prompt, user_prompt) for the one planning call (all models)."""
     task_lines = "\n".join(f"  - {count} {qtype}" for qtype, count in tasks)
     lang_block = _language_block(language).replace(
-        "ALL generated content", "the 'topic' and 'concept_to_test' values"
+        "ALL generated content", "the 'topic', 'concept', and 'idea_to_test' values"
     ).replace("field VALUES must be written in", "values must be written in") \
         if language != "en" else ""
     user_prompt = (
@@ -455,18 +455,18 @@ def build_planner_prompt(
 
         f"{lang_block}"
 
-        f"## Selected source content (titles + short snippets)\n{planner_context}\n\n"
+        f"## Selected source content (titles + full selected context)\n{planner_context}\n\n"
 
         f"Produce a plan for EVERY exam model. Each model's plan must contain exactly "
         f"the requested per-type counts, and the concepts must be distributed so the "
-        f"exam versions differ meaningfully. Distribute different concepts across the "
-        f"models where the source material allows.\n\n"
+        f"exam versions remain equivalent. Reuse broad concepts when appropriate, but "
+        f"assign different grounded ideas or angles across models.\n\n"
 
         f"## Required JSON format (use exactly these field names)\n{PLANNER_SCHEMA_EXAMPLE}"
         f"\n\nThe 'exams' array must contain exactly {num_models} entries, one per "
-        f"exam model, each with non-empty question_type / topic / concept_to_test. "
-        f"question_type must be one of: mcq, true_false, fill_in_the_blank, "
-        f"short_answer, essay.\n"
+        f"exam model. Each model has an 'items' object whose requested question-type "
+        f"arrays contain source_chunk_id / topic / concept / idea_to_test. Use only "
+        f"source_chunk_id values printed in the selected content.\n"
         f"{PLANNER_OUTPUT_DIRECTIVE}"
     )
     return PLANNER_SYSTEM_PROMPT, user_prompt
@@ -494,7 +494,7 @@ def build_plan_repair_prompt(
         "- If an item is missing a field: fill in the missing field(s).\n"
         "- If two models reuse the same concept where the source allows distinct "
         "concepts: replace one with a different concept.\n\n"
-        f"## Selected source content (titles + short snippets)\n{planner_context}\n\n"
+        f"## Selected source content (titles + full selected context)\n{planner_context}\n\n"
         f"## Previous planner output to repair\n{previous_output}\n\n"
         "Return ONLY the corrected raw JSON with the exact same schema as before "
         "(an exams array with model_number, and per model a questions array of "
@@ -565,7 +565,8 @@ def build_prompt(
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
         f"## Task\nGenerate exactly {count} {type_name} exam question(s) following "
-        f"the rules and the required JSON format above.\n\n"
+        f"the rules and the enforced JSON Schema. Copy every slot_id exactly from "
+        f"the question plan.\n\n"
 
         f"{_OUTPUT_DIRECTIVE}"
     )
@@ -576,7 +577,9 @@ def _plan_block(planned_items: list[dict[str, Any]] | None) -> str:
     if not planned_items:
         return ""
     plan_lines = "\n".join(
-        f"{i}. topic={it.get('topic', '')} | concept_to_test={it.get('concept_to_test', '')}"
+        f"{i}. slot_id={it.get('slot_id', '')} | source_chunk_id={it.get('source_chunk_id', '')} "
+        f"| topic={it.get('topic', '')} | concept={it.get('concept', it.get('topic', ''))} "
+        f"| idea_to_test={it.get('idea_to_test', it.get('concept_to_test', ''))}"
         for i, it in enumerate(planned_items, start=1)
     )
     return (
@@ -631,6 +634,7 @@ def build_fitb_items_prompt(
     context: str,
     difficulty: str = "mix",
     model_number: int = 1,
+    planned_items: list[dict[str, Any]] | None = None,
     language: str = "en",
 ) -> tuple[str, str]:
     """Stage 2: write numbered items using ONLY the fixed, already-shuffled Word Bank."""
@@ -643,9 +647,11 @@ def build_fitb_items_prompt(
 
         f"## Selected Source Content\n{context}\n\n"
 
+        f"{_plan_block(planned_items)}"
+
         f"## Fixed Word Bank (use ONLY these entries)\n{bank_line}\n\n"
         "- Every answer must be one of these entries.\n"
-        "- Use every entry except the two distractors in at least one blank.\n"
+        "- Across the completed section, exactly two Word Bank entries must remain unused.\n"
         "- Never introduce a term that is not in the Word Bank.\n\n"
 
         f"## Item Rules\n{rules}\n\n"
@@ -661,7 +667,8 @@ def build_fitb_items_prompt(
 
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
-        f"## Task\nGenerate exactly {count} numbered items using only the fixed Word Bank.\n\n"
+        f"## Task\nGenerate exactly {count} items using only the fixed Word Bank. "
+        "Copy every slot_id exactly from the plan.\n\n"
 
         f"{_OUTPUT_DIRECTIVE}"
     )
@@ -725,32 +732,24 @@ def build_obj_bundled_prompt(
     feedback: str = "",
     language: str = "en",
 ) -> tuple[str, str]:
-    """Build ONE prompt that returns MCQ + True/False + Fill-in-the-Blank together.
-
-    ``planned`` maps qtype -> list of {topic, concept_to_test} plan items for the
-    three objective types (the still-missing items on a retry). The FITB count is
-    derived from its own plan list; the Word Bank must hold that many correct
-    terms plus exactly 2 distractors. ``feedback`` lists already-accepted
-    questions the model must not repeat.
-    """
+    """Build one exact-slot prompt for MCQ and True/False questions."""
     mcq_planned = planned.get("mcq") or []
     tf_planned = planned.get("true_false") or []
-    fitb_planned = planned.get("fill_in_the_blank") or []
     mcq_count = len(mcq_planned)
     tf_count = len(tf_planned)
-    fitb_count = len(fitb_planned)
 
     plan_lines = []
     for qtype, label in (
         ("mcq", "Multiple Choice"),
         ("true_false", "True/False"),
-        ("fill_in_the_blank", "Fill-in-the-Blank"),
     ):
         items = planned.get(qtype) or []
         if not items:
             continue
         block = f"### {label} ({len(items)} items)\n" + "\n".join(
-            f"{i}. topic={it.get('topic', '')} | concept_to_test={it.get('concept_to_test', '')}"
+            f"{i}. slot_id={it.get('slot_id', '')} | source_chunk_id={it.get('source_chunk_id', '')} "
+            f"| topic={it.get('topic', '')} | concept={it.get('concept', it.get('topic', ''))} "
+            f"| idea_to_test={it.get('idea_to_test', it.get('concept_to_test', ''))}"
             for i, it in enumerate(items, start=1)
         )
         plan_lines.append(block)
@@ -763,15 +762,11 @@ def build_obj_bundled_prompt(
         else ""
     )
 
-    bank_rules = FILL_IN_THE_BLANK_BANK_RULES.format(count=fitb_count)
-    items_rules = FILL_IN_THE_BLANK_ITEMS_RULES.format(count=fitb_count)
-
     user_prompt = (
         "Create the objective sections of an exam in ONE response: Multiple "
-        f"Choice ({mcq_count}), True/False ({tf_count}), and Fill-in-the-Blank "
-        f"({fitb_count} items with a shared Word Bank).\n\n"
+        f"Choice ({mcq_count}) and True/False ({tf_count}).\n\n"
         "Read the full selected source content below FIRST. It is the ONLY knowledge "
-        "source for every question, answer, option, True/False decision, and FITB term. "
+        "source for every question, answer, option, and True/False decision. "
         "Do not copy its wording and do not refer to it inside the questions.\n\n"
 
         f"## Selected Source Content\n{context}\n\n"
@@ -780,13 +775,7 @@ def build_obj_bundled_prompt(
 
         f"## Multiple Choice Rules\n{MCQ_RULES}\n\n"
         f"## True/False Rules\n{TRUE_FALSE_RULES}\n\n"
-        f"## Word Bank Rules\n{bank_rules}\n\n"
-        f"## Fill-in-the-Blank Item Rules\n{items_rules}\n\n"
-
-        f"## Required JSON Format (use exactly these field names)\n"
-        f"{OBJ_BUNDLED_SCHEMA}\n\n"
-
-        f"## Example of a valid output\n{OBJ_BUNDLED_EXAMPLE}\n\n"
+        "Every returned question must copy its slot_id exactly from the plan.\n\n"
 
         f"{_difficulty_block(difficulty)}\n\n"
 
@@ -794,10 +783,8 @@ def build_obj_bundled_prompt(
 
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
-        f"## Task\nReturn one JSON object with three keys: 'mcq' ({mcq_count} questions), "
-        f"'true_false' ({tf_count} statements), and 'fill_in_the_blank' (a 'word_bank' of "
-        f"exactly {fitb_count} correct terms plus 2 distractors, and {fitb_count} numbered "
-        f"'items' answered ONLY from that Word Bank, distractors never used).\n\n"
+        f"## Task\nReturn one JSON object with 'mcq' ({mcq_count} questions) and "
+        f"'true_false' ({tf_count} statements). Follow the enforced JSON Schema.\n\n"
 
         f"{feedback}"
 

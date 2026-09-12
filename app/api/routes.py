@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from app.api import storage as registry
 from app.api import evaluation_store, exam_store
 from app import db
-from app.config import UPLOAD_DIR
+from app.config import QDRANT_URL, UPLOAD_DIR
+from app.llm.factory import create_llm_client
 from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
 from app.offline.structure_store import load_structure
@@ -80,18 +81,18 @@ def health() -> dict[str, str]:
     try:
         from qdrant_client import QdrantClient
 
-        QdrantClient(url="http://localhost:6333").get_collections()
+        QdrantClient(url=QDRANT_URL).get_collections()
         statuses["qdrant"] = "ok"
     except Exception:
         statuses["qdrant"] = "error"
 
+    llm = None
     try:
-        import requests
-
-        requests.get("http://127.0.0.1:1234/api/v1/models", timeout=3)
-        statuses["lm_studio"] = "ok"
+        llm = create_llm_client()
+        llm.health(timeout=3)
+        statuses[llm.provider_name] = "ok"
     except Exception:
-        statuses["lm_studio"] = "error"
+        statuses[getattr(llm, "provider_name", "llm")] = "error"
 
     statuses["status"] = "ok" if all(v == "ok" for v in statuses.values()) else "degraded"
     return statuses
@@ -241,6 +242,9 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     warnings = result["warnings"]
     eval_stats = result.get("eval") or {}
     document_language = result.get("document_language") or "en"
+    complete = bool(result.get("complete"))
+    status = result.get("status") or ("complete" if complete else "partial")
+    missing_slot_ids = result.get("missing_slot_ids") or []
 
     total_elapsed = time.perf_counter() - t_total
 
@@ -290,7 +294,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
 
     logger.info(
         "Exam generation completed | document_id=%s | exam_id=%s | models=%d | difficulty=%s | types=%s | "
-        "total_questions=%d | total_time=%.2fs | success=True",
+        "total_questions=%d | total_time=%.2fs | success=%s | status=%s | missing_slots=%s",
         document_id,
         exam_id,
         num_models,
@@ -302,6 +306,9 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
             for section in exam["questions"].values()
         ),
         total_elapsed,
+        complete,
+        status,
+        missing_slot_ids,
     )
 
     return {
@@ -314,4 +321,7 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         "exams": exams,
         "warnings": warnings,
         "eval": eval_stats,
+        "complete": complete,
+        "status": status,
+        "missing_slot_ids": missing_slot_ids,
     }

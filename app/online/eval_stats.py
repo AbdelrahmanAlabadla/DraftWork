@@ -62,6 +62,15 @@ def create_pipeline_eval(
         models[str(model_number)] = {
             **_empty_counts(sum(requested.values())),
             "question_types": question_types,
+            "slot_outcomes": {
+                f"m{model_number}_{qtype}_{index}": {
+                    "question_type": qtype,
+                    "attempts": 0,
+                    "status": "pending",
+                }
+                for qtype, count in requested.items()
+                for index in range(1, count + 1)
+            },
         }
     stats = {
         "overall": {**_empty_counts(), "question_types": {}},
@@ -124,6 +133,7 @@ def record_generation_rejection(
     qtype: str,
     reason: str,
     count: int = 1,
+    slot_id: str | None = None,
 ) -> None:
     """Record raw generation candidates rejected by existing filters."""
     if stats is None or count <= 0:
@@ -132,6 +142,33 @@ def record_generation_rejection(
     counters["generation_rejected"] += count
     reasons = counters["generation_rejection_reasons"]
     reasons[reason] = reasons.get(reason, 0) + count
+    if slot_id:
+        outcomes = stats["models"][str(model_number)].setdefault("slot_outcomes", {})
+        entry = outcomes.setdefault(
+            slot_id,
+            {"question_type": qtype, "attempts": 0, "status": "pending"},
+        )
+        entry["attempts"] += count
+        entry["status"] = "rejected"
+        entry["last_rejection_reason"] = reason
+
+
+def record_slot_accepted(
+    stats: dict[str, Any] | None,
+    model_number: int,
+    qtype: str,
+    slot_id: str,
+) -> None:
+    if stats is None or not slot_id:
+        return
+    outcomes = stats["models"][str(model_number)].setdefault("slot_outcomes", {})
+    entry = outcomes.setdefault(
+        slot_id,
+        {"question_type": qtype, "attempts": 0, "status": "pending"},
+    )
+    entry["attempts"] += 1
+    entry["status"] = "accepted"
+    entry.pop("last_rejection_reason", None)
 
 
 def record_shortfall_result(

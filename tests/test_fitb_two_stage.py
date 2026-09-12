@@ -27,7 +27,7 @@ def fake_llm(monkeypatch):
 
     def install(responses):
         llm = FakeLLM(responses)
-        monkeypatch.setattr("app.llm.client.LMStudioClient", lambda: llm)
+        monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: llm)
         holder["llm"] = llm
         return llm
 
@@ -69,7 +69,8 @@ def test_two_stage_happy_path(fake_llm):
         ]},
     ])
     section, warnings = eb._generate_fitb_type(
-        4, [], "context about hardware", "easy", 1, [], []
+        4, [{"concept_to_test": str(i)} for i in range(4)],
+        "context about hardware", "easy", 1, [], []
     )
     assert section is not None
     assert len(section["items"]) == 4
@@ -92,7 +93,7 @@ def test_stage1_retry_only_refetches_bank(fake_llm):
                    for i in range(4)]},                            # short set
     ])
     section, _ = eb._generate_fitb_type(
-        4, [], "ctx", "easy", 1, [], []
+        4, [{"concept_to_test": str(i)} for i in range(4)], "ctx", "easy", 1, [], []
     )
     # Stage A retried once (2 calls), then stage B ran.
     assert len([c for c in llm.calls if "TERMS" in c]) == 2
@@ -109,7 +110,7 @@ def test_items_kept_even_if_count_short_with_warning(fake_llm):
         ]},
     ])
     section, warnings = eb._generate_fitb_type(
-        4, [], "ctx", "easy", 1, [], []
+        4, [{"concept_to_test": str(i)} for i in range(4)], "ctx", "easy", 1, [], []
     )
     assert section is not None
     # Short-but-valid set is accepted immediately (no wasted retries).
@@ -124,15 +125,15 @@ def test_items_rejected_when_answer_not_in_bank_then_partial(fake_llm):
         {"items": [{"question": "The ________ runs programs.", "answers": ["CPU"]}]},
     ])
     section, warnings = eb._generate_fitb_type(
-        4, [], "ctx", "easy", 1, [], []
+        4, [{"concept_to_test": str(i)} for i in range(4)], "ctx", "easy", 1, [], []
     )
     assert section is not None
     assert section["items"][0]["answers"] == ["CPU"]
     assert any("rejected" in w for w in warnings)
 
 
-def test_bundle_fitb_uses_two_stage(monkeypatch, fake_llm):
-    """The objective bundle path also generates FITB via stages A+B."""
+def test_bundle_excludes_fitb_for_separate_generation(monkeypatch, fake_llm):
+    """MCQ/TF stay together while FITB is generated in its own call path."""
     llm = fake_llm([
         {"questions": [{"question": "MCQ one?", "options":
                         {"A": "a", "B": "b", "C": "c", "D": "d"},
@@ -179,17 +180,20 @@ def test_bundle_fitb_uses_two_stage(monkeypatch, fake_llm):
                     return resp
             return responses_by_marker["default"]
 
-    monkeypatch.setattr("app.llm.client.LMStudioClient", lambda: KeyedLLM())
+    monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: KeyedLLM())
 
     planned = {
         "mcq": [{}],
         "true_false": [],
-        "fill_in_the_blank": [{}, {}, {}, {}],   # count = 4 -> bank of 6
+        "fill_in_the_blank": [{}, {}, {}, {}],
     }
     bundle, _warnings = eb._generate_obj_bundle(
         planned, "hardware context", "easy", 1, [], set(), []
     )
-    assert bundle["fill_in_the_blank"] is not None
-    fitb = bundle["fill_in_the_blank"]
+    assert "fill_in_the_blank" not in bundle
+    fitb, _ = eb._generate_fitb_type(
+        4, planned["fill_in_the_blank"], "hardware context", "easy", 1, [], []
+    )
+    assert fitb is not None
     assert len(fitb["word_bank"]) == 6
     assert fitb["items"][0]["answers"] == ["CPU"]

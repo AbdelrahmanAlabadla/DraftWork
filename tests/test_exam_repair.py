@@ -64,7 +64,10 @@ def test_missing_fills_exact_amount(monkeypatch):
     monkeypatch.setattr(eb, "_generate_type_from_plan", _fake_gen)
     questions = {"short_answer": [{"question": "orig sa", "reference_answer": "ans"}]}
     tasks = [("short_answer", 2)]
-    plan_items = {"short_answer": [{"topic": "x", "concept_to_test": "c"}]}
+    plan_items = {"short_answer": [
+        {"topic": "x", "concept_to_test": "c1"},
+        {"topic": "x", "concept_to_test": "c2"},
+    ]}
     appended = {}
     eb._repair_shortfalls(
         questions, tasks, plan_items, "", "easy", 1, set(), [], [],
@@ -135,41 +138,44 @@ def test_shortfall_rejections_reach_model_overall_and_persistence(monkeypatch):
     )
 
 
-def test_grounded_fallback_not_blank(monkeypatch):
-    """When the plan is empty, the repair must NOT send a blank concept."""
-    captured = {}
+def test_empty_plan_is_not_fabricated_by_generator(monkeypatch):
+    """A missing planner slot remains explicit instead of being invented."""
+    captured = {"called": False}
 
     def _fake_gen(qtype, planned, *a, **k):
-        captured["planned"] = planned
-        return [{"question": "q", "reference_answer": "a"} for _ in planned], []
+        captured["called"] = True
+        return [], []
 
     monkeypatch.setattr(eb, "_generate_type_from_plan", _fake_gen)
     context = "First heading line\nSome body text about science."
     questions = {"essay": []}
     tasks = [("essay", 1)]
-    eb._repair_shortfalls(questions, tasks, {}, context, "easy", 1, set(), [], [], max_passes=2)
-    p = captured["planned"][0]
-    assert p["topic"], "topic must not be blank"
-    assert p["concept_to_test"], "concept must not be blank"
-    assert "blank" not in p["topic"].lower() and "blank" not in p["concept_to_test"].lower()
+    warnings = eb._repair_shortfalls(
+        questions, tasks, {}, context, "easy", 1, set(), [], [], max_passes=2
+    )
+    assert captured["called"] is False
+    assert any("m1_essay_1" in warning for warning in warnings)
 
 
 def test_fitb_missing_regenerated_full(monkeypatch):
     captured = {}
     stats = create_pipeline_eval([("fill_in_the_blank", 3)], 1)
 
-    def _fake_bundle(planned, *a, **k):
+    def _fake_fitb(count, planned, *a, **k):
         captured["planned"] = planned
         captured["eval_stats"] = k.get("eval_stats")
-        # produce a full valid fitb for the requested count
-        return {"fill_in_the_blank": {"word_bank": [f"t{i}" for i in range(3)] + ["d1", "d2"], "items": [
-            {"question": f"___ {i}", "answers": [f"t{i}"]} for i in range(3)]}, "mcq": [], "true_false": []}, []
+        return {"word_bank": [f"t{i}" for i in range(3)] + ["d1", "d2"], "items": [
+            {"question": f"___ {i}", "answers": [f"t{i}"], "slot_id": planned[i]["slot_id"]}
+            for i in range(3)]}, []
 
-    monkeypatch.setattr(eb, "_generate_obj_bundle", _fake_bundle)
+    monkeypatch.setattr(eb, "_generate_fitb_type", _fake_fitb)
     questions = {}
     tasks = [("fill_in_the_blank", 3)]
+    plans = {"fill_in_the_blank": [
+        {"topic": "t", "concept_to_test": f"c{i}"} for i in range(3)
+    ]}
     eb._repair_shortfalls(
-        questions, tasks, {}, "", "easy", 1, set(), [], [],
+        questions, tasks, plans, "", "easy", 1, set(), [], [],
         max_passes=2, eval_stats=stats,
     )
     assert len(questions["fill_in_the_blank"]["items"]) == 3
@@ -223,13 +229,11 @@ def test_structural_repair_preserves_valid_content(monkeypatch):
             ]
         }
 
-    import app.llm.client as client_mod
-
     class FakeClient:
         def chat_json(self, *a, **k):
             return fake_chat_json(*a, **k)
 
-    monkeypatch.setattr(client_mod, "LMStudioClient", lambda: FakeClient())
+    monkeypatch.setattr("app.llm.factory.create_llm_client", FakeClient)
 
     invalid = [{
         "question": "What is photosynthesis?",

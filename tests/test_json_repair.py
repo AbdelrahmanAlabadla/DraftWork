@@ -38,6 +38,42 @@ def _make_client(chat_fn) -> LMStudioClient:
     return client
 
 
+def test_structured_output_uses_lm_studio_json_schema_endpoint(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": '{"value":"ok"}'}}]}
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(url=url, payload=json, headers=headers, timeout=timeout)
+        return Response()
+
+    monkeypatch.setattr("app.llm.client.requests.post", fake_post)
+    client = LMStudioClient(url="http://localhost:1234", model="local-model")
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+    }
+    result = client.chat_structured(
+        "return a value", json_schema=schema, schema_name="test schema"
+    )
+    assert result == {"value": "ok"}
+    assert captured["url"] == "http://localhost:1234/v1/chat/completions"
+    response_format = captured["payload"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"] == {
+        "name": "test_schema",
+        "strict": True,
+        "schema": schema,
+    }
+
+
 def test_build_repair_prompt_contains_error_and_broken():
     prompt = build_repair_prompt("{}", "Expecting ',' delimiter")
     assert "Expecting ',' delimiter" in prompt

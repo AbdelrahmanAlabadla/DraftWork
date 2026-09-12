@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from app.config import VALIDATOR_BATCH_SIZE
-from app.llm.client import LMStudioClient
+from app.llm.client import request_structured
+from app.llm.factory import create_llm_client
+from app.llm.schemas import repair_response_model, validator_response_model
 from app.logging_conf import get_logger
 from app.online.eval_stats import record_first_validation, record_repair_outcome
 from app.online.models import (
@@ -343,13 +345,13 @@ VALIDATOR_SYSTEM_PROMPT = (
 VALIDATOR_OUTPUT_SCHEMA = (
     '[\n'
     '  {\n'
-    '    "question_id": "model1_mcq_2",\n'
+    '    "question_id": "...",\n'
     '    "question_valid": true,\n'
     '    "answer_valid": false,\n'
     '    "action": "FIX_ANSWER",\n'
     '    "fields_to_fix": ["answer"],\n'
-    '    "reason": "The correct option is C, but the stored answer is B.",\n'
-    '    "expected_fix": "Change the answer to C. Keep the question and options unchanged."\n'
+    '    "reason": "...",\n'
+    '    "expected_fix": "..."\n'
     '  }\n'
     ']'
 )
@@ -405,10 +407,10 @@ REPAIR_SYSTEM_PROMPT = (
 REPAIR_OUTPUT_SCHEMA = (
     '[\n'
     '  {\n'
-    '    "question_id": "example_mcq_1",\n'
-    '    "repaired_fields": ["answer"],\n'
+    '    "question_id": "...",\n'
+    '    "repaired_fields": ["..."],\n'
     '    "question": {"question": "...", "options": {"A": "...", "B": "...", '
-    '"C": "...", "D": "..."}, "correct_answer": "C"}\n'
+    '"C": "...", "D": "..."}, "correct_answer": "..."}\n'
     '  }\n'
     ']'
 )
@@ -475,7 +477,7 @@ def _sanitize_verdict(raw: Any, known: Set[str]) -> Optional[Dict[str, Any]]:
 
 
 def validate_exam(
-        exam: Dict[str, Any], client: Optional[Any] = None
+        exam: Dict[str, Any], client: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Validate every question in bounded batches, retrying missing IDs once.
 
@@ -508,7 +510,7 @@ def validate_exam(
     verdicts: Dict[str, Dict[str, Any]] = dict(local_verdicts)
     coverage: List[Dict[str, Any]] = []
     if entries:
-        llm = client or LMStudioClient(reasoning=VALIDATOR_REASONING)
+        llm = client or create_llm_client(local_reasoning=VALIDATOR_REASONING)
         for offset in range(0, len(entries), VALIDATOR_BATCH_SIZE):
             batch = entries[offset: offset + VALIDATOR_BATCH_SIZE]
             sent_ids = [entry["question_id"] for entry in batch]
@@ -572,8 +574,16 @@ def validate_exam(
                         verdicts[v["question_id"]] = v
 
             try:
-                raw = llm.chat_json(
+                raw = request_structured(
+                    llm,
                     build_validator_prompt(batch),
+                    response_model=validator_response_model(sent_ids),
+                    schema_name="validator_verdicts",
+                    agent="validator",
+                    item_count=len(batch),
+                    expected_ids=sent_ids,
+                    expected_id_field="question_id",
+                    local_json=True,
                     system_prompt=VALIDATOR_SYSTEM_PROMPT,
                     temperature=VALIDATOR_TEMPERATURE,
                     max_tokens=VALIDATOR_MAX_TOKENS,
@@ -591,8 +601,17 @@ def validate_exam(
                     f"validate: {len(missing)} question(s) had no verdict; retrying once"
                 )
                 try:
-                    raw2 = llm.chat_json(
+                    missing_ids = [entry["question_id"] for entry in missing]
+                    raw2 = request_structured(
+                        llm,
                         build_validator_prompt(missing),
+                        response_model=validator_response_model(missing_ids),
+                        schema_name="validator_missing_verdicts",
+                        agent="validator",
+                        item_count=len(missing),
+                        expected_ids=missing_ids,
+                        expected_id_field="question_id",
+                        local_json=True,
                         system_prompt=VALIDATOR_RETRY_SYSTEM_PROMPT,
                         temperature=VALIDATOR_TEMPERATURE,
                         max_tokens=VALIDATOR_MAX_TOKENS,
@@ -738,11 +757,23 @@ def repair_exam(
 
     sent_ids = [item["question_id"] for item in payload]
 
-    llm = client or LMStudioClient(reasoning=REPAIR_REASONING)
+    llm = client or create_llm_client(local_reasoning=REPAIR_REASONING)
     user_prompt = build_repair_prompt(payload)
     try:
-        raw = llm.chat_json(
+        repair_model_items = [
+            (item["question_id"], by_id[item["question_id"]][0])
+            for item in payload
+        ]
+        raw = request_structured(
+            llm,
             user_prompt,
+            response_model=repair_response_model(repair_model_items),
+            schema_name="question_repairs",
+            agent="repairer",
+            item_count=len(payload),
+            expected_ids=sent_ids,
+            expected_id_field="question_id",
+            local_json=True,
             system_prompt=REPAIR_SYSTEM_PROMPT,
             temperature=REPAIR_TEMPERATURE,
             max_tokens=REPAIR_MAX_TOKENS,
@@ -790,11 +821,14 @@ def repair_exam(
             continue
 
         stashed_id = item.get("question_id")
+        stashed_slot_id = item.get("slot_id")
         normalized = _normalize(qtype, new_item)
         if normalized is None:
             warnings.append(f"repair: {qid} output failed normalization; rejected")
             continue
         normalized["question_id"] = stashed_id
+        if stashed_slot_id:
+            normalized["slot_id"] = stashed_slot_id
 
         # FITB: word bank is section-level. Only a word_bank-enabled repair may
         # rewrite it; a single item repair never touches other items' content.
@@ -851,7 +885,7 @@ def repair_exam(
 # LangGraph nodes
 # --------------------------------------------------------------------------
 def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Node: validate every not-yet-passed exam model (one LLM call per model)."""
+    """Node: validate each not-yet-passed model and track the latest report."""
     generated = state.get("generated_exams") or []
     validated = list(state.get("validated_models") or [])
     attempts = state.get("question_repair_attempts") or {}
