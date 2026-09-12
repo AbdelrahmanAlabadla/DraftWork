@@ -780,6 +780,123 @@ def test_repair_failure_keeps_original_for_revalidation():
 # ---------------------------------------------------------------------------
 # Graph nodes: revalidation, bounded and per-model attempts, isolation
 # ---------------------------------------------------------------------------
+def test_selective_revalidation_merges_untouched_passes(monkeypatch):
+    all_ids = [f"model1_mcq_{index}" for index in range(1, 11)]
+    invalid_ids = all_ids[-3:]
+    exam = _exam({"mcq": [_mcq(qid) for qid in all_ids]})
+    validation_scopes = []
+
+    def fake_validate(_exam_value, client=None, question_ids=None):
+        scope = None if question_ids is None else list(question_ids)
+        validation_scopes.append(scope)
+        ids = all_ids if scope is None else scope
+        verdicts = [
+            (
+                _verdict(qid, "FIX_ANSWER", av=False, fields=["answer"])
+                if scope is None and qid in invalid_ids
+                else _pass_verdict(qid)
+            )
+            for qid in ids
+        ]
+        return {
+            "model_number": 1,
+            "all_pass": all(v["action"] == "PASS" for v in verdicts),
+            "verdicts": verdicts,
+            "warnings": [],
+            "coverage": [],
+        }
+
+    monkeypatch.setattr(val, "validate_exam", fake_validate)
+    monkeypatch.setattr(
+        val,
+        "repair_exam",
+        lambda _exam_value, _verdicts: {
+            "warnings": [],
+            "sent_ids": invalid_ids,
+            "repaired_ids": invalid_ids,
+            "failed_ids": [],
+        },
+    )
+    state = {
+        "generated_exams": [exam],
+        "validation_reports": [],
+        "validated_models": [],
+        "question_repair_attempts": {},
+        "pending_revalidation_ids": {},
+        "warnings": [],
+    }
+    state = {**state, **validate_generated_questions(state)}
+    first_passes = {
+        verdict["question_id"]: verdict
+        for verdict in state["validation_reports"][0]["verdicts"]
+        if verdict["action"] == "PASS"
+    }
+    state = {**state, **repair_invalid_questions(state)}
+    state = {**state, **validate_generated_questions(state)}
+
+    assert validation_scopes == [None, invalid_ids]
+    report = state["validation_reports"][0]
+    assert report["all_pass"]
+    assert len(report["verdicts"]) == 10
+    assert all(verdict["action"] == "PASS" for verdict in report["verdicts"])
+    for verdict in report["verdicts"][:7]:
+        assert verdict is first_passes[verdict["question_id"]]
+
+
+def test_second_repair_revalidates_only_second_repaired_ids(monkeypatch):
+    qids = ["model1_mcq_1", "model1_mcq_2"]
+    exam = _exam({"mcq": [_mcq(qid) for qid in qids]})
+    scopes = []
+    repair_round = {"value": 0}
+
+    def fake_validate(_exam_value, client=None, question_ids=None):
+        scope = None if question_ids is None else list(question_ids)
+        scopes.append(scope)
+        if scope is None:
+            verdicts = [
+                _verdict(qid, "FIX_ANSWER", av=False, fields=["answer"])
+                for qid in qids
+            ]
+        else:
+            verdicts = [_pass_verdict(qid) for qid in scope]
+        return {
+            "model_number": 1,
+            "all_pass": all(v["action"] == "PASS" for v in verdicts),
+            "verdicts": verdicts,
+            "warnings": [],
+            "coverage": [],
+        }
+
+    def fake_repair(_exam_value, _verdicts):
+        qid = qids[repair_round["value"]]
+        repair_round["value"] += 1
+        return {
+            "warnings": [],
+            "sent_ids": qids,
+            "repaired_ids": [qid],
+            "failed_ids": [other for other in qids if other != qid],
+        }
+
+    monkeypatch.setattr(val, "validate_exam", fake_validate)
+    monkeypatch.setattr(val, "repair_exam", fake_repair)
+    state = {
+        "generated_exams": [exam],
+        "validation_reports": [],
+        "validated_models": [],
+        "question_repair_attempts": {},
+        "pending_revalidation_ids": {},
+        "warnings": [],
+    }
+    state = {**state, **validate_generated_questions(state)}
+    state = {**state, **repair_invalid_questions(state)}
+    state = {**state, **validate_generated_questions(state)}
+    state = {**state, **repair_invalid_questions(state)}
+    state = {**state, **validate_generated_questions(state)}
+
+    assert scopes == [None, [qids[0]], [qids[1]]]
+    assert state["validation_reports"][0]["all_pass"]
+
+
 def test_repair_flow_revalidates_repaired_model(monkeypatch):
     fake = FakeClient(
         validator_result=[_verdict("model1_mcq_1", "FIX_ANSWER", av=False, fields=["answer"])],

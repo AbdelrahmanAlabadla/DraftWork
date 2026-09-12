@@ -30,6 +30,7 @@ The system combines document parsing, semantic chunking, embeddings, selected-se
 * Retry only missing plan items when generation falls short
 * Automatically validate generated questions
 * Repair only invalid questions instead of regenerating the entire exam
+* Revalidate only the question IDs changed by each repair pass
 * Track generation, validation, repair, and final outcome telemetry
 * Review overall and per-model performance in a read-only Eval Dashboard
 * Separate question-quality failures from validator operational failures
@@ -186,8 +187,7 @@ flowchart TD
 
     I -->|Valid| J[Final Exam]
     I -->|Invalid| K[Repairer: Targeted Fields]
-
-    K --> I
+    K -->|Repaired IDs only| I
 
     G -.-> L[Shared LLM Factory]
     H -.-> L
@@ -246,7 +246,7 @@ model1_true_false_1
 model1_fill_in_the_blank_1
 ```
 
-If a question fails validation, the system repairs only that question instead of regenerating the whole exam.
+If a question fails validation, the system repairs only that question instead of regenerating the whole exam. Initial validation covers every generated question. After a repair pass, Validator receives only the IDs successfully repaired in that pass. The new verdicts are merged into the existing report by `question_id`, preserving PASS verdicts for untouched questions. If a second repair attempt is needed, only the questions repaired during that second attempt are revalidated.
 
 ```text id="4igx1e"
 Generate
@@ -259,10 +259,10 @@ FIX
    ↓
 Repair Invalid Question
    ↓
-Revalidate
+Revalidate Repaired ID Only
 ```
 
-This keeps already-valid questions unchanged and reduces unnecessary LLM regeneration.
+This keeps already-valid questions unchanged and avoids sending them through Validator again.
 
 ## Tech Stack
 
@@ -431,7 +431,7 @@ The tests cover core components including:
 * selected content loading
 * structured planning and plan-slot preservation
 * schema-based exam generation and targeted shortfall recovery
-* validation and targeted repair
+* validation, targeted repair, and selective revalidation
 * DeepSeek client retries, errors, and token accounting
 * API behavior
 * PostgreSQL evaluation persistence and aggregation

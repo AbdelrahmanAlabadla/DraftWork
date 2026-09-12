@@ -31,6 +31,7 @@ class ExamState(TypedDict):
     validation_reports: list[dict[str, Any]]  # one report per validated model
     validated_models: list[int]  # models that fully passed (skip re-validation)
     question_repair_attempts: dict[int, int]  # per-model repair budget already used
+    pending_revalidation_ids: dict[int, list[str]]  # repaired IDs awaiting validation
     eval_stats: PipelineEvalStats  # JSON-safe V1 pipeline telemetry
     # --- Warnings / Result ----------------------------------------------
     warnings: list[str]

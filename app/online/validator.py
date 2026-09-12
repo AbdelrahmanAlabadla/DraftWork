@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from app.config import VALIDATOR_BATCH_SIZE
 from app.llm.client import request_structured
@@ -478,6 +478,7 @@ def _sanitize_verdict(raw: Any, known: Set[str]) -> Optional[Dict[str, Any]]:
 
 def validate_exam(
         exam: Dict[str, Any], client: Optional[Any] = None,
+        question_ids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Validate every question in bounded batches, retrying missing IDs once.
 
@@ -487,6 +488,11 @@ def validate_exam(
     """
     model_number = exam.get("model_number") or 1
     questions = exam.get("questions") or {}
+    selected_ids = (
+        {str(question_id) for question_id in question_ids if str(question_id)}
+        if question_ids is not None
+        else None
+    )
     warnings: List[str] = []
 
     # Deterministic structural problems never consume an LLM call.
@@ -497,6 +503,8 @@ def validate_exam(
         if not qid:
             warnings.append(f"validate: question missing question_id; skipped")
             continue
+        if selected_ids is not None and str(qid) not in selected_ids:
+            continue
         verdict = _local_verdict(qtype, item, container)
         if verdict is not None:
             verdict["question_id"] = str(qid)
@@ -506,6 +514,14 @@ def validate_exam(
         if qtype == "fill_in_the_blank" and isinstance(container, dict):
             payload["word_bank"] = container.get("word_bank") or []
         entries.append({"question_id": str(qid), "question_type": qtype, "question": payload})
+
+    scope_ids = [*local_verdicts, *(entry["question_id"] for entry in entries)]
+    logger.info(
+        "Validation scope | model=%d | question_count=%d | question_ids=%s",
+        model_number,
+        len(scope_ids),
+        scope_ids,
+    )
 
     verdicts: Dict[str, Dict[str, Any]] = dict(local_verdicts)
     coverage: List[Dict[str, Any]] = []
@@ -643,6 +659,8 @@ def validate_exam(
         qid = str(item.get("question_id") or "")
         if not qid:
             continue
+        if selected_ids is not None and qid not in selected_ids:
+            continue
         v = verdicts.get(qid)
         if v is None:
             warnings.append(
@@ -675,6 +693,45 @@ def validate_exam(
         "warnings": warnings,
         "coverage": coverage,
     }
+
+
+def _merge_validation_report(
+    previous: Dict[str, Any], update: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Replace revalidated verdicts by ID and retain every untouched verdict."""
+    replacements = {
+        str(verdict.get("question_id")): verdict
+        for verdict in (update.get("verdicts") or [])
+        if verdict.get("question_id")
+    }
+    merged_verdicts: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for verdict in previous.get("verdicts") or []:
+        qid = str(verdict.get("question_id") or "")
+        merged_verdicts.append(replacements.get(qid, verdict))
+        if qid:
+            seen.add(qid)
+    for qid, verdict in replacements.items():
+        if qid not in seen:
+            merged_verdicts.append(verdict)
+
+    merged = dict(previous)
+    merged["model_number"] = update.get(
+        "model_number", previous.get("model_number")
+    )
+    merged["verdicts"] = merged_verdicts
+    merged["all_pass"] = all(
+        verdict.get("action") == "PASS" for verdict in merged_verdicts
+    )
+    merged["warnings"] = [
+        *(previous.get("warnings") or []),
+        *(update.get("warnings") or []),
+    ]
+    merged["coverage"] = [
+        *(previous.get("coverage") or []),
+        *(update.get("coverage") or []),
+    ]
+    return merged
 
 
 # --------------------------------------------------------------------------
@@ -885,10 +942,11 @@ def repair_exam(
 # LangGraph nodes
 # --------------------------------------------------------------------------
 def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Node: validate each not-yet-passed model and track the latest report."""
+    """Validate every question initially, then only successfully repaired IDs."""
     generated = state.get("generated_exams") or []
     validated = list(state.get("validated_models") or [])
     attempts = state.get("question_repair_attempts") or {}
+    pending_revalidation = dict(state.get("pending_revalidation_ids") or {})
     warnings = list(state.get("warnings") or [])
     # Preserve one latest report per model. Earlier passing models are skipped
     # by validation but their reports remain available for final telemetry.
@@ -902,7 +960,28 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         mn = exam.get("model_number")
         if mn in validated:
             continue
-        report = validate_exam(exam)
+        previous = reports_by_model.get(mn)
+        if mn in pending_revalidation:
+            repaired_ids = list(pending_revalidation.pop(mn) or [])
+            if repaired_ids:
+                logger.info(
+                    "Selective revalidation | model=%d | question_count=%d | question_ids=%s",
+                    mn,
+                    len(repaired_ids),
+                    repaired_ids,
+                )
+                update = validate_exam(exam, question_ids=repaired_ids)
+                report = (
+                    _merge_validation_report(previous, update)
+                    if previous is not None
+                    else update
+                )
+            elif previous is not None:
+                report = previous
+            else:
+                report = validate_exam(exam)
+        else:
+            report = validate_exam(exam)
         reports_by_model[mn] = report
         if eval_stats is not None:
             record_first_validation(eval_stats, exam, report)
@@ -918,6 +997,7 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "validation_reports": list(reports_by_model.values()),
         "validated_models": validated,
+        "pending_revalidation_ids": pending_revalidation,
         "warnings": warnings,
         "eval_stats": eval_stats,
     }
@@ -931,6 +1011,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     validated = list(state.get("validated_models") or [])
     warnings = list(state.get("warnings") or [])
     eval_stats = state.get("eval_stats")
+    pending_revalidation = dict(state.get("pending_revalidation_ids") or {})
     exam_by_model = {e.get("model_number"): e for e in generated}
 
     for r in reports:
@@ -960,6 +1041,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 outcome.get("sent_ids") or [],
             )
         attempts[mn] = attempt
+        pending_revalidation[mn] = list(outcome.get("repaired_ids") or [])
         warnings.extend(outcome["warnings"])
         if mn in validated:
             validated.remove(mn)
@@ -967,6 +1049,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "question_repair_attempts": attempts,
         "validated_models": validated,
+        "pending_revalidation_ids": pending_revalidation,
         "warnings": warnings,
         "eval_stats": eval_stats,
     }

@@ -1432,6 +1432,7 @@ def generate_exams(
         "validation_reports": [],
         "validated_models": [],
         "question_repair_attempts": {},
+        "pending_revalidation_ids": {},
         "eval_stats": create_pipeline_eval(tasks, num_models),
         "warnings": [],
         "error": None,
