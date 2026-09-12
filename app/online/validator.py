@@ -4,7 +4,9 @@ import json
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from app.config import VALIDATOR_BATCH_SIZE
-from app.llm.client import LMStudioClient
+from app.llm.client import request_structured
+from app.llm.factory import create_llm_client
+from app.llm.schemas import repair_response_model, validator_response_model
 from app.logging_conf import get_logger
 from app.online.eval_stats import record_first_validation, record_repair_outcome
 from app.online.models import (
@@ -343,13 +345,13 @@ VALIDATOR_SYSTEM_PROMPT = (
 VALIDATOR_OUTPUT_SCHEMA = (
     '[\n'
     '  {\n'
-    '    "question_id": "model1_mcq_2",\n'
+    '    "question_id": "...",\n'
     '    "question_valid": true,\n'
     '    "answer_valid": false,\n'
     '    "action": "FIX_ANSWER",\n'
     '    "fields_to_fix": ["answer"],\n'
-    '    "reason": "The correct option is C, but the stored answer is B.",\n'
-    '    "expected_fix": "Change the answer to C. Keep the question and options unchanged."\n'
+    '    "reason": "...",\n'
+    '    "expected_fix": "..."\n'
     '  }\n'
     ']'
 )
@@ -405,10 +407,10 @@ REPAIR_SYSTEM_PROMPT = (
 REPAIR_OUTPUT_SCHEMA = (
     '[\n'
     '  {\n'
-    '    "question_id": "example_mcq_1",\n'
-    '    "repaired_fields": ["answer"],\n'
+    '    "question_id": "...",\n'
+    '    "repaired_fields": ["..."],\n'
     '    "question": {"question": "...", "options": {"A": "...", "B": "...", '
-    '"C": "...", "D": "..."}, "correct_answer": "C"}\n'
+    '"C": "...", "D": "..."}, "correct_answer": "..."}\n'
     '  }\n'
     ']'
 )
@@ -475,7 +477,8 @@ def _sanitize_verdict(raw: Any, known: Set[str]) -> Optional[Dict[str, Any]]:
 
 
 def validate_exam(
-        exam: Dict[str, Any], client: Optional[Any] = None
+        exam: Dict[str, Any], client: Optional[Any] = None,
+        question_ids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Validate every question in bounded batches, retrying missing IDs once.
 
@@ -485,6 +488,11 @@ def validate_exam(
     """
     model_number = exam.get("model_number") or 1
     questions = exam.get("questions") or {}
+    selected_ids = (
+        {str(question_id) for question_id in question_ids if str(question_id)}
+        if question_ids is not None
+        else None
+    )
     warnings: List[str] = []
 
     # Deterministic structural problems never consume an LLM call.
@@ -494,6 +502,8 @@ def validate_exam(
         qid = item.get("question_id")
         if not qid:
             warnings.append(f"validate: question missing question_id; skipped")
+            continue
+        if selected_ids is not None and str(qid) not in selected_ids:
             continue
         verdict = _local_verdict(qtype, item, container)
         if verdict is not None:
@@ -505,10 +515,18 @@ def validate_exam(
             payload["word_bank"] = container.get("word_bank") or []
         entries.append({"question_id": str(qid), "question_type": qtype, "question": payload})
 
+    scope_ids = [*local_verdicts, *(entry["question_id"] for entry in entries)]
+    logger.info(
+        "Validation scope | model=%d | question_count=%d | question_ids=%s",
+        model_number,
+        len(scope_ids),
+        scope_ids,
+    )
+
     verdicts: Dict[str, Dict[str, Any]] = dict(local_verdicts)
     coverage: List[Dict[str, Any]] = []
     if entries:
-        llm = client or LMStudioClient(reasoning=VALIDATOR_REASONING)
+        llm = client or create_llm_client(local_reasoning=VALIDATOR_REASONING)
         for offset in range(0, len(entries), VALIDATOR_BATCH_SIZE):
             batch = entries[offset: offset + VALIDATOR_BATCH_SIZE]
             sent_ids = [entry["question_id"] for entry in batch]
@@ -572,8 +590,16 @@ def validate_exam(
                         verdicts[v["question_id"]] = v
 
             try:
-                raw = llm.chat_json(
+                raw = request_structured(
+                    llm,
                     build_validator_prompt(batch),
+                    response_model=validator_response_model(sent_ids),
+                    schema_name="validator_verdicts",
+                    agent="validator",
+                    item_count=len(batch),
+                    expected_ids=sent_ids,
+                    expected_id_field="question_id",
+                    local_json=True,
                     system_prompt=VALIDATOR_SYSTEM_PROMPT,
                     temperature=VALIDATOR_TEMPERATURE,
                     max_tokens=VALIDATOR_MAX_TOKENS,
@@ -591,8 +617,17 @@ def validate_exam(
                     f"validate: {len(missing)} question(s) had no verdict; retrying once"
                 )
                 try:
-                    raw2 = llm.chat_json(
+                    missing_ids = [entry["question_id"] for entry in missing]
+                    raw2 = request_structured(
+                        llm,
                         build_validator_prompt(missing),
+                        response_model=validator_response_model(missing_ids),
+                        schema_name="validator_missing_verdicts",
+                        agent="validator",
+                        item_count=len(missing),
+                        expected_ids=missing_ids,
+                        expected_id_field="question_id",
+                        local_json=True,
                         system_prompt=VALIDATOR_RETRY_SYSTEM_PROMPT,
                         temperature=VALIDATOR_TEMPERATURE,
                         max_tokens=VALIDATOR_MAX_TOKENS,
@@ -623,6 +658,8 @@ def validate_exam(
     for _, _, item in _iter_questions(questions):
         qid = str(item.get("question_id") or "")
         if not qid:
+            continue
+        if selected_ids is not None and qid not in selected_ids:
             continue
         v = verdicts.get(qid)
         if v is None:
@@ -656,6 +693,45 @@ def validate_exam(
         "warnings": warnings,
         "coverage": coverage,
     }
+
+
+def _merge_validation_report(
+    previous: Dict[str, Any], update: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Replace revalidated verdicts by ID and retain every untouched verdict."""
+    replacements = {
+        str(verdict.get("question_id")): verdict
+        for verdict in (update.get("verdicts") or [])
+        if verdict.get("question_id")
+    }
+    merged_verdicts: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for verdict in previous.get("verdicts") or []:
+        qid = str(verdict.get("question_id") or "")
+        merged_verdicts.append(replacements.get(qid, verdict))
+        if qid:
+            seen.add(qid)
+    for qid, verdict in replacements.items():
+        if qid not in seen:
+            merged_verdicts.append(verdict)
+
+    merged = dict(previous)
+    merged["model_number"] = update.get(
+        "model_number", previous.get("model_number")
+    )
+    merged["verdicts"] = merged_verdicts
+    merged["all_pass"] = all(
+        verdict.get("action") == "PASS" for verdict in merged_verdicts
+    )
+    merged["warnings"] = [
+        *(previous.get("warnings") or []),
+        *(update.get("warnings") or []),
+    ]
+    merged["coverage"] = [
+        *(previous.get("coverage") or []),
+        *(update.get("coverage") or []),
+    ]
+    return merged
 
 
 # --------------------------------------------------------------------------
@@ -738,11 +814,23 @@ def repair_exam(
 
     sent_ids = [item["question_id"] for item in payload]
 
-    llm = client or LMStudioClient(reasoning=REPAIR_REASONING)
+    llm = client or create_llm_client(local_reasoning=REPAIR_REASONING)
     user_prompt = build_repair_prompt(payload)
     try:
-        raw = llm.chat_json(
+        repair_model_items = [
+            (item["question_id"], by_id[item["question_id"]][0])
+            for item in payload
+        ]
+        raw = request_structured(
+            llm,
             user_prompt,
+            response_model=repair_response_model(repair_model_items),
+            schema_name="question_repairs",
+            agent="repairer",
+            item_count=len(payload),
+            expected_ids=sent_ids,
+            expected_id_field="question_id",
+            local_json=True,
             system_prompt=REPAIR_SYSTEM_PROMPT,
             temperature=REPAIR_TEMPERATURE,
             max_tokens=REPAIR_MAX_TOKENS,
@@ -790,11 +878,14 @@ def repair_exam(
             continue
 
         stashed_id = item.get("question_id")
+        stashed_slot_id = item.get("slot_id")
         normalized = _normalize(qtype, new_item)
         if normalized is None:
             warnings.append(f"repair: {qid} output failed normalization; rejected")
             continue
         normalized["question_id"] = stashed_id
+        if stashed_slot_id:
+            normalized["slot_id"] = stashed_slot_id
 
         # FITB: word bank is section-level. Only a word_bank-enabled repair may
         # rewrite it; a single item repair never touches other items' content.
@@ -851,10 +942,11 @@ def repair_exam(
 # LangGraph nodes
 # --------------------------------------------------------------------------
 def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Node: validate every not-yet-passed exam model (one LLM call per model)."""
+    """Validate every question initially, then only successfully repaired IDs."""
     generated = state.get("generated_exams") or []
     validated = list(state.get("validated_models") or [])
     attempts = state.get("question_repair_attempts") or {}
+    pending_revalidation = dict(state.get("pending_revalidation_ids") or {})
     warnings = list(state.get("warnings") or [])
     # Preserve one latest report per model. Earlier passing models are skipped
     # by validation but their reports remain available for final telemetry.
@@ -868,7 +960,28 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         mn = exam.get("model_number")
         if mn in validated:
             continue
-        report = validate_exam(exam)
+        previous = reports_by_model.get(mn)
+        if mn in pending_revalidation:
+            repaired_ids = list(pending_revalidation.pop(mn) or [])
+            if repaired_ids:
+                logger.info(
+                    "Selective revalidation | model=%d | question_count=%d | question_ids=%s",
+                    mn,
+                    len(repaired_ids),
+                    repaired_ids,
+                )
+                update = validate_exam(exam, question_ids=repaired_ids)
+                report = (
+                    _merge_validation_report(previous, update)
+                    if previous is not None
+                    else update
+                )
+            elif previous is not None:
+                report = previous
+            else:
+                report = validate_exam(exam)
+        else:
+            report = validate_exam(exam)
         reports_by_model[mn] = report
         if eval_stats is not None:
             record_first_validation(eval_stats, exam, report)
@@ -884,6 +997,7 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "validation_reports": list(reports_by_model.values()),
         "validated_models": validated,
+        "pending_revalidation_ids": pending_revalidation,
         "warnings": warnings,
         "eval_stats": eval_stats,
     }
@@ -897,6 +1011,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     validated = list(state.get("validated_models") or [])
     warnings = list(state.get("warnings") or [])
     eval_stats = state.get("eval_stats")
+    pending_revalidation = dict(state.get("pending_revalidation_ids") or {})
     exam_by_model = {e.get("model_number"): e for e in generated}
 
     for r in reports:
@@ -926,6 +1041,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 outcome.get("sent_ids") or [],
             )
         attempts[mn] = attempt
+        pending_revalidation[mn] = list(outcome.get("repaired_ids") or [])
         warnings.extend(outcome["warnings"])
         if mn in validated:
             validated.remove(mn)
@@ -933,6 +1049,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "question_repair_attempts": attempts,
         "validated_models": validated,
+        "pending_revalidation_ids": pending_revalidation,
         "warnings": warnings,
         "eval_stats": eval_stats,
     }

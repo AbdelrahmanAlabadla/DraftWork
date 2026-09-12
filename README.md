@@ -22,11 +22,15 @@ The system combines document parsing, semantic chunking, embeddings, selected-se
   * Multiple Choice
   * True / False
   * Fill in the Blank
-  * Why Questions
+  * Short Answer
   * Essay
 * Load only selected child chunks for generation
+* Build a structured question plan with stable plan-slot IDs
+* Generate each question from its assigned concept, difficulty, and source chunk
+* Retry only missing plan items when generation falls short
 * Automatically validate generated questions
 * Repair only invalid questions instead of regenerating the entire exam
+* Revalidate only the question IDs changed by each repair pass
 * Track generation, validation, repair, and final outcome telemetry
 * Review overall and per-model performance in a read-only Eval Dashboard
 * Separate question-quality failures from validator operational failures
@@ -74,7 +78,7 @@ Supported question types include:
 | Multiple Choice   | Four options with one correct answer |
 | True / False      | Quick factual recall                 |
 | Fill in the Blank | Key-term recall                      |
-| Why Questions     | Short reasoning questions            |
+| Short Answer      | Concise reasoning questions           |
 | Essay             | Open-ended responses                 |
 
 ### 05 — Eval Dashboard
@@ -177,15 +181,41 @@ flowchart TD
     D --> E[(Qdrant Vector Store)]
 
     E --> F[Selected Child Chunk Loading]
-    F --> G[Exam Planner]
-    G --> H[Question Generation]
-    H --> I[Validation]
+    F --> G[Planner: Structured Plan Items]
+    G --> H[Generator: Questions by Plan Slot]
+    H --> I[Validator: Structured Verdicts]
 
     I -->|Valid| J[Final Exam]
-    I -->|Invalid| K[Targeted Repair]
+    I -->|Invalid| K[Repairer: Targeted Fields]
+    K -->|Repaired IDs only| I
 
-    K --> I
+    G -.-> L[Shared LLM Factory]
+    H -.-> L
+    I -.-> L
+    K -.-> L
+    L --> M[LM Studio Client]
+    L --> N[DeepSeek Client]
 ```
+
+Planner, Generator, Validator, and Repairer all use the shared LLM factory. The
+factory selects LM Studio or DeepSeek from `LLM_PROVIDER`, so agent code does not
+need provider-specific branches. Agent responses are checked against Pydantic
+models before entering the pipeline. DeepSeek sends the corresponding JSON Schema
+through the Responses API for native structured output and then applies the same
+local Pydantic validation.
+
+## Planning & Generation
+
+Planner creates one structured plan item for every requested question. Each item
+has a stable plan-slot ID, a source chunk ID, a focused concept, a question type,
+and a difficulty. If a plan item fails validation, its corrective retry keeps the
+same slot ID and fixes that item instead of creating a replacement slot.
+
+Generator follows these plan items rather than choosing questions loosely from the
+combined source context. A generated question must return the expected slot ID,
+which keeps it connected to the Planner's concept and source chunk. If generation
+falls short, the next attempt receives only the missing plan items. Existing
+questions and completed slots remain unchanged.
 
 ## Validation & Repair
 
@@ -216,7 +246,7 @@ model1_true_false_1
 model1_fill_in_the_blank_1
 ```
 
-If a question fails validation, the system repairs only that question instead of regenerating the whole exam.
+If a question fails validation, the system repairs only that question instead of regenerating the whole exam. Initial validation covers every generated question. After a repair pass, Validator receives only the IDs successfully repaired in that pass. The new verdicts are merged into the existing report by `question_id`, preserving PASS verdicts for untouched questions. If a second repair attempt is needed, only the questions repaired during that second attempt are revalidated.
 
 ```text id="4igx1e"
 Generate
@@ -229,16 +259,16 @@ FIX
    ↓
 Repair Invalid Question
    ↓
-Revalidate
+Revalidate Repaired ID Only
 ```
 
-This keeps already-valid questions unchanged and reduces unnecessary LLM regeneration.
+This keeps already-valid questions unchanged and avoids sending them through Validator again.
 
 ## Tech Stack
 
 | Component              | Technology                   |
 | ---------------------- | ---------------------------- |
-| Language               | Python                       |
+| Language               | Python 3.11                  |
 | Backend API            | FastAPI                      |
 | Workflow Orchestration | LangGraph                    |
 | Embeddings             | FlagEmbedding / Transformers |
@@ -246,10 +276,14 @@ This keeps already-valid questions unchanged and reduces unnecessary LLM regener
 | Evaluation History     | PostgreSQL                   |
 | ML Runtime             | PyTorch                      |
 | PDF Parsing            | LlamaParse                   |
+| LLM Providers          | LM Studio + DeepSeek V4.1 Flash |
+| DeepSeek API Client    | OpenAI Python SDK / Responses API |
+| Structured Output      | Pydantic v2 + JSON Schema    |
 | Validation             | Pydantic + custom validation |
 | NLP                    | spaCy                        |
 | Testing                | Pytest                       |
 | Frontend               | HTML / JavaScript            |
+| Containers             | Docker Compose               |
 
 ## Setup
 
@@ -284,6 +318,58 @@ Create a `.env` file from `.env.example` and configure the required model and AP
 DATABASE_URL=postgresql://postgres:your_password@localhost:1966/draftwork
 ```
 
+Choose the provider with `LLM_PROVIDER`. The existing local LM Studio backend
+remains the default and does not require any DeepSeek settings:
+
+```text
+LLM_PROVIDER=local
+LMS_URL=http://127.0.0.1:1234
+LMS_MODEL=mistralai/mistral-7b-instruct-v0.3
+LMS_API_KEY=
+LMS_REASONING=off
+TITLE_LMS_URL=http://127.0.0.1:1234/v1
+TITLE_MODEL=mistralai/mistral-7b-instruct-v0.3
+```
+
+To use DeepSeek V4.1 Flash instead, store the key only in the gitignored `.env`
+file and select the DeepSeek provider:
+
+```text
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_real_deepseek_api_key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_CONCURRENCY_LIMIT=4
+DEEPSEEK_MAX_STRUCTURED_ATTEMPTS=3
+DEEPSEEK_MAX_TRANSIENT_RETRIES=2
+DEEPSEEK_RETRY_BASE_SECONDS=1.0
+```
+
+At startup, `python-dotenv` loads `.env` into the process environment. The
+DeepSeek client reads `DEEPSEEK_API_KEY` from that environment and sends it in
+the OpenAI Python SDK. The SDK sends it as a Bearer token to DeepSeek's
+Responses API. Docker Compose also reads the project `.env` file and passes
+these variables to the `app` container; the image never contains the key.
+
+Provider environment variables:
+
+| Variable | Purpose |
+| -------- | ------- |
+| `LLM_PROVIDER` | Selects `local` or `deepseek`; defaults to `local` |
+| `LMS_URL` | LM Studio server URL |
+| `LMS_MODEL` | Model served by LM Studio |
+| `LMS_API_KEY` | Optional bearer token for compatible local endpoints |
+| `LMS_REASONING` | Default local-model reasoning setting |
+| `TITLE_LMS_URL` | Optional LM Studio endpoint used for local title generation |
+| `TITLE_MODEL` | Optional local model used for title generation |
+| `DEEPSEEK_API_KEY` | DeepSeek credential; required only for the DeepSeek provider |
+| `DEEPSEEK_BASE_URL` | DeepSeek API base URL |
+| `DEEPSEEK_MODEL` | DeepSeek model identifier; currently `deepseek-flash` |
+| `DEEPSEEK_CONCURRENCY_LIMIT` | Maximum simultaneous DeepSeek requests |
+| `DEEPSEEK_MAX_STRUCTURED_ATTEMPTS` | Maximum attempts for one structured operation |
+| `DEEPSEEK_MAX_TRANSIENT_RETRIES` | Retries for rate limits, network failures, timeouts, and server errors |
+| `DEEPSEEK_RETRY_BASE_SECONDS` | Initial delay used by exponential backoff |
+
 Create the `draftwork` database if needed, then apply the evaluation-history migration:
 
 ```bash
@@ -302,6 +388,34 @@ Run the application:
 .venv\Scripts\python.exe -m uvicorn app.api.main:app --host 127.0.0.1 --port 8000
 ```
 
+### Docker Compose quick-start
+
+Copy the example environment file and add your own credentials:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Set `POSTGRES_PASSWORD` and `LLAMA_PARSE_API` in `.env`. Keep
+`LLM_PROVIDER=local` for LM Studio, or set `LLM_PROVIDER=deepseek` and add
+`DEEPSEEK_API_KEY` for DeepSeek. Then build and start the application, PostgreSQL,
+and Qdrant:
+
+```powershell
+docker compose up -d --build
+```
+
+Open DraftWork at `http://localhost:8000`. To follow application logs:
+
+```powershell
+docker compose logs -f app
+```
+
+The Compose configuration expects an NVIDIA-compatible Docker GPU runtime for the
+embedding model. Application data, PostgreSQL data, Qdrant data, and the
+Hugging Face cache use mounted directories or named volumes and survive an app
+container rebuild.
+
 ## Tests
 
 Run the test suite with:
@@ -315,8 +429,10 @@ The tests cover core components including:
 * document processing
 * semantic chunking
 * selected content loading
-* exam generation
-* validation and repair
+* structured planning and plan-slot preservation
+* schema-based exam generation and targeted shortfall recovery
+* validation, targeted repair, and selective revalidation
+* DeepSeek client retries, errors, and token accounting
 * API behavior
 * PostgreSQL evaluation persistence and aggregation
 * best-effort telemetry failure handling

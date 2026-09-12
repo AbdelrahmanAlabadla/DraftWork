@@ -89,6 +89,13 @@ def _clean_str(value: Any) -> str:
     return str(value).strip()
 
 
+def _keep_slot_id(normalized: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:
+    slot = _clean_str(item.get("slot_id"))
+    if slot:
+        normalized["slot_id"] = slot
+    return normalized
+
+
 def _normalize_mcq(item: dict[str, Any]) -> dict[str, Any] | None:
     question = _clean_str(item.get("question") or item.get("question_text"))
     if not question:
@@ -111,7 +118,9 @@ def _normalize_mcq(item: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     ordered = {key: options[key] for key in sorted(options, key=lambda k: ("ABCDEF".index(k) if k in "ABCDEF" else 99, k))}
-    return {"question": question, "options": ordered, "correct_answer": correct}
+    return _keep_slot_id(
+        {"question": question, "options": ordered, "correct_answer": correct}, item
+    )
 
 
 def _normalize_true_false(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -124,7 +133,10 @@ def _normalize_true_false(item: dict[str, Any]) -> dict[str, Any] | None:
     answer = _clean_str(answer)
     if answer.lower() not in {"true", "false"}:
         return None
-    return {"statement": statement, "answer": "True" if answer.lower() == "true" else "False"}
+    return _keep_slot_id(
+        {"statement": statement, "answer": "True" if answer.lower() == "true" else "False"},
+        item,
+    )
 
 
 def _normalize_short_answer(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -134,7 +146,7 @@ def _normalize_short_answer(item: dict[str, Any]) -> dict[str, Any] | None:
     )
     if not question or not reference:
         return None
-    return {"question": question, "reference_answer": reference}
+    return _keep_slot_id({"question": question, "reference_answer": reference}, item)
 
 
 def _normalize_essay(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -153,7 +165,10 @@ def _normalize_essay(item: dict[str, Any]) -> dict[str, Any] | None:
     key_points: list[str] = []
     if isinstance(key_points_raw, list):
         key_points = [_clean_str(k) for k in key_points_raw if _clean_str(k)]
-    return {"question": question, "reference_answer": reference, "key_points": key_points}
+    return _keep_slot_id(
+        {"question": question, "reference_answer": reference, "key_points": key_points},
+        item,
+    )
 
 
 def normalize_fitb_item(item: dict[str, Any]) -> dict[str, Any] | None:
@@ -171,7 +186,7 @@ def normalize_fitb_item(item: dict[str, Any]) -> dict[str, Any] | None:
         answers = [_clean_str(a) for a in raw_answers if _clean_str(a)]
     if not (1 <= len(answers) <= 2):
         return None
-    return {"question": question, "answers": answers}
+    return _keep_slot_id({"question": question, "answers": answers}, item)
 
 
 _NORMALIZERS = {

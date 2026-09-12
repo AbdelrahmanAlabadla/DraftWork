@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import time
 
-from app.config import LMS_MODEL
-from app.llm.client import LMStudioClient
+from app.config import ACTIVE_LLM_MODEL
+from app.llm.client import request_structured
+from app.llm.factory import create_llm_client
 from app.llm.json_utils import JSONExtractionError
+from app.llm.schemas import generation_response_model
 from app.logging_conf import get_logger
 from app.online.graph import ExamState
 from app.online.models import parse_questions_obj
@@ -27,7 +29,7 @@ def generate_questions(state: ExamState) -> dict:
     t0 = time.perf_counter()
     logger.info(
         "Generation started | model=%s | type=%s | count=%d | difficulty=%s | model_number=%d",
-        LMS_MODEL,
+        ACTIVE_LLM_MODEL,
         qtype,
         count,
         difficulty,
@@ -44,11 +46,20 @@ def generate_questions(state: ExamState) -> dict:
             "Do NOT repeat these mistakes; produce only NEW, distinct questions.\n"
             f"{feedback}"
         )
-    client = LMStudioClient()
+    client = create_llm_client()
+    slot_ids = [f"m{model_number}_{qtype}_{index}" for index in range(1, count + 1)]
 
     try:
-        parsed = client.chat_json(
+        parsed = request_structured(
+            client,
             user_prompt,
+            response_model=generation_response_model(qtype, slot_ids),
+            schema_name=f"{qtype}_questions",
+            agent="generator",
+            item_count=count,
+            expected_ids=slot_ids,
+            expected_id_field="slot_id",
+            local_json=True,
             system_prompt=system_prompt,
             temperature=0.5,
             max_tokens=max(2048, count * 256),

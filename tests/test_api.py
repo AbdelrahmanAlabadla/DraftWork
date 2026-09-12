@@ -65,7 +65,7 @@ def _distinct_stem(type_name: str, model: int, idx: int) -> str:
 
 
 def _fake_planner(prompt: str, num_models: int) -> object:
-    """Return a valid, cross-model-distinct plan for every model/type count."""
+    """Return a valid grounded slot plan for every model/type count."""
     counts = {qtype: int(n) for n, qtype in _PLANNER_COUNT_RE.findall(prompt)}
     if not counts:
         counts = {"mcq": 1}
@@ -76,10 +76,22 @@ def _fake_planner(prompt: str, num_models: int) -> object:
         3: "gene expression",
     }
     exams = []
+    chunk_ids = re.findall(r"\[source_chunk_id=([^\]]+)\]", prompt) or ["c1"]
     for m in range(1, num_models + 1):
         topic = model_topic.get(m, f"domain {m}")
-        questions = [{"question_type": qtype, "topic": topic, "concept_to_test": f"distinct {qtype} concept {m}-{idx}"} for qtype, count in counts.items() for idx in range(count)]
-        exams.append({"model_number": m, "questions": questions})
+        items = {
+            qtype: [
+                {
+                    "source_chunk_id": chunk_ids[idx % len(chunk_ids)],
+                    "topic": topic,
+                    "concept": f"shared {qtype} concept {idx}",
+                    "idea_to_test": f"distinct {qtype} idea {m}-{idx}",
+                }
+                for idx in range(count)
+            ]
+            for qtype, count in counts.items()
+        }
+        exams.append({"model_number": m, "items": items})
     return {"exams": exams}
 
 
@@ -132,14 +144,13 @@ def _make_fake_llm(captured_prompts: list[str] | None = None):
 
         if "objective sections of an exam in ONE response" in prompt:
             counts_match = re.search(
-                r"Multiple Choice \((\d+)\), True/False \((\d+)\), and "
-                r"Fill-in-the-Blank \((\d+) items",
+                r"Multiple Choice \((\d+)\) and True/False \((\d+)\)",
                 prompt,
             )
-            mcq_count, tf_count, _ = (
+            mcq_count, tf_count = (
                 (int(value) for value in counts_match.groups())
                 if counts_match
-                else (0, 0, 0)
+                else (0, 0)
             )
             mcq_texts = (
                 mcq_pool[:mcq_count]
@@ -285,8 +296,8 @@ def _install_fakes(monkeypatch, document_id: str = "doc-x") -> None:
     _install_registry_and_store(monkeypatch, document_id)
     # LLM fake: serves both the planner role and the generator role.
     fake = _make_fake_llm()
-    monkeypatch.setattr("app.online.planner.LMStudioClient", fake)
-    monkeypatch.setattr("app.llm.client.LMStudioClient", fake)
+    monkeypatch.setattr("app.online.planner.create_llm_client", fake)
+    monkeypatch.setattr("app.llm.factory.create_llm_client", fake)
 
     # API tests exercise orchestration/serialization, not validator quality.
     # Return deterministic PASS verdicts so the suite never contacts a live
@@ -570,8 +581,8 @@ def test_difficulty_directive_in_prompt(monkeypatch):
         captured: list[str] = []
         _install_registry_and_store(monkeypatch)
         fake = _make_fake_llm(captured)
-        monkeypatch.setattr("app.online.planner.LMStudioClient", fake)
-        monkeypatch.setattr("app.llm.client.LMStudioClient", fake)
+        monkeypatch.setattr("app.online.planner.create_llm_client", fake)
+        monkeypatch.setattr("app.llm.factory.create_llm_client", fake)
         monkeypatch.setattr("app.online.validator.validate_exam", _pass_validate_exam)
         resp = client.post(
             "/generate",
@@ -727,8 +738,8 @@ def test_generate_repairs_malformed_json(monkeypatch):
             ]
 
     monkeypatch.setattr("app.online.retrieval.VectorStore", FakeStore)
-    monkeypatch.setattr("app.online.planner.LMStudioClient", FakeLLM)
-    monkeypatch.setattr("app.llm.client.LMStudioClient", FakeLLM)
+    monkeypatch.setattr("app.online.planner.create_llm_client", FakeLLM)
+    monkeypatch.setattr("app.llm.factory.create_llm_client", FakeLLM)
     monkeypatch.setattr(
         "app.online.validator.validate_exam",
         lambda exam: {
