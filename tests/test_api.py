@@ -246,7 +246,6 @@ def _make_fake_llm(captured_prompts: list[str] | None = None):
 
 def _install_registry_and_store(monkeypatch, document_id: str = "doc-x") -> None:
     # Registry fakes (avoid writing data/documents.json).
-    monkeypatch.setattr("app.api.storage.get_current_document", lambda: document_id)
     monkeypatch.setattr(
         "app.api.storage.get_document",
         lambda doc_id: {"document_id": doc_id, "filename": "x.pdf"},
@@ -514,6 +513,7 @@ def test_generate_html_payload_multiple_types(monkeypatch):
     resp = client.post(
         "/generate",
         json={
+            "document_id": "doc-x",
             "mcq_count": 1,
             "tf_count": 1,
             "fitb_count": 3,
@@ -631,6 +631,7 @@ def test_generate_no_supported_types_returns_400(monkeypatch):
     resp = client.post(
         "/generate",
         json={
+            "document_id": "doc-x",
             "mcq_count": 0,
             "tf_count": 0,
             "fitb_count": 0,
@@ -721,7 +722,6 @@ def test_generate_repairs_malformed_json(monkeypatch):
                         max_tokens=max_tokens * 2,
                     )
 
-    monkeypatch.setattr("app.api.storage.get_current_document", lambda: "doc-x")
     monkeypatch.setattr(
         "app.api.storage.get_document",
         lambda doc_id: {"document_id": doc_id, "filename": "x.pdf"},

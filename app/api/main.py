@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -13,31 +12,18 @@ from starlette.responses import JSONResponse
 
 from app import config
 from app import db
-from app.api.auth_routes import router as auth_router
 from app.api.export_routes import router as export_router
+from app.api.job_routes import router as job_router
 from app.api.routes import router
+from app.api.session_middleware import SessionMiddleware
 from app.logging_conf import configure_logging, get_logger, set_request_id
 
 configure_logging(config.LOG_LEVEL)
 
 
-def _preload_models() -> None:
-    """Load the embedding model (GPU) and the spaCy NLP model at startup."""
-    logger = get_logger("WARMUP")
-    logger.info("Model warmup started")
-    from app.offline import embeddings
-    from app.offline import title_nlp
-
-    embeddings.warmup()
-    title_nlp.warmup()
-    logger.info("Model warmup completed | device=%s", embeddings.device_name())
-
-
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    threading.Thread(target=_preload_models, daemon=True).start()
-    # Evaluation persistence is secondary to generation: connection failures
-    # are logged by the database layer and never prevent application startup.
+    # The API stays lightweight; Celery workers own model warmup and GPU use.
     db.open_pool(wait=True)
     try:
         yield
@@ -54,15 +40,16 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(config.CORS_ALLOW_ORIGINS),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(SessionMiddleware)
 
 app.include_router(router)
 app.include_router(export_router)
-app.include_router(auth_router)
+app.include_router(job_router)
 
 # Serve the frontend (ES modules require http://, not file://).
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "FrontEnd"
@@ -115,6 +102,12 @@ def root() -> dict[str, object]:
     return {
         "service": "ExamGen AI",
         "docs": "/docs",
-        "endpoints": ["POST /upload", "POST /generate", "GET /documents", "GET /health",
-                      "POST /exams/{exam_id}/export/{pdf|docx|google-forms}"],
+        "endpoints": [
+            "POST /api/v1/documents",
+            "POST /api/v1/documents/{document_id}/exam-jobs",
+            "GET /api/v1/jobs/{job_id}",
+            "GET /api/v1/exams/{exam_id}",
+            "POST /api/v1/exams/{exam_id}/export/{pdf|docx}",
+            "GET /health",
+        ],
     }

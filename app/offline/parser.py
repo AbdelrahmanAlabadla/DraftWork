@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from app.config import LLAMA_PARSE_API
+from app.config import LLAMA_PARSE_API, PARSING_TIMEOUT_SECONDS
 from app.logging_conf import get_logger
 from app.offline.parser_items import (
     ParserSchemaError,
@@ -30,6 +30,8 @@ class LlamaParser:
             api_key=LLAMA_PARSE_API,
             result_type="json",
             ignore_errors=False,
+            max_timeout=PARSING_TIMEOUT_SECONDS,
+            job_timeout_in_seconds=PARSING_TIMEOUT_SECONDS,
         )
 
     def parse(self, file_path: str | Path) -> list[dict[str, Any]]:
