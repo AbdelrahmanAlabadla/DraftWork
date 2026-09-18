@@ -70,14 +70,18 @@ def test_max_cap_evicts_oldest(monkeypatch):
 def test_ttl_expires(monkeypatch):
     monkeypatch.setattr(exam_store, "EXAM_TTL_SECONDS", 10)
     exam_id = exam_store.save_exam([_exam()])
-    # Simulate aging by rewriting created_at directly.
-    entry = exam_store._exams[exam_id]
+    # Simulate aging by rewriting the compatibility record directly.
+    import json
+
+    path = exam_store._path_for(exam_id)
+    entry = json.loads(path.read_text(encoding="utf-8"))
     entry["created_at"] -= 11
+    path.write_text(json.dumps(entry), encoding="utf-8")
     with pytest.raises(exam_store.ExamNotFound):
         exam_store.get_exam(exam_id)
 
 
-def test_in_memory_note():
-    """Documented behavior: store module states it is in-memory."""
+def test_store_documents_database_migration_path():
     doc = exam_store.__doc__ or ""
-    assert "in-memory" in doc.lower()
+    assert "postgresql" in doc.lower()
+    assert "process-global" in doc.lower()

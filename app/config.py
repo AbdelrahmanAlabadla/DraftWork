@@ -17,6 +17,9 @@ def _env(name: str, default: str | None = None) -> str | None:
 LLAMA_PARSE_API: str | None = _env("LLAMA_PARSE_API")
 QDRANT_URL: str = _env("QDRANT_URL", "http://localhost:6333") or "http://localhost:6333"
 QDRANT_COLLECTION: str = _env("QDRANT_COLLECTION", "genexam") or "genexam"
+QDRANT_TIMEOUT_SECONDS: int = max(
+    1, int(_env("QDRANT_TIMEOUT_SECONDS", "30") or "30")
+)
 
 # Base URL of the LM Studio server (native REST API /api/v1/chat is used).
 # A trailing /v1 (OpenAI-compatible form) is tolerated and stripped.
@@ -74,63 +77,74 @@ EMBEDDING_DIM: int = int(_env("EMBEDDING_DIM", "1024") or "1024")
 
 UPLOAD_DIR: str = _env("UPLOAD_DIR", "data/uploads") or "data/uploads"
 REGISTRY_FILE: str = _env("REGISTRY_FILE", "data/documents.json") or "data/documents.json"
+LEGACY_EXAM_DIR: str = _env("LEGACY_EXAM_DIR", "data/legacy_exams") or "data/legacy_exams"
+
+# Durable application state and replaceable file storage.  The local backend is
+# deliberately addressed by opaque keys so Azure Blob can implement the same
+# interface later without changing API or worker code.
+STORAGE_BACKEND: str = (_env("STORAGE_BACKEND", "local") or "local").lower()
+LOCAL_STORAGE_ROOT: str = _env("LOCAL_STORAGE_ROOT", "data/storage") or "data/storage"
+
+# Anonymous browser sessions.
+SESSION_COOKIE_NAME: str = _env("SESSION_COOKIE_NAME", "genexam_session") or "genexam_session"
+SESSION_COOKIE_SECURE: bool = str(_env("SESSION_COOKIE_SECURE", "false")).lower() in (
+    "1", "true", "yes", "on"
+)
+SESSION_COOKIE_SAMESITE: str = (_env("SESSION_COOKIE_SAMESITE", "lax") or "lax").lower()
+SESSION_TTL_SECONDS: int = max(300, int(_env("SESSION_TTL_SECONDS", "604800") or "604800"))
+SESSION_TOKEN_BYTES: int = max(32, int(_env("SESSION_TOKEN_BYTES", "32") or "32"))
+SESSION_HASH_PEPPER: str = _env("SESSION_HASH_PEPPER", "") or ""
+
+# Celery/Redis local job queue.  Azure Service Bus will replace this transport
+# at deployment time; application messages contain only a job id.
+CELERY_BROKER_URL: str = _env("CELERY_BROKER_URL", "redis://localhost:6379/0") or "redis://localhost:6379/0"
+CELERY_RESULT_BACKEND: str = _env("CELERY_RESULT_BACKEND", "redis://localhost:6379/1") or "redis://localhost:6379/1"
+CELERY_TASK_ALWAYS_EAGER: bool = str(_env("CELERY_TASK_ALWAYS_EAGER", "false")).lower() in (
+    "1", "true", "yes", "on"
+)
+ENABLE_LEGACY_SYNC_API: bool = str(
+    _env("ENABLE_LEGACY_SYNC_API", "false")
+).lower() in ("1", "true", "yes", "on")
+
+# Agreed server-side limits.  Token-accounting limits intentionally remain TBD.
+MAX_UPLOAD_BYTES: int = max(1, int(_env("MAX_UPLOAD_BYTES", "104857600") or "104857600"))
+MAX_QUESTIONS_PER_GENERATION: int = max(
+    1, int(_env("MAX_QUESTIONS_PER_GENERATION", "150") or "150")
+)
+MAX_MODELS_PER_GENERATION: int = max(
+    1, min(4, int(_env("MAX_MODELS_PER_GENERATION", "4") or "4"))
+)
+MAX_ACTIVE_GENERATION_JOBS_PER_SESSION: int = max(
+    1, int(_env("MAX_ACTIVE_GENERATION_JOBS_PER_SESSION", "2") or "2")
+)
+GENERATION_REQUESTS_PER_MINUTE: int = max(
+    1, int(_env("GENERATION_REQUESTS_PER_MINUTE", "2") or "2")
+)
+PARSING_TIMEOUT_SECONDS: int = max(
+    1, int(_env("PARSING_TIMEOUT_SECONDS", "120") or "120")
+)
+GENERATION_TIMEOUT_SECONDS: int = max(
+    1, int(_env("GENERATION_TIMEOUT_SECONDS", "420") or "420")
+)
+JOB_HEARTBEAT_SECONDS: int = max(5, int(_env("JOB_HEARTBEAT_SECONDS", "30") or "30"))
+JOB_STALE_AFTER_SECONDS: int = max(
+    GENERATION_TIMEOUT_SECONDS + 30,
+    int(_env("JOB_STALE_AFTER_SECONDS", "480") or "480"),
+)
 
 # PostgreSQL is the durable source for evaluation history.  It is optional at
 # runtime so a telemetry outage never prevents the core exam-generation flow.
 DATABASE_URL: str | None = _env("DATABASE_URL")
 
 LOG_LEVEL: str = _env("LOG_LEVEL", "INFO") or "INFO"
-
-# --- Google Forms export (optional, downstream of generation) ---------------
-# Master switch; when false/absent the export endpoints return 503.
-GOOGLE_FORMS_ENABLED: bool = str(_env("GOOGLE_FORMS_ENABLED", "false")).lower() in (
-    "1", "true", "yes", "on"
+CORS_ALLOW_ORIGINS: tuple[str, ...] = tuple(
+    origin.strip()
+    for origin in (_env(
+        "CORS_ALLOW_ORIGINS",
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ) or "").split(",")
+    if origin.strip()
 )
-# OAuth desktop-client secrets file (NEVER committed) and cached user token.
-# Both live under gitignored data/ by default.
-GOOGLE_OAUTH_CLIENT_FILE: str = _env(
-    "GOOGLE_OAUTH_CLIENT_FILE", "data/google_forms/oauth_client.json"
-) or "data/google_forms/oauth_client.json"
-GOOGLE_OAUTH_TOKEN_FILE: str = _env(
-    "GOOGLE_OAUTH_TOKEN_FILE", "data/google_forms/token.json"
-) or "data/google_forms/token.json"
-# 0 disables page breaks inside a question-type section.
-GOOGLE_FORMS_QUESTIONS_PER_PAGE: int = int(
-    _env("GOOGLE_FORMS_QUESTIONS_PER_PAGE", "0") or "0"
-)
-# Points assigned to each auto-graded question in Google Forms quizzes.
-GOOGLE_FORMS_POINTS: int = int(_env("GOOGLE_FORMS_POINTS", "1") or "1")
-
-# --- Google Forms ownership mode --------------------------------------------
-# teacher: Forms are created with the signed-in teacher's OAuth credentials
-#          (teacher owns them). Requires the Web OAuth client config below.
-# central: legacy fallback — Forms created under the desktop-client account,
-#          shared as writer with one explicit email. Never automatic.
-# disabled: Google Forms export fully off.
-GOOGLE_FORMS_MODE: str = (_env("GOOGLE_FORMS_MODE", "teacher") or "teacher").lower()
-if GOOGLE_FORMS_MODE not in ("teacher", "central", "disabled"):
-    GOOGLE_FORMS_MODE = "teacher"
-
-# Web application OAuth client (teacher sign-in + teacher-owned Forms).
-GOOGLE_WEB_OAUTH_CLIENT_ID: str | None = _env("GOOGLE_WEB_OAUTH_CLIENT_ID")
-GOOGLE_WEB_OAUTH_CLIENT_SECRET: str | None = _env("GOOGLE_WEB_OAUTH_CLIENT_SECRET")
-GOOGLE_WEB_OAUTH_REDIRECT_URI: str = _env(
-    "GOOGLE_WEB_OAUTH_REDIRECT_URI", "http://127.0.0.1:8000/auth/google/callback"
-) or "http://127.0.0.1:8000/auth/google/callback"
-
-# Server-side signing key for the session cookie. If unset, a random key is
-# generated PER BOOT: every server restart invalidates all sessions (and, in
-# teacher mode, connections are lost too). Set it for stable sessions.
-SESSION_SECRET: str | None = _env("SESSION_SECRET")
-SESSION_MAX_AGE_SECONDS: int = int(_env("SESSION_MAX_AGE_SECONDS", "604800") or "604800")
-
-
-def web_oauth_configured() -> bool:
-    return bool(
-        GOOGLE_WEB_OAUTH_CLIENT_ID
-        and GOOGLE_WEB_OAUTH_CLIENT_SECRET
-        and GOOGLE_WEB_OAUTH_REDIRECT_URI
-    )
 
 # --- Online exam planning --------------------------------------------------
 # The planner LLM receives a LIGHTWEIGHT context per selected child chunk:

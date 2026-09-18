@@ -24,7 +24,13 @@ class PipelineError(RuntimeError):
     pass
 
 
-def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
+def run_pipeline(
+    file_path: str | Path,
+    document_id: str,
+    *,
+    session_id: str | None = None,
+    job_id: str | None = None,
+) -> dict[str, Any]:
     """Execute PDF parsing, cleaning, chunking, embedding, and indexing."""
     set_request_id(document_id)
     path = Path(file_path)
@@ -109,8 +115,10 @@ def run_pipeline(file_path: str | Path, document_id: str) -> dict[str, Any]:
         t0 = time.perf_counter()
         store = VectorStore()
         store.ensure_collection()
-        store.delete_document(document_id)
-        vectors_uploaded = store.upsert(children, embeddings)
+        store.delete_document(document_id, session_id=session_id)
+        vectors_uploaded = store.upsert(
+            children, embeddings, session_id=session_id, job_id=job_id
+        )
         timings["qdrant_upload"] = time.perf_counter() - t0
 
         # --- Stage 6: Persist parent structure (sections) to JSON ------------

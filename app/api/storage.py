@@ -8,7 +8,6 @@ from typing import Any
 from app.config import REGISTRY_FILE
 
 _lock = threading.Lock()
-_current_document: str | None = None
 
 
 def _load_registry() -> dict[str, Any]:
@@ -28,12 +27,10 @@ def _save_registry(registry: dict[str, Any]) -> None:
 
 
 def register_document(document_id: str, metadata: dict[str, Any]) -> None:
-    global _current_document
     with _lock:
         registry = _load_registry()
         registry[document_id] = metadata
         _save_registry(registry)
-        _current_document = document_id
 
 
 def list_documents() -> dict[str, Any]:
@@ -44,14 +41,3 @@ def list_documents() -> dict[str, Any]:
 def get_document(document_id: str) -> dict[str, Any] | None:
     with _lock:
         return _load_registry().get(document_id)
-
-
-def get_current_document() -> str | None:
-    global _current_document
-    if _current_document:
-        return _current_document
-    with _lock:
-        registry = _load_registry()
-        if registry:
-            _current_document = max(registry, key=lambda k: registry[k].get("uploaded_at", ""))
-    return _current_document

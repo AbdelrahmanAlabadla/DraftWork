@@ -1406,6 +1406,9 @@ def generate_exams(
     num_models: int,
     selected_child_ids: list[str] | None = None,
     difficulty: str = "mix",
+    *,
+    session_id: str | None = None,
+    index_job_id: str | None = None,
 ) -> dict[str, Any]:
     """Generate ``num_models`` complete, distinct exam versions.
 
@@ -1419,6 +1422,8 @@ def generate_exams(
         "tasks": list(tasks),
         "num_models": num_models,
         "selected_child_ids": selected_child_ids,
+        "session_id": session_id,
+        "index_job_id": index_job_id,
         "difficulty": difficulty,
         "document_language": "en",
         "retrieved_chunks": [],

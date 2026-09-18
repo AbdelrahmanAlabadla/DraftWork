@@ -14,6 +14,8 @@ class ExamState(TypedDict):
     tasks: list[tuple[str, int]]  # [(question_type, count), ...]
     num_models: int
     selected_child_ids: Optional[list[str]]
+    session_id: Optional[str]
+    index_job_id: Optional[str]
     difficulty: Optional[str]
     document_language: str  # language detected from the uploaded content ("en" | "ar")
     # --- Retrieval (once) ----------------------------------------------

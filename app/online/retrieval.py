@@ -64,13 +64,26 @@ def build_planner_context(
 def retrieve_selected(
     document_id: str,
     selected_child_ids: list[str],
+    *,
+    session_id: str | None = None,
+    job_id: str | None = None,
 ) -> dict:
     """Pull the exact child chunks the user selected (by id, no search).
 
     Returns the selected tree context for question generation and planning.
     """
     t0 = time.perf_counter()
-    children = VectorStore().get_by_child_ids(document_id, selected_child_ids)
+    store = VectorStore()
+    if session_id or job_id:
+        children = store.get_by_child_ids(
+            document_id,
+            selected_child_ids,
+            session_id=session_id,
+            job_id=job_id,
+        )
+    else:
+        # Preserve the public pipeline contract for local callers and tests.
+        children = store.get_by_child_ids(document_id, selected_child_ids)
 
     if not children:
         logger.warning(
@@ -118,9 +131,16 @@ def retrieve_context(state: ExamState) -> dict:
     """
     document_id = state["document_id"]
     selected_child_ids = state.get("selected_child_ids") or None
+    session_id = state.get("session_id")
+    index_job_id = state.get("index_job_id")
 
     if selected_child_ids:
-        return retrieve_selected(document_id, selected_child_ids)
+        return retrieve_selected(
+            document_id,
+            selected_child_ids,
+            session_id=session_id,
+            job_id=index_job_id,
+        )
 
     logger.warning(
         "No sections selected | document_id=%s — refusing to search whole document",
