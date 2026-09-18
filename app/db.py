@@ -5,8 +5,8 @@ import threading
 from contextlib import contextmanager
 from typing import Iterator
 
-from psycopg import Connection
-from psycopg_pool import ConnectionPool
+from psycopg import Connection, OperationalError
+from psycopg_pool import ConnectionPool, PoolTimeout
 
 from app import config
 from app.logging_conf import get_logger
@@ -67,5 +67,5 @@ def connection() -> Iterator[Connection]:
     try:
         with _pool.connection(timeout=3) as conn:
             yield conn
-    except Exception as exc:
+    except (OperationalError, PoolTimeout) as exc:
         raise DatabaseUnavailable(str(exc)) from exc

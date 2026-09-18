@@ -12,7 +12,15 @@ from pydantic import BaseModel, Field
 from app.api import storage as registry
 from app.api import evaluation_store, exam_store
 from app import db
-from app.config import QDRANT_URL, UPLOAD_DIR
+from app.config import (
+    CELERY_BROKER_URL,
+    MAX_MODELS_PER_GENERATION,
+    MAX_QUESTIONS_PER_GENERATION,
+    MAX_UPLOAD_BYTES,
+    QDRANT_URL,
+    QDRANT_TIMEOUT_SECONDS,
+    UPLOAD_DIR,
+)
 from app.llm.factory import create_llm_client
 from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
@@ -36,10 +44,12 @@ _VALID_QTYPES = frozenset(_SUPPORTED_COUNTS.values())
 
 _VALID_DIFFICULTIES = frozenset({"easy", "medium", "hard", "mix"})
 _NUM_MODELS_MIN = 1
-_NUM_MODELS_MAX = 4
+_NUM_MODELS_MAX = MAX_MODELS_PER_GENERATION
 
 
-@router.get("/api/eval-summary")
+@router.get("/api/v1/eval-summary")
+@router.get("/api/v1/api/eval-summary", include_in_schema=False)
+@router.get("/api/eval-summary", include_in_schema=False)
 def eval_summary() -> dict[str, Any]:
     """Return a read-only aggregate of persisted evaluation telemetry."""
     try:
@@ -75,13 +85,33 @@ class GenerateRequest(BaseModel):
     child_ids: Optional[list[str]] = None
 
 
+@router.get("/health/live")
+def liveness() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @router.get("/health")
 def health() -> dict[str, str]:
     statuses: dict[str, str] = {}
     try:
+        with db.connection() as conn:
+            conn.execute("SELECT 1")
+        statuses["postgres"] = "ok"
+    except Exception:
+        statuses["postgres"] = "error"
+
+    try:
+        from redis import Redis
+
+        Redis.from_url(CELERY_BROKER_URL, socket_timeout=3).ping()
+        statuses["redis"] = "ok"
+    except Exception:
+        statuses["redis"] = "error"
+
+    try:
         from qdrant_client import QdrantClient
 
-        QdrantClient(url=QDRANT_URL).get_collections()
+        QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS).get_collections()
         statuses["qdrant"] = "ok"
     except Exception:
         statuses["qdrant"] = "error"
@@ -119,13 +149,25 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported in V1")
+    if file.size is not None and file.size > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="PDF exceeds the 100 MB limit")
 
     upload_dir = Path(UPLOAD_DIR)
     upload_dir.mkdir(parents=True, exist_ok=True)
     dest = upload_dir / f"{document_id}.pdf"
 
-    content = await file.read()
-    dest.write_bytes(content)
+    size_bytes = 0
+    with dest.open("wb") as output:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            size_bytes += len(chunk)
+            if size_bytes > MAX_UPLOAD_BYTES:
+                output.close()
+                dest.unlink(missing_ok=True)
+                raise HTTPException(status_code=413, detail="PDF exceeds the 100 MB limit")
+            output.write(chunk)
 
     try:
         summary = run_pipeline(dest, document_id)
@@ -145,7 +187,7 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
     metadata = {
         "document_id": document_id,
         "filename": filename,
-        "size_bytes": file.size or len(content),
+        "size_bytes": file.size or size_bytes,
         "uploaded_at": datetime.now(timezone.utc).isoformat(),
         "stats": summary,
     }
@@ -167,11 +209,11 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @router.post("/generate")
 def generate(body: GenerateRequest) -> dict[str, Any]:
-    document_id = body.document_id or registry.get_current_document()
+    document_id = body.document_id
     if not document_id:
         raise HTTPException(
             status_code=400,
-            detail="No document_id provided and no document uploaded yet. Upload a PDF first.",
+            detail="document_id is required. Upload a PDF first.",
         )
     if not registry.get_document(document_id):
         raise HTTPException(status_code=404, detail=f"Unknown document_id: {document_id}")
@@ -209,6 +251,11 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=400,
             detail="No supported question types requested. Supported: MCQ, True/False, Fill in the Blank, Short Answer, and Essay.",
+        )
+    if sum(count for _, count in tasks) > MAX_QUESTIONS_PER_GENERATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A generation may request at most {MAX_QUESTIONS_PER_GENERATION} questions.",
         )
 
     num_models = body.num_models if body.num_models is not None else 1

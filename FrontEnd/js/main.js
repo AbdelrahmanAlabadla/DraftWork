@@ -1,4 +1,4 @@
-import { postJSON } from "./api.js";
+import { getJSON, postJSON, waitForJob } from "./api.js";
 import { state } from "./state.js";
 import { initI18n, t } from "./i18n.js";
 import { initUpload } from "./upload.js";
@@ -7,7 +7,6 @@ import { initTopics } from "./topics.js";
 import { step, toggleType, updateTotal } from "./qtypes.js";
 import { copyExam, renderExamOutput } from "./exam-view.js";
 import { initExport } from "./export.js";
-import { initGoogleAuth } from "./google-auth.js";
 
 initI18n();
 
@@ -30,6 +29,10 @@ function fileToDataUrl(inputId) {
     reader.onerror = () => reject(new Error("A logo could not be read."));
     reader.readAsDataURL(file);
   });
+}
+
+function renderGeneratedExam(data) {
+  renderExamOutput(data.exams, data.metadata || {});
 }
 
 function initGenerate() {
@@ -85,10 +88,21 @@ function initGenerate() {
     };
 
     try {
-      const { ok, data } = await postJSON("/generate", body);
-      if (ok && data.exams?.length) {
-        state.examId = data.exam_id || null;
-        renderExamOutput(data.exams, data.metadata || {});
+      const { ok, data } = await postJSON(
+        `/documents/${state.currentDocId}/exam-jobs`, body
+      );
+      if (ok && data.job_id) {
+        state.generationJobId = data.job_id;
+        const job = await waitForJob(data.job_id, (current) => {
+          genStatus.dataset.stage = current.stage;
+        });
+        const examId = job.result?.exam_id;
+        const examResponse = await getJSON(`/exams/${examId}`);
+        if (!examResponse.ok) {
+          throw new Error(examResponse.data.detail || "Could not load the generated exam.");
+        }
+        state.examId = examId;
+        renderGeneratedExam(examResponse.data);
         // Let an already-open Eval Dashboard refresh immediately. The
         // dashboard still polls independently, so this is only a fast path.
         try {
@@ -97,10 +111,10 @@ function initGenerate() {
           // Storage can be unavailable in private/restricted browser contexts.
         }
       } else {
-        alert(`Generation failed: ${data.detail}`);
+        alert(`Generation failed: ${data.detail || "Unknown error"}`);
       }
     } catch (e) {
-      alert("Cannot reach server. Is FastAPI running?");
+      alert(e.message || "Cannot reach server. Is FastAPI running?");
     } finally {
       btn.disabled = false;
       genStatus.classList.remove("show");
@@ -113,7 +127,6 @@ initSettings();
 initTopics();
 initExport();
 initGenerate();
-initGoogleAuth();
 
 // Wire steppers/toggles by their card ids.
 ["mcq", "tf", "fitb", "why", "essay"].forEach((key) => {

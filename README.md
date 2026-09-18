@@ -124,7 +124,7 @@ The dashboard refreshes automatically every 30 seconds and can also be refreshed
 
 Evaluation history is stored persistently in PostgreSQL. Each database row represents one generation request, which may contain more than one exam model. For that reason, **Exam Runs** is the total number of generated models across all stored requests, rather than simply the number of database rows. Dashboard totals and rates are calculated from the saved raw counters.
 
-Generated exam content is handled separately. It remains in the application's temporary in-memory store for up to one hour so PDF, DOCX, and Google Forms exports can use it. Restarting the server clears this temporary exam content, but it does not clear the PostgreSQL evaluation history.
+The versioned `/api/v1` workflow stores sessions, documents, jobs, and generated exams in PostgreSQL. Upload parsing and exam generation run in a Celery worker through Redis, so API restarts do not lose job or exam state. The old synchronous endpoints can be enabled temporarily with `ENABLE_LEGACY_SYNC_API=true`; they are disabled by default.
 
 Saving evaluation telemetry is best-effort. If PostgreSQL is temporarily unavailable, the generated exam is still returned to the teacher and remains available for export, but that generation run may not appear in the Eval Dashboard.
 
@@ -142,8 +142,6 @@ Answers_Biology_Midterm_Grade_10_Model_1.pdf
 ```
 
 If only one of those details is present, the filename uses that value. If neither is present, DraftWork falls back to `Exam_Model_1.pdf` and `Answers_Exam_Model_1.pdf`. The same naming rules apply to DOCX exports.
-
-Google Forms export continues to create a separate form for each exam model and is not packaged into the downloadable ZIP.
 
 ## Sample Generated Exam
 
@@ -273,7 +271,9 @@ This keeps already-valid questions unchanged and avoids sending them through Val
 | Workflow Orchestration | LangGraph                    |
 | Embeddings             | FlagEmbedding / Transformers |
 | Vector/Document Retrieval | Qdrant                    |
-| Evaluation History     | PostgreSQL                   |
+| Application State      | PostgreSQL                   |
+| Background Jobs        | Celery + Redis               |
+| File Storage           | Replaceable local backend    |
 | ML Runtime             | PyTorch                      |
 | PDF Parsing            | LlamaParse                   |
 | LLM Providers          | LM Studio + DeepSeek V4.1 Flash |
@@ -370,10 +370,10 @@ Provider environment variables:
 | `DEEPSEEK_MAX_TRANSIENT_RETRIES` | Retries for rate limits, network failures, timeouts, and server errors |
 | `DEEPSEEK_RETRY_BASE_SECONDS` | Initial delay used by exponential backoff |
 
-Create the `draftwork` database if needed, then apply the evaluation-history migration:
+Create the `draftwork` database if needed, then apply all migrations:
 
 ```bash
-psql "postgresql://postgres:your_password@localhost:1966/draftwork" -f migrations/001_create_evaluation_runs.sql
+.venv\Scripts\python.exe scripts\apply_migrations.py
 ```
 
 Start Qdrant:
@@ -398,8 +398,8 @@ Copy-Item .env.example .env
 
 Set `POSTGRES_PASSWORD` and `LLAMA_PARSE_API` in `.env`. Keep
 `LLM_PROVIDER=local` for LM Studio, or set `LLM_PROVIDER=deepseek` and add
-`DEEPSEEK_API_KEY` for DeepSeek. Then build and start the application, PostgreSQL,
-and Qdrant:
+`DEEPSEEK_API_KEY` for DeepSeek. Then build and start the API, Celery worker,
+Redis, PostgreSQL, and Qdrant:
 
 ```powershell
 docker compose up -d --build
@@ -409,12 +409,14 @@ Open DraftWork at `http://localhost:8000`. To follow application logs:
 
 ```powershell
 docker compose logs -f app
+docker compose logs -f worker
 ```
 
-The Compose configuration expects an NVIDIA-compatible Docker GPU runtime for the
-embedding model. Application data, PostgreSQL data, Qdrant data, and the
-Hugging Face cache use mounted directories or named volumes and survive an app
-container rebuild.
+The worker expects an NVIDIA-compatible Docker GPU runtime for the embedding
+model. The API does not request a GPU. Local application files, Redis,
+PostgreSQL, Qdrant, and the Hugging Face cache use mounted directories or named
+volumes and survive a container rebuild. The migration service applies every
+SQL migration before the API and worker start.
 
 ## Tests
 

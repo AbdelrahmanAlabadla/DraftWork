@@ -6,7 +6,12 @@ from typing import Any
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qm
 
-from app.config import EMBEDDING_DIM, QDRANT_COLLECTION, QDRANT_URL
+from app.config import (
+    EMBEDDING_DIM,
+    QDRANT_COLLECTION,
+    QDRANT_TIMEOUT_SECONDS,
+    QDRANT_URL,
+)
 from app.logging_conf import get_logger
 
 logger = get_logger("QDRANT")
@@ -17,7 +22,7 @@ _SPARSE_NAME = "lexical"
 
 class VectorStore:
     def __init__(self) -> None:
-        self.client = QdrantClient(url=QDRANT_URL)
+        self.client = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS)
         self.collection = QDRANT_COLLECTION
 
     def ensure_collection(self) -> None:
@@ -38,6 +43,7 @@ class VectorStore:
                 EMBEDDING_DIM,
                 time.perf_counter() - t0,
             )
+            self._ensure_payload_indexes()
         else:
             info = self.client.get_collection(self.collection)
             params_vectors = info.config.params.vectors
@@ -58,16 +64,50 @@ class VectorStore:
                 self.ensure_collection()
                 return
             logger.info("Collection exists | name=%s", self.collection)
+            self._ensure_payload_indexes()
 
-    def delete_document(self, document_id: str) -> int:
+    def _ensure_payload_indexes(self) -> None:
+        for field in ("session_id", "document_id", "job_id", "child_id", "chunk_type"):
+            self.client.create_payload_index(
+                collection_name=self.collection,
+                field_name=field,
+                field_schema=qm.PayloadSchemaType.KEYWORD,
+                wait=True,
+            )
+
+    @staticmethod
+    def _scope_conditions(
+        document_id: str,
+        session_id: str | None = None,
+        job_id: str | None = None,
+    ) -> list[qm.FieldCondition]:
+        conditions = [
+            qm.FieldCondition(
+                key="document_id", match=qm.MatchValue(value=document_id)
+            )
+        ]
+        if session_id:
+            conditions.append(
+                qm.FieldCondition(
+                    key="session_id", match=qm.MatchValue(value=session_id)
+                )
+            )
+        if job_id:
+            conditions.append(
+                qm.FieldCondition(key="job_id", match=qm.MatchValue(value=job_id))
+            )
+        return conditions
+
+    def delete_document(
+        self,
+        document_id: str,
+        session_id: str | None = None,
+        job_id: str | None = None,
+    ) -> int:
         """Remove all points belonging to a document (idempotent re-indexing)."""
         selector = qm.FilterSelector(
             filter=qm.Filter(
-                must=[
-                    qm.FieldCondition(
-                        key="document_id", match=qm.MatchValue(value=document_id)
-                    )
-                ]
+                must=self._scope_conditions(document_id, session_id, job_id)
             )
         )
         try:
@@ -89,6 +129,9 @@ class VectorStore:
         self,
         chunks: list[dict[str, Any]],
         embeddings: list[dict[str, Any]],
+        *,
+        session_id: str | None = None,
+        job_id: str | None = None,
     ) -> int:
         t0 = time.perf_counter()
         points: list[qm.PointStruct] = []
@@ -107,6 +150,10 @@ class VectorStore:
                 "heading": chunk.get("heading"),
                 "content": chunk["content"],
             }
+            if session_id:
+                payload["session_id"] = session_id
+            if job_id:
+                payload["job_id"] = job_id
             # Sparse (lexical) half is optional: only present for models that
             # produce one (e.g. BGE-M3). Dense-only models omit the field.
             vector: dict[str, Any] = {_DENSE_NAME: emb["dense"]}
@@ -141,15 +188,15 @@ class VectorStore:
         document_id: str,
         top_k: int = 6,
         selected_child_ids: list[str] | None = None,
+        session_id: str | None = None,
+        job_id: str | None = None,
     ) -> list[dict[str, Any]]:
         t0 = time.perf_counter()
         must = [
             qm.FieldCondition(
                 key="chunk_type", match=qm.MatchValue(value="child")
             ),
-            qm.FieldCondition(
-                key="document_id", match=qm.MatchValue(value=document_id)
-            ),
+            *self._scope_conditions(document_id, session_id, job_id),
         ]
         if selected_child_ids:
             must.append(
@@ -222,6 +269,9 @@ class VectorStore:
         self,
         document_id: str,
         child_ids: list[str],
+        *,
+        session_id: str | None = None,
+        job_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return the exact child (subsection) payloads for the given ids.
 
@@ -238,9 +288,7 @@ class VectorStore:
                 qm.FieldCondition(
                     key="chunk_type", match=qm.MatchValue(value="child")
                 ),
-                qm.FieldCondition(
-                    key="document_id", match=qm.MatchValue(value=document_id)
-                ),
+                *self._scope_conditions(document_id, session_id, job_id),
                 qm.FieldCondition(
                     key="child_id", match=qm.MatchAny(any=list(child_ids))
                 ),

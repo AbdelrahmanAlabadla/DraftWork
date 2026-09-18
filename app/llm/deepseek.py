@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import re
 import threading
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, TypeVar
 
@@ -92,17 +90,6 @@ class DeepSeekClient:
     supports_agent_structured_output = True
     provider_name = "deepseek"
     _concurrency = threading.BoundedSemaphore(DEEPSEEK_CONCURRENCY_LIMIT)
-    _usage_lock = threading.Lock()
-    _usage_by_agent: dict[str, dict[str, int]] = defaultdict(
-        lambda: {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "reasoning_tokens": 0,
-            "cached_tokens": 0,
-            "total_tokens": 0,
-            "requests": 0,
-        }
-    )
 
     def __init__(self) -> None:
         if not DEEPSEEK_API_KEY:
@@ -113,11 +100,6 @@ class DeepSeekClient:
         self.model = DEEPSEEK_MODEL
         self.api_key = DEEPSEEK_API_KEY
         self.last_usage: dict[str, int | str] | None = None
-
-    @classmethod
-    def usage_snapshot(cls) -> dict[str, dict[str, int]]:
-        with cls._usage_lock:
-            return copy.deepcopy(dict(cls._usage_by_agent))
 
     async def _sdk_request(self, *, timeout: int, **kwargs):
         await asyncio.to_thread(self._concurrency.acquire)
@@ -211,17 +193,6 @@ class DeepSeekClient:
             "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
         }
         self.last_usage = values
-        with self._usage_lock:
-            totals = self._usage_by_agent[agent]
-            for key in (
-                "input_tokens",
-                "output_tokens",
-                "reasoning_tokens",
-                "cached_tokens",
-                "total_tokens",
-            ):
-                totals[key] += int(values[key])
-            totals["requests"] += 1
         logger.info(
             "DeepSeek usage | agent=%s | input_tokens=%d | output_tokens=%d | "
             "reasoning_tokens=%d | cached_tokens=%d | total_tokens=%d",

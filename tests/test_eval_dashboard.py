@@ -125,6 +125,26 @@ def test_eval_summary_handles_zero_denominators(monkeypatch):
     assert data["recent_exam_runs"] == []
 
 
+def test_versioned_eval_summary_endpoint(monkeypatch):
+    summary = {"total_exam_runs": 1, "overall": {}, "models": {}}
+    monkeypatch.setattr("app.api.routes.evaluation_store.load_eval_summary", lambda: summary)
+
+    response = client.get("/api/v1/eval-summary")
+
+    assert response.status_code == 200
+    assert response.json() == summary
+
+
+def test_cached_dashboard_eval_summary_url_remains_compatible(monkeypatch):
+    summary = {"total_exam_runs": 1, "overall": {}, "models": {}}
+    monkeypatch.setattr("app.api.routes.evaluation_store.load_eval_summary", lambda: summary)
+
+    response = client.get("/api/v1/api/eval-summary")
+
+    assert response.status_code == 200
+    assert response.json() == summary
+
+
 def test_eval_dashboard_page_loads_successfully():
     response = client.get("/eval.html")
     assert response.status_code == 200

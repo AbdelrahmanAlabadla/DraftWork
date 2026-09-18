@@ -149,4 +149,3 @@ def test_frontend_uses_model_dialog_only_for_multiple_document_models():
     assert "showModal()" in script
     assert "model_numbers: modelNumbers" in script
     assert 'kind === "pdf" || kind === "docx"' in script
-    assert "google-forms" in script

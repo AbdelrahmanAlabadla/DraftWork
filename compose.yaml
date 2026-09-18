@@ -1,6 +1,5 @@
 services:
   app:
-    gpus: all
     build:
       context: .
     container_name: genexam-app
@@ -14,6 +13,10 @@ services:
       PORT: 8000
       QDRANT_URL: http://qdrant:6333
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/draftwork
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_ROOT: data/storage
       LMS_URL: http://host.docker.internal:1234
       TITLE_LMS_URL: http://host.docker.internal:1234/v1
       LLM_PROVIDER: ${LLM_PROVIDER:-local}
@@ -26,17 +29,94 @@ services:
       DEEPSEEK_RETRY_BASE_SECONDS: ${DEEPSEEK_RETRY_BASE_SECONDS:-1.0}
     volumes:
       - ./data:/app/data
-      - huggingface-cache:/root/.cache/huggingface
     depends_on:
       qdrant:
         condition: service_started
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    gpus: all
+    build:
+      context: .
+    container_name: genexam-worker
+    init: true
+    command: ["celery", "-A", "app.jobs.celery_app:celery_app", "worker", "--beat", "--loglevel=INFO", "--pool=solo", "--concurrency=1"]
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/draftwork
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_ROOT: data/storage
+      LMS_URL: http://host.docker.internal:1234
+      TITLE_LMS_URL: http://host.docker.internal:1234/v1
+      LLM_PROVIDER: ${LLM_PROVIDER:-local}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      PARSING_TIMEOUT_SECONDS: 120
+      GENERATION_TIMEOUT_SECONDS: 420
+      JOB_HEARTBEAT_SECONDS: 30
+      JOB_STALE_AFTER_SECONDS: 480
+    volumes:
+      - ./data:/app/data
+      - huggingface-cache:/home/app/.cache/huggingface
+    depends_on:
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+    command: ["python", "scripts/apply_migrations.py"]
+    healthcheck:
+      disable: true
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/draftwork
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: genexam-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
     container_name: genexam-qdrant
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
     volumes:
       - qdrant-data:/qdrant/storage
     restart: unless-stopped
@@ -44,6 +124,8 @@ services:
   postgres:
     image: postgres:17
     container_name: genexam-postgres
+    ports:
+      - "${POSTGRES_PORT:-1966}:5432"
     environment:
       POSTGRES_DB: draftwork
       POSTGRES_USER: postgres
@@ -51,6 +133,7 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./migrations/001_create_evaluation_runs.sql:/docker-entrypoint-initdb.d/001_create_evaluation_runs.sql:ro
+      - ./migrations/002_create_core_tables.sql:/docker-entrypoint-initdb.d/002_create_core_tables.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d draftwork"]
       interval: 5s
@@ -62,3 +145,4 @@ volumes:
   postgres-data:
   qdrant-data:
   huggingface-cache:
+  redis-data:
