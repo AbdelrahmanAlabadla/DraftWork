@@ -109,7 +109,7 @@ function render(summary) {
 async function refresh() {
   const state = document.getElementById("evalState");
   try {
-    const response = await fetch(`${BASE}/api/eval-summary`, { cache: "no-store" });
+    const response = await fetch(`${BASE}/eval-summary`, { cache: "no-store" });
     if (!response.ok) throw new Error(`Endpoint returned ${response.status}`);
     render(await response.json());
   } catch (error) {

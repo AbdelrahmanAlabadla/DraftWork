@@ -6,9 +6,10 @@ export const state = {
   difficulty: "easy",
   uploadDone: false,
   currentDocId: null,
+  uploadJobId: null,
+  generationJobId: null,
   selectedChildren: new Set(),
   examId: null,
   exams: [],
   rawExam: "",
-  teacherEmail: null,
 };

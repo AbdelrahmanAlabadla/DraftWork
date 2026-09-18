@@ -1,4 +1,4 @@
-import { BASE } from "./api.js";
+import { BASE, getJSON, waitForJob } from "./api.js";
 import { state } from "./state.js";
 import { renderSectionsTree, showSectionsLoading, hideSectionsLoading } from "./topics.js";
 
@@ -44,19 +44,31 @@ async function uploadFile(file) {
   const formData = new FormData();
   formData.append("file", file);
   try {
-    const res = await fetch(`${BASE}/upload`, { method: "POST", body: formData });
+    const res = await fetch(`${BASE}/documents`, {
+      method: "POST",
+      credentials: "same-origin",
+      body: formData,
+    });
     const data = await res.json();
     if (res.ok) {
-      setUploadStatus("success", data.message || "File indexed successfully.");
+      state.uploadJobId = data.job_id;
+      await waitForJob(data.job_id, (job) => {
+        setUploadStatus("loading", `Processing PDF: ${job.stage} (${job.progress}%)`);
+      });
+      const documentResponse = await getJSON(`/documents/${data.document_id}`);
+      if (!documentResponse.ok) {
+        throw new Error(documentResponse.data.detail || "Could not load the processed document.");
+      }
+      setUploadStatus("success", "File indexed successfully.");
       state.uploadDone = true;
       state.currentDocId = data.document_id;
-      renderSectionsTree(data.structure || {});
+      renderSectionsTree(documentResponse.data.structure || {});
     } else {
       setUploadStatus("error", data.detail || "Upload failed.");
       hideSectionsLoading();
     }
   } catch (e) {
-    setUploadStatus("error", "Cannot reach server. Is FastAPI running?");
+    setUploadStatus("error", e.message || "Cannot reach the server.");
     hideSectionsLoading();
   }
 }
