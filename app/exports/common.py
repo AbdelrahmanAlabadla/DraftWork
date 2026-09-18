@@ -1,6 +1,6 @@
 """Shared normalized export representation.
 
-Every exporter (PDF / DOCX / Google Forms) consumes the flat item list
+Every document exporter (PDF / DOCX) consumes the flat item list
 produced by :func:`flatten_exam_items` so the structured ``questions`` data —
 not the markdown rendering — is the single source of truth for exports.
 """
@@ -13,7 +13,7 @@ from app.online.models import TYPE_LABELS, TYPE_ORDER
 
 # Printed order follows the supplied exam model while staying limited to the
 # question types the application currently supports.  ``TYPE_ORDER`` remains
-# unchanged because Google Forms and the generation pipeline rely on it.
+# unchanged because the generation and document export pipelines rely on it.
 EXPORT_TYPE_ORDER = [
     "mcq",
     "fill_in_the_blank",

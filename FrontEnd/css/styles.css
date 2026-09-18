@@ -1152,34 +1152,6 @@
   border-top: 1px solid var(--border);
 }
 
-/* Teacher email field inside the Google Forms export option */
-.export-share {
-  padding: 8px 14px;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-}
-
-.export-share input {
-  width: 100%;
-  background: var(--surface2);
-  border: 1px solid var(--border2);
-  border-radius: 6px;
-  padding: 7px 10px;
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--text);
-  outline: none;
-  transition: border-color 0.15s;
-}
-
-.export-share input:focus {
-  border-color: var(--accent);
-}
-
-.export-share input::placeholder {
-  color: var(--muted2);
-}
-
 /* ---- Downloadable export model selection ---- */
 .export-model-dialog {
   width: min(440px, calc(100vw - 32px));
@@ -1280,30 +1252,6 @@
   font-size: 12px;
 }
 
-/* ---- Forms links + export status inside exam output ---- */
-.forms-links {
-  margin-top: 14px;
-}
-
-.forms-link-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-family: var(--mono);
-  font-size: 12px;
-  padding: 8px 0;
-  border-bottom: 1px solid var(--border);
-}
-
-.forms-link-row a {
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.forms-link-row a:hover {
-  text-decoration: underline;
-}
-
 /* Readable shared UI type scale. The exam-paper preview keeps its print scale. */
 .header .tag,
 .header-link,
@@ -1328,9 +1276,7 @@
 .qtype-desc,
 .stepper .count,
 .model-tab,
-.export-item,
-.export-share input,
-.forms-link-row,
+  .export-item,
 .gen-status,
 .sections-loading,
 .section-title,
