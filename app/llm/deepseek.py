@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, TypeVar
 
@@ -22,13 +23,17 @@ from app.config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_CONCURRENCY_LIMIT,
+    DEEPSEEK_INPUT_COST_PER_MTOK,
+    DEEPSEEK_CACHED_INPUT_COST_PER_MTOK,
     DEEPSEEK_MAX_STRUCTURED_ATTEMPTS,
     DEEPSEEK_MAX_TRANSIENT_RETRIES,
     DEEPSEEK_MODEL,
+    DEEPSEEK_OUTPUT_COST_PER_MTOK,
     DEEPSEEK_RETRY_BASE_SECONDS,
 )
 from app.llm.schemas import strict_json_schema
-from app.logging_conf import get_logger
+from app.logging_conf import current_job_id, get_logger
+from app.metrics import increment
 
 logger = get_logger("LLM")
 T = TypeVar("T")
@@ -176,7 +181,9 @@ class DeepSeekClient:
             return min(16000, max(4096, count * 512)), 16000
         return min(8000, max(2048, count * 320)), 8000
 
-    def _capture_usage(self, response: Any, agent: str) -> None:
+    def _capture_usage(
+        self, response: Any, agent: str, *, duration_ms: int | None = None
+    ) -> None:
         usage = getattr(response, "usage", None)
         if usage is None:
             return
@@ -193,6 +200,49 @@ class DeepSeekClient:
             "total_tokens": int(getattr(usage, "total_tokens", 0) or 0),
         }
         self.last_usage = values
+        uncached_input = max(0, int(values["input_tokens"]) - int(values["cached_tokens"]))
+        estimated_cost = (
+            uncached_input * DEEPSEEK_INPUT_COST_PER_MTOK
+            + int(values["cached_tokens"]) * DEEPSEEK_CACHED_INPUT_COST_PER_MTOK
+            + int(values["output_tokens"]) * DEEPSEEK_OUTPUT_COST_PER_MTOK
+        ) / 1_000_000
+        increment(
+            "genexam_llm_tokens",
+            value=int(values["input_tokens"]),
+            provider=self.provider_name,
+            model=self.model,
+            direction="input",
+        )
+        increment(
+            "genexam_llm_tokens",
+            value=int(values["output_tokens"]),
+            provider=self.provider_name,
+            model=self.model,
+            direction="output",
+        )
+        increment(
+            "genexam_llm_estimated_cost_usd",
+            value=estimated_cost,
+            provider=self.provider_name,
+            model=self.model,
+        )
+        try:
+            from app.api import repositories
+
+            repositories.record_llm_usage(
+                job_id=current_job_id(),
+                provider=self.provider_name,
+                model=self.model,
+                operation=agent,
+                input_tokens=int(values["input_tokens"]),
+                output_tokens=int(values["output_tokens"]),
+                cached_tokens=int(values["cached_tokens"]),
+                reasoning_tokens=int(values["reasoning_tokens"]),
+                estimated_cost_usd=estimated_cost,
+                duration_ms=duration_ms,
+            )
+        except Exception as exc:
+            logger.warning("LLM usage persistence failed | error=%s", type(exc).__name__)
         logger.info(
             "DeepSeek usage | agent=%s | input_tokens=%d | output_tokens=%d | "
             "reasoning_tokens=%d | cached_tokens=%d | total_tokens=%d",
@@ -202,6 +252,15 @@ class DeepSeekClient:
             values["reasoning_tokens"],
             values["cached_tokens"],
             values["total_tokens"],
+            extra={
+                "event": "llm_call_completed",
+                "provider": self.provider_name,
+                "model": self.model,
+                "input_tokens": int(values["input_tokens"]),
+                "output_tokens": int(values["output_tokens"]),
+                "total_tokens": int(values["total_tokens"]),
+                "duration_ms": duration_ms,
+            },
         )
 
     @staticmethod
@@ -309,6 +368,7 @@ class DeepSeekClient:
                     )
                     if part
                 )
+                request_started = time.perf_counter()
                 response = await self._request_with_backoff(
                     timeout=timeout,
                     model=self.model,
@@ -334,7 +394,11 @@ class DeepSeekClient:
                     ) from exc
                 raise DeepSeekError("DeepSeek rejected the structured request") from exc
 
-            self._capture_usage(response, agent)
+            self._capture_usage(
+                response,
+                agent,
+                duration_ms=int((time.perf_counter() - request_started) * 1000),
+            )
             previous_output = self._output_text(response)
             status = str(getattr(response, "status", "") or "")
             if status == "incomplete":
@@ -417,6 +481,7 @@ class DeepSeekClient:
         max_tokens: int = 4096,
         timeout: int = 600,
     ) -> str:
+        request_started = time.perf_counter()
         response = await self._request_with_backoff(
             timeout=timeout,
             model=self.model,
@@ -426,7 +491,11 @@ class DeepSeekClient:
             temperature=temperature,
             max_output_tokens=max_tokens,
         )
-        self._capture_usage(response, "title")
+        self._capture_usage(
+            response,
+            "title",
+            duration_ms=int((time.perf_counter() - request_started) * 1000),
+        )
         status = str(getattr(response, "status", "") or "")
         if status == "incomplete":
             details = getattr(response, "incomplete_details", None)

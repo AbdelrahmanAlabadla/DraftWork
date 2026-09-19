@@ -9,8 +9,10 @@ from qdrant_client.http import models as qm
 from app.config import (
     EMBEDDING_DIM,
     QDRANT_COLLECTION,
+    QDRANT_API_KEY,
     QDRANT_TIMEOUT_SECONDS,
     QDRANT_URL,
+    QDRANT_VERIFY_TLS,
 )
 from app.logging_conf import get_logger
 
@@ -22,7 +24,12 @@ _SPARSE_NAME = "lexical"
 
 class VectorStore:
     def __init__(self) -> None:
-        self.client = QdrantClient(url=QDRANT_URL, timeout=QDRANT_TIMEOUT_SECONDS)
+        self.client = QdrantClient(
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY,
+            timeout=QDRANT_TIMEOUT_SECONDS,
+            verify=QDRANT_VERIFY_TLS,
+        )
         self.collection = QDRANT_COLLECTION
 
     def ensure_collection(self) -> None:
@@ -103,6 +110,7 @@ class VectorStore:
         document_id: str,
         session_id: str | None = None,
         job_id: str | None = None,
+        raise_errors: bool = False,
     ) -> int:
         """Remove all points belonging to a document (idempotent re-indexing)."""
         selector = qm.FilterSelector(
@@ -120,6 +128,8 @@ class VectorStore:
                 "delete_document | document_id=%s | no prior points to delete",
                 document_id,
             )
+            if raise_errors:
+                raise
             return 0
         count = getattr(result, "status", "ok")
         logger.info("Deleted previous vectors | document_id=%s | status=%s", document_id, count)
@@ -341,3 +351,45 @@ class VectorStore:
             exact=True,
         )
         return result.count
+
+    def delete_orphaned_session_points(
+        self,
+        valid_scopes: set[tuple[str, str]],
+        *,
+        max_points: int,
+    ) -> int:
+        """Delete versioned points whose session/document no longer exists."""
+        offset = None
+        scanned = 0
+        orphan_ids: list[Any] = []
+        while scanned < max_points:
+            points, next_offset = self.client.scroll(
+                collection_name=self.collection,
+                limit=min(256, max_points - scanned),
+                offset=offset,
+                with_payload=["session_id", "document_id"],
+                with_vectors=False,
+            )
+            if not points:
+                break
+            scanned += len(points)
+            for point in points:
+                payload = point.payload or {}
+                session_id = payload.get("session_id")
+                document_id = payload.get("document_id")
+                # Legacy synchronous-pipeline points have no session scope and
+                # are outside this cleanup policy.
+                if session_id and document_id and (
+                    str(session_id), str(document_id)
+                ) not in valid_scopes:
+                    orphan_ids.append(point.id)
+            if next_offset is None:
+                break
+            offset = next_offset
+        if orphan_ids:
+            self.client.delete(
+                collection_name=self.collection,
+                points_selector=qm.PointIdsList(points=orphan_ids),
+                wait=True,
+            )
+        return len(orphan_ids)
