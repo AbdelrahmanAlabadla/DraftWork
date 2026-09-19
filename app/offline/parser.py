@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import LLAMA_PARSE_API, PARSING_TIMEOUT_SECONDS
+from app.deadlines import DeadlineExceeded, deadline
 from app.logging_conf import get_logger
 from app.offline.parser_items import (
     ParserSchemaError,
@@ -15,6 +16,10 @@ from app.offline.parser_items import (
 logger = get_logger("PARSER")
 
 class ParserError(RuntimeError):
+    pass
+
+
+class ParserTimeoutError(ParserError, TimeoutError):
     pass
 
 
@@ -43,7 +48,17 @@ class LlamaParser:
         logger.info("Parsing started | parser=LlamaParse | file=%s", path.name)
 
         try:
-            result = self.parser.parse(str(path))
+            with deadline(PARSING_TIMEOUT_SECONDS, "LlamaParse"):
+                result = self.parser.parse(str(path))
+        except DeadlineExceeded as exc:
+            logger.error(
+                "Parsing timed out | parser=LlamaParse | file=%s | timeout=%ss",
+                path.name,
+                PARSING_TIMEOUT_SECONDS,
+            )
+            raise ParserTimeoutError("LlamaParse timed out") from exc
+        except TimeoutError as exc:
+            raise ParserTimeoutError("LlamaParse timed out") from exc
         except Exception as exc:
             logger.error(
                 "Parsing failed | parser=LlamaParse | file=%s | exc=%s: %s",
