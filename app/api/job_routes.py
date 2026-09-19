@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import binascii
+import json
 import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 
 from app import config, db
@@ -35,10 +38,84 @@ _SUPPORTED_COUNTS = {
     "essay": "essay",
 }
 _VALID_DIFFICULTIES = {"easy", "medium", "hard", "mix"}
+_LOGO_PREFIXES = {
+    "data:image/png;base64,",
+    "data:image/jpeg;base64,",
+    "data:image/webp;base64,",
+}
 
 
 def _http_not_found(exc: Exception) -> HTTPException:
     return HTTPException(status_code=404, detail=str(exc).strip("'"))
+
+
+def _validate_idempotency_key(value: str | None) -> str | None:
+    if value is None:
+        if config.REQUIRE_IDEMPOTENCY_KEY:
+            raise HTTPException(status_code=400, detail="Idempotency-Key is required")
+        return None
+    key = value.strip()
+    if not key or len(key) > config.IDEMPOTENCY_KEY_MAX_LENGTH:
+        raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
+    if any(ord(character) < 33 or ord(character) > 126 for character in key):
+        raise HTTPException(status_code=400, detail="Invalid Idempotency-Key")
+    return key
+
+
+def _request_hash(value: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_logo(value: str, field_name: str) -> None:
+    prefix = next((item for item in _LOGO_PREFIXES if value.startswith(item)), None)
+    if prefix is None:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be PNG, JPEG, or WebP")
+    try:
+        decoded = base64.b64decode(value[len(prefix):], validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} is not valid base64") from exc
+    if not decoded or len(decoded) > config.MAX_LOGO_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must be no larger than {config.MAX_LOGO_BYTES} bytes",
+        )
+    valid_signature = (
+        (prefix == "data:image/png;base64," and decoded.startswith(b"\x89PNG\r\n\x1a\n"))
+        or (prefix == "data:image/jpeg;base64," and decoded.startswith(b"\xff\xd8\xff"))
+        or (
+            prefix == "data:image/webp;base64,"
+            and len(decoded) >= 12
+            and decoded.startswith(b"RIFF")
+            and decoded[8:12] == b"WEBP"
+        )
+    )
+    if not valid_signature:
+        raise HTTPException(status_code=400, detail=f"{field_name} content does not match its image type")
+
+
+def _validate_child_selection(document: dict[str, Any], child_ids: list[str]) -> None:
+    structure_key = document.get("structure_storage_key")
+    if not structure_key:
+        raise HTTPException(status_code=409, detail="Document structure is unavailable")
+    try:
+        structure = get_file_storage().read_json(str(structure_key))
+    except (OSError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=409, detail="Document structure is unavailable") from exc
+    if not isinstance(structure, dict) or not isinstance(structure.get("sections"), list):
+        raise HTTPException(status_code=409, detail="Document structure is unavailable")
+    available = {
+        str(child_id)
+        for section in structure.get("sections", [])
+        if isinstance(section, dict)
+        for child_id in section.get("child_ids", [])
+        if child_id
+    }
+    missing = [child_id for child_id in child_ids if child_id not in available]
+    if missing:
+        raise HTTPException(status_code=400, detail="One or more selected sections are invalid")
 
 
 def _generation_payload(body: GenerateRequest) -> dict[str, Any]:
@@ -74,6 +151,11 @@ def _generation_payload(body: GenerateRequest) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Unsupported difficulty")
     if not body.child_ids:
         raise HTTPException(status_code=400, detail="Choose at least one section topic")
+    if len(body.child_ids) > config.MAX_CHILD_IDS_PER_GENERATION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Choose at most {config.MAX_CHILD_IDS_PER_GENERATION} section topics",
+        )
 
     metadata = {
         key: value.strip() if isinstance(value, str) else value
@@ -89,6 +171,10 @@ def _generation_payload(body: GenerateRequest) -> dict[str, Any]:
         }.items()
         if value
     }
+    for field_name in ("left_logo_data", "right_logo_data"):
+        value = metadata.get(field_name)
+        if value:
+            _validate_logo(str(value), field_name)
     return {
         "tasks": tasks,
         "num_models": num_models,
@@ -102,7 +188,9 @@ def _generation_payload(body: GenerateRequest) -> dict[str, Any]:
 async def create_document(
     file: UploadFile = File(...),
     session_id: str = Depends(require_session_id),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
+    idempotency_key = _validate_idempotency_key(idempotency_key)
     filename = Path(file.filename or "upload.pdf").name
     if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -135,17 +223,39 @@ async def create_document(
         storage.put_file(storage_key, temporary)
 
     try:
-        document, job = repositories.create_document_with_job(
-            session_id=session_id,
-            filename=filename,
-            media_type=file.content_type or "application/pdf",
-            size_bytes=size,
-            sha256=digest.hexdigest(),
-            source_storage_key=storage_key,
-            document_id=document_id,
-        )
-        job_service.enqueue_ingestion(str(job["id"]))
-        repositories.mark_job_dispatched(str(job["id"]))
+        if idempotency_key:
+            document, job, reused = repositories.create_document_with_job_idempotent(
+                session_id=session_id,
+                filename=filename,
+                media_type="application/pdf",
+                size_bytes=size,
+                sha256=digest.hexdigest(),
+                source_storage_key=storage_key,
+                document_id=document_id,
+                idempotency_key=idempotency_key,
+                request_hash=_request_hash(
+                    {"filename": filename, "size": size, "sha256": digest.hexdigest()}
+                ),
+            )
+        else:
+            document, job = repositories.create_document_with_job(
+                session_id=session_id,
+                filename=filename,
+                media_type="application/pdf",
+                size_bytes=size,
+                sha256=digest.hexdigest(),
+                source_storage_key=storage_key,
+                document_id=document_id,
+            )
+            reused = False
+        if reused:
+            storage.delete(storage_key)
+        else:
+            job_service.enqueue_ingestion(str(job["id"]))
+            repositories.mark_job_dispatched(str(job["id"]))
+    except repositories.IdempotencyConflict as exc:
+        storage.delete(storage_key)
+        raise HTTPException(status_code=409, detail=str(exc))
     except db.DatabaseUnavailable:
         storage.delete(storage_key)
         raise HTTPException(status_code=503, detail="Application database is unavailable")
@@ -157,7 +267,8 @@ async def create_document(
     return {
         "document_id": str(document["id"]),
         "job_id": str(job["id"]),
-        "status": "queued",
+        "status": str(job.get("status") or "queued"),
+        "idempotency_replayed": reused,
         "message": f"File '{filename}' was accepted for processing.",
     }
 
@@ -203,13 +314,21 @@ def create_exam_job(
     document_id: uuid.UUID,
     body: GenerateRequest,
     session_id: str = Depends(require_session_id),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
+    idempotency_key = _validate_idempotency_key(idempotency_key)
     payload = _generation_payload(body)
     try:
+        document = repositories.get_document_for_session(str(document_id), session_id)
+        if document["status"] != "ready":
+            raise repositories.InvalidState("Document is not ready for exam generation")
+        _validate_child_selection(document, payload["child_ids"])
         job = repositories.create_generation_job(
             session_id=session_id,
             document_id=str(document_id),
             request_data=payload,
+            idempotency_key=idempotency_key,
+            request_hash=_request_hash(payload) if idempotency_key else None,
         )
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
@@ -223,13 +342,22 @@ def create_exam_job(
             detail="Only two generation requests per minute are allowed",
             headers={"Retry-After": str(exc.retry_after_seconds)},
         )
+    except repositories.IdempotencyConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
-    try:
-        job_service.enqueue_generation(str(job["id"]))
-        repositories.mark_job_dispatched(str(job["id"]))
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail="Background job queue is unavailable")
-    return {"job_id": str(job["id"]), "document_id": str(document_id), "status": "queued"}
+    reused = bool(job.pop("_idempotency_reused", False))
+    if not reused:
+        try:
+            job_service.enqueue_generation(str(job["id"]))
+            repositories.mark_job_dispatched(str(job["id"]))
+        except Exception:
+            raise HTTPException(status_code=503, detail="Background job queue is unavailable")
+    return {
+        "job_id": str(job["id"]),
+        "document_id": str(document_id),
+        "status": str(job.get("status") or "queued"),
+        "idempotency_replayed": reused,
+    }
 
 
 @router.get("/jobs/{job_id}")
@@ -278,20 +406,6 @@ def _owned_exam(exam_id: str, session_id: str) -> dict[str, Any]:
         raise _http_not_found(exc)
 
 
-def _persist_export(
-    *, session_id: str, exam_id: str, extension: str,
-    selected: list[dict[str, Any]], content: bytes,
-) -> None:
-    model_numbers = "-".join(
-        str(int(exam.get("model_number") or 1)) for exam in selected
-    )
-    key = (
-        f"sessions/{session_id}/exams/{exam_id}/exports/"
-        f"{extension}-models-{model_numbers}.zip"
-    )
-    get_file_storage().put_bytes(key, content)
-
-
 @router.post("/exams/{exam_id}/export/pdf")
 def export_pdf(
     exam_id: str,
@@ -301,10 +415,6 @@ def export_pdf(
     record = _owned_exam(exam_id, session_id)
     selected = _selected_models(record, body)
     archive = _document_archive(record, selected, "pdf", render_exam_pdf, render_answers_pdf)
-    _persist_export(
-        session_id=session_id, exam_id=exam_id, extension="pdf",
-        selected=selected, content=archive,
-    )
     return _zip_response(archive)
 
 
@@ -317,8 +427,4 @@ def export_docx(
     record = _owned_exam(exam_id, session_id)
     selected = _selected_models(record, body)
     archive = _document_archive(record, selected, "docx", render_exam_docx, render_answers_docx)
-    _persist_export(
-        session_id=session_id, exam_id=exam_id, extension="docx",
-        selected=selected, content=archive,
-    )
     return _zip_response(archive)

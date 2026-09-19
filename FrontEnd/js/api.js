@@ -1,9 +1,34 @@
 export const BASE = "/api/v1";
 
-export async function postJSON(path, body) {
+export function beginIdempotentOperation(name) {
+  const storageKey = `genexam:idempotency:${name}`;
+  try {
+    const existing = sessionStorage.getItem(storageKey);
+    if (existing) return { key: existing, storageKey };
+    const key = globalThis.crypto?.randomUUID?.()
+      || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    sessionStorage.setItem(storageKey, key);
+    return { key, storageKey };
+  } catch (_) {
+    return {
+      key: globalThis.crypto?.randomUUID?.()
+        || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      storageKey: null,
+    };
+  }
+}
+
+export function completeIdempotentOperation(operation) {
+  if (!operation?.storageKey) return;
+  try { sessionStorage.removeItem(operation.storageKey); } catch (_) { /* no-op */ }
+}
+
+export async function postJSON(path, body, idempotencyKey = null) {
+  const headers = { "Content-Type": "application/json" };
+  if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers,
     credentials: "same-origin",
     body: JSON.stringify(body),
   });

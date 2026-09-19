@@ -1,4 +1,6 @@
-import { getJSON, postJSON, waitForJob } from "./api.js";
+import {
+  beginIdempotentOperation, completeIdempotentOperation, getJSON, postJSON, waitForJob,
+} from "./api.js";
 import { state } from "./state.js";
 import { initI18n, t } from "./i18n.js";
 import { initUpload } from "./upload.js";
@@ -88,10 +90,14 @@ function initGenerate() {
     };
 
     try {
-      const { ok, data } = await postJSON(
-        `/documents/${state.currentDocId}/exam-jobs`, body
+      const operation = beginIdempotentOperation(
+        `generation:${state.currentDocId}`
+      );
+      const { ok, status, data } = await postJSON(
+        `/documents/${state.currentDocId}/exam-jobs`, body, operation.key
       );
       if (ok && data.job_id) {
+        completeIdempotentOperation(operation);
         state.generationJobId = data.job_id;
         const job = await waitForJob(data.job_id, (current) => {
           genStatus.dataset.stage = current.stage;
@@ -111,6 +117,7 @@ function initGenerate() {
           // Storage can be unavailable in private/restricted browser contexts.
         }
       } else {
+        if (status < 500) completeIdempotentOperation(operation);
         alert(`Generation failed: ${data.detail || "Unknown error"}`);
       }
     } catch (e) {
