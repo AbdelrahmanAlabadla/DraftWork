@@ -9,8 +9,13 @@ import { initTopics } from "./topics.js";
 import { step, toggleType, updateTotal } from "./qtypes.js";
 import { copyExam, renderExamOutput } from "./exam-view.js";
 import { initExport } from "./export.js";
+import { initAuthNavigation } from "./auth.js";
+import { initMyExamsDialog, loadExamIntoPreview } from "./my-exams-dialog.js";
 
 initI18n();
+// Account controls load independently so a slow Clerk CDN never blocks the
+// anonymous upload and generation interface.
+initAuthNavigation().catch(() => {});
 
 function inputValue(id) {
   return document.getElementById(id)?.value.trim() || "";
@@ -134,6 +139,20 @@ initSettings();
 initTopics();
 initExport();
 initGenerate();
+initMyExamsDialog();
+
+async function loadSavedExam() {
+  const savedExamId = new URLSearchParams(window.location.search).get("exam");
+  if (!savedExamId) return;
+  await loadExamIntoPreview(savedExamId);
+}
+
+loadSavedExam().catch(() => {
+  const output = document.getElementById("examOutput");
+  if (output) {
+    output.dataset.loadError = "true";
+  }
+});
 
 // Wire steppers/toggles by their card ids.
 ["mcq", "tf", "fitb", "why", "essay"].forEach((key) => {
@@ -147,5 +166,5 @@ initGenerate();
 
 document.querySelector("#examOutput .copy-btn").addEventListener("click", copyExam);
 
-updateTotal();
 window.__dwBooted = true;
+updateTotal();

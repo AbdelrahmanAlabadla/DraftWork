@@ -83,3 +83,63 @@ def test_core_repository_ownership_and_active_job_limit():
         with db.connection() as connection:
             connection.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
             connection.commit()
+
+
+def test_clerk_session_claim_preserves_exam_across_session_deletion():
+    session = repositories.create_session(
+        repositories.hash_session_token(secrets.token_urlsafe(32))
+    )
+    session_id = str(session["id"])
+    user = repositories.upsert_user(
+        "user_integration_claim", primary_email="claim@example.test"
+    )
+    user_id = str(user["id"])
+    exam_id = f"integration-{secrets.token_hex(8)}"
+    try:
+        document, job = repositories.create_document_with_job(
+            session_id=session_id,
+            filename="claimed.pdf",
+            media_type="application/pdf",
+            size_bytes=10,
+            sha256="1" * 64,
+            source_storage_key="integration/claimed.pdf",
+        )
+        repositories.complete_generation_job(
+            str(job["id"]),
+            exam_id=exam_id,
+            document_id=str(document["id"]),
+            session_id=session_id,
+            status="success",
+            exams=[{"model_number": 1}],
+            warnings=[],
+            metadata={"exam_title": "Claimed"},
+            evaluation={},
+        )
+        repositories.claim_session(session_id, user_id)
+
+        second = repositories.create_session(
+            repositories.hash_session_token(secrets.token_urlsafe(32))
+        )
+        second_id = str(second["id"])
+        repositories.claim_session(second_id, user_id)
+        assert repositories.get_exam_for_session(exam_id, second_id, user_id)[
+            "exam_id"
+        ] == exam_id
+
+        with db.connection() as connection:
+            connection.execute("DELETE FROM sessions WHERE id = %s", (session_id,))
+            row = connection.execute(
+                "SELECT session_id, user_id FROM exams WHERE id = %s", (exam_id,)
+            ).fetchone()
+            connection.commit()
+        assert row[0] is None
+        assert str(row[1]) == user_id
+    finally:
+        with db.connection() as connection:
+            connection.execute("DELETE FROM exams WHERE id = %s", (exam_id,))
+            connection.execute(
+                "DELETE FROM sessions WHERE user_id = %s OR id = %s",
+                (user_id, session_id),
+            )
+            connection.execute("DELETE FROM users WHERE id = %s", (user_id,))
+            connection.commit()

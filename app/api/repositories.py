@@ -33,6 +33,10 @@ class IdempotencyConflict(RuntimeError):
     pass
 
 
+class SessionOwnershipConflict(RuntimeError):
+    pass
+
+
 def hash_session_token(token: str) -> str:
     value = f"{config.SESSION_HASH_PEPPER}:{token}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()
@@ -69,6 +73,99 @@ def resolve_session(token_hash: str) -> dict[str, Any] | None:
             )
             row = cursor.fetchone()
         conn.commit()
+    return dict(row) if row else None
+
+
+def revoke_session(session_id: str) -> None:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE sessions SET revoked_at = CURRENT_TIMESTAMP,
+                          expires_at = CURRENT_TIMESTAMP
+                   WHERE id = %s AND revoked_at IS NULL""",
+                (session_id,),
+            )
+        conn.commit()
+
+
+def get_user_by_clerk_id(clerk_user_id: str) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "SELECT * FROM users WHERE clerk_user_id = %s",
+                (clerk_user_id,),
+            )
+            row = cursor.fetchone()
+    return dict(row) if row else None
+
+
+def upsert_user(
+    clerk_user_id: str, *, primary_email: str | None = None,
+    display_name: str | None = None, image_url: str | None = None,
+) -> dict[str, Any]:
+    user_id = str(uuid.uuid4())
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """INSERT INTO users (
+                       id, clerk_user_id, primary_email, display_name, image_url,
+                       last_login_at
+                   ) VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                   ON CONFLICT (clerk_user_id) DO UPDATE SET
+                       primary_email = COALESCE(EXCLUDED.primary_email, users.primary_email),
+                       display_name = COALESCE(EXCLUDED.display_name, users.display_name),
+                       image_url = COALESCE(EXCLUDED.image_url, users.image_url),
+                       last_login_at = CURRENT_TIMESTAMP,
+                       updated_at = CURRENT_TIMESTAMP
+                   RETURNING *""",
+                (user_id, clerk_user_id, primary_email, display_name, image_url),
+            )
+            row = cursor.fetchone()
+        conn.commit()
+    assert row is not None
+    return dict(row)
+
+
+def claim_session(session_id: str, user_id: str) -> dict[str, Any]:
+    """Attach one anonymous session and its exams, without moving stored data."""
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("SELECT * FROM sessions WHERE id = %s FOR UPDATE", (session_id,))
+            session = cursor.fetchone()
+            if session is None:
+                raise ResourceNotFound("Session not found")
+            owner = str(session["user_id"]) if session.get("user_id") else None
+            if owner is not None and owner != user_id:
+                raise SessionOwnershipConflict("Session already belongs to another user")
+            cursor.execute(
+                """UPDATE sessions SET user_id = %s,
+                          claimed_at = COALESCE(claimed_at, CURRENT_TIMESTAMP),
+                          last_seen_at = CURRENT_TIMESTAMP
+                   WHERE id = %s RETURNING *""",
+                (user_id, session_id),
+            )
+            claimed = cursor.fetchone()
+            cursor.execute(
+                """UPDATE exams SET user_id = %s
+                   WHERE session_id = %s AND user_id IS NULL""",
+                (user_id, session_id),
+            )
+            cursor.execute(
+                """UPDATE users SET last_login_at = CURRENT_TIMESTAMP,
+                          updated_at = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (user_id,),
+            )
+        conn.commit()
+    assert claimed is not None
+    return dict(claimed)
+
+
+def get_user(user_id: str) -> dict[str, Any] | None:
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+            row = cursor.fetchone()
     return dict(row) if row else None
 
 
@@ -189,28 +286,62 @@ def create_document_with_job_idempotent(
     return dict(document), dict(job), False
 
 
-def list_documents_for_session(session_id: str) -> list[dict[str, Any]]:
+def list_documents_for_session(
+    session_id: str, user_id: str | None = None
+) -> list[dict[str, Any]]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
+            if user_id is None:
+                cursor.execute(
+                    """SELECT id AS document_id, status,
+                              original_filename AS filename, size_bytes, stats,
+                              error_code, error_message, created_at, updated_at
+                       FROM documents
+                       WHERE session_id = %s AND status <> 'deleted'
+                       ORDER BY created_at DESC""",
+                    (session_id,),
+                )
+                return [dict(row) for row in cursor.fetchall()]
             cursor.execute(
                 """SELECT id AS document_id, status, original_filename AS filename,
                           size_bytes, stats, error_code, error_message, created_at,
                           updated_at
-                   FROM documents
-                   WHERE session_id = %s AND status <> 'deleted'
-                   ORDER BY created_at DESC""",
-                (session_id,),
+                   FROM documents d
+                   WHERE d.status <> 'deleted' AND (
+                       d.session_id = %s OR EXISTS (
+                           SELECT 1 FROM sessions s
+                           WHERE s.id = d.session_id AND s.user_id = %s
+                       )
+                   ) ORDER BY d.created_at DESC""",
+                (session_id, user_id),
             )
             return [dict(row) for row in cursor.fetchall()]
 
 
-def get_document_for_session(document_id: str, session_id: str) -> dict[str, Any]:
+def get_document_for_session(
+    document_id: str, session_id: str, user_id: str | None = None
+) -> dict[str, Any]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
+            if user_id is None:
+                cursor.execute(
+                    """SELECT * FROM documents
+                       WHERE id = %s AND session_id = %s AND status <> 'deleted'""",
+                    (document_id, session_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ResourceNotFound("Document not found")
+                return dict(row)
             cursor.execute(
-                """SELECT * FROM documents
-                   WHERE id = %s AND session_id = %s AND status <> 'deleted'""",
-                (document_id, session_id),
+                """SELECT d.* FROM documents d
+                   WHERE d.id = %s AND d.status <> 'deleted' AND (
+                       d.session_id = %s OR EXISTS (
+                           SELECT 1 FROM sessions s
+                           WHERE s.id = d.session_id AND s.user_id = %s
+                       )
+                   )""",
+                (document_id, session_id, user_id),
             )
             row = cursor.fetchone()
     if row is None:
@@ -327,12 +458,29 @@ def create_generation_job(
     return result
 
 
-def get_job_for_session(job_id: str, session_id: str) -> dict[str, Any]:
+def get_job_for_session(
+    job_id: str, session_id: str, user_id: str | None = None
+) -> dict[str, Any]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
+            if user_id is None:
+                cursor.execute(
+                    "SELECT * FROM jobs WHERE id = %s AND session_id = %s",
+                    (job_id, session_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ResourceNotFound("Job not found")
+                return dict(row)
             cursor.execute(
-                "SELECT * FROM jobs WHERE id = %s AND session_id = %s",
-                (job_id, session_id),
+                """SELECT j.* FROM jobs j
+                   WHERE j.id = %s AND (
+                       j.session_id = %s OR EXISTS (
+                           SELECT 1 FROM sessions s
+                           WHERE s.id = j.session_id AND s.user_id = %s
+                       )
+                   )""",
+                (job_id, session_id, user_id),
             )
             row = cursor.fetchone()
     if row is None:
@@ -514,12 +662,14 @@ def complete_generation_job(
         with conn.cursor() as cursor:
             cursor.execute(
                 """INSERT INTO exams (
-                       id, session_id, document_id, job_id, status, metadata,
-                       exams, warnings, evaluation
-                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                       id, session_id, user_id, document_id, job_id, status,
+                       metadata, exams, warnings, evaluation
+                   ) SELECT %s, %s, s.user_id, %s, %s, %s, %s, %s, %s, %s
+                     FROM sessions s WHERE s.id = %s""",
                 (
                     exam_id, session_id, document_id, job_id, status,
                     Jsonb(metadata), Jsonb(exams), Jsonb(warnings), Jsonb(evaluation),
+                    session_id,
                 ),
             )
             cursor.execute(
@@ -556,19 +706,50 @@ def fail_job(job_id: str, error_code: str, error_message: str) -> None:
         conn.commit()
 
 
-def get_exam_for_session(exam_id: str, session_id: str) -> dict[str, Any]:
+def get_exam_for_session(
+    exam_id: str, session_id: str, user_id: str | None = None
+) -> dict[str, Any]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
+            if user_id is None:
+                cursor.execute(
+                    """SELECT id AS exam_id, document_id, created_at, exams,
+                              warnings, metadata, evaluation, status
+                       FROM exams WHERE id = %s AND session_id = %s""",
+                    (exam_id, session_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ResourceNotFound("Exam not found")
+                return dict(row)
             cursor.execute(
                 """SELECT id AS exam_id, document_id, created_at, exams,
                           warnings, metadata, evaluation, status
-                   FROM exams WHERE id = %s AND session_id = %s""",
-                (exam_id, session_id),
+                   FROM exams WHERE id = %s AND (
+                       session_id = %s OR user_id = %s
+                   )""",
+                (exam_id, session_id, user_id),
             )
             row = cursor.fetchone()
     if row is None:
         raise ResourceNotFound("Exam not found")
     return dict(row)
+
+
+def list_exams_for_user(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT id AS exam_id, document_id, created_at, status,
+                          metadata, warnings,
+                          jsonb_array_length(exams) AS model_count
+                   FROM exams
+                   WHERE user_id = %s
+                   ORDER BY created_at DESC
+                   LIMIT %s""",
+                (user_id, max(1, min(limit, 200))),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
 
 def cleanup_document_candidates(

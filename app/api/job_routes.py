@@ -21,7 +21,7 @@ from app.api.export_routes import (
     _selected_models,
     _zip_response,
 )
-from app.api.session_middleware import require_session_id
+from app.api.session_middleware import optional_user_id, require_session_id
 from app.file_storage import get_file_storage
 from app.jobs import service as job_service
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
@@ -29,6 +29,24 @@ from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
 
 
 router = APIRouter(prefix="/api/v1", tags=["jobs"])
+
+
+def _document_for_actor(document_id: str, session_id: str, user_id: str | None):
+    if user_id is None:
+        return repositories.get_document_for_session(document_id, session_id)
+    return repositories.get_document_for_session(document_id, session_id, user_id)
+
+
+def _job_for_actor(job_id: str, session_id: str, user_id: str | None):
+    if user_id is None:
+        return repositories.get_job_for_session(job_id, session_id)
+    return repositories.get_job_for_session(job_id, session_id, user_id)
+
+
+def _exam_for_actor(exam_id: str, session_id: str, user_id: str | None):
+    if user_id is None:
+        return repositories.get_exam_for_session(exam_id, session_id)
+    return repositories.get_exam_for_session(exam_id, session_id, user_id)
 
 _SUPPORTED_COUNTS = {
     "mcq": "mcq",
@@ -276,17 +294,19 @@ async def create_document(
 @router.get("/documents")
 def list_documents(
     session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
 ) -> dict[str, Any]:
-    return {"documents": repositories.list_documents_for_session(session_id)}
+    return {"documents": repositories.list_documents_for_session(session_id, user_id)}
 
 
 @router.get("/documents/{document_id}")
 def get_document(
     document_id: uuid.UUID,
     session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
 ) -> dict[str, Any]:
     try:
-        document = repositories.get_document_for_session(str(document_id), session_id)
+        document = _document_for_actor(str(document_id), session_id, user_id)
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
     structure = {}
@@ -314,12 +334,13 @@ def create_exam_job(
     document_id: uuid.UUID,
     body: GenerateRequest,
     session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> dict[str, Any]:
     idempotency_key = _validate_idempotency_key(idempotency_key)
     payload = _generation_payload(body)
     try:
-        document = repositories.get_document_for_session(str(document_id), session_id)
+        document = _document_for_actor(str(document_id), session_id, user_id)
         if document["status"] != "ready":
             raise repositories.InvalidState("Document is not ready for exam generation")
         _validate_child_selection(document, payload["child_ids"])
@@ -364,9 +385,10 @@ def create_exam_job(
 def get_job(
     job_id: uuid.UUID,
     session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
 ) -> dict[str, Any]:
     try:
-        job = repositories.get_job_for_session(str(job_id), session_id)
+        job = _job_for_actor(str(job_id), session_id, user_id)
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
     return {
@@ -391,17 +413,20 @@ def get_job(
 def get_exam(
     exam_id: str,
     session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
 ) -> dict[str, Any]:
     try:
-        record = repositories.get_exam_for_session(exam_id, session_id)
+        record = _exam_for_actor(exam_id, session_id, user_id)
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
     return record
 
 
-def _owned_exam(exam_id: str, session_id: str) -> dict[str, Any]:
+def _owned_exam(
+    exam_id: str, session_id: str, user_id: str | None = None
+) -> dict[str, Any]:
     try:
-        return repositories.get_exam_for_session(exam_id, session_id)
+        return _exam_for_actor(exam_id, session_id, user_id)
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
 
@@ -411,8 +436,9 @@ def export_pdf(
     exam_id: str,
     body: DocumentExportRequest | None = None,
     session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
 ) -> StreamingResponse:
-    record = _owned_exam(exam_id, session_id)
+    record = _owned_exam(exam_id, session_id, user_id)
     selected = _selected_models(record, body)
     archive = _document_archive(record, selected, "pdf", render_exam_pdf, render_answers_pdf)
     return _zip_response(archive)
@@ -423,8 +449,9 @@ def export_docx(
     exam_id: str,
     body: DocumentExportRequest | None = None,
     session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
 ) -> StreamingResponse:
-    record = _owned_exam(exam_id, session_id)
+    record = _owned_exam(exam_id, session_id, user_id)
     selected = _selected_models(record, body)
     archive = _document_archive(record, selected, "docx", render_exam_docx, render_answers_docx)
     return _zip_response(archive)

@@ -12,8 +12,14 @@
   <div class="page">
     <div class="header">
       <h1>Smart<span>Exam</span> AI</h1>
-      <span class="tag" data-i18n="header.tag">RAG-POWERED</span>
-      <a class="header-link" href="/eval.html" data-i18n="nav.eval">Eval Dashboard</a>
+      <nav class="auth-nav" aria-label="Account">
+        <div id="authSignedOut" hidden>
+          <a class="auth-link primary" href="/sign-in.html">Log in</a>
+        </div>
+        <div id="authSignedIn" hidden>
+          <div id="clerkUserButton"></div>
+        </div>
+      </nav>
     </div>
 
     <div class="section-label" data-i18n="section.upload">01 — Upload Document</div>
@@ -226,6 +232,21 @@
     </form>
   </dialog>
 
+  <dialog class="my-exams-dialog" id="myExamsDialog" aria-labelledby="myExamsTitle">
+    <section class="my-exams-dialog-card">
+      <header class="my-exams-dialog-heading">
+        <div>
+          <div class="section-label">Your account</div>
+          <h2 id="myExamsTitle">My Exams</h2>
+          <p>Open a saved exam directly in the preview.</p>
+        </div>
+        <button class="my-exams-dialog-close" id="myExamsClose" type="button" aria-label="Close">&times;</button>
+      </header>
+      <div class="my-exams-dialog-list" id="myExamsList" aria-live="polite"></div>
+      <p class="my-exams-dialog-status" id="myExamsStatus" role="status"></p>
+    </section>
+  </dialog>
+
   <script type="module" src="js/main.js"></script>
   <script>
     // Failsafe: if the module graph didn't boot (file:// open, server down,
@@ -242,7 +263,7 @@
           "UI failed to start. Run the server (python run.py) and open http://127.0.0.1:8000/";
         document.body.appendChild(b);
       }
-    }, 1500);
+    }, 5000);
   </script>
 </body>
 

@@ -1,5 +1,6 @@
 import { state } from "./state.js";
 import { BASE } from "./api.js";
+import { authHeaders } from "./auth.js";
 
 const EXPORT_ARCHIVE_NAME = "SmartExam_Export.zip";
 let pendingDocumentKind = null;
@@ -110,6 +111,7 @@ async function triggerDownload(path, filename, body = null) {
     options.headers = { "Content-Type": "application/json" };
     options.body = JSON.stringify(body);
   }
+  options.headers = await authHeaders(options.headers || {});
   options.credentials = "same-origin";
   const res = await fetch(`${BASE}${path}`, options);
   if (!res.ok) {

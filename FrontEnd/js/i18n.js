@@ -2,8 +2,6 @@
 // be Arabic while generated exams follow the uploaded document's language.
 const STRINGS = {
   en: {
-    "header.tag": "RAG-POWERED",
-    "nav.eval": "Eval Dashboard",
     "section.upload": "01 — Upload Document",
     "upload.title": "Drop your file here",
     "upload.hint": "Click to browse or drag and drop your document",
@@ -52,8 +50,6 @@ const STRINGS = {
     "alert.select_sections": "Please select at least one subsection to include in the exam.",
   },
   ar: {
-    "header.tag": "مدعوم بالاسترجاع الذكي",
-    "nav.eval": "لوحة التقييم",
     "section.upload": "٠١ — رفع المستند",
     "upload.title": "أفلت ملفك هنا",
     "upload.hint": "انقر للاختيار أو اسحب وأفلت مستندك",

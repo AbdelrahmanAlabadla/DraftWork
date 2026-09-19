@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign in · DraftWork</title>
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body class="auth-body" data-auth-page="signin">
+  <main class="auth-shell">
+    <section class="auth-intro" aria-labelledby="authIntroTitle">
+      <a class="auth-brand" href="/">Draft<span>Work</span></a>
+      <div>
+        <p class="auth-kicker">Your exam workspace</p>
+        <h1 id="authIntroTitle">Return to every exam you create.</h1>
+        <p class="auth-intro-copy">Sign in to open saved exams on any device while keeping DraftWork's anonymous workflow available.</p>
+        <ul class="auth-benefits">
+          <li>Keep generated exams in your account</li>
+          <li>Continue from another device</li>
+          <li>Export PDF and DOCX again at any time</li>
+        </ul>
+      </div>
+      <a class="auth-guest-link" href="/">Continue without an account →</a>
+    </section>
+    <section class="auth-panel" aria-labelledby="authPanelTitle">
+      <a class="auth-back" href="/">← Back to DraftWork</a>
+      <div class="auth-panel-heading">
+        <p class="auth-kicker">Welcome back</p>
+        <h2 id="authPanelTitle">Sign in to DraftWork</h2>
+        <p>Continue with Google or use your email and password.</p>
+      </div>
+      <div id="authLoading" class="auth-loading" role="status">
+        <span class="auth-loading-dot"></span> Loading secure sign-in…
+      </div>
+      <div id="clerkAuth" class="clerk-auth-mount" aria-live="polite"></div>
+      <p class="auth-switch">New to DraftWork? <a href="/sign-up.html">Create an account</a></p>
+    </section>
+  </main>
+  <script type="module" src="/js/auth-page.js"></script>
+</body>
+</html>
