@@ -685,6 +685,22 @@ def get_exam_for_session(
     return dict(row)
 
 
+def list_exams_for_user(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT id AS exam_id, document_id, created_at, status,
+                          metadata, warnings,
+                          jsonb_array_length(exams) AS model_count
+                   FROM exams
+                   WHERE user_id = %s
+                   ORDER BY created_at DESC
+                   LIMIT %s""",
+                (user_id, max(1, min(limit, 200))),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+
 def cleanup_document_candidates(
     *, abandoned_after_seconds: int, limit: int
 ) -> list[dict[str, Any]]:

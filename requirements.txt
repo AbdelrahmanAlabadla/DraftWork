@@ -26,3 +26,4 @@ redis>=5.2.0
 psutil>=6.0.0,<8.0
 alembic>=1.14.0,<2.0
 SQLAlchemy>=2.0.0,<3.0
+clerk-backend-api>=6.0.0,<7.0.0

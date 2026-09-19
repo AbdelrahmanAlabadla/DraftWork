@@ -115,6 +115,21 @@ SESSION_TTL_SECONDS: int = max(300, int(_env("SESSION_TTL_SECONDS", "604800") or
 SESSION_TOKEN_BYTES: int = max(32, int(_env("SESSION_TOKEN_BYTES", "32") or "32"))
 SESSION_HASH_PEPPER: str = _env("SESSION_HASH_PEPPER", "") or ""
 
+# Clerk verifies signed browser session tokens on the API.  The publishable key
+# is intentionally safe for browser delivery; the secret key is server-only.
+CLERK_PUBLISHABLE_KEY: str | None = _env("CLERK_PUBLISHABLE_KEY")
+CLERK_SECRET_KEY: str | None = _env("CLERK_SECRET_KEY")
+CLERK_JWT_KEY: str | None = _env("CLERK_JWT_KEY")
+CLERK_FRONTEND_API_URL: str | None = _env("CLERK_FRONTEND_API_URL")
+CLERK_AUTHORIZED_PARTIES: tuple[str, ...] = tuple(
+    origin.strip()
+    for origin in (_env(
+        "CLERK_AUTHORIZED_PARTIES",
+        "http://127.0.0.1:8000,http://localhost:8000",
+    ) or "").split(",")
+    if origin.strip()
+)
+
 # Celery/Redis local job queue.  Azure Service Bus will replace this transport
 # at deployment time; application messages contain only a job id.
 CELERY_BROKER_URL: str = _env("CELERY_BROKER_URL", "redis://localhost:6379/0") or "redis://localhost:6379/0"
@@ -210,7 +225,7 @@ CORS_ALLOW_HEADERS: tuple[str, ...] = tuple(
     for header in (
         _env(
             "CORS_ALLOW_HEADERS",
-            "Content-Type,Idempotency-Key,X-Request-ID",
+            "Content-Type,Idempotency-Key,X-Request-ID,Authorization",
         )
         or ""
     ).split(",")
@@ -262,6 +277,18 @@ def validate_runtime_config() -> None:
         problems.append("LLAMA_PARSE_API is required")
     if placeholder(METRICS_TOKEN) or len(METRICS_TOKEN or "") < 24:
         problems.append("METRICS_TOKEN must contain at least 24 characters")
+    if placeholder(CLERK_PUBLISHABLE_KEY):
+        problems.append("CLERK_PUBLISHABLE_KEY is required")
+    if placeholder(CLERK_SECRET_KEY):
+        problems.append("CLERK_SECRET_KEY is required")
+    if not CLERK_AUTHORIZED_PARTIES:
+        problems.append("CLERK_AUTHORIZED_PARTIES must contain the production frontend origin")
+    for origin in CLERK_AUTHORIZED_PARTIES:
+        lowered = origin.lower()
+        if "localhost" in lowered or "127.0.0.1" in lowered:
+            problems.append(f"Clerk authorized party is not allowed in production: {origin}")
+        elif not lowered.startswith("https://"):
+            problems.append(f"Clerk authorized party must use HTTPS in production: {origin}")
     if not DATABASE_URL or "replace" in DATABASE_URL.lower() or "your_" in DATABASE_URL.lower():
         problems.append("DATABASE_URL must not contain placeholder credentials")
     qdrant_url = urlparse(QDRANT_URL)
