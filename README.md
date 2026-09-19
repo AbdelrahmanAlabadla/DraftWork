@@ -40,6 +40,28 @@ The system combines document parsing, semantic chunking, embeddings, selected-se
 
 ## Application
 
+### Accounts and Saved Exams
+
+DraftWork can still be used without creating an account.
+
+Users can upload documents and generate exams anonymously. If they decide to sign in later, their current session and generated exams are linked to their account instead of being lost.
+
+Authentication is handled through **Clerk**, with support for Google and email/password sign-in.
+
+After signing in, the profile menu provides:
+
+* **Manage account**
+* **My Exams**
+* **Sign out**
+
+**My Exams** opens directly inside the generator rather than on a separate page. Saved exams can be reopened in the existing Exam Preview and exported again as PDF or DOCX.
+
+Account ownership is enforced by the backend so users can only access their own documents, jobs, exams, and exports. Saved exams remain attached to the account across sessions and devices.
+
+The frontend sends the active Clerk session token to FastAPI through the `Authorization` header. Authentication tokens are not stored in PostgreSQL, `localStorage`, or `sessionStorage`.
+
+Signing out keeps the user's saved exams attached to their account and starts a new anonymous DraftWork session in the browser.
+
 ### 01 — Upload Document
 
 Upload the educational PDF that will be used as the exam source.
