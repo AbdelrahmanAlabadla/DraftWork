@@ -286,28 +286,62 @@ def create_document_with_job_idempotent(
     return dict(document), dict(job), False
 
 
-def list_documents_for_session(session_id: str) -> list[dict[str, Any]]:
+def list_documents_for_session(
+    session_id: str, user_id: str | None = None
+) -> list[dict[str, Any]]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
+            if user_id is None:
+                cursor.execute(
+                    """SELECT id AS document_id, status,
+                              original_filename AS filename, size_bytes, stats,
+                              error_code, error_message, created_at, updated_at
+                       FROM documents
+                       WHERE session_id = %s AND status <> 'deleted'
+                       ORDER BY created_at DESC""",
+                    (session_id,),
+                )
+                return [dict(row) for row in cursor.fetchall()]
             cursor.execute(
                 """SELECT id AS document_id, status, original_filename AS filename,
                           size_bytes, stats, error_code, error_message, created_at,
                           updated_at
-                   FROM documents
-                   WHERE session_id = %s AND status <> 'deleted'
-                   ORDER BY created_at DESC""",
-                (session_id,),
+                   FROM documents d
+                   WHERE d.status <> 'deleted' AND (
+                       d.session_id = %s OR EXISTS (
+                           SELECT 1 FROM sessions s
+                           WHERE s.id = d.session_id AND s.user_id = %s
+                       )
+                   ) ORDER BY d.created_at DESC""",
+                (session_id, user_id),
             )
             return [dict(row) for row in cursor.fetchall()]
 
 
-def get_document_for_session(document_id: str, session_id: str) -> dict[str, Any]:
+def get_document_for_session(
+    document_id: str, session_id: str, user_id: str | None = None
+) -> dict[str, Any]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
+            if user_id is None:
+                cursor.execute(
+                    """SELECT * FROM documents
+                       WHERE id = %s AND session_id = %s AND status <> 'deleted'""",
+                    (document_id, session_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ResourceNotFound("Document not found")
+                return dict(row)
             cursor.execute(
-                """SELECT * FROM documents
-                   WHERE id = %s AND session_id = %s AND status <> 'deleted'""",
-                (document_id, session_id),
+                """SELECT d.* FROM documents d
+                   WHERE d.id = %s AND d.status <> 'deleted' AND (
+                       d.session_id = %s OR EXISTS (
+                           SELECT 1 FROM sessions s
+                           WHERE s.id = d.session_id AND s.user_id = %s
+                       )
+                   )""",
+                (document_id, session_id, user_id),
             )
             row = cursor.fetchone()
     if row is None:
@@ -424,12 +458,29 @@ def create_generation_job(
     return result
 
 
-def get_job_for_session(job_id: str, session_id: str) -> dict[str, Any]:
+def get_job_for_session(
+    job_id: str, session_id: str, user_id: str | None = None
+) -> dict[str, Any]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
+            if user_id is None:
+                cursor.execute(
+                    "SELECT * FROM jobs WHERE id = %s AND session_id = %s",
+                    (job_id, session_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ResourceNotFound("Job not found")
+                return dict(row)
             cursor.execute(
-                "SELECT * FROM jobs WHERE id = %s AND session_id = %s",
-                (job_id, session_id),
+                """SELECT j.* FROM jobs j
+                   WHERE j.id = %s AND (
+                       j.session_id = %s OR EXISTS (
+                           SELECT 1 FROM sessions s
+                           WHERE s.id = j.session_id AND s.user_id = %s
+                       )
+                   )""",
+                (job_id, session_id, user_id),
             )
             row = cursor.fetchone()
     if row is None:
