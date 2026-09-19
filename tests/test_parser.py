@@ -63,6 +63,8 @@ def test_parser_returns_json_pages(monkeypatch, tmp_path):
     assert result == pages
     assert captured["result_type"] == "json"
     assert captured["ignore_errors"] is False
+    assert captured["max_timeout"] == parser_module.PARSING_TIMEOUT_SECONDS
+    assert captured["job_timeout_in_seconds"] == parser_module.PARSING_TIMEOUT_SECONDS
     assert validate_pages(result) == {"heading": 1, "text": 1, "table": 1}
 
 

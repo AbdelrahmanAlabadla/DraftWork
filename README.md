@@ -345,7 +345,7 @@ DEEPSEEK_MAX_TRANSIENT_RETRIES=2
 DEEPSEEK_RETRY_BASE_SECONDS=1.0
 ```
 
-At startup, `python-dotenv` loads `.env` into the process environment. The
+Outside production, `python-dotenv` loads `.env` into the process environment. The
 DeepSeek client reads `DEEPSEEK_API_KEY` from that environment and sends it in
 the OpenAI Python SDK. The SDK sends it as a Bearer token to DeepSeek's
 Responses API. Docker Compose also reads the project `.env` file and passes
@@ -376,10 +376,10 @@ Create the `draftwork` database if needed, then apply all migrations:
 .venv\Scripts\python.exe scripts\apply_migrations.py
 ```
 
-Start Qdrant:
+Start the pinned Qdrant version used by Compose:
 
 ```bash id="mjzm19"
-docker run -p 6333:6333 qdrant/qdrant
+docker run -p 6333:6333 qdrant/qdrant:v1.15.5
 ```
 
 Run the application:
@@ -413,10 +413,48 @@ docker compose logs -f worker
 ```
 
 The worker expects an NVIDIA-compatible Docker GPU runtime for the embedding
-model. The API does not request a GPU. Local application files, Redis,
+model and runs with `--pool=solo --concurrency=1`; CUDA workers must not use
+Celery's prefork pool. `PARSING_TIMEOUT_SECONDS=120` applies only to the
+LlamaParse call. Exam generation has a separate application deadline controlled
+by `GENERATION_TIMEOUT_SECONDS=420`, which remains enforceable with the solo
+pool. The API does not request a GPU. Local application files, Redis,
 PostgreSQL, Qdrant, and the Hugging Face cache use mounted directories or named
-volumes and survive a container rebuild. The migration service applies every
-SQL migration before the API and worker start.
+volumes and survive a container rebuild. The migration service runs
+`alembic upgrade head` before the API and worker start.
+
+### Deployment hardening
+
+Set `APP_ENV=production` to enable startup validation, HTTPS redirects, HSTS,
+trusted-host checks, and required secure cookies. Start from
+`.env.production.example`, but provide every real credential through the
+deployment environment. Production startup rejects placeholder secrets,
+localhost CORS origins, insecure remote PostgreSQL/Qdrant connections, and an
+unprotected metrics endpoint.
+
+The browser sends an `Idempotency-Key` for upload and generation requests. A
+retry with the same key and request returns the existing job; reusing the key
+with different data returns a conflict. Worker-side atomic job claims remain a
+second protection against duplicate Celery delivery.
+
+Uploaded PDFs are streamed through a byte limit and are fully opened with
+`pypdf` before parsing. Encrypted or malformed PDFs are rejected. There is
+intentionally no PDF page-count limit.
+
+Operational endpoints are:
+
+* `/health/live` for process liveness
+* `/health/ready` for PostgreSQL, Redis, Qdrant, and file-storage readiness
+* `/metrics` for Prometheus-format process, request, queue, job, cleanup, and
+  LLM usage metrics; worker metrics are read from PostgreSQL so they remain
+  visible from the API process. Send `Authorization: Bearer <METRICS_TOKEN>`
+  when a token is configured. Set the three `DEEPSEEK_*_COST_PER_MTOK`
+  variables to current provider prices to populate estimated-cost metrics.
+
+Celery Beat runs retention cleanup hourly. It removes expired anonymous-session
+assets, abandoned uploads/jobs, temporary exports, and orphaned storage/Qdrant
+data. Expired anonymous sessions are deleted, while generated exam rows remain
+permanent through `ON DELETE SET NULL` foreign keys. PDF/DOCX ZIP exports are
+generated in memory and can always be regenerated from the saved exam.
 
 ## Tests
 

@@ -29,6 +29,10 @@ class GenerationRateLimitExceeded(RuntimeError):
         self.retry_after_seconds = max(1, retry_after_seconds)
 
 
+class IdempotencyConflict(RuntimeError):
+    pass
+
+
 def hash_session_token(token: str) -> str:
     value = f"{config.SESSION_HASH_PEPPER}:{token}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()
@@ -103,6 +107,88 @@ def create_document_with_job(
     return dict(document), dict(job)
 
 
+def create_document_with_job_idempotent(
+    *, session_id: str, filename: str, media_type: str, size_bytes: int,
+    sha256: str, source_storage_key: str, document_id: str,
+    idempotency_key: str, request_hash: str,
+) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    endpoint = "create_document"
+    job_id = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(
+        seconds=config.IDEMPOTENCY_TTL_SECONDS
+    )
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{session_id}:{endpoint}:{idempotency_key}",),
+            )
+            cursor.execute(
+                """DELETE FROM idempotency_records
+                   WHERE session_id = %s AND endpoint = %s
+                     AND idempotency_key = %s
+                     AND expires_at <= CURRENT_TIMESTAMP""",
+                (session_id, endpoint, idempotency_key),
+            )
+            cursor.execute(
+                """SELECT i.request_hash, d.*, j.id AS existing_job_id
+                   FROM idempotency_records i
+                   JOIN documents d ON d.id = i.document_id
+                   JOIN jobs j ON j.id = i.job_id
+                   WHERE i.session_id = %s AND i.endpoint = %s
+                     AND i.idempotency_key = %s
+                     AND i.expires_at > CURRENT_TIMESTAMP""",
+                (session_id, endpoint, idempotency_key),
+            )
+            existing = cursor.fetchone()
+            if existing is not None:
+                if existing["request_hash"] != request_hash:
+                    raise IdempotencyConflict(
+                        "The idempotency key was already used with different upload data"
+                    )
+                document = dict(existing)
+                cursor.execute("SELECT * FROM jobs WHERE id = %s", (existing["existing_job_id"],))
+                job = cursor.fetchone()
+                assert job is not None
+                return document, dict(job), True
+
+            cursor.execute(
+                """INSERT INTO documents (
+                       id, session_id, status, original_filename, media_type,
+                       size_bytes, sha256, source_storage_key
+                   ) VALUES (%s, %s, 'queued', %s, %s, %s, %s, %s)
+                   RETURNING *""",
+                (
+                    document_id, session_id, filename, media_type, size_bytes,
+                    sha256, source_storage_key,
+                ),
+            )
+            document = cursor.fetchone()
+            cursor.execute(
+                """INSERT INTO jobs (
+                       id, session_id, document_id, type, status, stage,
+                       progress, max_attempts
+                   ) VALUES (%s, %s, %s, 'document_ingestion', 'queued',
+                             'queued', 0, 3)
+                   RETURNING *""",
+                (job_id, session_id, document_id),
+            )
+            job = cursor.fetchone()
+            cursor.execute(
+                """INSERT INTO idempotency_records (
+                       session_id, endpoint, idempotency_key, request_hash,
+                       job_id, document_id, expires_at
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    session_id, endpoint, idempotency_key, request_hash,
+                    job_id, document_id, expires_at,
+                ),
+            )
+        conn.commit()
+    assert document is not None and job is not None
+    return dict(document), dict(job), False
+
+
 def list_documents_for_session(session_id: str) -> list[dict[str, Any]]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
@@ -143,6 +229,7 @@ def get_document(document_id: str) -> dict[str, Any] | None:
 
 def create_generation_job(
     *, session_id: str, document_id: str, request_data: dict[str, Any],
+    idempotency_key: str | None = None, request_hash: str | None = None,
 ) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -150,6 +237,32 @@ def create_generation_job(
         with conn.cursor(row_factory=dict_row) as cursor:
             # Serialize limit decisions for this session across API replicas.
             cursor.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (session_id,))
+            if idempotency_key:
+                cursor.execute(
+                    """DELETE FROM idempotency_records
+                       WHERE session_id = %s AND endpoint = 'create_exam_job'
+                         AND idempotency_key = %s
+                         AND expires_at <= CURRENT_TIMESTAMP""",
+                    (session_id, idempotency_key),
+                )
+                cursor.execute(
+                    """SELECT i.request_hash, j.*
+                       FROM idempotency_records i
+                       JOIN jobs j ON j.id = i.job_id
+                       WHERE i.session_id = %s AND i.endpoint = 'create_exam_job'
+                         AND i.idempotency_key = %s
+                         AND i.expires_at > CURRENT_TIMESTAMP""",
+                    (session_id, idempotency_key),
+                )
+                existing = cursor.fetchone()
+                if existing is not None:
+                    if existing["request_hash"] != request_hash:
+                        raise IdempotencyConflict(
+                            "The idempotency key was already used with different generation data"
+                        )
+                    result = dict(existing)
+                    result["_idempotency_reused"] = True
+                    return result
             cursor.execute(
                 """SELECT status FROM documents
                    WHERE id = %s AND session_id = %s AND status <> 'deleted'""",
@@ -193,9 +306,25 @@ def create_generation_job(
                 (job_id, session_id, document_id, Jsonb(request_data)),
             )
             job = cursor.fetchone()
+            if idempotency_key:
+                expires_at = datetime.now(timezone.utc) + timedelta(
+                    seconds=config.IDEMPOTENCY_TTL_SECONDS
+                )
+                cursor.execute(
+                    """INSERT INTO idempotency_records (
+                           session_id, endpoint, idempotency_key, request_hash,
+                           job_id, document_id, expires_at
+                       ) VALUES (%s, 'create_exam_job', %s, %s, %s, %s, %s)""",
+                    (
+                        session_id, idempotency_key, request_hash, job_id,
+                        document_id, expires_at,
+                    ),
+                )
         conn.commit()
     assert job is not None
-    return dict(job)
+    result = dict(job)
+    result["_idempotency_reused"] = False
+    return result
 
 
 def get_job_for_session(job_id: str, session_id: str) -> dict[str, Any]:
@@ -305,7 +434,7 @@ def recover_stale_jobs(stale_after_seconds: int) -> list[dict[str, Any]]:
                 if int(row["attempt_count"]) < int(row["max_attempts"]):
                     cursor.execute(
                         """UPDATE jobs SET status = 'retrying', stage = 'retrying',
-                                  worker_id = NULL, error_code = 'worker_lost',
+                                  worker_id = NULL, error_code = 'WORKER_LOST',
                                   error_message = 'Worker heartbeat expired',
                                   updated_at = CURRENT_TIMESTAMP
                            WHERE id = %s""",
@@ -315,7 +444,7 @@ def recover_stale_jobs(stale_after_seconds: int) -> list[dict[str, Any]]:
                 else:
                     cursor.execute(
                         """UPDATE jobs SET status = 'failed', stage = 'failed',
-                                  error_code = 'worker_lost',
+                                  error_code = 'WORKER_LOST',
                                   error_message = 'Worker heartbeat expired',
                                   finished_at = CURRENT_TIMESTAMP,
                                   updated_at = CURRENT_TIMESTAMP
@@ -325,7 +454,7 @@ def recover_stale_jobs(stale_after_seconds: int) -> list[dict[str, Any]]:
                     if row["type"] == "document_ingestion":
                         cursor.execute(
                             """UPDATE documents d SET status = 'failed',
-                                      error_code = 'worker_lost',
+                                      error_code = 'WORKER_LOST',
                                       error_message = 'Worker heartbeat expired',
                                       updated_at = CURRENT_TIMESTAMP
                                FROM jobs j
@@ -440,3 +569,207 @@ def get_exam_for_session(exam_id: str, session_id: str) -> dict[str, Any]:
     if row is None:
         raise ResourceNotFound("Exam not found")
     return dict(row)
+
+
+def cleanup_document_candidates(
+    *, abandoned_after_seconds: int, limit: int
+) -> list[dict[str, Any]]:
+    """Return expired-session or abandoned documents without deleting exams."""
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT d.id, d.session_id, d.source_storage_key,
+                          d.structure_storage_key, d.active_index_job_id,
+                          EXISTS(SELECT 1 FROM exams e WHERE e.document_id = d.id)
+                              AS has_exam
+                   FROM documents d
+                   JOIN sessions s ON s.id = d.session_id
+                   WHERE d.status <> 'deleted'
+                     AND (
+                         s.expires_at <= CURRENT_TIMESTAMP
+                         OR (
+                             d.status IN ('uploading', 'queued', 'processing', 'failed')
+                             AND d.updated_at < CURRENT_TIMESTAMP
+                                 - (%s * INTERVAL '1 second')
+                         )
+                     )
+                   ORDER BY d.updated_at
+                   FOR UPDATE OF d SKIP LOCKED
+                   LIMIT %s""",
+                (abandoned_after_seconds, limit),
+            )
+            rows = [dict(row) for row in cursor.fetchall()]
+        conn.commit()
+    return rows
+
+
+def mark_document_assets_deleted(document_id: str) -> None:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE documents
+                   SET status = 'deleted', updated_at = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (document_id,),
+            )
+        conn.commit()
+
+
+def cleanup_database_records(*, terminal_job_days: int) -> dict[str, int]:
+    """Remove regenerable metadata while explicitly preserving every exam row."""
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                "DELETE FROM idempotency_records WHERE expires_at <= CURRENT_TIMESTAMP"
+            )
+            idempotency = cursor.rowcount
+            cursor.execute(
+                """DELETE FROM jobs j
+                   WHERE j.status IN ('completed', 'failed', 'cancelled')
+                     AND j.finished_at < CURRENT_TIMESTAMP - (%s * INTERVAL '1 day')""",
+                (terminal_job_days,),
+            )
+            jobs = cursor.rowcount
+            cursor.execute(
+                """DELETE FROM sessions s
+                   WHERE s.expires_at <= CURRENT_TIMESTAMP"""
+            )
+            sessions = cursor.rowcount
+        conn.commit()
+    return {
+        "idempotency_records": max(0, idempotency),
+        "jobs": max(0, jobs),
+        "sessions": max(0, sessions),
+    }
+
+
+def expired_session_ids(*, limit: int) -> list[str]:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT s.id FROM sessions s
+                   WHERE s.expires_at <= CURRENT_TIMESTAMP
+                   ORDER BY s.expires_at
+                   LIMIT %s""",
+                (limit,),
+            )
+            return [str(row[0]) for row in cursor.fetchall()]
+
+
+def active_document_scopes() -> set[tuple[str, str]]:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """SELECT session_id, id FROM documents
+                   WHERE status <> 'deleted'"""
+            )
+            return {(str(session_id), str(document_id)) for session_id, document_id in cursor.fetchall()}
+
+
+def start_cleanup_run() -> int:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE cleanup_runs
+                   SET status = 'failed', finished_at = CURRENT_TIMESTAMP,
+                       error_message = 'Cleanup worker stopped before completion'
+                   WHERE status = 'running'
+                     AND started_at < CURRENT_TIMESTAMP - INTERVAL '2 hours'"""
+            )
+            cursor.execute(
+                "INSERT INTO cleanup_runs (status) VALUES ('running') RETURNING id"
+            )
+            row = cursor.fetchone()
+        conn.commit()
+    assert row is not None
+    return int(row[0])
+
+
+def finish_cleanup_run(
+    cleanup_id: int, *, stats: dict[str, Any] | None = None, error: str | None = None
+) -> None:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE cleanup_runs
+                   SET status = %s, stats = %s, error_message = %s,
+                       finished_at = CURRENT_TIMESTAMP
+                   WHERE id = %s""",
+                (
+                    "failed" if error else "completed",
+                    Jsonb(stats or {}),
+                    str(error)[:1000] if error else None,
+                    cleanup_id,
+                ),
+            )
+        conn.commit()
+
+
+def record_llm_usage(
+    *, job_id: str | None, provider: str, model: str, operation: str,
+    input_tokens: int, output_tokens: int, cached_tokens: int,
+    reasoning_tokens: int, estimated_cost_usd: float,
+    duration_ms: int | None = None,
+) -> None:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO llm_usage (
+                       job_id, provider, model, operation, input_tokens,
+                       output_tokens, cached_tokens, reasoning_tokens,
+                       estimated_cost_usd, duration_ms
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    job_id, provider, model, operation, input_tokens,
+                    output_tokens, cached_tokens, reasoning_tokens,
+                    estimated_cost_usd, duration_ms,
+                ),
+            )
+        conn.commit()
+
+
+def job_status_counts() -> dict[str, int]:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT status, COUNT(*) FROM jobs GROUP BY status")
+            return {str(status): int(count) for status, count in cursor.fetchall()}
+
+
+def monitoring_snapshot() -> dict[str, list[dict[str, Any]]]:
+    """Return durable worker metrics for the API process to expose."""
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT type, status, COUNT(*) AS count,
+                          COALESCE(SUM(EXTRACT(EPOCH FROM (finished_at - started_at)))
+                              FILTER (WHERE finished_at IS NOT NULL
+                                      AND started_at IS NOT NULL), 0) AS duration_sum,
+                          COUNT(*) FILTER (WHERE finished_at IS NOT NULL
+                                           AND started_at IS NOT NULL) AS duration_count
+                   FROM jobs
+                   GROUP BY type, status"""
+            )
+            jobs = [dict(row) for row in cursor.fetchall()]
+            cursor.execute(
+                """SELECT status, COUNT(*) AS count,
+                          COALESCE(SUM(EXTRACT(EPOCH FROM (finished_at - started_at)))
+                              FILTER (WHERE finished_at IS NOT NULL), 0) AS duration_sum,
+                          COUNT(*) FILTER (WHERE finished_at IS NOT NULL) AS duration_count
+                   FROM cleanup_runs
+                   GROUP BY status"""
+            )
+            cleanup_runs = [dict(row) for row in cursor.fetchall()]
+            cursor.execute(
+                """SELECT provider, model, operation, COUNT(*) AS calls,
+                          COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                          COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                          COALESCE(SUM(cached_tokens), 0) AS cached_tokens,
+                          COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
+                          COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost_usd,
+                          COALESCE(SUM(duration_ms), 0) / 1000.0 AS duration_sum,
+                          COUNT(duration_ms) AS duration_count
+                   FROM llm_usage
+                   GROUP BY provider, model, operation"""
+            )
+            llm_usage = [dict(row) for row in cursor.fetchall()]
+    return {"jobs": jobs, "cleanup_runs": cleanup_runs, "llm_usage": llm_usage}

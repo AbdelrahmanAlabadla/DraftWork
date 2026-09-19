@@ -107,7 +107,7 @@ def export_pdf(
         )
     except Exception as exc:
         logger.error("PDF export failed | exam_id=%s | exc=%s", exam_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"PDF export failed: {exc}")
+        raise HTTPException(status_code=500, detail="PDF export failed")
     return _zip_response(archive)
 
 @router.post("/docx")
@@ -123,5 +123,5 @@ def export_docx(
         )
     except Exception as exc:
         logger.error("DOCX export failed | exam_id=%s | exc=%s", exam_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"DOCX export failed: {exc}")
+        raise HTTPException(status_code=500, detail="DOCX export failed")
     return _zip_response(archive)

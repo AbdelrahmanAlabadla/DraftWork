@@ -9,6 +9,7 @@ from starlette.responses import JSONResponse, Response
 from app import config, db
 from app.api import repositories
 from app.api.request_context import reset_session_id, set_session_id
+from app.errors import ErrorCode, public_error_payload
 
 
 def _needs_session(path: str) -> bool:
@@ -45,9 +46,15 @@ class SessionMiddleware(BaseHTTPMiddleware):
                     repositories.hash_session_token(new_token)
                 )
         except db.DatabaseUnavailable:
+            request_id = getattr(request.state, "request_id", "-")
             return JSONResponse(
                 status_code=503,
-                content={"detail": "Application database is temporarily unavailable"},
+                content=public_error_payload(
+                    ErrorCode.DATABASE_UNAVAILABLE,
+                    "Application database is temporarily unavailable",
+                    request_id,
+                    retryable=True,
+                ),
             )
 
         session_id = str(session["id"])

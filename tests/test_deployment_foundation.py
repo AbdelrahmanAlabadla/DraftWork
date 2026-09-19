@@ -13,7 +13,7 @@ from app.api.job_routes import _generation_payload
 from app.api.main import app
 from app.api.routes import GenerateRequest
 from app.file_storage.local import LocalFileStorage
-from app.jobs.tasks import generate_exam
+from app.jobs.tasks import generate_exam, ingest_document
 from app.offline.vector_store import VectorStore
 
 
@@ -87,6 +87,18 @@ def test_generation_limits_match_agreed_configuration():
 def test_generation_task_has_seven_minute_hard_timeout():
     assert generate_exam.time_limit == 420
     assert generate_exam.soft_time_limit == 410
+
+
+def test_ingestion_task_does_not_limit_downstream_pipeline_runtime():
+    assert ingest_document.time_limit is None
+    assert ingest_document.soft_time_limit is None
+
+
+def test_gpu_worker_uses_solo_pool_and_process_liveness_healthcheck():
+    compose = (Path(__file__).parents[1] / "compose.yaml").read_text(encoding="utf-8")
+    assert '"--pool=solo", "--concurrency=1"' in compose
+    assert "psutil.process_iter" in compose
+    assert "inspect\", \"ping" not in compose
 
 
 def test_local_storage_rejects_keys_outside_root(tmp_path):

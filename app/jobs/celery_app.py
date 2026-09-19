@@ -34,5 +34,9 @@ celery_app.conf.update(
             "task": "genexam.dispatch_undispatched_jobs",
             "schedule": 30.0,
         },
+        "cleanup-expired-data": {
+            "task": "genexam.cleanup_expired_data",
+            "schedule": 3600.0,
+        },
     },
 )

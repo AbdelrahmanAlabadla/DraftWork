@@ -1,4 +1,6 @@
-import { BASE, getJSON, waitForJob } from "./api.js";
+import {
+  BASE, beginIdempotentOperation, completeIdempotentOperation, getJSON, waitForJob,
+} from "./api.js";
 import { state } from "./state.js";
 import { renderSectionsTree, showSectionsLoading, hideSectionsLoading } from "./topics.js";
 
@@ -29,8 +31,8 @@ export function initUpload() {
 
 function handleFile(file) {
   const ext = file.name.split(".").pop().toLowerCase();
-  if (!["pdf", "txt"].includes(ext)) {
-    setUploadStatus("error", "Only .pdf and .txt files are supported.");
+  if (ext !== "pdf") {
+    setUploadStatus("error", "Only .pdf files are supported.");
     return;
   }
   document.getElementById("fileName").textContent = file.name;
@@ -43,14 +45,19 @@ async function uploadFile(file) {
   showSectionsLoading();
   const formData = new FormData();
   formData.append("file", file);
+  const operation = beginIdempotentOperation(
+    `upload:${file.name}:${file.size}:${file.lastModified}`
+  );
   try {
     const res = await fetch(`${BASE}/documents`, {
       method: "POST",
       credentials: "same-origin",
+      headers: { "Idempotency-Key": operation.key },
       body: formData,
     });
     const data = await res.json();
     if (res.ok) {
+      completeIdempotentOperation(operation);
       state.uploadJobId = data.job_id;
       await waitForJob(data.job_id, (job) => {
         setUploadStatus("loading", `Processing PDF: ${job.stage} (${job.progress}%)`);
@@ -64,6 +71,7 @@ async function uploadFile(file) {
       state.currentDocId = data.document_id;
       renderSectionsTree(documentResponse.data.structure || {});
     } else {
+      if (res.status < 500) completeIdempotentOperation(operation);
       setUploadStatus("error", data.detail || "Upload failed.");
       hideSectionsLoading();
     }
