@@ -35,6 +35,8 @@ The system combines document parsing, semantic chunking, embeddings, selected-se
 * Review overall and per-model performance in a read-only Eval Dashboard
 * Separate question-quality failures from validator operational failures
 * Export each exam model and its answer key as separate PDF or DOCX files
+* Continue anonymously, then claim the current session by signing in with Clerk
+* Sign in with Google or email/password and open saved exams on another device
 
 ## Application
 
@@ -283,6 +285,7 @@ This keeps already-valid questions unchanged and avoids sending them through Val
 | NLP                    | spaCy                        |
 | Testing                | Pytest                       |
 | Frontend               | HTML / JavaScript            |
+| Authentication         | ClerkJS + Clerk Python SDK   |
 | Containers             | Docker Compose               |
 
 ## Setup
@@ -317,6 +320,25 @@ Create a `.env` file from `.env.example` and configure the required model and AP
 ```text
 DATABASE_URL=postgresql://postgres:your_password@localhost:1966/draftwork
 ```
+
+Configure the existing Clerk application for account sign-in. The publishable
+key is delivered to ClerkJS in the browser, while the secret key stays in the
+FastAPI environment:
+
+```text
+CLERK_PUBLISHABLE_KEY=pk_test_...
+CLERK_SECRET_KEY=sk_test_...
+CLERK_AUTHORIZED_PARTIES=http://127.0.0.1:8000,http://localhost:8000
+```
+
+Email/password and Google are enabled in Clerk. DraftWork still creates an
+anonymous HTTP-only session for visitors. On sign-in, FastAPI verifies the
+Clerk session token, creates or finds the local user by Clerk `sub`, and claims
+the current anonymous session in one database transaction. Files and Qdrant
+vectors stay at their existing paths. The exam receives direct user ownership,
+so **My Exams** works across devices and the exam survives session cleanup.
+Signing out rotates the browser to a clean anonymous DraftWork session without
+deleting account-owned exams.
 
 Choose the provider with `LLM_PROVIDER`. The existing local LM Studio backend
 remains the default and does not require any DeepSeek settings:

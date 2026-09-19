@@ -1596,6 +1596,99 @@ html[dir="rtl"] .toggle.on::after {
   text-decoration: underline;
   text-underline-offset: 3px;
 }
+.my-exams-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: min(680px, calc(100vw - 28px));
+  max-height: min(760px, calc(100vh - 28px));
+  margin: 0;
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  transform: translate(-50%, -50%);
+}
+.my-exams-dialog::backdrop {
+  background: rgba(3, 7, 18, 0.8);
+  backdrop-filter: blur(4px);
+}
+.my-exams-dialog-card {
+  display: flex;
+  flex-direction: column;
+  max-height: min(760px, calc(100vh - 28px));
+  padding: clamp(20px, 4vw, 30px);
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: 16px;
+  box-shadow: 0 28px 80px rgba(0, 0, 0, 0.58);
+}
+.my-exams-dialog-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 20px;
+  border-bottom: 1px solid var(--border);
+}
+.my-exams-dialog-heading .section-label { margin-bottom: 8px; }
+.my-exams-dialog-heading h2 { margin-bottom: 7px; font-size: 25px; }
+.my-exams-dialog-heading p { color: var(--muted); line-height: 1.5; }
+.my-exams-dialog-close {
+  flex: 0 0 auto;
+  padding: 0 7px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+}
+.my-exams-dialog-close:hover { color: var(--accent); }
+.my-exams-dialog-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 20px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.my-exams-dialog-list.is-empty {
+  min-height: min(300px, 42vh);
+  place-items: center;
+  color: var(--muted);
+  text-align: center;
+  font-size: 17px;
+}
+.my-exams-dialog-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 18px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+}
+.my-exams-dialog-copy { min-width: 0; }
+.my-exams-dialog-copy h3 {
+  margin-bottom: 7px;
+  overflow: hidden;
+  font-size: 17px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.my-exams-dialog-copy p { color: var(--muted); font-size: 13px; }
+.my-exams-open { flex: 0 0 auto; }
+.my-exams-open:disabled { opacity: 0.6; cursor: wait; }
+.my-exams-dialog-status {
+  min-height: 22px;
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.my-exams-dialog-status[data-kind="error"] { color: #ffb4b4; }
+
 @media (max-width: 860px) {
   .auth-shell {
     width: min(520px, calc(100% - 24px));
@@ -1611,6 +1704,11 @@ html[dir="rtl"] .toggle.on::after {
     margin-top: 0;
     margin-inline-start: auto;
   }
+  .my-exams-dialog-item {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .my-exams-open { width: 100%; }
 }
 
 html[dir="rtl"] .section-label,

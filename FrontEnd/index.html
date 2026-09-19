@@ -232,6 +232,21 @@
     </form>
   </dialog>
 
+  <dialog class="my-exams-dialog" id="myExamsDialog" aria-labelledby="myExamsTitle">
+    <section class="my-exams-dialog-card">
+      <header class="my-exams-dialog-heading">
+        <div>
+          <div class="section-label">Your account</div>
+          <h2 id="myExamsTitle">My Exams</h2>
+          <p>Open a saved exam directly in the preview.</p>
+        </div>
+        <button class="my-exams-dialog-close" id="myExamsClose" type="button" aria-label="Close">&times;</button>
+      </header>
+      <div class="my-exams-dialog-list" id="myExamsList" aria-live="polite"></div>
+      <p class="my-exams-dialog-status" id="myExamsStatus" role="status"></p>
+    </section>
+  </dialog>
+
   <script type="module" src="js/main.js"></script>
   <script>
     // Failsafe: if the module graph didn't boot (file:// open, server down,
