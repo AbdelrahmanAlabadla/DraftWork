@@ -1,3 +1,5 @@
+import { authHeaders } from "./auth.js";
+
 export const BASE = "/api/v1";
 
 export function beginIdempotentOperation(name) {
@@ -24,8 +26,9 @@ export function completeIdempotentOperation(operation) {
 }
 
 export async function postJSON(path, body, idempotencyKey = null) {
-  const headers = { "Content-Type": "application/json" };
+  let headers = { "Content-Type": "application/json" };
   if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
+  headers = await authHeaders(headers);
   const res = await fetch(`${BASE}${path}`, {
     method: "POST",
     headers,
@@ -37,7 +40,10 @@ export async function postJSON(path, body, idempotencyKey = null) {
 }
 
 export async function getJSON(path) {
-  const res = await fetch(`${BASE}${path}`, { credentials: "same-origin" });
+  const res = await fetch(`${BASE}${path}`, {
+    credentials: "same-origin",
+    headers: await authHeaders(),
+  });
   const data = await res.json().catch(() => ({}));
   return { ok: res.ok, status: res.status, data };
 }

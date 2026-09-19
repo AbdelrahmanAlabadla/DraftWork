@@ -12,8 +12,14 @@
   <div class="page">
     <div class="header">
       <h1>Smart<span>Exam</span> AI</h1>
-      <span class="tag" data-i18n="header.tag">RAG-POWERED</span>
-      <a class="header-link" href="/eval.html" data-i18n="nav.eval">Eval Dashboard</a>
+      <nav class="auth-nav" aria-label="Account">
+        <div id="authSignedOut" hidden>
+          <a class="auth-link primary" href="/sign-in.html">Log in</a>
+        </div>
+        <div id="authSignedIn" hidden>
+          <div id="clerkUserButton"></div>
+        </div>
+      </nav>
     </div>
 
     <div class="section-label" data-i18n="section.upload">01 — Upload Document</div>
@@ -242,7 +248,7 @@
           "UI failed to start. Run the server (python run.py) and open http://127.0.0.1:8000/";
         document.body.appendChild(b);
       }
-    }, 1500);
+    }, 5000);
   </script>
 </body>
 

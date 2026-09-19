@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Create account · DraftWork</title>
+  <link rel="stylesheet" href="/css/styles.css">
+</head>
+<body class="auth-body" data-auth-page="signup">
+  <main class="auth-shell">
+    <section class="auth-intro" aria-labelledby="authIntroTitle">
+      <a class="auth-brand" href="/">Draft<span>Work</span></a>
+      <div>
+        <p class="auth-kicker">Save your work</p>
+        <h1 id="authIntroTitle">Your anonymous exams come with you.</h1>
+        <p class="auth-intro-copy">Create an account after generating an exam and DraftWork attaches the current session without moving or regenerating anything.</p>
+        <ul class="auth-benefits">
+          <li>Claim exams already made in this browser</li>
+          <li>Access My Exams across devices</li>
+          <li>Keep using DraftWork anonymously whenever you prefer</li>
+        </ul>
+      </div>
+      <a class="auth-guest-link" href="/">Continue without an account →</a>
+    </section>
+    <section class="auth-panel" aria-labelledby="authPanelTitle">
+      <a class="auth-back" href="/">← Back to DraftWork</a>
+      <div class="auth-panel-heading">
+        <p class="auth-kicker">Create your account</p>
+        <h2 id="authPanelTitle">Sign up for DraftWork</h2>
+        <p>Use Google for a quick start, or create an account with email and password.</p>
+      </div>
+      <div id="authLoading" class="auth-loading" role="status">
+        <span class="auth-loading-dot"></span> Loading secure sign-up…
+      </div>
+      <div id="clerkAuth" class="clerk-auth-mount" aria-live="polite"></div>
+      <p class="auth-switch">Already have an account? <a href="/sign-in.html">Sign in</a></p>
+    </section>
+  </main>
+  <script type="module" src="/js/auth-page.js"></script>
+</body>
+</html>

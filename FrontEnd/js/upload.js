@@ -3,6 +3,7 @@ import {
 } from "./api.js";
 import { state } from "./state.js";
 import { renderSectionsTree, showSectionsLoading, hideSectionsLoading } from "./topics.js";
+import { authHeaders } from "./auth.js";
 
 export function initUpload() {
   const zone = document.getElementById("uploadZone");
@@ -52,7 +53,7 @@ async function uploadFile(file) {
     const res = await fetch(`${BASE}/documents`, {
       method: "POST",
       credentials: "same-origin",
-      headers: { "Idempotency-Key": operation.key },
+      headers: await authHeaders({ "Idempotency-Key": operation.key }),
       body: formData,
     });
     const data = await res.json();
