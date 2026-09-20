@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from app.config import VALIDATOR_BATCH_SIZE
@@ -10,10 +11,13 @@ from app.llm.schemas import repair_response_model, validator_response_model
 from app.logging_conf import get_logger
 from app.online.eval_stats import record_first_validation, record_repair_outcome
 from app.online.models import (
+    _normalize_definition,
+    _normalize_equation,
     _normalize_essay,
     _normalize_mcq,
     _normalize_short_answer,
     _normalize_true_false,
+    _normalize_word_problem,
     normalize_fitb_item,
 )
 
@@ -63,10 +67,29 @@ _LOGICAL_TO_CANONICAL: Dict[str, Dict[str, Set[str]]] = {
         "answers": {"answers"},
         "word_bank": {"word_bank"},
     },
+    "definition": {
+        "question": {"term"},
+        "term": {"term"},
+        "answer": {"reference_answer"},
+        "reference_answer": {"reference_answer"},
+    },
     "short_answer": {
         "question": {"question"},
         "answer": {"reference_answer"},
         "reference_answer": {"reference_answer"},
+    },
+    "equation": {
+        "question": {"equation"},
+        "equation": {"equation"},
+        "answer": {"solution_steps", "final_answer"},
+        "solution_steps": {"solution_steps"},
+        "final_answer": {"final_answer"},
+    },
+    "word_problem": {
+        "question": {"question"},
+        "answer": {"solution_steps", "final_answer"},
+        "solution_steps": {"solution_steps"},
+        "final_answer": {"final_answer"},
     },
     "essay": {
         "question": {"question"},
@@ -97,7 +120,25 @@ _ACTION_DEFAULT_FIELDS: Dict[str, Dict[str, List[str]]] = {
         "FIX_QUESTION": ["question"],
         "FIX_QUESTION_AND_ANSWER": ["question", "answer"],
     },
+    "definition": {
+        "FIX_ANSWER": ["answer"],
+        "FIX_OPTIONS": ["answer"],
+        "FIX_QUESTION": ["term"],
+        "FIX_QUESTION_AND_ANSWER": ["term", "answer"],
+    },
     "short_answer": {
+        "FIX_ANSWER": ["answer"],
+        "FIX_OPTIONS": ["answer"],
+        "FIX_QUESTION": ["question"],
+        "FIX_QUESTION_AND_ANSWER": ["question", "answer"],
+    },
+    "equation": {
+        "FIX_ANSWER": ["answer"],
+        "FIX_OPTIONS": ["answer"],
+        "FIX_QUESTION": ["equation"],
+        "FIX_QUESTION_AND_ANSWER": ["equation", "answer"],
+    },
+    "word_problem": {
         "FIX_ANSWER": ["answer"],
         "FIX_OPTIONS": ["answer"],
         "FIX_QUESTION": ["question"],
@@ -115,12 +156,31 @@ _ALL_CANONICAL: Dict[str, Set[str]] = {
     "mcq": {"question", "options", "correct_answer"},
     "true_false": {"statement", "answer"},
     "fill_in_the_blank": {"question", "answers", "word_bank"},
+    "definition": {"term", "reference_answer"},
     "short_answer": {"question", "reference_answer"},
+    "equation": {"equation", "solution_steps", "final_answer"},
+    "word_problem": {"question", "solution_steps", "final_answer"},
     "essay": {"question", "reference_answer", "key_points"},
 }
 
 # Cheap local detectors that never need an LLM call.
 _BLANK_MARKERS = ("___", "____", "_____", "________", "…")
+
+
+def _equation_is_direct(text: str) -> bool:
+    """Distinguish a displayed calculation from a narrative word problem."""
+    value = text.strip()
+    if not re.search(r"(?:=|[+\-−×÷*/^]|[²³])", value):
+        return False
+    if re.match(r"^(?:an|the)\s+", value, flags=re.IGNORECASE):
+        return False
+    if re.match(r"^a\s+(?![=:+\-−×÷*/^])", value, flags=re.IGNORECASE):
+        return False
+    return not re.search(
+        r"\b(?:calculate|find|determine|what\s+is|how\s+much)\b",
+        value,
+        flags=re.IGNORECASE,
+    )
 
 
 def _normalize(qtype: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -131,8 +191,14 @@ def _normalize(qtype: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return _normalize_true_false(item)
     if qtype == "fill_in_the_blank":
         return normalize_fitb_item(item)
+    if qtype == "definition":
+        return _normalize_definition(item)
     if qtype == "short_answer":
         return _normalize_short_answer(item)
+    if qtype == "equation":
+        return _normalize_equation(item)
+    if qtype == "word_problem":
+        return _normalize_word_problem(item)
     if qtype == "essay":
         return _normalize_essay(item)
     return None
@@ -154,10 +220,24 @@ def _canonical_values(qtype: str, q: Dict[str, Any]) -> Dict[str, Any]:
             "answers": q.get("answers"),
             "word_bank": q.get("word_bank"),
         }
+    if qtype == "definition":
+        return {"term": q.get("term"), "reference_answer": q.get("reference_answer")}
     if qtype == "short_answer":
         return {
             "question": q.get("question"),
             "reference_answer": q.get("reference_answer"),
+        }
+    if qtype == "equation":
+        return {
+            "equation": q.get("equation"),
+            "solution_steps": q.get("solution_steps"),
+            "final_answer": q.get("final_answer"),
+        }
+    if qtype == "word_problem":
+        return {
+            "question": q.get("question"),
+            "solution_steps": q.get("solution_steps"),
+            "final_answer": q.get("final_answer"),
         }
     if qtype == "essay":
         return {
@@ -197,6 +277,10 @@ def _allowed_canonical(
     # fixing the option set when the answer is wrong. Never allow stem edits.
     if qtype == "mcq" and ("options" in canon or "correct_answer" in canon):
         canon |= {"options", "correct_answer"}
+    if qtype in {"equation", "word_problem"} and (
+        "solution_steps" in canon or "final_answer" in canon
+    ):
+        canon |= {"solution_steps", "final_answer"}
     return canon
 
 
@@ -280,6 +364,40 @@ def _local_verdict(qtype: str, item: Dict[str, Any], section: Any) -> Optional[D
                 return _verdict(True, False, "FIX_OPTIONS", ["word_bank", "answer"],
                                 f"Answer(s) not present in the Word Bank: {missing}.",
                                 "Add the correct term(s) to the Word Bank (or fix the answer).")
+    elif qtype == "definition":
+        term = str(item.get("term") or "").strip()
+        if not term:
+            return _verdict(False, False, "FIX_QUESTION", ["term"],
+                            "Definition term is empty.",
+                            "Provide only the term, concept, law, principle, or idea to define.")
+        if term.lower().startswith(("define ", "what is ", "explain ")):
+            return _verdict(False, True, "FIX_QUESTION", ["term"],
+                            "Definition term contains a question or instruction.",
+                            "Keep only the term itself, without 'Define' or other question wording.")
+        if not str(item.get("reference_answer") or "").strip():
+            return _verdict(True, False, "FIX_ANSWER", ["answer"],
+                            "Expected definition is empty.",
+                            "Write a concise definition grounded in the selected source.")
+    elif qtype in {"equation", "word_problem"}:
+        text_field = "equation" if qtype == "equation" else "question"
+        calculation_text = str(item.get(text_field) or "").strip()
+        if not calculation_text:
+            return _verdict(False, False, "FIX_QUESTION", [text_field],
+                            "Calculation question text is empty.",
+                            "Provide a complete, solvable calculation question.")
+        if qtype == "equation" and not _equation_is_direct(calculation_text):
+            return _verdict(False, True, "FIX_QUESTION", ["equation"],
+                            "Equation item is written as a narrative or lacks a direct mathematical expression.",
+                            "Replace it with only the directly displayed equation, calculation, or formula substitution; do not write a word-problem sentence.")
+        steps = item.get("solution_steps")
+        if not isinstance(steps, list) or not steps or not all(str(step).strip() for step in steps):
+            return _verdict(True, False, "FIX_ANSWER", ["solution_steps", "final_answer"],
+                            "Calculation solution steps are missing or malformed.",
+                            "Provide ordered solution steps and a consistent final answer.")
+        if not str(item.get("final_answer") or "").strip():
+            return _verdict(True, False, "FIX_ANSWER", ["solution_steps", "final_answer"],
+                            "Calculation final answer is empty.",
+                            "Provide a final answer consistent with the solution steps.")
     elif qtype in ("short_answer", "essay"):
         if not str(item.get("question") or "").strip():
             return _verdict(False, False, "FIX_QUESTION", ["question"],
@@ -328,6 +446,13 @@ VALIDATOR_SYSTEM_PROMPT = (
     "- For Fill-in-the-Blank: check the blank has one clear intended answer, the stored "
     "answer fits, other Word Bank entries do not fit equally, and the sentence is "
     "grammatically valid after filling.\n"
+    "- For Definition: the term must contain only the item to define, without an instruction, "
+    "and the reference answer must accurately define that exact term.\n"
+    "- For Equation: independently solve the displayed equation or calculation. Check every "
+    "solution step, final answer, sign, and unit. The equation must be directly provided.\n"
+    "- For Word Problem: verify that the written situation supplies enough information, does "
+    "not directly give away the formula unless naturally required, uses the correct relationship, "
+    "and has correct substitution, calculation steps, units, and final answer.\n"
     "- For Short Answer / Essay / writing questions: do NOT compare wording. Judge "
     "whether the reference answer actually answers the question, is relevant, logically "
     "correct, complete enough, and free of contradictions or unrelated material.\n"
@@ -398,6 +523,9 @@ REPAIR_SYSTEM_PROMPT = (
     "the minimum number of options needed; never regenerate the whole MCQ randomly; "
     "keep the question text unchanged unless the validator explicitly marked the "
     "question itself as broken.\n"
+    "- Equation and Word Problem solution_steps and final_answer must remain consistent. "
+    "When either answer field is broken, repair both while preserving the question unless it "
+    "was explicitly marked for repair.\n"
     "- Return an array of repair objects, one per input item, in any order, each:\n"
     '  {"question_id": "...", "repaired_fields": ["..."], '
     '"question": {the full repaired question object with the same fields}]}\n'

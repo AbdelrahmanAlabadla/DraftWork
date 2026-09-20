@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from app.api.main import app
@@ -133,6 +135,13 @@ def test_versioned_eval_summary_endpoint(monkeypatch):
 
     assert response.status_code == 200
     assert response.json() == summary
+
+
+def test_eval_dashboard_fetch_omits_user_session_cookie():
+    source = (Path(__file__).parents[1] / "FrontEnd" / "js" / "eval.js").read_text(
+        encoding="utf-8"
+    )
+    assert 'credentials: "omit"' in source
 
 
 def test_cached_dashboard_eval_summary_url_remains_compatible(monkeypatch):

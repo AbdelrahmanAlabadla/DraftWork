@@ -33,10 +33,13 @@ from app.online.models import (
     split_valid_invalid,
 )
 from app.online.prompts import (
+    DEFINITION_SCHEMA,
+    EQUATION_SCHEMA,
     ESSAY_SCHEMA,
     MCQ_SCHEMA,
     SHORT_ANSWER_SCHEMA,
     TRUE_FALSE_SCHEMA,
+    WORD_PROBLEM_SCHEMA,
     build_validation_repair_prompt,
 )
 
@@ -72,7 +75,10 @@ _TYPE_ID_SLUGS = {
     "mcq": "mcq",
     "true_false": "true_false",
     "fill_in_the_blank": "fill_in_the_blank",
+    "definition": "definition",
     "short_answer": "short_answer",
+    "equation": "equation",
+    "word_problem": "word_problem",
     "essay": "essay",
 }
 
@@ -182,8 +188,11 @@ def _content_tokens(qtype: str, question: dict[str, Any]) -> set[str]:
     the reference answer is a strong signal and is included.
     """
     parts = [question_text(qtype, question)]
-    if qtype == "short_answer":
+    if qtype in {"definition", "short_answer"}:
         parts.append(str(question.get("reference_answer") or ""))
+    elif qtype in {"equation", "word_problem"}:
+        parts.extend(str(step) for step in (question.get("solution_steps") or []))
+        parts.append(str(question.get("final_answer") or ""))
     elif qtype == "essay":
         parts.append(str(question.get("reference_answer") or ""))
         parts.extend(str(kp) for kp in (question.get("key_points") or []))
@@ -219,7 +228,10 @@ def _is_near_duplicate(
 _SCHEMAS = {
     "mcq": MCQ_SCHEMA,
     "true_false": TRUE_FALSE_SCHEMA,
+    "definition": DEFINITION_SCHEMA,
     "short_answer": SHORT_ANSWER_SCHEMA,
+    "equation": EQUATION_SCHEMA,
+    "word_problem": WORD_PROBLEM_SCHEMA,
     "essay": ESSAY_SCHEMA,
 }
 
@@ -1120,7 +1132,7 @@ def _repair_shortfalls(
                     )
                 within_model[:] = _reindex_within(questions)
 
-        for q in ("short_answer", "essay"):
+        for q in ("definition", "short_answer", "equation", "word_problem", "essay"):
             if q not in missing:
                 continue
             planned = missing[q]

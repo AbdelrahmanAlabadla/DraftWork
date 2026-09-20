@@ -5,7 +5,10 @@ from app.online.graph import ExamState
 
 logger = get_logger("RECEIVE")
 
-VALID_TYPES = {"mcq", "true_false", "short_answer"}
+VALID_TYPES = {
+    "mcq", "true_false", "fill_in_the_blank", "definition", "short_answer",
+    "equation", "word_problem", "essay",
+}
 MAX_PER_TYPE = 100
 _NUM_MODELS_MIN = 1
 _NUM_MODELS_MAX = 4

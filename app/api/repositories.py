@@ -360,6 +360,7 @@ def get_document(document_id: str) -> dict[str, Any] | None:
 
 def create_generation_job(
     *, session_id: str, document_id: str, request_data: dict[str, Any],
+    user_id: str | None = None,
     idempotency_key: str | None = None, request_hash: str | None = None,
 ) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
@@ -394,11 +395,24 @@ def create_generation_job(
                     result = dict(existing)
                     result["_idempotency_reused"] = True
                     return result
-            cursor.execute(
-                """SELECT status FROM documents
-                   WHERE id = %s AND session_id = %s AND status <> 'deleted'""",
-                (document_id, session_id),
-            )
+            if user_id is None:
+                cursor.execute(
+                    """SELECT status FROM documents
+                       WHERE id = %s AND session_id = %s AND status <> 'deleted'""",
+                    (document_id, session_id),
+                )
+            else:
+                cursor.execute(
+                    """SELECT d.status FROM documents d
+                       WHERE d.id = %s AND d.status <> 'deleted' AND (
+                           d.session_id = %s OR EXISTS (
+                               SELECT 1 FROM sessions owner_session
+                               WHERE owner_session.id = d.session_id
+                                 AND owner_session.user_id = %s
+                           )
+                       )""",
+                    (document_id, session_id, user_id),
+                )
             document = cursor.fetchone()
             if document is None:
                 raise ResourceNotFound("Document not found")

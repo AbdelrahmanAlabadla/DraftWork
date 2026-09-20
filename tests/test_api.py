@@ -28,7 +28,8 @@ def _disable_real_eval_persistence(monkeypatch):
 _COUNT_RE = re.compile(r"Create exactly (\d+)")
 _PLANNER_MODELS_RE = re.compile(r"Plan exam questions for (\d+)")
 _PLANNER_COUNT_RE = re.compile(
-    r"^\s*-\s*(\d+)\s+(mcq|true_false|fill_in_the_blank|short_answer|essay)\s*$", re.M
+    r"^\s*-\s*(\d+)\s+(mcq|true_false|fill_in_the_blank|definition|short_answer|equation|word_problem|essay)\s*$",
+    re.M,
 )
 _MODEL_RE = re.compile(r"Exam Model #(\d+)")
 
@@ -190,6 +191,29 @@ def _make_fake_llm(captured_prompts: list[str] | None = None):
                     "question": stems[i],
                     "reference_answer": f"reference for {i} in {model}",
                     "key_points": [f"point {i}a", f"point {i}b"],
+                }
+                for i in range(count)
+            ]}
+        if "Definition exam question" in prompt:
+            return {"questions": [
+                {"term": f"term {model}-{i}", "reference_answer": f"definition {model}-{i}"}
+                for i in range(count)
+            ]}
+        if "Equation exam question" in prompt:
+            return {"questions": [
+                {
+                    "equation": f"x + {i + model} = {i + model + 2}",
+                    "solution_steps": [f"x = {i + model + 2} - {i + model}", "x = 2"],
+                    "final_answer": f"x = 2 (model {model})",
+                }
+                for i in range(count)
+            ]}
+        if "Word Problem exam question" in prompt:
+            return {"questions": [
+                {
+                    "question": f"Cart {model} travels {i + model + 2} metres in 2 seconds. Find its speed.",
+                    "solution_steps": ["Use speed = distance ÷ time", f"speed = {i + model + 2} ÷ 2"],
+                    "final_answer": f"{(i + model + 2) / 2:g} m/s",
                 }
                 for i in range(count)
             ]}
@@ -517,7 +541,10 @@ def test_generate_html_payload_multiple_types(monkeypatch):
             "mcq_count": 1,
             "tf_count": 1,
             "fitb_count": 3,
+            "definition_count": 1,
             "why_count": 1,
+            "equation_count": 1,
+            "word_problem_count": 1,
             "essay_count": 2,
             "num_models": 2,
             "difficulty": "hard",
@@ -531,12 +558,16 @@ def test_generate_html_payload_multiple_types(monkeypatch):
     assert len(data["exams"]) == 2
     for exam in data["exams"]:
         assert set(exam["questions"].keys()) == {
-            "mcq", "true_false", "fill_in_the_blank", "short_answer", "essay",
+            "mcq", "true_false", "fill_in_the_blank", "definition",
+            "short_answer", "equation", "word_problem", "essay",
         }
         assert "Multiple Choice" in exam["markdown"]
         assert "True / False" in exam["markdown"]
         assert "Fill in the Blank" in exam["markdown"]
-        assert "Short Answer" in exam["markdown"]
+        assert "Define" in exam["markdown"]
+        assert "Why Questions" in exam["markdown"]
+        assert "Solve the equations" in exam["markdown"]
+        assert "Solve the word problems" in exam["markdown"]
         assert "Essay" in exam["markdown"]
         # FITB: one shared Word Bank + exactly the requested number of items.
         fitb = exam["questions"]["fill_in_the_blank"]

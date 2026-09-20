@@ -17,7 +17,7 @@ Instead of relying on one large AI prompt, DraftWork combines document retrieval
 * Select Easy, Medium, Hard, or mixed difficulty
 * Choose the number and type of questions
 * Generate multiple exam models
-* Generate MCQ, True/False, Fill-in-the-Blank, Why/Short Answer, and Essay questions
+* Generate MCQ, Fill-in-the-Blank, True/False, Definition, Why, Equation, Word Problem, and Essay questions
 * Generate answer keys automatically
 * Preview exams before downloading
 * Export exams as PDF or DOCX

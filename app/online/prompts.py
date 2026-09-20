@@ -258,6 +258,73 @@ SHORT_ANSWER_EXAMPLE = (
     '}'
 )
 
+DEFINITION_RULES = (
+    "- Select one important term, concept, law, principle, or named idea from the source.\n"
+    '- The "term" field must contain ONLY the term itself. Never write "Define", a question, '
+    "or a full instruction in that field.\n"
+    '- Provide a concise, accurate "reference_answer" that defines the term using only the '
+    "selected source content.\n"
+    "- Prefer terms whose meaning is explicitly supported by the source and avoid vague labels.\n"
+)
+
+DEFINITION_SCHEMA = (
+    '{\n'
+    '  "questions": [\n'
+    '    {"term": "Kinetic energy", "reference_answer": "The energy an object has due to its motion."}\n'
+    '  ]\n'
+    '}'
+)
+
+DEFINITION_EXAMPLE = DEFINITION_SCHEMA
+
+EQUATION_RULES = (
+    "- Give the mathematical equation, expression, formula substitution, or calculation directly.\n"
+    "- This type is not a word problem. Do NOT write a narrative sentence, real-world scenario, "
+    "or a request such as 'find' or 'calculate'. Put only the mathematical problem and any "
+    "needed variable values in the equation field.\n"
+    '- The "equation" field must contain the complete problem to solve, without introductory '
+    "phrases such as 'Solve' or 'Calculate'.\n"
+    "- The equation must be solvable from the information shown and grounded in the source.\n"
+    "- Preserve meaningful units and use clear Unicode mathematical symbols and superscripts "
+    "when appropriate.\n"
+    '- Provide an ordered "solution_steps" array showing the complete calculation and a '
+    'separate "final_answer" including units when applicable.\n'
+)
+
+EQUATION_SCHEMA = (
+    '{\n'
+    '  "questions": [\n'
+    '    {"equation": "F = ma; m = 6 kg; a = 3 m/s²", "solution_steps": ["F = 6 × 3", "F = 18 N"], "final_answer": "18 N"}\n'
+    '  ]\n'
+    '}'
+)
+
+EQUATION_EXAMPLE = EQUATION_SCHEMA
+
+WORD_PROBLEM_RULES = (
+    "- Write a calculation question as a clear sentence or realistic situation.\n"
+    "- The student must identify the needed relationship or equation, substitute the values, "
+    "and solve it.\n"
+    "- Do NOT give the formula directly in the question unless it is naturally required by the "
+    "problem or explicitly supplied by the source.\n"
+    "- Include every value and unit needed to solve the problem, and do not invent facts or "
+    "values absent from the source.\n"
+    '- Provide an ordered "solution_steps" array that includes the formula choice, substitution, '
+    'calculation, and a separate "final_answer" with units when applicable.\n'
+)
+
+WORD_PROBLEM_SCHEMA = (
+    '{\n'
+    '  "questions": [\n'
+    '    {"question": "A 5 kg object accelerates at 4 m/s². Calculate the force acting on it.", '
+    '"solution_steps": ["Use F = ma", "F = 5 kg × 4 m/s²", "F = 20 N"], '
+    '"final_answer": "20 N"}\n'
+    '  ]\n'
+    '}'
+)
+
+WORD_PROBLEM_EXAMPLE = WORD_PROBLEM_SCHEMA
+
 ESSAY_RULES = (
     "- Ask an open-ended question that requires a structured, multi-sentence answer.\n"
     '- Provide a "reference_answer" (a model essay outline of several sentences) that is fully '
@@ -395,6 +462,15 @@ PLANNER_SYSTEM_PROMPT = (
     "inside those concepts. A model may freely choose another grounded idea when useful.\n"
     "- Do not assign the same specific idea to two versions of the same question type.\n\n"
 
+    "=== QUESTION-TYPE PLANNING RULES ===\n"
+    "- definition: choose an explicitly supported term, concept, law, principle, or named idea.\n"
+    "- equation: choose source material containing a directly solvable equation, formula, "
+    "expression, or calculation with enough information to obtain an answer.\n"
+    "- word_problem: choose a calculation-ready relationship and values that can be expressed "
+    "as a written situation; the later question must require the student to identify the formula.\n"
+    "- Never assign equation or word_problem to a source chunk that cannot support a complete "
+    "calculation without inventing facts or values.\n\n"
+
     "=== CONCEPT DISTINCTNESS RULES ===\n"
     "- Reusing a broad concept across models is allowed and expected.\n"
     "- Within that concept, select a different grounded idea or angle for each model.\n"
@@ -519,12 +595,23 @@ def build_prompt(
     elif question_type == "true_false":
         rules, schema, example = TRUE_FALSE_RULES, TRUE_FALSE_SCHEMA, TRUE_FALSE_EXAMPLE
         type_name = "True/False"
+    elif question_type == "definition":
+        rules, schema, example = DEFINITION_RULES, DEFINITION_SCHEMA, DEFINITION_EXAMPLE
+        type_name = "Definition"
+    elif question_type == "short_answer":
+        rules, schema, example = SHORT_ANSWER_RULES, SHORT_ANSWER_SCHEMA, SHORT_ANSWER_EXAMPLE
+        type_name = "Why Question"
+    elif question_type == "equation":
+        rules, schema, example = EQUATION_RULES, EQUATION_SCHEMA, EQUATION_EXAMPLE
+        type_name = "Equation"
+    elif question_type == "word_problem":
+        rules, schema, example = WORD_PROBLEM_RULES, WORD_PROBLEM_SCHEMA, WORD_PROBLEM_EXAMPLE
+        type_name = "Word Problem"
     elif question_type == "essay":
         rules, schema, example = ESSAY_RULES, ESSAY_SCHEMA, ESSAY_EXAMPLE
         type_name = "Essay"
     else:
-        rules, schema, example = SHORT_ANSWER_RULES, SHORT_ANSWER_SCHEMA, SHORT_ANSWER_EXAMPLE
-        type_name = "Short Answer"
+        raise ValueError(f"Unsupported question type: {question_type}")
 
     if planned_items:
         plan_lines = "\n".join(

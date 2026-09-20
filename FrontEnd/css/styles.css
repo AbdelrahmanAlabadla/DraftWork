@@ -788,6 +788,47 @@
       font-weight: 700;
     }
 
+    .preview-definition-row {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+      color: #1f2937;
+      font-size: 14px;
+      line-height: 1.35;
+    }
+
+    .preview-definition-line {
+      flex: 1;
+      min-width: 80px;
+      height: 1em;
+      border-bottom: 1px solid #475569;
+    }
+
+    .preview-equation-row {
+      position: relative;
+      min-height: 24px;
+      color: #1f2937;
+      font-size: 14px;
+      line-height: 1.5;
+      font-weight: 700;
+    }
+
+    .preview-equation-number {
+      position: absolute;
+      inset-inline-start: 0;
+    }
+
+    .preview-equation-text {
+      padding-inline: 32px;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
+
+    .preview-equation,
+    .preview-word_problem {
+      margin-bottom: 17px;
+    }
+
     .preview-options {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -844,6 +885,11 @@
       line-height: 16pt;
       white-space: nowrap;
       overflow: hidden;
+    }
+
+    html[dir="rtl"] .preview-response-lines {
+      margin-right: 10px;
+      margin-left: 0;
     }
 
     .answer-key-paper {

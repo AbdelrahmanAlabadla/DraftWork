@@ -8,6 +8,7 @@ from clerk_backend_api.security.types import AuthStatus
 from fastapi.testclient import TestClient
 
 from app.api.main import app
+from app.api.session_middleware import _needs_session
 from app.auth import clerk as clerk_auth
 
 
@@ -41,6 +42,12 @@ def test_clerk_identity_uses_verified_subject(monkeypatch):
 def test_missing_bearer_token_remains_anonymous():
     request = SimpleNamespace(headers={})
     assert asyncio.run(clerk_auth.authenticate(request)) is None
+
+
+def test_global_eval_dashboard_does_not_participate_in_user_sessions():
+    assert not _needs_session("/api/v1/eval-summary")
+    assert not _needs_session("/api/v1/api/eval-summary")
+    assert _needs_session("/api/v1/documents")
 
 
 def test_static_auth_pages_use_clerk_without_token_storage():
