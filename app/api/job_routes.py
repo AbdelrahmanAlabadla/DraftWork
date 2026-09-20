@@ -348,6 +348,7 @@ def create_exam_job(
             session_id=session_id,
             document_id=str(document_id),
             request_data=payload,
+            user_id=user_id,
             idempotency_key=idempotency_key,
             request_hash=_request_hash(payload) if idempotency_key else None,
         )

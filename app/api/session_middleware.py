@@ -17,7 +17,14 @@ def _needs_session(path: str) -> bool:
     # The versioned API is the durable, isolated contract.  Unversioned routes
     # remain temporarily available for existing local scripts and pipeline
     # regression tests while the browser migrates to /api/v1.
-    return path.startswith("/api/v1/") and path != "/api/v1/auth/config"
+    sessionless_paths = {
+        "/api/v1/auth/config",
+        # Developer telemetry is global and read-only.  It must not participate
+        # in browser sessions or rotate a signed-in user's document cookie.
+        "/api/v1/eval-summary",
+        "/api/v1/api/eval-summary",
+    }
+    return path.startswith("/api/v1/") and path not in sessionless_paths
 
 
 def _create_session() -> tuple[dict, str]:

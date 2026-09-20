@@ -109,7 +109,12 @@ function render(summary) {
 async function refresh() {
   const state = document.getElementById("evalState");
   try {
-    const response = await fetch(`${BASE}/eval-summary`, { cache: "no-store" });
+    // This is global developer telemetry, so it must not send or mutate the
+    // user-session cookie used by the exam generator in another tab.
+    const response = await fetch(`${BASE}/eval-summary`, {
+      cache: "no-store",
+      credentials: "omit",
+    });
     if (!response.ok) throw new Error(`Endpoint returned ${response.status}`);
     render(await response.json());
   } catch (error) {

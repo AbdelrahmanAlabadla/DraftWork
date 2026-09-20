@@ -212,6 +212,7 @@ def test_generation_idempotency_reuses_job_and_validates_selection(monkeypatch):
 
     assert response.status_code == 202
     assert captured["idempotency_key"] == "generation-operation-123"
+    assert captured["user_id"] is None
     assert len(captured["request_hash"]) == 64
 
 
