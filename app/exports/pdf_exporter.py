@@ -22,6 +22,7 @@ PAGE_MARGIN_MM = 12.7  # exactly 0.5 inch
 FOOTER_Y_MM = -9.5
 BODY_FONT = "helvetica"
 ARABIC_FONT = "Amiri"
+MATH_FONT = "DejaVuSans"
 FONT_DIR = Path(__file__).parent / "fonts"
 BODY_SIZE = 10.5
 LINE_HEIGHT = 5.4
@@ -120,6 +121,21 @@ def _register_arabic_font() -> bool:
     try:
         probe.add_font(ARABIC_FONT, "", str(regular))
         probe.add_font(ARABIC_FONT, "B", str(bold))
+    except Exception:
+        return False
+    return True
+
+
+def _register_math_font() -> bool:
+    """Check that the bundled Unicode font can render calculation notation."""
+    regular = FONT_DIR / "DejaVuSans.ttf"
+    bold = FONT_DIR / "DejaVuSans-Bold.ttf"
+    if not (regular.is_file() and bold.is_file()):
+        return False
+    probe = FPDF()
+    try:
+        probe.add_font(MATH_FONT, "", str(regular))
+        probe.add_font(MATH_FONT, "B", str(bold))
     except Exception:
         return False
     return True
@@ -357,12 +373,60 @@ def _draw_open_ended(
     text = marker + _clean(item['text'], '(missing question text)')
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     stem_h = _text_height(pdf, text, pdf.epw)
-    # Keep the stem with the first response line. Remaining lines may continue
-    # on the next page, using the same fixed count as DOCX and browser preview.
+    line_count = response_line_count(qtype)
+    block_height = stem_h + 1 + (line_count * ANSWER_LINE_HEIGHT) + 2.5
+    usable_page_height = pdf.page_break_trigger - pdf.t_margin
+    # Keep a question and its complete writing area together whenever that
+    # block can fit on one page. This prevents orphan response lines on the
+    # next page while still allowing an exceptionally large block to flow.
+    pdf.ensure_space(
+        block_height if block_height <= usable_page_height
+        else stem_h + ANSWER_LINE_HEIGHT + 2
+    )
+    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+    pdf.ln(1)
+    _draw_answer_lines(pdf, line_count)
+    pdf.ln(2.5)
+    pdf.set_text_color(*INK)
+
+
+def _draw_definition(pdf: _ExamPDF, item: dict[str, Any]) -> None:
+    marker = f"{item['number']}. "
+    term = marker + _clean(item.get("text"), "(missing term)") + ": "
+    line = "_" * 54
+    text = term + line
+    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
+    height = _text_height(pdf, text, pdf.epw)
+    pdf.ensure_space(height + 4)
+    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+    pdf.ln(4)
+
+
+def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
+    equation = _clean(item.get("text"), "(missing equation)")
+    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
+    number_gutter = 12.0
+    equation_width = pdf.epw - (2 * number_gutter)
+    equation_h = _text_height(pdf, equation, equation_width)
+    pdf.ensure_space(equation_h + ANSWER_LINE_HEIGHT + 4)
+    y = pdf.get_y()
+    pdf.cell(number_gutter, LINE_HEIGHT, f"{item['number']}.")
+    pdf.set_xy(pdf.l_margin + number_gutter, y)
+    pdf.multi_cell(equation_width, LINE_HEIGHT, equation, align="C", new_x="LEFT", new_y="NEXT")
+    pdf.ln(1)
+    _draw_answer_lines(pdf, response_line_count("equation"))
+    pdf.ln(2.5)
+    pdf.set_text_color(*INK)
+
+
+def _draw_word_problem(pdf: _ExamPDF, item: dict[str, Any]) -> None:
+    text = f"{item['number']}. " + _clean(item.get("text"), "(missing question text)")
+    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
+    stem_h = _text_height(pdf, text, pdf.epw)
     pdf.ensure_space(stem_h + ANSWER_LINE_HEIGHT + 2)
     pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf), new_x="LEFT", new_y="NEXT")
     pdf.ln(1)
-    _draw_answer_lines(pdf, response_line_count(qtype))
+    _draw_answer_lines(pdf, response_line_count("word_problem"))
     pdf.ln(2.5)
     pdf.set_text_color(*INK)
 
@@ -387,7 +451,9 @@ def _draw_student_exam(
     for section_index, section in enumerate(sections):
         if section["qtype"] == "essay" and section_index > 0:
             pdf.add_page()
-        minimum_after = 22 if section["qtype"] in {"short_answer", "essay"} else 18
+        minimum_after = 22 if section["qtype"] in {
+            "short_answer", "equation", "word_problem", "essay"
+        } else 18
         _draw_section_heading(pdf, section["label"], minimum_after=minimum_after)
         if section["qtype"] == "fill_in_the_blank":
             _draw_word_bank(pdf, section.get("word_bank") or [])
@@ -401,6 +467,12 @@ def _draw_student_exam(
                 _draw_fill_blank(pdf, item)
             elif qtype == "true_false":
                 _draw_true_false(pdf, item)
+            elif qtype == "definition":
+                _draw_definition(pdf, item)
+            elif qtype == "equation":
+                _draw_equation(pdf, item)
+            elif qtype == "word_problem":
+                _draw_word_problem(pdf, item)
             else:
                 _draw_open_ended(pdf, item, qtype)
 
@@ -420,6 +492,10 @@ def _answer_text(item: dict[str, Any], language: str = "en") -> str:
         return raw
     if qtype == "fill_in_the_blank":
         return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or "No answer supplied"
+    if qtype in {"equation", "word_problem"}:
+        steps = [_clean(step) for step in (item.get("solution_steps") or []) if _clean(step)]
+        final = _clean(item.get("final_answer"), "No final answer supplied")
+        return " → ".join([*steps, final])
     answer = _clean(item.get("reference_answer"), "No reference answer supplied")
     key_points = [_clean(point) for point in (item.get("key_points") or []) if _clean(point)]
     if key_points:
@@ -465,19 +541,34 @@ def _render_model_pdf(
     global _UNICODE_OUTPUT, BODY_FONT
     metadata = dict(metadata or {})
     language = str(metadata.get("document_language") or "en")
-    has_unicode = _register_arabic_font()
+    has_arabic = _register_arabic_font()
+    has_math = _register_math_font()
     try:
         pdf = _ExamPDF(language)
         pdf.alias_nb_pages()
-        if has_unicode and pdf.rtl:
+        questions = exam.get("questions") or {}
+        needs_math_font = any(questions.get(qtype) for qtype in ("equation", "word_problem"))
+        if pdf.rtl and has_arabic:
             BODY_FONT = ARABIC_FONT
             _UNICODE_OUTPUT = True
             pdf.add_font(ARABIC_FONT, "", str(FONT_DIR / "Amiri-Regular.ttf"))
             pdf.add_font(ARABIC_FONT, "B", str(FONT_DIR / "Amiri-Bold.ttf"))
+            if has_math:
+                pdf.add_font(MATH_FONT, "", str(FONT_DIR / "DejaVuSans.ttf"))
+                pdf.add_font(MATH_FONT, "B", str(FONT_DIR / "DejaVuSans-Bold.ttf"))
+                try:
+                    pdf.set_fallback_fonts([MATH_FONT])
+                except Exception:
+                    pass
             try:
                 pdf.set_text_shaping(True)
             except Exception:
                 pass
+        elif needs_math_font and has_math:
+            BODY_FONT = MATH_FONT
+            _UNICODE_OUTPUT = True
+            pdf.add_font(MATH_FONT, "", str(FONT_DIR / "DejaVuSans.ttf"))
+            pdf.add_font(MATH_FONT, "B", str(FONT_DIR / "DejaVuSans-Bold.ttf"))
         else:
             # Latin content keeps the original Helvetica layout.
             BODY_FONT = "helvetica"

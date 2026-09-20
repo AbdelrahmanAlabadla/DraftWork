@@ -439,6 +439,53 @@ def _add_answer_lines(doc: Document, count: int) -> None:
         _set_run_font(run, size=9, color=RGBColor(71, 85, 105))
 
 
+def _add_definition(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(7)
+    if rtl:
+        _set_paragraph_rtl(p)
+    run = p.add_run(f"{item['number']}. ")
+    _set_run_font(run, bold=True)
+    run = p.add_run(_clean(item.get("text"), "(missing term)") + ": ")
+    _set_run_font(run, bold=True)
+    run = p.add_run("_" * 58)
+    _set_run_font(run, size=9, color=RGBColor(71, 85, 105))
+
+
+def _add_equation(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
+    table = doc.add_table(rows=1, cols=3)
+    _set_table_geometry(table, [0.45, CONTENT_WIDTH_IN - 0.9, 0.45])
+    _remove_table_borders(table)
+    number_cell, equation_cell, _ = table.rows[0].cells
+    number_cell.text = ""
+    equation_cell.text = ""
+    number = number_cell.paragraphs[0]
+    number.paragraph_format.space_after = Pt(0)
+    run = number.add_run(f"{item['number']}.")
+    _set_run_font(run, bold=True)
+    equation = equation_cell.paragraphs[0]
+    equation.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    equation.paragraph_format.space_after = Pt(0)
+    if rtl:
+        _set_paragraph_rtl(equation)
+    run = equation.add_run(_clean(item.get("text"), "(missing equation)"))
+    _set_run_font(run, bold=True)
+    _add_answer_lines(doc, response_line_count("equation"))
+
+
+def _add_word_problem(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(2)
+    p.paragraph_format.keep_with_next = True
+    if rtl:
+        _set_paragraph_rtl(p)
+    run = p.add_run(f"{item['number']}. ")
+    _set_run_font(run, bold=True)
+    run = p.add_run(_clean(item.get("text"), "(missing question text)"))
+    _set_run_font(run, bold=True)
+    _add_answer_lines(doc, response_line_count("word_problem"))
+
+
 def _answer_text(item: dict[str, Any], language: str = "en") -> str:
     qtype = item["qtype"]
     if qtype == "mcq":
@@ -452,6 +499,10 @@ def _answer_text(item: dict[str, Any], language: str = "en") -> str:
         return raw
     if qtype == "fill_in_the_blank":
         return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or "No answer supplied"
+    if qtype in {"equation", "word_problem"}:
+        steps = [_clean(step) for step in (item.get("solution_steps") or []) if _clean(step)]
+        final = _clean(item.get("final_answer"), "No final answer supplied")
+        return " → ".join([*steps, final])
     answer = _clean(item.get("reference_answer"), "No reference answer supplied")
     points = [_clean(point) for point in (item.get("key_points") or []) if _clean(point)]
     return answer + ((" | Key points: " + "; ".join(points)) if points else "")
@@ -494,6 +545,12 @@ def _render_student_sections(doc: Document, sections: list[dict[str, Any]], lang
                     _set_run_font(run, size=9.5)
             elif qtype == "fill_in_the_blank":
                 _add_question_stem(doc, item, rtl=rtl)
+            elif qtype == "definition":
+                _add_definition(doc, item, rtl=rtl)
+            elif qtype == "equation":
+                _add_equation(doc, item, rtl=rtl)
+            elif qtype == "word_problem":
+                _add_word_problem(doc, item, rtl=rtl)
             else:
                 _add_question_stem(doc, item, rtl=rtl)
                 _add_answer_lines(doc, response_line_count(qtype))

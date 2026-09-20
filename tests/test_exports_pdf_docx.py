@@ -45,6 +45,23 @@ def _stored_record() -> dict:
                         "question": "Why is cache useful?",
                         "reference_answer": "It speeds up repeated access.",
                     }],
+                    "definition": [{
+                        "question_id": "model1_definition_1",
+                        "term": "Operating system",
+                        "reference_answer": "Software that manages computer resources.",
+                    }],
+                    "equation": [{
+                        "question_id": "model1_equation_1",
+                        "equation": "2x + 5 = 15",
+                        "solution_steps": ["2x = 10", "x = 5"],
+                        "final_answer": "x = 5",
+                    }],
+                    "word_problem": [{
+                        "question_id": "model1_word_problem_1",
+                        "question": "A car travels 120 km in 2 hours. Calculate its average speed.",
+                        "solution_steps": ["speed = distance ÷ time", "120 ÷ 2 = 60"],
+                        "final_answer": "60 km/h",
+                    }],
                     "essay": [{
                         "question_id": "model1_essay_1",
                         "question": "Explain the fetch-decode-execute cycle.",
@@ -71,12 +88,13 @@ def _stored_record() -> dict:
 def test_flatten_items_structure():
     items = flatten_exam_items(_stored_record()["exams"][0]["questions"])
     assert [i["qtype"] for i in items] == [
-        "mcq", "true_false", "fill_in_the_blank", "short_answer", "essay"]
-    assert [i["number"] for i in items] == [1, 2, 3, 4, 5]
+        "mcq", "fill_in_the_blank", "true_false", "definition",
+        "short_answer", "equation", "word_problem", "essay"]
+    assert [i["number"] for i in items] == list(range(1, 9))
     mcq = items[0]
     assert mcq["options"]["A"] == "Central Processing Unit"
     assert mcq["correct_answer"] == "A"
-    fitb = items[2]
+    fitb = items[1]
     assert fitb["word_bank"] == ["CPU", "RAM", "ROM", "GPU"]
     assert fitb["answers"] == ["CPU"]
     # question_ids preserved for tracing
@@ -86,7 +104,8 @@ def test_flatten_items_structure():
 def test_print_sections_follow_reference_order_and_restart_numbers():
     sections = group_exam_sections(_stored_record()["exams"][0]["questions"])
     assert [section["qtype"] for section in sections] == [
-        "mcq", "fill_in_the_blank", "true_false", "short_answer", "essay"]
+        "mcq", "fill_in_the_blank", "true_false", "definition",
+        "short_answer", "equation", "word_problem", "essay"]
     assert all(section["items"][0]["number"] == 1 for section in sections)
     assert sections[1]["word_bank"] == ["CPU", "RAM", "ROM", "GPU"]
 
@@ -116,15 +135,20 @@ def test_pdf_student_copy_has_metadata_and_no_reference_answer_leak():
     assert "Multiple Choice Questions" in student
     assert "Fill in the Blank" in student
     assert "True / False" in student
-    assert "Short Answer" in student
+    assert "Define" in student
+    assert "Why Questions" in student
+    assert "Solve the equations and show your steps." in student
+    assert "Solve the word problems and show your steps." in student
     assert "Essay" in student
     assert "Answer Key" not in student
     assert "It speeds up repeated access." not in student
     assert "Long explanation..." not in student
+    assert "Software that manages computer resources." not in student
+    assert "speed = distance" not in student
     assert "Do your best!" not in student
     assert student.count("Computer Science Final Examination") == 1
-    # Three short-answer lines plus 22 essay lines, exactly matching DOCX.
-    assert student.count(RESPONSE_LINE_TEXT) == 25
+    # 3 Why + 3 Equation + 5 Word Problem + 22 Essay lines.
+    assert student.count(RESPONSE_LINE_TEXT) == 33
 
 
 def test_pdf_answer_file_contains_answers_without_student_exam():
@@ -135,7 +159,26 @@ def test_pdf_answer_file_contains_answers_without_student_exam():
     assert "Answer Key - Model 1" in text
     assert "It speeds up repeated access." in text
     assert "Long explanation..." in text
+    assert "Software that manages computer resources." in text
+    assert "120" in text and "60 km/h" in text
     assert RESPONSE_LINE_TEXT not in text
+
+
+def test_pdf_keeps_each_essay_writing_area_with_its_question():
+    pypdf = pytest.importorskip("pypdf")
+    exam = {
+        "model_number": 1,
+        "questions": {
+            "essay": [
+                {"question_id": "model1_essay_1", "question": "Explain the first topic.", "reference_answer": "A"},
+                {"question_id": "model1_essay_2", "question": "Explain the second topic.", "reference_answer": "B"},
+            ]
+        },
+    }
+    pages = pypdf.PdfReader(io.BytesIO(render_exam_pdf(exam, {"exam_title": "Essay test"}))).pages
+    page_texts = [page.extract_text() or "" for page in pages]
+    second_page = next(text for text in page_texts if "Explain the second topic." in text)
+    assert second_page.count(RESPONSE_LINE_TEXT) == 22
 
 
 def test_pdf_unknown_model_empty_questions_produces_no_pages():
@@ -163,7 +206,11 @@ def test_docx_uses_a4_half_inch_margins_and_grouped_sections():
     assert 'w:right="720"' in document_xml
     assert 'w:bottom="720"' in document_xml
     assert 'w:left="720"' in document_xml
-    for heading in ("Multiple Choice Questions", "Fill in the Blank", "True / False", "Short Answer", "Essay"):
+    for heading in (
+        "Multiple Choice Questions", "Fill in the Blank", "True / False", "Define",
+        "Why Questions", "Solve the equations and show your steps.",
+        "Solve the word problems and show your steps.", "Essay",
+    ):
         assert heading in document_xml
 
 
@@ -186,8 +233,8 @@ def test_docx_has_page_number_only_and_visible_open_answer_lines():
     assert "It speeds up repeated access." not in document_xml
     assert "Do your best!" not in document_xml
     assert "PAGE" in footer_xml and "NUMPAGES" in footer_xml
-    # Three short-answer lines plus 22 essay lines. FITB gets no extra rule.
-    assert document_xml.count("_" * 92) == 25
+    # 3 Why + 3 Equation + 5 Word Problem + 22 Essay lines.
+    assert document_xml.count("_" * 92) == 33
 
 
 def test_docx_answer_file_contains_answers_without_student_sections():
@@ -198,6 +245,8 @@ def test_docx_answer_file_contains_answers_without_student_sections():
     assert "Answer Key - Model 1" in document_xml
     assert "It speeds up repeated access." in document_xml
     assert "Long explanation..." in document_xml
+    assert "Software that manages computer resources." in document_xml
+    assert "60 km/h" in document_xml
     assert RESPONSE_LINE_TEXT not in document_xml
 
 
@@ -208,8 +257,25 @@ def test_browser_preview_uses_structured_student_and_key_layout():
     preview_js = (root / "FrontEnd/js/exam-view.js").read_text(encoding="utf-8")
     main_js = (root / "FrontEnd/js/main.js").read_text(encoding="utf-8")
     assert "marked.parse" not in preview_js
-    assert 'short_answer: 3, essay: 22' in preview_js
-    assert "buildAnswerKey(exam)" in preview_js
+    assert 'short_answer: 3, equation: 3, word_problem: 5, essay: 22' in preview_js
+    assert "buildAnswerKey(exam, labels)" in preview_js
     assert "item.correct_answer" in preview_js
     assert "addResponseLines(question" in preview_js
     assert "renderExamOutput(data.exams, data.metadata || {})" in main_js
+
+
+def test_frontend_question_type_order_and_word_problem_naming():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    html = (root / "FrontEnd/index.html").read_text(encoding="utf-8")
+    i18n = (root / "FrontEnd/js/i18n.js").read_text(encoding="utf-8")
+    cards = [
+        "card-mcq", "card-fitb", "card-tf", "card-definition",
+        "card-why", "card-equation", "card-word_problem", "card-essay",
+    ]
+    positions = [html.index(f'id="{card}"') for card in cards]
+    assert positions == sorted(positions)
+    assert '"qtype.word_problem": "Word Problem"' in i18n
+    assert '"qtype.word_problem": "سؤال كلامي"' in i18n
+    assert "verbal_equation" not in html + i18n

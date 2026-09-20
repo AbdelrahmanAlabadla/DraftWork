@@ -2,14 +2,33 @@ import { state } from "./state.js";
 
 // Mirrors app.exports.common so screen, PDF, and DOCX use one visual contract.
 const RESPONSE_LINE = "_".repeat(92);
-const RESPONSE_LINE_COUNTS = { short_answer: 3, essay: 22 };
+const RESPONSE_LINE_COUNTS = { short_answer: 3, equation: 3, word_problem: 5, essay: 22 };
 const SECTION_ORDER = [
-  ["mcq", "Multiple Choice Questions"],
-  ["fill_in_the_blank", "Fill in the Blank"],
-  ["true_false", "True / False"],
-  ["short_answer", "Short Answer"],
-  ["essay", "Essay"],
+  "mcq", "fill_in_the_blank", "true_false", "definition",
+  "short_answer", "equation", "word_problem", "essay",
 ];
+const SECTION_LABELS = {
+  en: {
+    mcq: "Multiple Choice Questions",
+    fill_in_the_blank: "Fill in the Blank",
+    true_false: "True / False",
+    definition: "Define",
+    short_answer: "Why Questions",
+    equation: "Solve the equations and show your steps.",
+    word_problem: "Solve the word problems and show your steps.",
+    essay: "Essay",
+  },
+  ar: {
+    mcq: "أسئلة الاختيار من متعدد",
+    fill_in_the_blank: "أكمل الفراغ",
+    true_false: "صح / خطأ",
+    definition: "تعريف",
+    short_answer: "علل",
+    equation: "حل المعادلات وأظهر خطواتك.",
+    word_problem: "حل المسائل الكلامية وأظهر خطواتك.",
+    essay: "مقال",
+  },
+};
 
 function element(tag, className = "", text = "") {
   const node = document.createElement(tag);
@@ -71,6 +90,13 @@ function addQuestionStem(parent, number, text) {
   parent.appendChild(stem);
 }
 
+function addPlainNumberedStem(parent, number, text) {
+  const stem = element("div", "preview-question-stem");
+  stem.appendChild(element("strong", "", `${number}. `));
+  stem.appendChild(document.createTextNode(clean(text, "(missing question text)")));
+  parent.appendChild(stem);
+}
+
 function addResponseLines(parent, count) {
   const lines = element("div", "preview-response-lines");
   for (let index = 0; index < count; index += 1) {
@@ -96,8 +122,26 @@ function addStudentSection(paper, qtype, label, questions) {
 
   items.forEach((item, index) => {
     const question = element("section", `preview-question preview-${qtype}`);
-    const text = qtype === "true_false" ? item.statement : item.question;
-    addQuestionStem(question, index + 1, text);
+    const text = qtype === "true_false" ? item.statement
+      : qtype === "definition" ? item.term
+      : qtype === "equation" ? item.equation
+      : item.question;
+
+    if (qtype === "definition") {
+      const row = element("div", "preview-definition-row");
+      row.appendChild(element("strong", "", `${index + 1}. ${clean(text, "(missing term)")}:`));
+      row.appendChild(element("span", "preview-definition-line"));
+      question.appendChild(row);
+    } else if (qtype === "equation") {
+      const row = element("div", "preview-equation-row");
+      row.appendChild(element("strong", "preview-equation-number", `${index + 1}.`));
+      row.appendChild(element("div", "preview-equation-text", clean(text, "(missing equation)")));
+      question.appendChild(row);
+    } else if (qtype === "word_problem") {
+      addPlainNumberedStem(question, index + 1, text);
+    } else {
+      addQuestionStem(question, index + 1, text);
+    }
 
     if (qtype === "mcq") {
       const options = element("div", "preview-options");
@@ -107,7 +151,7 @@ function addStudentSection(paper, qtype, label, questions) {
       question.appendChild(options);
     } else if (qtype === "true_false") {
       question.appendChild(element("div", "preview-tf-choices", "(   ) True     (   ) False"));
-    } else if (qtype === "short_answer" || qtype === "essay") {
+    } else if (["short_answer", "equation", "word_problem", "essay"].includes(qtype)) {
       addResponseLines(question, RESPONSE_LINE_COUNTS[qtype]);
     }
     paper.appendChild(question);
@@ -120,19 +164,24 @@ function answerText(qtype, item) {
   if (qtype === "fill_in_the_blank") {
     return (item.answers || []).map((answer) => clean(answer)).filter(Boolean).join(", ") || "No answer supplied";
   }
+  if (qtype === "equation" || qtype === "word_problem") {
+    const steps = (item.solution_steps || []).map((step) => clean(step)).filter(Boolean);
+    const finalAnswer = clean(item.final_answer, "No final answer supplied");
+    return [...steps, `Final answer: ${finalAnswer}`].join(" → ");
+  }
   let answer = clean(item.reference_answer, "No reference answer supplied");
   const points = (item.key_points || []).map((point) => clean(point)).filter(Boolean);
   if (points.length) answer += ` | Key points: ${points.join("; ")}`;
   return answer;
 }
 
-function buildAnswerKey(exam) {
+function buildAnswerKey(exam, labels) {
   const paper = element("article", "exam-paper answer-key-paper");
   paper.appendChild(element("h1", "preview-key-title", `Answer Key - Model ${exam.model_number || 1}`));
-  SECTION_ORDER.forEach(([qtype, label]) => {
+  SECTION_ORDER.forEach((qtype) => {
     const items = sectionItems(exam.questions || {}, qtype);
     if (!items.length) return;
-    addSectionHeading(paper, label);
+    addSectionHeading(paper, labels[qtype]);
     items.forEach((item, index) => {
       const row = element("div", "preview-key-answer");
       row.appendChild(element("strong", "", `Q${index + 1}. `));
@@ -147,13 +196,15 @@ function buildModelPreview(exam, metadata, index) {
   const model = element("div", `exam-model${index === 0 ? " active" : ""}`);
   model.dataset.index = String(index);
 
+  const language = clean(exam.document_language || metadata.document_language, "en");
+  const labels = SECTION_LABELS[language] || SECTION_LABELS.en;
   const studentPaper = element("article", "exam-paper student-paper");
   addTitleBlock(studentPaper, exam, metadata);
-  SECTION_ORDER.forEach(([qtype, label]) => {
-    addStudentSection(studentPaper, qtype, label, exam.questions || {});
+  SECTION_ORDER.forEach((qtype) => {
+    addStudentSection(studentPaper, qtype, labels[qtype], exam.questions || {});
   });
   model.appendChild(studentPaper);
-  model.appendChild(buildAnswerKey(exam));
+  model.appendChild(buildAnswerKey(exam, labels));
   return model;
 }
 

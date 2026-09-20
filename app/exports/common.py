@@ -14,19 +14,16 @@ from app.online.models import TYPE_LABELS, TYPE_ORDER
 # Printed order follows the supplied exam model while staying limited to the
 # question types the application currently supports.  ``TYPE_ORDER`` remains
 # unchanged because the generation and document export pipelines rely on it.
-EXPORT_TYPE_ORDER = [
-    "mcq",
-    "fill_in_the_blank",
-    "true_false",
-    "short_answer",
-    "essay",
-]
+EXPORT_TYPE_ORDER = list(TYPE_ORDER)
 
 EXPORT_TYPE_LABELS = {
     "mcq": "Multiple Choice Questions",
     "fill_in_the_blank": "Fill in the Blank",
     "true_false": "True / False",
-    "short_answer": "Short Answer",
+    "definition": "Define",
+    "short_answer": "Why Questions",
+    "equation": "Solve the equations and show your steps.",
+    "word_problem": "Solve the word problems and show your steps.",
     "essay": "Essay",
 }
 
@@ -36,8 +33,11 @@ EXPORT_TYPE_LABELS_BY_LANG = {
         "mcq": "أسئلة الاختيار من متعدد",
         "fill_in_the_blank": "أكمل الفراغ",
         "true_false": "صح / خطأ",
-        "short_answer": "سؤال قصير",
-        "essay": "مقالي",
+        "definition": "تعريف",
+        "short_answer": "علل",
+        "equation": "حل المعادلات وأظهر خطواتك.",
+        "word_problem": "حل المسائل الكلامية وأظهر خطواتك.",
+        "essay": "مقال",
     },
 }
 
@@ -73,11 +73,16 @@ HEADER_LABELS_BY_LANG = {
 def export_type_label(qtype: str, language: str = "en") -> str:
     return EXPORT_TYPE_LABELS_BY_LANG.get(language, EXPORT_TYPE_LABELS).get(qtype, qtype)
 
-TEACHER_ONLY_FIELDS = ("reference_answer", "key_points", "correct_answer", "answers")
+TEACHER_ONLY_FIELDS = (
+    "reference_answer", "key_points", "correct_answer", "answers",
+    "solution_steps", "final_answer",
+)
 
 # One response-space contract shared by PDF, DOCX, and the browser preview.
 # Keeping these values here prevents the three representations from drifting.
 SHORT_ANSWER_RESPONSE_LINES = 3
+EQUATION_RESPONSE_LINES = 3
+WORD_PROBLEM_RESPONSE_LINES = 5
 ESSAY_RESPONSE_LINES = 22
 RESPONSE_LINE_TEXT = "_" * 92
 
@@ -92,7 +97,12 @@ _WINDOWS_RESERVED_NAMES = {
 
 def response_line_count(qtype: str) -> int:
     """Return the fixed number of student writing lines for an open question."""
-    return SHORT_ANSWER_RESPONSE_LINES if qtype == "short_answer" else ESSAY_RESPONSE_LINES
+    return {
+        "short_answer": SHORT_ANSWER_RESPONSE_LINES,
+        "equation": EQUATION_RESPONSE_LINES,
+        "word_problem": WORD_PROBLEM_RESPONSE_LINES,
+        "essay": ESSAY_RESPONSE_LINES,
+    }.get(qtype, 0)
 
 
 def safe_filename_part(value: object, *, max_length: int = 80) -> str:
@@ -171,6 +181,21 @@ def flatten_exam_items(questions: dict[str, Any]) -> list[dict[str, Any]]:
             elif qtype == "fill_in_the_blank":
                 item["text"] = str(q.get("question") or "")
                 item["answers"] = [str(a) for a in (q.get("answers") or []) if str(a).strip()]
+            elif qtype == "definition":
+                item["text"] = str(q.get("term") or "")
+                item["reference_answer"] = str(q.get("reference_answer") or "")
+            elif qtype == "equation":
+                item["text"] = str(q.get("equation") or "")
+                item["solution_steps"] = [
+                    str(step) for step in (q.get("solution_steps") or []) if str(step).strip()
+                ]
+                item["final_answer"] = str(q.get("final_answer") or "")
+            elif qtype == "word_problem":
+                item["text"] = str(q.get("question") or "")
+                item["solution_steps"] = [
+                    str(step) for step in (q.get("solution_steps") or []) if str(step).strip()
+                ]
+                item["final_answer"] = str(q.get("final_answer") or "")
             else:  # short_answer / essay
                 item["text"] = str(q.get("question") or "")
                 item["reference_answer"] = str(q.get("reference_answer") or "")
