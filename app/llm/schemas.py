@@ -94,6 +94,26 @@ class ShortAnswerQuestion(StrictOutputModel):
     reference_answer: str = Field(min_length=1)
 
 
+class DefinitionQuestion(StrictOutputModel):
+    slot_id: str = Field(min_length=1)
+    term: str = Field(min_length=1)
+    reference_answer: str = Field(min_length=1)
+
+
+class EquationQuestion(StrictOutputModel):
+    slot_id: str = Field(min_length=1)
+    equation: str = Field(min_length=1)
+    solution_steps: list[NonEmptyString] = Field(min_length=1)
+    final_answer: str = Field(min_length=1)
+
+
+class WordProblemQuestion(StrictOutputModel):
+    slot_id: str = Field(min_length=1)
+    question: str = Field(min_length=1)
+    solution_steps: list[NonEmptyString] = Field(min_length=1)
+    final_answer: str = Field(min_length=1)
+
+
 class EssayQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     question: str = Field(min_length=1)
@@ -144,6 +164,23 @@ class RepairShortAnswerQuestion(StrictOutputModel):
     reference_answer: str = Field(min_length=1)
 
 
+class RepairDefinitionQuestion(StrictOutputModel):
+    term: str = Field(min_length=1)
+    reference_answer: str = Field(min_length=1)
+
+
+class RepairEquationQuestion(StrictOutputModel):
+    equation: str = Field(min_length=1)
+    solution_steps: list[NonEmptyString] = Field(min_length=1)
+    final_answer: str = Field(min_length=1)
+
+
+class RepairWordProblemQuestion(StrictOutputModel):
+    question: str = Field(min_length=1)
+    solution_steps: list[NonEmptyString] = Field(min_length=1)
+    final_answer: str = Field(min_length=1)
+
+
 class RepairEssayQuestion(StrictOutputModel):
     question: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
@@ -154,7 +191,10 @@ _GENERATION_ITEMS: dict[str, type[StrictOutputModel]] = {
     "mcq": MCQQuestion,
     "true_false": TrueFalseQuestion,
     "fill_in_the_blank": FITBQuestion,
+    "definition": DefinitionQuestion,
     "short_answer": ShortAnswerQuestion,
+    "equation": EquationQuestion,
+    "word_problem": WordProblemQuestion,
     "essay": EssayQuestion,
 }
 
@@ -162,7 +202,10 @@ _REPAIR_QUESTIONS: dict[str, type[StrictOutputModel]] = {
     "mcq": RepairMCQQuestion,
     "true_false": RepairTrueFalseQuestion,
     "fill_in_the_blank": RepairFITBQuestion,
+    "definition": RepairDefinitionQuestion,
     "short_answer": RepairShortAnswerQuestion,
+    "equation": RepairEquationQuestion,
+    "word_problem": RepairWordProblemQuestion,
     "essay": RepairEssayQuestion,
 }
 

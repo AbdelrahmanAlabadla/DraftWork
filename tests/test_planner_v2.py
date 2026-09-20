@@ -26,6 +26,18 @@ def test_plan_schema_enforces_exact_counts_and_selected_chunks():
     assert chunk_rule["enum"] == ["chunk-a", "chunk-b"]
 
 
+def test_plan_schema_supports_new_question_types():
+    schema = planner.build_plan_schema(
+        [("definition", 1), ("equation", 2), ("word_problem", 1)],
+        1,
+        ["chunk-a"],
+    )
+    items = schema["properties"]["exams"]["items"]["properties"]["items"]["properties"]
+    assert set(items) == {"definition", "equation", "word_problem"}
+    assert items["definition"]["minItems"] == 1
+    assert items["equation"]["maxItems"] == 2
+
+
 def test_same_concept_with_different_ideas_is_valid():
     plans = [
         {"model_number": 1, "items": {"mcq": [_item("chunk-a", "uses labeled examples")]}},

@@ -300,7 +300,7 @@ def test_assemble_exam_continuous_numbering():
     md = exam_builder.assemble_exam(questions)
     assert "## Multiple Choice" in md
     assert "## True / False" in md
-    assert "## Short Answer" in md
+    assert "## Why Questions" in md
     assert md.index("1. mcq1") < md.index("2. mcq2") < md.index("3. tf1") < md.index("4. sa1")
 
 
@@ -308,7 +308,7 @@ def test_assemble_exam_skips_empty_types():
     md = exam_builder.assemble_exam({"mcq": [_mcq("only")], "true_false": [], "short_answer": []})
     assert "## Multiple Choice" in md
     assert "## True / False" not in md
-    assert "## Short Answer" not in md
+    assert "## Why Questions" not in md
 
 
 def test_parse_questions_rejects_structural_badness():
@@ -393,22 +393,30 @@ def test_assemble_exam_fitb_section_and_essay():
             ],
         },
         "short_answer": [{"question": "sa1", "reference_answer": "ans"}],
+        "definition": [{"term": "CPU", "reference_answer": "Central processing unit."}],
+        "equation": [{"equation": "2x + 5 = 15", "solution_steps": ["2x = 10", "x = 5"], "final_answer": "x = 5"}],
+        "word_problem": [{"question": "A car travels 120 km in 2 hours. Find its speed.", "solution_steps": ["speed = distance ÷ time", "120 ÷ 2 = 60"], "final_answer": "60 km/h"}],
         "essay": [{"question": "es1", "reference_answer": "ref", "key_points": ["kp1", "kp2"]}],
     }
     md = exam_builder.assemble_exam(questions)
     order = [
         md.index("## Multiple Choice"),
-        md.index("## True / False"),
         md.index("## Fill in the Blank"),
-        md.index("## Short Answer"),
+        md.index("## True / False"),
+        md.index("## Define"),
+        md.index("## Why Questions"),
+        md.index("## Solve the equations"),
+        md.index("## Solve the word problems"),
         md.index("## Essay"),
     ]
     assert order == sorted(order)
     assert 'class="word-bank"' in md
     assert "area · perimeter · length · width · diagonal" in md
-    assert "1. mcq1" in md and "2. tf1" in md
-    assert "3. To calculate the ________" in md and "4. A rectangle's ________" in md
-    assert "5. sa1" in md and "6. es1" in md
+    assert "1. mcq1" in md
+    assert "2. To calculate the ________" in md and "3. A rectangle's ________" in md
+    assert "4. tf1" in md and "5. CPU:" in md
+    assert "6. sa1" in md and "7. 2x + 5 = 15" in md
+    assert "8. A car travels" in md and "9. es1" in md
     assert "**Reference answer:** ref" in md
     assert "kp1" in md and "kp2" in md
 
@@ -422,6 +430,21 @@ def test_parse_questions_essay():
     assert len(parsed) == 1
     assert parsed[0]["question"] == "q"
     assert parsed[0]["key_points"] == ["a", "b", "c"]
+
+
+def test_parse_new_question_types_keep_separate_shapes():
+    definition = parse_questions(
+        "definition", '{"questions":[{"term":"Force","reference_answer":"A push or pull."}]}'
+    )
+    equation = parse_questions(
+        "equation", '{"questions":[{"equation":"2x = 8","solution_steps":["x = 4"],"final_answer":"x = 4"}]}'
+    )
+    word_problem = parse_questions(
+        "word_problem", '{"questions":[{"question":"A car travels 60 km in 2 h. Find its speed.","solution_steps":["60 ÷ 2 = 30"],"final_answer":"30 km/h"}]}'
+    )
+    assert definition[0]["term"] == "Force"
+    assert equation[0]["equation"] == "2x = 8"
+    assert word_problem[0]["question"].startswith("A car")
 
 
 def test_fitb_validation_enforces_word_bank_membership_and_distractors():

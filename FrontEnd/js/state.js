@@ -1,7 +1,10 @@
 // Shared application state (replaces former inline-script globals).
 export const state = {
-  counts: { mcq: 10, tf: 5, fitb: 5, why: 3, essay: 2 },
-  enabled: { mcq: true, tf: true, fitb: true, why: true, essay: true },
+  counts: { mcq: 10, tf: 5, fitb: 5, definition: 3, why: 3, equation: 3, word_problem: 3, essay: 2 },
+  enabled: {
+    mcq: true, tf: true, fitb: true, definition: false, why: true,
+    equation: false, word_problem: false, essay: true,
+  },
   numModels: 1,
   difficulty: "easy",
   uploadDone: false,

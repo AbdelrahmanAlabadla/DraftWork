@@ -49,7 +49,10 @@ _SUPPORTED_COUNTS = {
     "mcq": "mcq",
     "tf": "true_false",
     "fitb": "fill_in_the_blank",
+    "definition": "definition",
     "why": "short_answer",
+    "equation": "equation",
+    "word_problem": "word_problem",
     "essay": "essay",
 }
 _VALID_QTYPES = frozenset(_SUPPORTED_COUNTS.values())
@@ -79,8 +82,11 @@ class GenerateRequest(BaseModel):
     difficulty: Optional[str] = None
     mcq_count: Optional[int] = Field(default=None, ge=0)
     tf_count: Optional[int] = Field(default=None, ge=0)
-    why_count: Optional[int] = Field(default=None, ge=0)
     fitb_count: Optional[int] = Field(default=None, ge=0)
+    definition_count: Optional[int] = Field(default=None, ge=0)
+    why_count: Optional[int] = Field(default=None, ge=0)
+    equation_count: Optional[int] = Field(default=None, ge=0)
+    word_problem_count: Optional[int] = Field(default=None, ge=0)
     essay_count: Optional[int] = Field(default=None, ge=0)
     # --- Optional print/export metadata ----------------------------------
     exam_title: Optional[str] = Field(default=None, max_length=120)
@@ -365,7 +371,10 @@ def generate(body: GenerateRequest) -> dict[str, Any]:
     if not tasks:
         raise HTTPException(
             status_code=400,
-            detail="No supported question types requested. Supported: MCQ, True/False, Fill in the Blank, Short Answer, and Essay.",
+            detail=(
+                "No supported question types requested. Supported: MCQ, True/False, "
+                "Fill in the Blank, Definition, Why Questions, Equation, Word Problem, and Essay."
+            ),
         )
     if sum(count for _, count in tasks) > MAX_QUESTIONS_PER_GENERATION:
         raise HTTPException(

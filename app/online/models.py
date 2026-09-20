@@ -12,7 +12,10 @@ TYPE_LABELS = {
     "mcq": "Multiple Choice",
     "true_false": "True / False",
     "fill_in_the_blank": "Fill in the Blank",
-    "short_answer": "Short Answer",
+    "definition": "Define",
+    "short_answer": "Why Questions",
+    "equation": "Solve the equations and show your steps.",
+    "word_problem": "Solve the word problems and show your steps.",
     "essay": "Essay",
 }
 
@@ -22,8 +25,11 @@ TYPE_LABELS_BY_LANG = {
         "mcq": "اختيار من متعدد",
         "true_false": "صح / خطأ",
         "fill_in_the_blank": "أكمل الفراغ",
-        "short_answer": "سؤال قصير",
-        "essay": "مقالي",
+        "definition": "تعريف",
+        "short_answer": "علل",
+        "equation": "معادلة",
+        "word_problem": "سؤال كلامي",
+        "essay": "مقال",
     },
 }
 
@@ -43,7 +49,16 @@ def tf_answer_label(answer: str, language: str = "en") -> str:
     true_label, false_label = TRUE_FALSE_ANSWER_LABELS.get(language, ("True", "False"))
     return true_label if str(answer).lower() == "true" else false_label
 
-TYPE_ORDER = ["mcq", "true_false", "fill_in_the_blank", "short_answer", "essay"]
+TYPE_ORDER = [
+    "mcq",
+    "fill_in_the_blank",
+    "true_false",
+    "definition",
+    "short_answer",
+    "equation",
+    "word_problem",
+    "essay",
+]
 
 # Phrases that reference the source of information; questions containing any of
 # these are treated as invalid and re-generated.
@@ -149,6 +164,44 @@ def _normalize_short_answer(item: dict[str, Any]) -> dict[str, Any] | None:
     return _keep_slot_id({"question": question, "reference_answer": reference}, item)
 
 
+def _normalize_definition(item: dict[str, Any]) -> dict[str, Any] | None:
+    term = _clean_str(item.get("term"))
+    reference = _clean_str(
+        item.get("reference_answer") or item.get("definition") or item.get("answer")
+    )
+    if not term or not reference:
+        return None
+    return _keep_slot_id({"term": term, "reference_answer": reference}, item)
+
+
+def _normalize_calculation(
+    item: dict[str, Any], *, text_field: str
+) -> dict[str, Any] | None:
+    text = _clean_str(item.get(text_field))
+    raw_steps = item.get("solution_steps")
+    if isinstance(raw_steps, str):
+        raw_steps = [raw_steps]
+    steps = (
+        [_clean_str(step) for step in raw_steps if _clean_str(step)]
+        if isinstance(raw_steps, list)
+        else []
+    )
+    final_answer = _clean_str(item.get("final_answer") or item.get("answer"))
+    if not text or not steps or not final_answer:
+        return None
+    return _keep_slot_id(
+        {text_field: text, "solution_steps": steps, "final_answer": final_answer}, item
+    )
+
+
+def _normalize_equation(item: dict[str, Any]) -> dict[str, Any] | None:
+    return _normalize_calculation(item, text_field="equation")
+
+
+def _normalize_word_problem(item: dict[str, Any]) -> dict[str, Any] | None:
+    return _normalize_calculation(item, text_field="question")
+
+
 def _normalize_essay(item: dict[str, Any]) -> dict[str, Any] | None:
     question = _clean_str(item.get("question") or item.get("question_text"))
     reference = _clean_str(
@@ -192,7 +245,10 @@ def normalize_fitb_item(item: dict[str, Any]) -> dict[str, Any] | None:
 _NORMALIZERS = {
     "mcq": _normalize_mcq,
     "true_false": _normalize_true_false,
+    "definition": _normalize_definition,
     "short_answer": _normalize_short_answer,
+    "equation": _normalize_equation,
+    "word_problem": _normalize_word_problem,
     "essay": _normalize_essay,
 }
 
@@ -291,6 +347,15 @@ def render_markdown(
             key_points = q.get("key_points") or []
             for kp in key_points:
                 lines.append(f"   - {kp}")
+        elif question_type == "definition":
+            lines.append(f"{offset}. {q['term']}: ________________________________")
+            lines.append(f"   **{strings['answer']}:** {q['reference_answer']}")
+        elif question_type in {"equation", "word_problem"}:
+            text_key = "equation" if question_type == "equation" else "question"
+            lines.append(f"{offset}. {q[text_key]}")
+            for step in q.get("solution_steps") or []:
+                lines.append(f"   - {step}")
+            lines.append(f"   **{strings['answer']}:** {q['final_answer']}")
         else:
             lines.append(f"{offset}. {q['question']}")
             lines.append(f"   **{strings['answer']}:** {q['reference_answer']}")
@@ -303,4 +368,8 @@ def question_text(qtype: str, question: dict[str, Any]) -> str:
     """Return the text used for phrase-filtering/dedup of a question."""
     if qtype == "true_false":
         return str(question.get("statement") or "")
+    if qtype == "definition":
+        return str(question.get("term") or "")
+    if qtype == "equation":
+        return str(question.get("equation") or "")
     return str(question.get("question") or "")

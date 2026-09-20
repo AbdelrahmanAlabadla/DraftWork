@@ -79,10 +79,13 @@ function initGenerate() {
       document_id: state.currentDocId,
       num_models: state.numModels,
       mcq_count: state.enabled.mcq ? state.counts.mcq : 0,
-      why_count: state.enabled.why ? state.counts.why : 0,
-      essay_count: state.enabled.essay ? state.counts.essay : 0,
-      tf_count: state.enabled.tf ? state.counts.tf : 0,
       fitb_count: state.enabled.fitb ? state.counts.fitb : 0,
+      tf_count: state.enabled.tf ? state.counts.tf : 0,
+      definition_count: state.enabled.definition ? state.counts.definition : 0,
+      why_count: state.enabled.why ? state.counts.why : 0,
+      equation_count: state.enabled.equation ? state.counts.equation : 0,
+      word_problem_count: state.enabled.word_problem ? state.counts.word_problem : 0,
+      essay_count: state.enabled.essay ? state.counts.essay : 0,
       difficulty: state.difficulty,
       child_ids: [...state.selectedChildren],
       exam_title: inputValue("examTitle"),
@@ -155,7 +158,7 @@ loadSavedExam().catch(() => {
 });
 
 // Wire steppers/toggles by their card ids.
-["mcq", "tf", "fitb", "why", "essay"].forEach((key) => {
+["mcq", "fitb", "tf", "definition", "why", "equation", "word_problem", "essay"].forEach((key) => {
   const card = document.getElementById(`card-${key}`);
   if (!card) return;
   const [minus, plus] = card.querySelectorAll(".stepper button");

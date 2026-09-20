@@ -52,7 +52,10 @@ _SUPPORTED_COUNTS = {
     "mcq": "mcq",
     "tf": "true_false",
     "fitb": "fill_in_the_blank",
+    "definition": "definition",
     "why": "short_answer",
+    "equation": "equation",
+    "word_problem": "word_problem",
     "essay": "essay",
 }
 _VALID_DIFFICULTIES = {"easy", "medium", "hard", "mix"}

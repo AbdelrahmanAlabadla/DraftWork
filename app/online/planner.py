@@ -28,7 +28,10 @@ logger = get_logger("PLANNER")
 MAX_PLAN_ATTEMPTS = 3
 _TARGETED_FILL_ATTEMPTS = 2
 
-VALID_TYPES = {"mcq", "true_false", "fill_in_the_blank", "short_answer", "essay"}
+VALID_TYPES = {
+    "mcq", "true_false", "fill_in_the_blank", "definition", "short_answer",
+    "equation", "word_problem", "essay",
+}
 
 def slot_id(model_number: int, qtype: str, index: int) -> str:
     """Return the stable identity of one requested plan/generation slot."""
@@ -331,7 +334,9 @@ def plan_exams(state: ExamState) -> dict[str, Any]:
     return result
 
 
-_SLOT_RE = re.compile(r"\b(m\d+_(?:mcq|true_false|fill_in_the_blank|short_answer|essay)_\d+)\b")
+_SLOT_RE = re.compile(
+    r"\b(m\d+_(?:mcq|true_false|fill_in_the_blank|definition|short_answer|equation|word_problem|essay)_\d+)\b"
+)
 
 
 def _invalid_slot_ids(errors: list[str]) -> list[str]:
@@ -346,7 +351,7 @@ def _invalid_slot_ids(errors: list[str]) -> list[str]:
 
 def _slot_location(sid: str) -> tuple[int, str, int] | None:
     match = re.fullmatch(
-        r"m(\d+)_(mcq|true_false|fill_in_the_blank|short_answer|essay)_(\d+)", sid
+        r"m(\d+)_(mcq|true_false|fill_in_the_blank|definition|short_answer|equation|word_problem|essay)_(\d+)", sid
     )
     if not match:
         return None

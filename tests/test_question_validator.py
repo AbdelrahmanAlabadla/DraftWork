@@ -102,6 +102,29 @@ def _sa(qid, question="Why is peer review important?",
     return {"question_id": qid, "question": question, "reference_answer": ref}
 
 
+def _definition(qid, term="Force", ref="A push or pull acting on an object."):
+    return {"question_id": qid, "term": term, "reference_answer": ref}
+
+
+def _equation(qid, equation="2x + 5 = 15", steps=None, final="x = 5"):
+    return {
+        "question_id": qid,
+        "equation": equation,
+        "solution_steps": steps or ["2x = 10", "x = 5"],
+        "final_answer": final,
+    }
+
+
+def _word_problem(qid, question="A car travels 120 km in 2 hours. Find its speed.",
+                  steps=None, final="60 km/h"):
+    return {
+        "question_id": qid,
+        "question": question,
+        "solution_steps": steps or ["speed = distance ÷ time", "120 ÷ 2 = 60"],
+        "final_answer": final,
+    }
+
+
 def _essay(qid, question="Compare precision and recall.", ref="A full reference answer.",
            key_points=None):
     return {"question_id": qid, "question": question, "reference_answer": ref,
@@ -421,6 +444,53 @@ def test_valid_writing_question_unchanged():
     report = validate_exam(exam, client=fake)
     assert report["all_pass"]
     assert exam["questions"]["short_answer"][0] is q
+
+
+def test_definition_instruction_in_term_is_rejected_locally():
+    exam = _exam({"definition": [_definition("model1_definition_1", term="Define force")]})
+    report = validate_exam(exam, client=FakeClient())
+    verdict = report["verdicts"][0]
+    assert verdict["action"] == "FIX_QUESTION"
+    assert verdict["fields_to_fix"] == ["term"]
+
+
+def test_equation_missing_steps_is_rejected_locally():
+    question = _equation("model1_equation_1")
+    question["solution_steps"] = []
+    exam = _exam({"equation": [question]})
+    report = validate_exam(exam, client=FakeClient())
+    assert report["verdicts"][0]["action"] == "FIX_ANSWER"
+
+
+def test_equation_narrative_is_rejected_locally():
+    question = _equation(
+        "model1_equation_1",
+        equation="A 4 kg object is raised 7 m. Using g = 10 N/kg, find the gravitational potential energy gained.",
+    )
+    report = validate_exam(_exam({"equation": [question]}), client=FakeClient())
+    verdict = report["verdicts"][0]
+    assert verdict["action"] == "FIX_QUESTION"
+    assert verdict["fields_to_fix"] == ["equation"]
+
+
+def test_direct_physics_equation_is_allowed_locally():
+    question = _equation(
+        "model1_equation_1",
+        equation="F = ma; m = 6 kg; a = 3 m/s²",
+        steps=["F = 6 × 3", "F = 18 N"],
+        final="18 N",
+    )
+    fake = FakeClient(validator_result=[_pass_verdict(question["question_id"])])
+    report = validate_exam(_exam({"equation": [question]}), client=fake)
+    assert report["all_pass"] is True
+
+
+def test_word_problem_is_sent_as_its_own_validator_type():
+    question = _word_problem("model1_word_problem_1")
+    fake = FakeClient(validator_result=[_pass_verdict(question["question_id"])])
+    report = validate_exam(_exam({"word_problem": [question]}), client=fake)
+    assert report["all_pass"] is True
+    assert '"question_type": "word_problem"' in fake.last_validator_prompt
 
 
 def test_missing_answer_detected_locally():
