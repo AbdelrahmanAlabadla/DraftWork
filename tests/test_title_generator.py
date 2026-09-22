@@ -185,9 +185,9 @@ def test_generate_title_rejects_question_form_and_retries():
 def test_section_prompt_has_toc_editor_framing():
     p = tg._SECTION_TITLE_PROMPT
     assert "Table of Contents" in p
-    assert "ONE main concept" in p
+    assert "dominant subject" in p
     assert "grouped together in the textbook" in p
-    assert "what would this section be called?" in p
+    assert "broader lesson" in p
     assert "Machine Learning Applications" in p
     assert "chapter" not in p
 
@@ -195,7 +195,7 @@ def test_section_prompt_has_toc_editor_framing():
 def test_subsection_prompt_is_focused_on_single_lesson():
     p = tg._SUBSECTION_TITLE_PROMPT
     assert "Table of Contents" in p
-    assert "ONE main concept" in p
+    assert "dominant subject" in p
     assert "single focused lesson" in p
     assert "what would this subsection be called?" in p
     assert "Regression vs Classification" in p
@@ -204,7 +204,8 @@ def test_subsection_prompt_is_focused_on_single_lesson():
 
 def test_prompts_share_style_abstraction_and_self_check():
     for p in (tg._SECTION_TITLE_PROMPT, tg._SUBSECTION_TITLE_PROMPT):
-        assert "2 to 6 words" in p
+        assert "4 to 12 words" in p
+        assert "BOOK HEADING" in p
         assert "Image Classification" in p
         assert "Cardiovascular Diseases" in p
         assert "Email Spam Filtering" in p
@@ -355,6 +356,90 @@ def test_generate_family_batch_titles_one_call_mixed_levels():
     assert "[SUBSECTION]" in client.calls[0]
 
 
+def test_family_prompt_includes_book_heading_and_representative_context():
+    words = [f"w{i}" for i in range(400)]
+    client = _FakeClient(lambda p: "1. Sensory Receptor Signal Transmission")
+    tg.generate_family_batch_titles(
+        [("section", " ".join(words), "المستقبلات الحسية")], client
+    )
+    prompt = client.calls[0]
+    assert "BOOK HEADING: المستقبلات الحسية" in prompt
+    assert "[BEGINNING]" in prompt
+    assert "[MIDDLE]" in prompt
+    assert "[END]" in prompt
+    assert "w399" in prompt
+
+
+def test_rejects_arabic_heading_copy_and_weak_category(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    content = " ".join(
+        ["تشرح المستقبلات الحسية اكتشاف المؤثرات ونقل الإشارات العصبية"] * 20
+    )
+    assert not tg.is_acceptable_title(
+        "المستقبلات الحسية", content, "section", set(), "المستقبلات الحسية"
+    )
+    assert tg.is_acceptable_title(
+        "دور المستقبلات الحسية في اكتشاف المؤثرات",
+        content,
+        "section",
+        set(),
+        "المستقبلات الحسية",
+    )
+    body_systems = "أجهزة الجسم تحافظ على الاتزان الداخلي عبر الجهاز العصبي والغدد الصماء " * 15
+    assert not tg.is_acceptable_title(
+        "أجهزة الجسم والاتزان الداخلي",
+        body_systems,
+        "section",
+        set(),
+        "القسم 1 أجهزة الجسم والإيزات الداخلي",
+    )
+
+
+def test_accepts_short_arabic_title_when_it_is_descriptive(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    content = "يشرح انتقال السيال العصبي عبر محور الخلية العصبية إلى الخلايا المجاورة " * 15
+    assert tg.is_acceptable_title(
+        "انتقال السيال العصبي", content, "subsection", set()
+    )
+
+
+def test_accepts_matching_book_heading_when_already_descriptive(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    mechanisms = "تشرح آلية عمل العقاقير ارتباط الدواء بالمستقبلات وتأثيره في الخلايا " * 15
+    assert tg.is_acceptable_title(
+        "آلية عمل العقاقير",
+        mechanisms,
+        "section",
+        set(),
+        "آلية عمل العقاقير",
+    )
+    structure = "يشرح تركيب الجهاز العصبي وأجزاءه ووظيفة كل جزء في نقل الإشارات " * 15
+    assert tg.is_acceptable_title(
+        "تركيب الجهاز العصبي",
+        structure,
+        "section",
+        set(),
+        "تركيب الجهاز العصبي",
+    )
+
+
+def test_arabic_title_rejects_comma_and_unsupported_invention(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    content = "تشرح الخلايا العصبية انتقال السيال العصبي عبر المحور " * 20
+    assert not tg.validate_title("يعمل الجهاز الهضمي، المتين", 2, 15)
+    assert not tg.is_acceptable_title(
+        "المستشفيات والمعاهد الطبية الحديثة", content, "subsection", set()
+    )
+
+
+def test_descriptive_fallback_is_grounded_and_nonempty():
+    content = "الجهاز العصبي ينقل الإشارات. جهاز الغدد الصماء يفرز الهرمونات. " * 10
+    title = tg.descriptive_fallback(content, "أجهزة الجسم", 6)
+    assert title
+    assert "أجهزة الجسم" in title
+    assert title != "أجهزة الجسم"
+
+
 def test_generate_family_batch_titles_blank_on_invalid(monkeypatch):
     monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
     client = _FakeClient(
@@ -417,6 +502,21 @@ def test_regenerate_title_avoids_used_title(monkeypatch):
         used_titles={"Robust Regression"},
     )
     assert out == "Outlier Handling"
+
+
+def test_regenerate_title_can_keep_descriptive_book_heading(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    heading = "آلية عمل العقاقير"
+    content = "تشرح آلية عمل العقاقير ارتباط الدواء بالمستقبلات وتأثيره في الخلايا " * 15
+    client = _FakeClient(lambda p: heading)
+    out = tg.regenerate_title(
+        client,
+        content=content,
+        level="section",
+        reject=["عنوان ضعيف"],
+        book_heading=heading,
+    )
+    assert out == heading
 
 
 def test_safe_fallback_rejects_single_word_stub():

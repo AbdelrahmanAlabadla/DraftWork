@@ -401,18 +401,19 @@ TITLE_BATCH_SIZE: int = int(_env("TITLE_BATCH_SIZE", "4") or "4")
 
 # How many of the most recent accepted titles are shown to the LLM in each
 # family-batch call so it avoids reusing a heading seen just before.
-TITLE_CONTEXT_RECENT: int = int(_env("TITLE_CONTEXT_RECENT", "4") or "4")
+TITLE_CONTEXT_RECENT: int = int(_env("TITLE_CONTEXT_RECENT", "12") or "12")
 
-# Navigation-label word bounds: sections and subsections 2-5 words.
+# Descriptive navigation-label bounds. Prompts prefer 4-12 words while 15 is
+# retained as an absolute guard against sentence-length output.
 SECTION_TITLE_MIN_WORDS: int = int(_env("SECTION_TITLE_MIN_WORDS", "2") or "2")
 SECTION_TITLE_MAX_WORDS: int = int(_env("SECTION_TITLE_MAX_WORDS", "15") or "15")
 SUBSECTION_TITLE_MIN_WORDS: int = int(_env("SUBSECTION_TITLE_MIN_WORDS", "2") or "2")
 SUBSECTION_TITLE_MAX_WORDS: int = int(_env("SUBSECTION_TITLE_MAX_WORDS", "15") or "15")
 
 # Fallback (safety-net) label caps.
-FALLBACK_SECTION_MAX_WORDS: int = int(_env("FALLBACK_SECTION_MAX_WORDS", "6") or "6")
+FALLBACK_SECTION_MAX_WORDS: int = int(_env("FALLBACK_SECTION_MAX_WORDS", "12") or "12")
 FALLBACK_SUBSECTION_MAX_WORDS: int = int(
-    _env("FALLBACK_SUBSECTION_MAX_WORDS", "6") or "6"
+    _env("FALLBACK_SUBSECTION_MAX_WORDS", "12") or "12"
 )
 
 # Generic filler headings that never make a usable navigation header. A title
