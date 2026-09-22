@@ -104,6 +104,7 @@ def test_clerk_session_claim_preserves_exam_across_session_deletion():
             sha256="1" * 64,
             source_storage_key="integration/claimed.pdf",
         )
+        repositories.claim_job(str(job["id"]), "integration-worker")
         repositories.complete_generation_job(
             str(job["id"]),
             exam_id=exam_id,

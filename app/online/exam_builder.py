@@ -1421,6 +1421,7 @@ def generate_exams(
     *,
     session_id: str | None = None,
     index_job_id: str | None = None,
+    progress_callback=None,
 ) -> dict[str, Any]:
     """Generate ``num_models`` complete, distinct exam versions.
 
@@ -1453,6 +1454,7 @@ def generate_exams(
         "eval_stats": create_pipeline_eval(tasks, num_models),
         "warnings": [],
         "error": None,
+        "progress_callback": progress_callback,
     }
     result = get_exam_graph().invoke(initial)
 

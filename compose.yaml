@@ -16,7 +16,6 @@ services:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/draftwork
       CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
       STORAGE_BACKEND: local
       LOCAL_STORAGE_ROOT: data/storage
       LMS_URL: http://host.docker.internal:1234
@@ -48,7 +47,7 @@ services:
       context: .
     container_name: genexam-worker
     init: true
-    command: ["celery", "-A", "app.jobs.celery_app:celery_app", "worker", "--beat", "--loglevel=INFO", "--pool=solo", "--concurrency=1"]
+    command: ["celery", "-A", "app.jobs.celery_app:celery_app", "worker", "--beat", "--loglevel=INFO", "--pool=prefork", "--concurrency=1"]
     healthcheck:
       test: ["CMD", "python", "-c", "import os, psutil, sys; alive = any(p.pid != os.getpid() and 'celery' in ' '.join(p.info.get('cmdline') or []) and 'worker' in (p.info.get('cmdline') or []) for p in psutil.process_iter(['cmdline'])); sys.exit(0 if alive else 1)"]
       interval: 30s
@@ -62,7 +61,6 @@ services:
       QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/draftwork
       CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/1
       STORAGE_BACKEND: local
       LOCAL_STORAGE_ROOT: data/storage
       LMS_URL: http://host.docker.internal:1234

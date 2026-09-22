@@ -13,7 +13,10 @@ from app.logging_conf import get_logger
 
 logger = get_logger("EMBEDDING")
 
-_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# CUDA capability must be checked inside the Celery task child. Checking it
+# while the prefork worker imports modules initializes CUDA in the parent and
+# makes PyTorch reject GPU use after fork.
+_DEVICE: str | None = None
 
 _model = None
 _model_lock = threading.Lock()
@@ -26,6 +29,13 @@ _EMBED_BATCH_SIZE = 64
 
 
 def device_name() -> str:
+    return _get_device()
+
+
+def _get_device() -> str:
+    global _DEVICE
+    if _DEVICE is None:
+        _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     return _DEVICE
 
 
@@ -103,6 +113,7 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
 def get_model() -> Any:
     """Lazily load the BGE-M3 model once (on GPU with fp16 when available)."""
     global _model
+    device = _get_device()
     if _model is None:
         with _model_lock:
             if _model is None:
@@ -112,13 +123,13 @@ def get_model() -> Any:
                 logger.info(
                     "Loading embedding model | model=%s | device=%s | fp16=%s",
                     EMBEDDING_MODEL,
-                    _DEVICE,
-                    _DEVICE == "cuda",
+                    device,
+                    device == "cuda",
                 )
                 _model = BGEM3FlagModel(
                     EMBEDDING_MODEL,
-                    use_fp16=(_DEVICE == "cuda"),
-                    device=_DEVICE,
+                    use_fp16=(device == "cuda"),
+                    device=device,
                 )
                 logger.info(
                     "Embedding model loaded | time=%.2fs", time.perf_counter() - t0

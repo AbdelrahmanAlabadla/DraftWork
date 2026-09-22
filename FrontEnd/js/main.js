@@ -1,8 +1,9 @@
 import {
-  beginIdempotentOperation, completeIdempotentOperation, getJSON, postJSON, waitForJob,
+  JobCancelledError, beginIdempotentOperation, completeIdempotentOperation,
+  deleteJSON, getJSON, postJSON, waitForJob,
 } from "./api.js";
 import { state } from "./state.js";
-import { initI18n, t } from "./i18n.js";
+import { examStageLabel, initI18n, localizedError, t } from "./i18n.js";
 import { initUpload } from "./upload.js";
 import { initSettings } from "./settings.js";
 import { initTopics } from "./topics.js";
@@ -25,15 +26,15 @@ function fileToDataUrl(inputId) {
   const file = document.getElementById(inputId)?.files?.[0];
   if (!file) return Promise.resolve("");
   if (file.size > 2_000_000) {
-    return Promise.reject(new Error("Each logo must be smaller than 2 MB."));
+    return Promise.reject(new Error(t("status.logo_size")));
   }
   if (!/^image\/(png|jpeg|webp)$/.test(file.type)) {
-    return Promise.reject(new Error("Logos must be PNG, JPEG, or WebP images."));
+    return Promise.reject(new Error(t("status.logo_type")));
   }
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () => resolve(String(reader.result || ""));
-    reader.onerror = () => reject(new Error("A logo could not be read."));
+    reader.onerror = () => reject(new Error(t("status.logo_read")));
     reader.readAsDataURL(file);
   });
 }
@@ -44,8 +45,57 @@ function renderGeneratedExam(data) {
 
 function initGenerate() {
   const btn = document.getElementById("generateBtn");
+  const stopBtn = document.getElementById("stopGenerationBtn");
   const genStatus = document.getElementById("genStatus");
   const examOutput = document.getElementById("examOutput");
+  let cancellationRequested = false;
+  let generationCompleted = false;
+
+  function renderGenerationProgress(stage, progress) {
+    genStatus.dataset.stage = stage;
+    genStatus.dataset.progress = String(progress);
+    const message = document.getElementById("genStatusMsg");
+    if (message) message.textContent = t("status.exam_progress", {
+      stage: examStageLabel(stage), progress,
+    });
+  }
+
+  document.addEventListener("draftwork:language-changed", () => {
+    if (genStatus.dataset.stage) {
+      renderGenerationProgress(
+        genStatus.dataset.stage,
+        Number(genStatus.dataset.progress || 0)
+      );
+    }
+  });
+
+  async function cancelGenerationJob() {
+    if (!state.generationJobId) return;
+    try {
+      const result = await deleteJSON(`/jobs/${state.generationJobId}`);
+      if (!result.ok) {
+        cancellationRequested = false;
+        stopBtn.disabled = false;
+        stopBtn.textContent = t("gen.stop");
+        alert(localizedError(result.data.detail, "status.cancel_failed"));
+      }
+    } catch (error) {
+      cancellationRequested = false;
+      stopBtn.disabled = false;
+      stopBtn.textContent = t("gen.stop");
+      alert(localizedError(error.message, "status.cancel_failed"));
+    }
+  }
+
+  stopBtn.addEventListener("click", async () => {
+    if (cancellationRequested) return;
+    cancellationRequested = true;
+    stopBtn.disabled = true;
+    stopBtn.textContent = t("gen.stopping");
+    const message = document.getElementById("genStatusMsg");
+    if (message) message.textContent = t("gen.stopping");
+    await cancelGenerationJob();
+  });
 
   btn.addEventListener("click", async () => {
     if (!state.uploadDone) {
@@ -58,7 +108,15 @@ function initGenerate() {
     }
 
     btn.disabled = true;
+    cancellationRequested = false;
+    generationCompleted = false;
+    state.generationJobId = null;
     genStatus.classList.add("show");
+    genStatus.classList.remove("complete");
+    renderGenerationProgress("analyzing_request", 5);
+    stopBtn.classList.add("show");
+    stopBtn.disabled = false;
+    stopBtn.textContent = t("gen.stop");
     examOutput.classList.remove("show");
 
     let leftLogoData = "";
@@ -72,6 +130,7 @@ function initGenerate() {
       alert(error.message);
       btn.disabled = false;
       genStatus.classList.remove("show");
+      stopBtn.classList.remove("show");
       return;
     }
 
@@ -107,16 +166,22 @@ function initGenerate() {
       if (ok && data.job_id) {
         completeIdempotentOperation(operation);
         state.generationJobId = data.job_id;
+        if (cancellationRequested) await cancelGenerationJob();
         const job = await waitForJob(data.job_id, (current) => {
-          genStatus.dataset.stage = current.stage;
+          renderGenerationProgress(current.stage, current.progress);
         });
         const examId = job.result?.exam_id;
         const examResponse = await getJSON(`/exams/${examId}`);
         if (!examResponse.ok) {
-          throw new Error(examResponse.data.detail || "Could not load the generated exam.");
+          throw new Error(localizedError(
+            examResponse.data.detail, "status.load_exam_failed"
+          ));
         }
         state.examId = examId;
         renderGeneratedExam(examResponse.data);
+        generationCompleted = true;
+        genStatus.classList.add("complete");
+        renderGenerationProgress("completed", 100);
         // Let an already-open Eval Dashboard refresh immediately. The
         // dashboard still polls independently, so this is only a fast path.
         try {
@@ -126,13 +191,20 @@ function initGenerate() {
         }
       } else {
         if (status < 500) completeIdempotentOperation(operation);
-        alert(`Generation failed: ${data.detail || "Unknown error"}`);
+        alert(t("status.generation_failed", {
+          detail: localizedError(data.detail, "status.unknown_error"),
+        }));
       }
     } catch (e) {
-      alert(e.message || "Cannot reach server. Is FastAPI running?");
+      if (!(cancellationRequested || e instanceof JobCancelledError)) {
+        alert(localizedError(e.message, "status.fastapi_unreachable"));
+      }
     } finally {
+      state.generationJobId = null;
       btn.disabled = false;
-      genStatus.classList.remove("show");
+      if (!generationCompleted) genStatus.classList.remove("show");
+      stopBtn.classList.remove("show");
+      stopBtn.disabled = false;
     }
   });
 }

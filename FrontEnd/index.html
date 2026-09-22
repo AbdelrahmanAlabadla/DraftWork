@@ -33,7 +33,7 @@
     <div class="file-pill" id="filePill">
       <span>📎</span>
       <span class="fname" id="fileName"></span>
-      <span class="remove" id="removeFile">×</span>
+      <button type="button" class="remove" id="removeFile" data-i18n-aria="upload.stop" aria-label="Stop document processing">×</button>
     </div>
     <div class="status-bar" id="uploadStatus">
       <div class="spinner" id="uploadSpinner"></div>
@@ -228,7 +228,8 @@
     </div>
 
     <div class="gen-status" id="genStatus">
-      <div class="gen-spinner"></div><span data-i18n="gen.status">Generating exam — this may take a moment...</span>
+      <div class="gen-spinner"></div><span id="genStatusMsg">Generating exam — this may take a moment...</span>
+      <button type="button" class="stop-generation-btn" id="stopGenerationBtn" data-i18n="gen.stop">Stop generation</button>
     </div>
     <button class="generate-btn" id="generateBtn" data-i18n="gen.button">Generate Exam →</button>
 
@@ -259,17 +260,20 @@
     <form method="dialog" class="export-model-card">
       <div class="export-model-heading">
         <div>
-          <div class="section-label">Export</div>
-          <h3 id="exportModelTitle">Select models to export</h3>
+          <div class="section-label" data-i18n="export.dialog_label">Export</div>
+          <h3 id="exportModelTitle" data-i18n="export.dialog_title">Select models to export</h3>
         </div>
-        <button class="export-model-close" value="cancel" aria-label="Close">&times;</button>
+        <button class="export-model-close" value="cancel" aria-label="Close" data-i18n-aria="common.close">&times;</button>
+      </div>
+      <div class="export-model-toolbar">
+        <button class="select-all-btn" id="exportModelToggleAll" type="button" data-i18n="export.select_all">Select all</button>
       </div>
       <div class="export-model-list" id="exportModelList"></div>
       <div class="export-model-error" id="exportModelError" role="alert"></div>
-      <p class="export-model-note">An answer file is automatically included with every selected model.</p>
+      <p class="export-model-note" data-i18n="export.dialog_note">An answer file is automatically included with every selected model.</p>
       <div class="export-model-actions">
-        <button class="copy-btn" value="cancel">Cancel</button>
-        <button class="generate-btn export-model-confirm" id="exportModelConfirm" type="button">Export selected</button>
+        <button class="copy-btn" value="cancel" data-i18n="export.cancel">Cancel</button>
+        <button class="generate-btn export-model-confirm" id="exportModelConfirm" type="button" data-i18n="export.confirm">Export selected</button>
       </div>
     </form>
   </dialog>
@@ -278,16 +282,18 @@
     <section class="my-exams-dialog-card">
       <header class="my-exams-dialog-heading">
         <div>
-          <div class="section-label">Your account</div>
-          <h2 id="myExamsTitle">My Exams</h2>
-          <p>Open a saved exam directly in the preview.</p>
+          <div class="section-label" data-i18n="saved.account">Your account</div>
+          <h2 id="myExamsTitle" data-i18n="saved.title">My Exams</h2>
+          <p data-i18n="saved.intro">Open a saved exam directly in the preview.</p>
         </div>
-        <button class="my-exams-dialog-close" id="myExamsClose" type="button" aria-label="Close">&times;</button>
+        <button class="my-exams-dialog-close" id="myExamsClose" type="button" aria-label="Close" data-i18n-aria="common.close">&times;</button>
       </header>
       <div class="my-exams-dialog-list" id="myExamsList" aria-live="polite"></div>
       <p class="my-exams-dialog-status" id="myExamsStatus" role="status"></p>
     </section>
   </dialog>
+
+  <div class="copy-toast" id="copyToast" role="status" aria-live="polite"></div>
 
   <script type="module" src="js/main.js"></script>
   <script>

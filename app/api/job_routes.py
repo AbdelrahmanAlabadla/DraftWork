@@ -413,6 +413,36 @@ def get_job(
     }
 
 
+@router.delete("/jobs/{job_id}")
+def cancel_job(
+    job_id: uuid.UUID,
+    session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
+) -> dict[str, Any]:
+    try:
+        owned_job = _job_for_actor(str(job_id), session_id, user_id)
+        job = repositories.cancel_job(str(owned_job["id"]))
+    except repositories.ResourceNotFound as exc:
+        raise _http_not_found(exc)
+
+    if job["status"] == "cancelled":
+        # With a process-based Celery pool this terminates the active task child.
+        # A queued/redelivered message is also harmless because claim_job only
+        # accepts queued or retrying database jobs.
+        job_service.terminate_job(
+            str(job_id),
+            document_id=str(job["document_id"]) if job.get("document_id") else None,
+            session_id=str(job["session_id"]),
+            cleanup_document=job["type"] == "document_ingestion",
+        )
+    return {
+        "job_id": str(job["id"]),
+        "document_id": str(job["document_id"]) if job.get("document_id") else None,
+        "status": job["status"],
+        "stage": job["stage"],
+    }
+
+
 @router.get("/exams/{exam_id}")
 def get_exam(
     exam_id: str,
