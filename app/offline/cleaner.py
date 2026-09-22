@@ -480,6 +480,7 @@ def clean_pages_with_stats(
     repeated = _detect_headers_footers(pages)
     cleaned_pages: list[dict[str, Any]] = []
     seen_paragraphs: set[str] = set()
+    seen_headings_on_page: set[tuple[int | None, str]] = set()
 
     for page in pages:
         items_out: list[dict[str, Any]] = []
@@ -494,9 +495,19 @@ def clean_pages_with_stats(
 
             # Structural headings are almost never junk: keep them clean.
             if kind == "heading":
-                if base and base not in seen_paragraphs:
+                box = item.get("bBox")
+                layout_label = (
+                    str(box.get("label") or "").lower()
+                    if isinstance(box, dict)
+                    else ""
+                )
+                heading_key = (page_number(page), base)
+                if layout_label in {"footer", "page_number"}:
+                    stats.paragraphs_removed += 1
+                    stats.by_category[CATEGORY_HEADER_FOOTER] += 1
+                elif base and heading_key not in seen_headings_on_page:
                     items_out.append(_fresh_item(item, base))
-                    seen_paragraphs.add(base)
+                    seen_headings_on_page.add(heading_key)
                 elif base:
                     stats.paragraphs_removed += 1
                     stats.duplicates_removed += 1
