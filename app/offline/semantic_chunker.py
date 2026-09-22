@@ -27,6 +27,7 @@ from app.config import (
     FALLBACK_SUBSECTION_MAX_WORDS,
 )
 from app.logging_conf import get_logger
+from app.language import arabic_comparison_key, detect_language
 from app.offline.embeddings import cosine_sim, dense_vector, device_name
 from app.offline.parser_items import item_text, item_type, page_items, page_number
 from app.offline.title_generator import (
@@ -61,6 +62,13 @@ _FIGURE_REF_RE = re.compile(
 _MASK = "\x00"
 
 
+def _resolved_chunk_language(content: str, document_language: str | None) -> str:
+    letters = re.findall(rf"[A-Za-z{_ARABIC_LETTER}]", content or "")
+    if len(letters) < 12 and document_language in {"ar", "en"}:
+        return document_language
+    return detect_language(content)
+
+
 def count_words(text: str) -> int:
     return len([w for w in text.split() if w.strip()])
 
@@ -74,6 +82,11 @@ class Paragraph:
     order: int = 0
     role: str = "content"
     strong_boundary: bool = False
+    parser_item_type: str | None = None
+    heading_score: int | None = None
+    heading_decision: str | None = None
+    heading_reasons: tuple[str, ...] = ()
+    atomic_id: str | None = None
 
 
 @dataclass
@@ -82,6 +95,7 @@ class Sentence:
     page: int | None = None
     item_type: str = "text"
     heading_level: int | None = None
+    atomic_id: str | None = None
 
 
 @dataclass
@@ -97,6 +111,7 @@ class ParentChunk:
     content_role: str = "content"
     source_items: list[Paragraph] | None = None
     protected_boundary: bool = False
+    language: str | None = None
 
 
 @dataclass
@@ -112,15 +127,10 @@ class ChildChunk:
     heading_level: int | None = None
     content_role: str = "content"
     source_items: list[Paragraph] | None = None
+    language: str | None = None
 
 
 _ARABIC_LETTER = r"\u0621-\u064A\u066E-\u06D3\u06FA-\u06FF"
-_MAJOR_HEADING_RE = re.compile(
-    r"^\s*(?:الوحدة|القسم|الفصل|الباب|الدرس|chapter|section|unit|lesson|part)\b"
-    r"|^\s*[\d٠-٩]+\s*(?:الوحدة|القسم|الفصل|الباب)\b"
-    r"|^\s*(?:دليل\s+الدراسة|التقويم|التقييم|مراجعة\s+(?:الوحدة|الفصل))\b",
-    re.IGNORECASE,
-)
 _SPECIAL_ROLE_RE = re.compile(
     r"^\s*(?:تمرين|تمارين|نشاط|أنشطة|تجربة|اختبر|"
     r"(?:(?:الوحدة|الفصل|القسم)\s*[\d٠-٩]*\s*)?(?:تقويم|تقييم|مراجعة)|"
@@ -130,15 +140,50 @@ _SPECIAL_ROLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_PARENT_MARKER_RE = re.compile(
+    r"^\s*(?:(?:فصل\s*[\d٠-٩]*\s*[:.-]?\s*)?(?:الدرس|درس)\s*[\d٠-٩]+|"
+    r"(?:الوحدة|القسم|الفصل|الباب)\s*[\d٠-٩]+|"
+    r"[\d٠-٩]+[\s:.-]*(?:الوحدة|القسم|الفصل|الباب|الدرس|درس)|"
+    r"(?:chapter|section|unit|lesson|part)\s*\d+)\b",
+    re.IGNORECASE,
+)
+_SECTION_NUMBER_RE = re.compile(
+    r"^\s*(?:(?:أولاً|أولًا|ثانياً|ثانيًا|ثالثاً|ثالثًا|رابعاً|رابعًا|خامساً|خامسًا|"
+    r"سادساً|سادسًا|سابعاً|سابعًا|ثامناً|ثامنًا|تاسعاً|تاسعًا)\s*[:.)-]|"
+    r"\d+(?:\.\d+)*\s*[:.)-]\s*\S)",
+    re.IGNORECASE,
+)
+_QUOTE_INTRO_RE = re.compile(
+    r"^\s*(?:قال|يقول|عن\s+\S+|روي\s+عن|رُوي\s+عن|ورد\s+في|نص(?:ت|تّ)|"
+    r"according\s+to|said|states?|the\s+(?:law|author|poet)\s+(?:says|states?))\b.*[:：]\s*$",
+    re.IGNORECASE,
+)
+_ATTRIBUTION_RE = re.compile(
+    r"^\s*(?:عن\s+.{1,80}(?:قال|رضي\s+الله\s+عنه)|رواه\s+\S+|"
+    r"according\s+to\s+.{1,80}|(?:written|said)\s+by\s+.{1,80})\s*[:：]?\s*$",
+    re.IGNORECASE,
+)
+_CITATION_RE = re.compile(
+    r"^\s*[\[({（]?\s*(?:[\d٠-٩]+\s*)?(?:[\u0600-\u06ffA-Za-z][\u0600-\u06ffA-Za-z\s.-]{0,35})?"
+    r"\s*[\d٠-٩:.,-]*\s*[\])}）]?\s*$"
+)
+_INSTRUCTION_RE = re.compile(
+    r"^\s*(?:أبادر|ابادر|أتعلم|اتعلم|نتعلم|أتأمل|اتأمل|أفكر|افكر|أجيب|اجيب|أكمل|اكمل|"
+    r"أنظم|انظم|أنشط|انشط|أقيم|اقيم|أقيّم|أضع|اضع|أقرأ|اقرأ|أتلو|اتلو|"
+    r"أبحث|ابحث|أستنتج|استنتج|أتعاون|اتعاون|ألاحظ|الاحظ|اقترح|حدد|أحدد|"
+    r"ناقش|أناقش|قارن|أقارن|اربط|أربط|اكتب|أكتب|اشرح|أشرح|استخدم|أستخدم|"
+    r"أفهم|افهم|إضاءات|اضاءات|أثري|اثري|تقييم\s+ذاتي|التقييم\s+الذاتي|"
+    r"read|answer|complete|discuss|compare|explain|identify|choose|activity|exercise)\b",
+    re.IGNORECASE,
+)
+_QUOTE_MARK_RE = re.compile(r"[«»“”„‟\"﴿﴾]")
+_HTML_OR_BROKEN_RE = re.compile(r"<[^>]+>|[\[\]{}<>]|�")
+_TERMINAL_SENTENCE_RE = re.compile(r"[.!?؟؛]\s*$")
+
 
 def _heading_level(item: dict[str, Any]) -> int | None:
     value = item.get("lvl", item.get("level"))
     return value if isinstance(value, int) and value > 0 else None
-
-
-def _layout_label(item: dict[str, Any]) -> str:
-    box = item.get("bBox")
-    return str(box.get("label") or "").lower() if isinstance(box, dict) else ""
 
 
 def _content_role(text: str, kind: str) -> str:
@@ -149,16 +194,218 @@ def _content_role(text: str, kind: str) -> str:
     return "content"
 
 
-def _is_strong_heading(item: dict[str, Any], text: str) -> bool:
-    """Return whether a parser heading is a reliable structural boundary."""
-    if item_type(item) != "heading":
+def _candidate_metadata(item: dict[str, Any]) -> tuple[float | None, bool, float | None]:
+    box = item.get("bBox")
+    confidence = None
+    height = None
+    if isinstance(box, dict):
+        raw_confidence = box.get("confidence")
+        confidence = float(raw_confidence) if isinstance(raw_confidence, (int, float)) else None
+        raw_height = box.get("h")
+        height = float(raw_height) if isinstance(raw_height, (int, float)) else None
+    markdown = str(item.get("md") or "")
+    emphasized = "**" in markdown or "<b>" in markdown.lower() or "<u>" in markdown.lower()
+    return confidence, emphasized, height
+
+
+def _looks_like_citation(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped or count_words(stripped) > 8:
         return False
-    if _MAJOR_HEADING_RE.search(text):
+    if re.fullmatch(r"[\[({（].{1,50}[\])}）]", stripped):
         return True
-    label = _layout_label(item)
-    if label in {"footer", "page_number"}:
+    if re.search(r"[\d٠-٩]+\s*[:،,.-]\s*[\d٠-٩]+", stripped):
+        return True
+    # A tiny bracket-damaged reference such as "[6 المائدة".
+    return bool(
+        _CITATION_RE.fullmatch(stripped)
+        and re.search(r"[\[\](){}]|[\d٠-٩]", stripped)
+        and count_words(stripped) <= 4
+    )
+
+
+def _looks_ocr_corrupted(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if _HTML_OR_BROKEN_RE.search(stripped):
+        return True
+    letters = [ch for ch in stripped if ch.isalpha()]
+    if not letters:
+        return True
+    arabic_or_latin = sum(
+        bool(re.match(rf"[A-Za-z{_ARABIC_LETTER}]", ch)) for ch in letters
+    )
+    return arabic_or_latin / len(letters) < 0.9
+
+
+def _grammatically_continues(text: str, following: str) -> bool:
+    stripped = text.strip()
+    if not stripped or not following.strip():
         return False
+    rule_text = arabic_comparison_key(stripped)
+    if _QUOTE_INTRO_RE.match(rule_text) or _ATTRIBUTION_RE.match(rule_text):
+        return True
+    if stripped.endswith(("،", ",", "؛", ";", "-", "–", "—")):
+        return True
     return False
+
+
+def _score_heading_candidate(
+    paragraph: Paragraph,
+    previous: Paragraph | None,
+    following: Paragraph | None,
+    *,
+    confidence: float | None,
+    emphasized: bool,
+    style_count: int,
+) -> tuple[int, str, tuple[str, ...]]:
+    """Classify a parser-reported heading using deterministic structure only."""
+    text = paragraph.text.strip()
+    rule_text = arabic_comparison_key(text)
+    words = count_words(text)
+    score = 1
+    reasons: list[str] = ["parser_heading"]
+
+    if _PARENT_MARKER_RE.match(rule_text):
+        score += 7
+        reasons.append("section_marker")
+    if _SECTION_NUMBER_RE.match(rule_text):
+        score += 2
+        reasons.append("section_numbering")
+    if 2 <= words <= 12:
+        score += 2
+        reasons.append("reasonable_length")
+    elif words > 18:
+        score -= 3
+        reasons.append("long_sentence")
+    if emphasized:
+        score += 1
+        reasons.append("emphasized_style")
+    if confidence is not None and confidence >= 0.7:
+        score += 1
+        reasons.append("layout_confidence")
+    elif confidence is not None and confidence < 0.35:
+        score -= 1
+        reasons.append("low_layout_confidence")
+    if style_count >= 2 and (emphasized or confidence is not None):
+        score += 1
+        reasons.append("consistent_style")
+    if following and count_words(following.text) >= 8:
+        score += 1
+        reasons.append("explanatory_content_follows")
+    if previous and _PARENT_MARKER_RE.match(arabic_comparison_key(previous.text)) and not _INSTRUCTION_RE.match(rule_text):
+        score += 3
+        reasons.append("follows_section_marker")
+
+    if _QUOTE_INTRO_RE.match(rule_text):
+        score -= 7
+        reasons.append("quotation_introduction")
+    elif _ATTRIBUTION_RE.match(rule_text):
+        score -= 6
+        reasons.append("attribution")
+    if _looks_like_citation(rule_text) and not _PARENT_MARKER_RE.match(rule_text):
+        score -= 7
+        reasons.append("citation")
+    if _INSTRUCTION_RE.match(rule_text):
+        score -= 5
+        reasons.append("instruction_or_exercise")
+    if paragraph.role == "supplementary":
+        score -= 3
+        reasons.append("supplementary_content")
+    if _looks_ocr_corrupted(text):
+        score -= 3
+        reasons.append("ocr_or_markup_noise")
+    if _grammatically_continues(text, following.text if following else ""):
+        score -= 3
+        reasons.append("continues_into_next_block")
+    if text.endswith((":", "：")) and ("," in text or "،" in text):
+        score -= 3
+        reasons.append("activity_prompt_shape")
+    if _TERMINAL_SENTENCE_RE.search(text) and words >= 8:
+        score -= 2
+        reasons.append("complete_sentence")
+
+    if _PARENT_MARKER_RE.match(rule_text) and score >= 5:
+        decision = "parent_heading"
+    elif score >= 4:
+        decision = "subsection_heading"
+    else:
+        decision = "content"
+    return score, decision, tuple(reasons)
+
+
+def _validate_heading_candidates(
+    paragraphs: list[Paragraph], metadata: dict[int, tuple[float | None, bool, float | None]]
+) -> None:
+    """Turn parser headings into validated structural headings or normal text."""
+    style_counts: Counter[tuple[int | None, bool, int | None]] = Counter()
+    for paragraph in paragraphs:
+        if paragraph.parser_item_type != "heading":
+            continue
+        confidence, emphasized, height = metadata.get(paragraph.order, (None, False, None))
+        height_bucket = round(height / 5) if height else None
+        style_counts[(paragraph.heading_level, emphasized, height_bucket)] += 1
+
+    for index, paragraph in enumerate(paragraphs):
+        if paragraph.parser_item_type != "heading":
+            continue
+        following = next(
+            (candidate for candidate in paragraphs[index + 1 :] if candidate.text.strip()),
+            None,
+        )
+        previous = next(
+            (candidate for candidate in reversed(paragraphs[:index]) if candidate.text.strip()),
+            None,
+        )
+        confidence, emphasized, height = metadata.get(paragraph.order, (None, False, None))
+        height_bucket = round(height / 5) if height else None
+        score, decision, reasons = _score_heading_candidate(
+            paragraph,
+            previous,
+            following,
+            confidence=confidence,
+            emphasized=emphasized,
+            style_count=style_counts[(paragraph.heading_level, emphasized, height_bucket)],
+        )
+        paragraph.heading_score = score
+        paragraph.heading_decision = decision
+        paragraph.heading_reasons = reasons
+        paragraph.item_type = "heading" if decision != "content" else "text"
+        paragraph.strong_boundary = decision == "parent_heading"
+
+
+def _assign_atomic_quote_units(paragraphs: list[Paragraph]) -> None:
+    """Protect adjacent quote introductions, quotations, citations and explanations."""
+    for index, paragraph in enumerate(paragraphs):
+        text = paragraph.text.strip()
+        rule_text = arabic_comparison_key(text)
+        starts_unit = bool(_QUOTE_INTRO_RE.match(rule_text) or _ATTRIBUTION_RE.match(rule_text))
+        quote_like = bool(_QUOTE_MARK_RE.search(text))
+        if not starts_unit and not (quote_like and index + 1 < len(paragraphs)):
+            continue
+        atomic_id = paragraph.atomic_id or f"quote-{paragraph.order}"
+        paragraph.atomic_id = atomic_id
+        word_budget = count_words(paragraph.text)
+        # Attach the quotation and one immediate explanatory/citation block.
+        for next_index in range(index + 1, min(len(paragraphs), index + 4)):
+            candidate = paragraphs[next_index]
+            if candidate.strong_boundary:
+                break
+            if next_index > index + 1 and candidate.item_type == "heading":
+                break
+            candidate_words = count_words(candidate.text)
+            if word_budget + candidate_words > _max_child_words():
+                break
+            candidate.atomic_id = atomic_id
+            word_budget += candidate_words
+            if next_index >= index + 2 and not _looks_like_citation(candidate.text):
+                break
+
+    # A trailing citation belongs to the immediately preceding quotation unit.
+    for index in range(1, len(paragraphs)):
+        if _looks_like_citation(paragraphs[index].text) and paragraphs[index - 1].atomic_id:
+            paragraphs[index].atomic_id = paragraphs[index - 1].atomic_id
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +423,7 @@ def extract_paragraphs(pages: list[dict[str, Any]]) -> list[Paragraph]:
     Parent chunking then merges consecutive paragraphs purely by similarity.
     """
     paragraphs: list[Paragraph] = []
+    candidate_metadata: dict[int, tuple[float | None, bool, float | None]] = {}
     order = 0
     for page in pages:
         page_num = page_number(page)
@@ -183,18 +431,22 @@ def extract_paragraphs(pages: list[dict[str, Any]]) -> list[Paragraph]:
             text = item_text(item)
             if text:
                 kind = item_type(item)
-                paragraphs.append(
-                    Paragraph(
-                        text=text,
-                        page=page_num,
-                        item_type=kind,
-                        heading_level=_heading_level(item),
-                        order=order,
-                        role=_content_role(text, kind),
-                        strong_boundary=_is_strong_heading(item, text),
-                    )
+                paragraph = Paragraph(
+                    text=text,
+                    page=page_num,
+                    item_type="heading_candidate" if kind == "heading" else kind,
+                    heading_level=_heading_level(item),
+                    order=order,
+                    role=_content_role(text, kind),
+                    strong_boundary=False,
+                    parser_item_type=kind,
                 )
+                paragraphs.append(paragraph)
+                if kind == "heading":
+                    candidate_metadata[order] = _candidate_metadata(item)
                 order += 1
+    _validate_heading_candidates(paragraphs, candidate_metadata)
+    _assign_atomic_quote_units(paragraphs)
     return paragraphs
 
 
@@ -294,21 +546,16 @@ def split_parents(
     encode_ms = (time.perf_counter() - t0) * 1000
     t0 = time.perf_counter()
 
-    # In a structurally marked book, explicit unit/section/review headings own
-    # parent boundaries and subordinate headings are left for child splitting.
-    # Documents without such markers retain the semantic/lvl-1 fallback.
+    # Only headings that passed deterministic candidate validation may own a
+    # parent boundary. Documents without reliable structural markers retain the
+    # semantic fallback; parser-reported level alone is never sufficient.
     structured = sum(1 for p in paragraphs if p.strong_boundary) >= 2
     groups: list[list[Paragraph]] = [[paragraphs[0]]]
     for i in range(1, len(paragraphs)):
         sim = cosine_sim(vecs[i - 1], vecs[i])
         current = paragraphs[i]
         previous = paragraphs[i - 1]
-        structural = current.strong_boundary or (
-            not structured
-            and current.item_type == "heading"
-            and current.heading_level == 1
-            and 1 <= count_words(current.text) <= 12
-        )
+        structural = current.strong_boundary
         if structural:
             marker_re = re.compile(
                 r"^\s*(الوحدة|القسم|الفصل|الباب|chapter|section|unit|part)\s*([\d٠-٩]+)",
@@ -331,9 +578,17 @@ def split_parents(
             ):
                 structural = False
         role_boundary = False
+        same_atomic_unit = bool(
+            current.atomic_id
+            and previous.atomic_id
+            and current.atomic_id == previous.atomic_id
+        )
         split = structural or (not structured and sim < threshold)
+        if same_atomic_unit:
+            split = False
+            structural = False
         reason = (
-            "heading" if structural else "content_role" if role_boundary
+            "atomic_quote" if same_atomic_unit else "heading" if structural else "content_role" if role_boundary
             else "similarity" if split else "merge"
         )
         logger.info(
@@ -372,13 +627,14 @@ def _group_content(group: list[Paragraph]) -> str:
 def _group_heading(group: list[Paragraph]) -> tuple[str | None, int | None]:
     headings = [unit for unit in group if unit.item_type == "heading"]
     generic = re.compile(
-        r"^\s*(?:(?:الوحدة|القسم|الفصل|الباب|chapter|section|unit|part)\s*[\d٠-٩]+|"
-        r"[\d٠-٩]+\s*(?:الوحدة|القسم|الفصل|الباب))\s*$",
+        r"^\s*(?:(?:الوحدة|القسم|الفصل|الباب|الدرس|درس|chapter|section|unit|lesson|part)\s*[\d٠-٩]+|"
+        r"[\d٠-٩]+\s*(?:الوحدة|القسم|الفصل|الباب|الدرس|درس))\s*$",
         re.IGNORECASE,
     )
     for unit in headings:
         if (
             not generic.match(unit.text)
+            and not _PARENT_MARKER_RE.match(unit.text)
             and not re.match(r"^\s*(?:الشكل|صورة|جدول|figure|table)\b", unit.text, re.IGNORECASE)
             and count_words(unit.text) <= 15
             and unit.role == "content"
@@ -436,6 +692,7 @@ def _merged_parent(left: ParentChunk, right: ParentChunk) -> ParentChunk:
         content_role=left.content_role,
         source_items=units or None,
         protected_boundary=left.protected_boundary,
+        language=left.language or right.language,
     )
 
 
@@ -521,6 +778,21 @@ def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
         if current_units:
             packed.append(current_units)
 
+        # Greedy packing can leave a tiny exercise/citation tail as its own
+        # parent (for example 760 words + a final 30-word activity). Rebalance
+        # source units from the previous pack so the tail has enough context to
+        # remain meaningful, without crossing a structural boundary or cap.
+        if len(packed) >= 2:
+            tail_words = sum(count_words(unit.text) for unit in packed[-1])
+            minimum_tail_words = max(1, int(PARENT_MERGE_TOKENS / WORDS_PER_TOKEN))
+            while tail_words < minimum_tail_words and len(packed[-2]) > 1:
+                moving = packed[-2][-1]
+                if moving.strong_boundary:
+                    break
+                packed[-2].pop()
+                packed[-1].insert(0, moving)
+                tail_words += count_words(moving.text)
+
         for index, part in enumerate(packed):
             page_start, page_end = _paragraph_pages(part)
             final.append(
@@ -536,6 +808,7 @@ def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
                     content_role=parent.content_role,
                     source_items=part,
                     protected_boundary=parent.protected_boundary and index == 0,
+                    language=parent.language,
                 )
             )
     return final
@@ -571,6 +844,7 @@ def build_parents(
                 content_role=_group_role(group),
                 source_items=list(group),
                 protected_boundary=bool(group[0].strong_boundary),
+                language=detect_language(content),
             )
         )
     return _apply_parent_policy(parents)
@@ -974,7 +1248,7 @@ def _prepare_child_sentence_units(parent: ParentChunk) -> list[Sentence]:
             if selected and _normalize_sentence(selected[-1].text) == norm:
                 continue
             selected.append(
-                Sentence(piece.strip(), unit.page, unit.item_type, unit.heading_level)
+                Sentence(piece.strip(), unit.page, unit.item_type, unit.heading_level, unit.atomic_id)
             )
     return selected
 
@@ -1066,6 +1340,7 @@ def build_children(
                 heading_level=parent.heading_level,
                 content_role=parent.content_role,
                 source_items=parent.source_items,
+                language=parent.language or detect_language(text),
             )
         ]
 
@@ -1077,6 +1352,7 @@ def build_children(
     current_chunk = child_sents[0].text
     current_heading_only = _is_child_heading(child_sents[0])
     current_kind = child_sents[0].item_type
+    current_atomic_id = child_sents[0].atomic_id
     groups: list[str] = []
 
     enc = time.perf_counter()
@@ -1090,6 +1366,22 @@ def build_children(
         count_in_chunk = 0
     for i, next_sent in enumerate(child_sents[1:]):
         candidate = f"{current_chunk} {next_sent.text}"
+        same_atomic_unit = bool(
+            current_atomic_id
+            and next_sent.atomic_id
+            and current_atomic_id == next_sent.atomic_id
+        )
+        if same_atomic_unit and count_words(candidate) <= max_child_words:
+            current_chunk = candidate
+            current_heading_only = False
+            current_kind = "content"
+            if vecs is not None:
+                c0, c1 = count_in_chunk, count_in_chunk + 1
+                centroid = [
+                    (a * c0 + b) / c1 for a, b in zip(centroid, vecs[i + 1])
+                ]
+                count_in_chunk = c1
+            continue
         if (
             current_heading_only
             and _is_child_heading(next_sent)
@@ -1110,6 +1402,7 @@ def build_children(
             current_chunk = next_sent.text
             current_heading_only = _is_child_heading(next_sent)
             current_kind = next_sent.item_type
+            current_atomic_id = next_sent.atomic_id
             if vecs is not None:
                 centroid = list(vecs[i + 1])
                 count_in_chunk = 1
@@ -1122,6 +1415,7 @@ def build_children(
             current_chunk = candidate
             current_heading_only = False
             current_kind = "content"
+            current_atomic_id = next_sent.atomic_id or current_atomic_id
             if vecs is not None:
                 c0, c1 = count_in_chunk, count_in_chunk + 1
                 centroid = [
@@ -1134,6 +1428,7 @@ def build_children(
             current_chunk = next_sent.text
             current_heading_only = False
             current_kind = next_sent.item_type
+            current_atomic_id = next_sent.atomic_id
             if vecs is not None:
                 centroid = list(vecs[i + 1])
                 count_in_chunk = 1
@@ -1158,6 +1453,7 @@ def build_children(
         if sim >= SIMILARITY_THRESHOLD_CHILD:
             current_chunk = candidate
             current_kind = "content"
+            current_atomic_id = next_sent.atomic_id or current_atomic_id
             if vecs is not None:
                 c0, c1 = count_in_chunk, count_in_chunk + 1
                 centroid = [
@@ -1169,6 +1465,7 @@ def build_children(
             current_chunk = next_sent.text
             current_heading_only = False
             current_kind = next_sent.item_type
+            current_atomic_id = next_sent.atomic_id
             if vecs is not None:
                 centroid = list(vecs[i + 1])
                 count_in_chunk = 1
@@ -1261,6 +1558,7 @@ def build_children(
                 heading_level=child_heading_level,
                 content_role=child_role,
                 source_items=source_items or None,
+                language=detect_language(body) if body.strip() else parent.language,
             )
         )
     return children
@@ -1348,6 +1646,7 @@ def verify_chunk_invariants(chunks: dict[str, Any]) -> list[str]:
 def _label_families(
     parents: list[ParentChunk], children: list[ChildChunk], client=None,
     check_cancelled: Callable[[], None] | None = None,
+    document_language: str | None = None,
 ) -> None:
     """Label sections and their subsections, one LLM call per batch of families.
 
@@ -1380,10 +1679,12 @@ def _label_families(
         entries: list[tuple[str, str, str | None]] = []
         owners: list[tuple[str, ParentChunk | ChildChunk]] = []
         for p in batch:
-            entries.append(("section", p.content, p.book_heading))
+            p.language = _resolved_chunk_language(p.content, document_language)
+            entries.append(("section", p.content, p.book_heading, p.language))
             owners.append(("section", p))
             for c in by_parent.get(p.parent_id, []):
-                entries.append(("subsection", c.content, c.book_heading))
+                c.language = _resolved_chunk_language(c.content, document_language)
+                entries.append(("subsection", c.content, c.book_heading, c.language))
                 owners.append(("subsection", c))
 
         titles = generate_family_batch_titles(
@@ -1395,7 +1696,12 @@ def _label_families(
             if not (
                 title
                 and is_acceptable_title(
-                    title, item.content, level, used, item.book_heading or ""
+                    title,
+                    item.content,
+                    level,
+                    used,
+                    item.book_heading or "",
+                    item.language,
                 )
             ):
                 title = regenerate_title(
@@ -1405,9 +1711,15 @@ def _label_families(
                     reject=[title] if title else [],
                     used_titles=used,
                     book_heading=item.book_heading or "",
+                    expected_language=item.language,
                 )
             if title and is_acceptable_title(
-                title, item.content, level, used, item.book_heading or ""
+                title,
+                item.content,
+                level,
+                used,
+                item.book_heading or "",
+                item.language,
             ):
                 item.title = title
                 used.add(title)
@@ -1426,6 +1738,7 @@ def _label_families(
 def _enforce_title_invariants(
     parents: list[ParentChunk], children: list[ChildChunk], client=None,
     check_cancelled: Callable[[], None] | None = None,
+    document_language: str | None = None,
 ) -> None:
     """Final document-wide grounding/uniqueness pass after optional review."""
     client = client or make_title_client()
@@ -1443,12 +1756,14 @@ def _enforce_title_invariants(
     for index, (level, item) in enumerate(items, 1):
         if check_cancelled:
             check_cancelled()
+        item.language = _resolved_chunk_language(item.content, document_language)
         if item.title and is_acceptable_title(
             item.title,
             item.content,
             level,
             used,
             item.book_heading or "",
+            item.language,
         ):
             used.add(item.title)
             continue
@@ -1459,6 +1774,7 @@ def _enforce_title_invariants(
             reject=[item.title] if item.title else [],
             used_titles=used,
             book_heading=item.book_heading or "",
+            expected_language=item.language,
         )
         if regenerated and is_acceptable_title(
             regenerated,
@@ -1466,6 +1782,7 @@ def _enforce_title_invariants(
             level,
             used,
             item.book_heading or "",
+            item.language,
         ):
             item.title = regenerated
             used.add(regenerated)
@@ -1478,6 +1795,7 @@ def _enforce_title_invariants(
             item.book_heading or "",
             index=index,
             max_words=FALLBACK_SECTION_MAX_WORDS,
+            language=item.language,
         )
         suffix = 2
         while emergency in used:
@@ -1490,6 +1808,7 @@ def _enforce_title_invariants(
 def build_semantic_structure(
     pages: list[dict[str, Any]], document_id: str,
     *,
+    document_language: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
@@ -1542,9 +1861,19 @@ def build_semantic_structure(
     # PHASE 2 - titles only (LLM): one call per batch of parent families.
     checkpoint("generating_titles")
     title_client = make_title_client()
-    _label_families(parents, children, client=title_client, check_cancelled=checkpoint)
+    _label_families(
+        parents,
+        children,
+        client=title_client,
+        check_cancelled=checkpoint,
+        document_language=document_language,
+    )
     _enforce_title_invariants(
-        parents, children, client=title_client, check_cancelled=checkpoint
+        parents,
+        children,
+        client=title_client,
+        check_cancelled=checkpoint,
+        document_language=document_language,
     )
     checkpoint()
     if any(not p.title for p in parents):
@@ -1577,6 +1906,12 @@ def build_semantic_structure(
                 "heading_level": item.heading_level,
                 "order": item.order,
                 "role": item.role,
+                "parser_type": item.parser_item_type,
+                "effective_type": item.item_type,
+                "heading_score": item.heading_score,
+                "heading_decision": item.heading_decision,
+                "heading_reasons": list(item.heading_reasons),
+                "atomic_id": item.atomic_id,
                 "text": item.text,
             }
             for item in (items or [])
@@ -1597,6 +1932,7 @@ def build_semantic_structure(
                 "book_heading": p.book_heading,
                 "heading_level": p.heading_level,
                 "content_role": p.content_role,
+                "language": p.language,
                 "source_items": source_metadata(p.source_items),
             }
             for p in parents
@@ -1619,6 +1955,7 @@ def build_semantic_structure(
                 "book_heading": c.book_heading,
                 "heading_level": c.heading_level,
                 "content_role": c.content_role,
+                "language": c.language,
                 "source_items": source_metadata(c.source_items),
             }
             for c in children

@@ -370,6 +370,42 @@ def test_family_prompt_includes_book_heading_and_representative_context():
     assert "w399" in prompt
 
 
+def test_family_prompt_requires_detected_title_language():
+    client = _FakeClient(lambda p: "1. دور المستقبلات الحسية في نقل الإشارات")
+    titles = tg.generate_family_batch_titles(
+        [("section", "تشرح المستقبلات الحسية اكتشاف المؤثرات ونقل الإشارات العصبية.", "المستقبلات الحسية", "ar")],
+        client,
+    )
+    assert "REQUIRED TITLE LANGUAGE: Arabic" in client.calls[0]
+    assert titles == ["دور المستقبلات الحسية في نقل الإشارات"]
+
+
+def test_wrong_language_title_is_rejected():
+    assert not tg.is_acceptable_title(
+        "Sensory Receptor Signal Transmission",
+        "تشرح المستقبلات الحسية اكتشاف المؤثرات ونقل الإشارات العصبية.",
+        "section",
+        set(),
+        "المستقبلات الحسية",
+        "ar",
+    )
+    assert tg.title_matches_language("دور DNA في تحديد الصفات الوراثية", "ar")
+
+
+def test_exercise_and_citation_fragments_are_rejected_as_titles(monkeypatch):
+    monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
+    content = "توضح الفقرة أحكام التيمم والمسح على الخفين وتطبيقاتها العملية."
+    assert not tg.is_acceptable_title(
+        "> أكمل بما يتناسب مع", content, "section", set(), "التيمم"
+    )
+    assert not tg.is_acceptable_title(
+        "[الزخرف] ٤٤ ربكم إذا استويتم عليه", content, "subsection", set(), "التيمم"
+    )
+    assert not tg.is_acceptable_title(
+        "درس 4 أدلة وحدانية الله", content, "section", set(), "أدلة وحدانية الله"
+    )
+
+
 def test_rejects_arabic_heading_copy_and_weak_category(monkeypatch):
     monkeypatch.setattr(tg, "is_noun_phrase", lambda title: True)
     content = " ".join(
