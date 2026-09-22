@@ -1,10 +1,13 @@
 import { state } from "./state.js";
+import { t } from "./i18n.js";
 
 export function updateTotal() {
-  let t = 0;
-  for (const k in state.counts) if (state.enabled[k]) t += state.counts[k];
-  document.getElementById("totalBadge").textContent = `Total: ${t} questions`;
+  let total = 0;
+  for (const k in state.counts) if (state.enabled[k]) total += state.counts[k];
+  document.getElementById("totalBadge").textContent = t("qtypes.total", { n: total });
 }
+
+document.addEventListener("draftwork:language-changed", updateTotal);
 
 export function step(key, dir) {
   if (!state.enabled[key]) return;

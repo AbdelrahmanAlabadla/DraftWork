@@ -94,11 +94,48 @@ def test_ingestion_task_does_not_limit_downstream_pipeline_runtime():
     assert ingest_document.soft_time_limit is None
 
 
-def test_gpu_worker_uses_solo_pool_and_process_liveness_healthcheck():
+def test_gpu_worker_uses_terminable_process_pool_and_process_liveness_healthcheck():
     compose = (Path(__file__).parents[1] / "compose.yaml").read_text(encoding="utf-8")
-    assert '"--pool=solo", "--concurrency=1"' in compose
+    assert '"--pool=prefork", "--concurrency=1"' in compose
     assert "psutil.process_iter" in compose
     assert "inspect\", \"ping" not in compose
+
+
+def test_cancel_job_is_owned_persisted_and_terminated(monkeypatch):
+    _session_fakes(monkeypatch)
+    job_id = "22222222-2222-4222-8222-222222222222"
+    terminated = []
+    monkeypatch.setattr(
+        repositories,
+        "get_job_for_session",
+        lambda requested, session_id: {"id": requested},
+    )
+    monkeypatch.setattr(
+        repositories,
+        "cancel_job",
+        lambda requested: {
+            "id": requested,
+            "document_id": "33333333-3333-4333-8333-333333333333",
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "type": "document_ingestion",
+            "status": "cancelled",
+            "stage": "cancelled",
+        },
+    )
+    monkeypatch.setattr(
+        "app.api.job_routes.job_service.terminate_job",
+        lambda requested, **kwargs: terminated.append((requested, kwargs)),
+    )
+
+    response = TestClient(app).delete(f"/api/v1/jobs/{job_id}")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    assert terminated == [(job_id, {
+        "document_id": "33333333-3333-4333-8333-333333333333",
+        "session_id": "11111111-1111-4111-8111-111111111111",
+        "cleanup_document": True,
+    })]
 
 
 def test_local_storage_rejects_keys_outside_root(tmp_path):

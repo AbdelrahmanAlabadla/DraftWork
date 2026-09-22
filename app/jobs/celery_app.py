@@ -8,15 +8,20 @@ from app import config
 celery_app = Celery(
     "genexam",
     broker=config.CELERY_BROKER_URL,
-    backend=config.CELERY_RESULT_BACKEND,
+    # Durable job state and results live in PostgreSQL; disabling Celery's
+    # result backend also avoids serializing the SystemExit raised by a hard
+    # task revocation.
+    backend=None,
     include=["app.jobs.tasks"],
 )
 
 celery_app.conf.update(
+    result_backend=None,
     task_always_eager=config.CELERY_TASK_ALWAYS_EAGER,
     task_eager_propagates=True,
     task_serializer="json",
     result_serializer="json",
+    task_ignore_result=True,
     accept_content=["json"],
     timezone="UTC",
     enable_utc=True,

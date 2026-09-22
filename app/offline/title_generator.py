@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 
 from app.config import (
     FALLBACK_SECTION_MAX_WORDS,
@@ -38,34 +39,37 @@ logger = get_logger("TITLE_GENERATOR")
 # passage -- not a Table of Contents description. Hierarchy is Section (parent
 # chunk) / Subsection (child chunk) only -- there is no chapter layer yet.
 _TITLE_CORE = (
-    "You are writing the short HEADER for a passage in a university textbook. "
-    "The header sits directly above the passage, labeling what it teaches. "
-    "Write a concise, scannable header the way a professional textbook editor "
-    "would, not a description or summary of the passage.\n"
+    "You are writing a standalone descriptive HEADER for a passage in a "
+    "university textbook. A student must understand the passage's main subject "
+    "and what it teaches about that subject without reading the passage.\n"
     "\n"
     "Before writing the header:\n"
     "1. Understand the passage.\n"
-    "2. Identify the ONE main concept being taught.\n"
-    "3. Ignore supporting information.\n"
-    "4. Create a concise header representing that concept.\n"
+    "2. Identify the dominant subject and the main function, process, relation, "
+    "cause, result, or distinction taught about it.\n"
+    "3. Check that this meaning is supported across the passage, not by one "
+    "small opening sentence.\n"
+    "4. Create a concise descriptive header representing that dominant content.\n"
     "\n"
     "Ignore examples, case studies, figures, tables, exercises, historical "
-    "stories, implementation details, code examples, dataset names, specific "
-    "instances, and explanations. The header represents the concept, not the "
-    "examples used to explain it."
+    "stories, implementation details, code examples, dataset names, and isolated "
+    "instances. Keep the explanatory relationship that makes the title useful."
 )
 
 # The passage often already carries a real textbook heading. Prefer it: only
 # invent a header when the heading is missing, noisy, or unrelated.
 _HEADING_RULE = (
     "\n"
-    "If the passage already contains a real textbook heading (a section or "
-    "subsection title), REUSE it: clean it up if needed and make it your "
-    "header, building the header around it. Only if the heading is missing, "
-    "garbage, or does not match the passage should you write a new header.\n"
+    "The BOOK HEADING supplied with a passage is topic context from the source. "
+    "Use it to stay within the correct topic. Keep it unchanged when it already "
+    "describes the chunk's dominant function, process, relation, cause, result, "
+    "or distinction. Otherwise expand or refine it using the representative "
+    "chunk content. Ignore a "
+    "heading only when it is OCR garbage or unrelated.\n"
     "\n"
-    "A meaningful heading wins over a newly invented one; a bad or unrelated "
-    "heading is abandoned and replaced."
+    "Example: BOOK HEADING: المستقبلات الحسية; content about detecting stimuli "
+    "and carrying neural signals -> دور المستقبلات الحسية في اكتشاف المؤثرات "
+    "ونقل الإشارات العصبية."
 )
 
 # Level-specific instruction: a SECTION groups several related subsections, so
@@ -74,9 +78,9 @@ _SECTION_LEVEL_BLOCK = (
     "This passage is a SECTION: several related subsections grouped together "
     "in the textbook.\n"
     "\n"
-    "Your header must name the broader theme that unifies the subsections, "
-    'as if answering "what would this section be called?" It is more general '
-    "than any single subsection and must never list the subsections' topics.\n"
+    "Your header must describe the broader lesson that unifies the subsections "
+    "while still saying what the section teaches about that subject. It must "
+    "not collapse into a vague category label or list subsection topics.\n"
     "\n"
     "Good:\n"
     "- Email Spam Filtering, Image Classification, Speech Recognition, "
@@ -102,14 +106,14 @@ _SUBSECTION_LEVEL_BLOCK = (
 # Shared style contract for both levels.
 _STYLE_RULES = (
     "Style rules:\n"
-    "- 2 to 6 words, Title Case.\n"
+    "- Prefer 4 to 12 words; never exceed 15 words.\n"
     "- Looks like a real Table of Contents entry written by a professional "
     "editor.\n"
-    "- Names ONE concept.\n"
+    "- Names the dominant subject and a useful content-specific relationship.\n"
     "- Concise and readable on its own, without the passage.\n"
     "- Abstraction level consistent with the sibling headings.\n"
     "\n"
-    'Never generate a sentence, an explanation, a summary, a keyword list, '
+    'Never generate a full sentence, an explanation, a vague category, a keyword list, '
     'comma-separated concepts, a numbered title, or a heading starting with '
     '"Introduction to", "Overview of", "A Comprehensive", or "Analysis of".'
 )
@@ -136,16 +140,18 @@ _ABSTRACTION_RULE = (
 # Self-check the model must run before returning; only the title is returned.
 _SELF_CHECK = (
     "Before returning, verify:\n"
-    "1. It names exactly one concept.\n"
+    "1. It names the dominant subject and what the passage teaches about it.\n"
     "2. It looks like a real Table of Contents entry.\n"
-    "3. It is 2 to 6 words.\n"
+    "3. It is preferably 4 to 12 words and no more than 15.\n"
     "4. It is not a sentence, explanation, or summary.\n"
     "5. It is not a keyword list.\n"
-    "6. It avoids examples and supporting details.\n"
+    "6. It avoids examples but keeps the dominant process or relationship.\n"
     "7. The abstraction level is right (the concept, not the most frequent "
     "words).\n"
     "8. Its style matches the sibling headings.\n"
-    "9. A student could tell what the passage teaches from the title alone.\n"
+    "9. A student can tell what the passage teaches from the title alone.\n"
+    "10. If it repeats the BOOK HEADING, that heading is already specific and "
+    "fully describes the dominant content.\n"
     "\n"
     "Return ONLY the final title."
 )
@@ -219,7 +225,7 @@ _BATCH_SELF_CHECK = (
 _FAMILY_BATCH_RULE = (
     "You are still writing the same short headers, but now each numbered entry "
     "is tagged with its level. A SECTION is a group of related subsections; "
-    "its header must name the broader theme unifying them. A SUBSECTION is a "
+    "its header must describe the broader lesson unifying them. A SUBSECTION is a "
     "single focused lesson inside a section; its header must name that ONE "
     "specific concept and must stay NARROWER than its own SECTION header.\n"
     "\n"
@@ -227,10 +233,11 @@ _FAMILY_BATCH_RULE = (
     "- Produce EXACTLY one header for EVERY numbered passage.\n"
     "- Every header must be DIFFERENT from every other header.\n"
     "- A SUBSECTION header must never equal or generalize its SECTION header.\n"
-    "- Base each header only on the content of its own numbered passage.\n"
-    "- If a passage already contains a meaningful textbook heading, REUSE it "
-    "(cleaned up) as that passage's header; only write a new header when the "
-    "heading is missing, garbage, or unrelated.\n"
+    "- Base each header mainly on the representative content of its own passage.\n"
+    "- Use BOOK HEADING as a topic anchor. Return it unchanged only when it is "
+    "already specific and fully describes the dominant content.\n"
+    "- Reject a broad category when the content supports a specific process, "
+    "function, relation, cause, result, or distinction.\n"
     "\n"
     'Output format (strict): a numbered list, one header per line, keeping '
     "the same order as the numbered passages. Example:\n"
@@ -245,7 +252,7 @@ _FAMILY_BATCH_SELF_CHECK = (
     "1. Every numbered passage received exactly one header.\n"
     "2. All headers are distinct from each other.\n"
     "3. SUBSECTION headers are narrower than their SECTION header.\n"
-    "4. Each header is 2 to 6 words, Title Case, one concept, ToC-style.\n"
+    "4. Each header is preferably 4 to 12 words, at most 15, and descriptive.\n"
     "5. Headers appear in the same order as the numbered passages.\n"
     "\n"
     "Return ONLY the numbered list of headers."
@@ -258,13 +265,17 @@ _REGENERATE_PROMPT = (
     "header. The previous attempt ({header!r}) was rejected and must not be "
     "reused.\n"
     "Rules:\n"
-    "- 2 to {max_words} words, Title Case, one concept, a noun heading.\n"
+    "- Prefer 4 to 12 words and use at most {max_words} words.\n"
+    "- State the dominant subject plus the function, process, relation, cause, "
+    "result, or distinction taught about it.\n"
+    "- Use the BOOK HEADING as a topic anchor. Keep it unchanged only when it "
+    "already describes the dominant content specifically.\n"
     "- No commas, no lists, no numbering, no question marks, no explanation.\n"
     "- Avoid starting with Introduction to, Overview of, A Comprehensive, "
     "Analysis of, or Summary of.\n"
     "- Do NOT use any of these already-taken headers: {reject}\n"
     "- Return ONLY the header.\n\n"
-    "## Content\n{content}"
+    "## BOOK HEADING\n{book_heading}\n\n## Representative content\n{content}"
 )
 
 # Stricter prompt used on the second (validation-fallback) attempt. Told to
@@ -286,6 +297,197 @@ _FALLBACK_PROMPT = (
 def _first_n_words(text: str, n: int) -> str:
     words = [w for w in text.split() if w.strip()]
     return " ".join(words[:n])
+
+
+def representative_context(text: str, max_words: int) -> str:
+    """Sample the beginning, middle and end instead of anchoring on the opening."""
+    words = [w for w in text.split() if w.strip()]
+    if len(words) <= max_words:
+        return " ".join(words)
+    first_n = max(1, int(max_words * 0.4))
+    middle_n = max(1, int(max_words * 0.3))
+    last_n = max(1, max_words - first_n - middle_n)
+    middle_start = max(first_n, (len(words) - middle_n) // 2)
+    return (
+        "[BEGINNING] " + " ".join(words[:first_n])
+        + "\n[MIDDLE] " + " ".join(words[middle_start : middle_start + middle_n])
+        + "\n[END] " + " ".join(words[-last_n:])
+    )
+
+
+def _normalize_heading(value: str) -> str:
+    value = re.sub(r"[\u064b-\u065f\u0670]", "", value or "")
+    value = value.translate(str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ى": "ي"}))
+    return re.sub(r"[^\w]+", " ", value.lower(), flags=re.UNICODE).strip()
+
+
+def titles_too_similar(title: str, used_titles: set[str]) -> bool:
+    """Catch normalized and near-duplicate Arabic/English navigation labels."""
+    normalized = _normalize_heading(title)
+    words = {
+        (word[1:] if _is_arabic(word) and word.startswith("و") and len(word) > 3 else word)
+        for word in normalized.split()
+        if len(word) > 1
+    }
+    for used in used_titles:
+        other_normalized = _normalize_heading(used)
+        if normalized == other_normalized:
+            return True
+        other = {
+            (word[1:] if _is_arabic(word) and word.startswith("و") and len(word) > 3 else word)
+            for word in other_normalized.split()
+            if len(word) > 1
+        }
+        if not words or not other:
+            continue
+        overlap = len(words & other)
+        union = len(words | other)
+        if overlap / union >= 0.8:
+            return True
+        smaller = min(len(words), len(other))
+        if smaller >= 2 and overlap == smaller and abs(len(words) - len(other)) <= 2:
+            return True
+    return False
+
+
+def _is_arabic(text: str) -> bool:
+    return bool(re.search(r"[\u0600-\u06ff]", text or ""))
+
+
+_ARABIC_TITLE_STOP = {
+    "في", "من", "عن", "على", "الى", "مع", "بين", "عبر", "دور", "شرح",
+    "اثر", "اثار", "اهميه", "مقدمه", "مفهوم", "كيفيه",
+}
+
+# Signals that a compact Arabic heading says something specific about its
+# subject. These are intentionally stems so common inflections (وظيفة/وظائف,
+# تأثير/تأثيرات, etc.) are handled without requiring a full Arabic stemmer.
+_ARABIC_DESCRIPTIVE_CUE_STEMS = (
+    "دور", "وظيف", "الي", "عمل", "تركيب", "تكوين", "انتقال", "نقل",
+    "تنظيم", "استجاب", "تاثير", "علاق", "سبب", "نتيج", "مرح",
+    "اكتشاف", "انتاج", "افراز", "حفاظ", "مقارن", "تمييز", "تقسيم",
+    "انقسام", "جهد", "توازن", "اتزان",
+)
+
+_ARABIC_STRUCTURAL_HEADING_WORDS = {
+    "قسم", "القسم", "وحدة", "الوحدة", "فصل", "الفصل", "باب", "الباب",
+}
+
+
+def _has_arabic_descriptive_cue(title: str) -> bool:
+    """Whether a compact Arabic title expresses a relation or precise process."""
+    words = _normalize_heading(title).split()
+    return any(
+        word.startswith(stem)
+        for word in words
+        for stem in _ARABIC_DESCRIPTIVE_CUE_STEMS
+    )
+
+
+def _book_heading_is_descriptive(book_heading: str) -> bool:
+    """Conservatively recognize headings that are already useful on their own.
+
+    This is deliberately an adequacy test rather than an equality test. A
+    short Arabic heading can pass when it names a function/process precisely;
+    longer clean headings can also pass. Numbered structural labels remain
+    context, not final UI titles.
+    """
+    normalized = _normalize_heading(book_heading)
+    words = normalized.split()
+    if not words or _blocklisted(book_heading):
+        return False
+    if any(word in _ARABIC_STRUCTURAL_HEADING_WORDS for word in words):
+        return False
+    if re.search(r"\d", normalized):
+        return False
+    if not _is_arabic(book_heading):
+        return True
+    return _has_arabic_descriptive_cue(book_heading) or len(words) >= 4
+
+
+def _short_arabic_title_is_too_broad(title: str, content: str) -> bool:
+    """Flag only terse category labels, not every Arabic title under 4 words."""
+    if _word_count(title) >= 4 or _word_count(content) < 80:
+        return False
+    return not _has_arabic_descriptive_cue(title)
+
+
+def _arabic_content_terms(text: str) -> set[str]:
+    normalized = _normalize_heading(text)
+    terms: set[str] = set()
+    for raw in normalized.split():
+        word = raw
+        if word.startswith("و") and len(word) > 4:
+            word = word[1:]
+        if word.startswith("ال") and len(word) > 4:
+            word = word[2:]
+        for suffix in ("يات", "ات", "يه", "ية", "ها"):
+            if word.endswith(suffix) and len(word) - len(suffix) >= 3:
+                word = word[: -len(suffix)]
+                break
+        if len(word) >= 3 and word not in _ARABIC_TITLE_STOP:
+            terms.add(word)
+    return terms
+
+
+def _arabic_title_is_grounded(title: str, content: str, book_heading: str) -> bool:
+    title_terms = _arabic_content_terms(title)
+    if not title_terms:
+        return False
+    source_terms = _arabic_content_terms(f"{book_heading} {content}")
+    matched = 0
+    for term in title_terms:
+        if term in source_terms or any(
+            min(len(term), len(source)) >= 4
+            and (term.startswith(source) or source.startswith(term))
+            for source in source_terms
+        ):
+            matched += 1
+    return matched / len(title_terms) >= 0.5
+
+
+def _merely_rephrases_arabic_heading(title: str, book_heading: str) -> bool:
+    title_terms = _arabic_content_terms(title)
+    heading_terms = _arabic_content_terms(book_heading) - {"قسم", "وحدة", "وحده", "فصل"}
+    if not title_terms or not heading_terms:
+        return False
+    matched = sum(
+        1
+        for term in title_terms
+        if term in heading_terms
+        or any(
+            min(len(term), len(source)) >= 4
+            and (term.startswith(source) or source.startswith(term))
+            for source in heading_terms
+        )
+    )
+    return matched / len(title_terms) >= 0.7
+
+
+def descriptive_fallback(
+    content: str, book_heading: str = "", index: int = 1, max_words: int = 15
+) -> str:
+    """Build a grounded emergency label; never return ``Untitled``/blank."""
+    heading = clean_title(re.sub(r"<[^>]+>|[*_#]", "", book_heading), max_words)
+    if _is_arabic(content):
+        words = [
+            word for word in _normalize_heading(content).split()
+            if len(word) >= 3 and word not in _ARABIC_TITLE_STOP
+        ]
+        heading_terms = _arabic_content_terms(heading)
+        bigrams = Counter(
+            " ".join(words[i : i + 2]) for i in range(max(0, len(words) - 1))
+        )
+        phrases = [
+            phrase for phrase, _ in bigrams.most_common()
+            if _arabic_content_terms(phrase) - heading_terms
+        ][:2]
+        base = heading or f"موضوع القسم {index}"
+        if phrases:
+            return clean_title(f"{base}: {' و'.join(phrases)}", max_words)
+        return clean_title(f"شرح محتوى {base}", max_words)
+    base = heading or f"Section Topic {index}"
+    return clean_title(f"Content of {base}", max_words)
 
 
 def _word_count(text: str) -> int:
@@ -445,7 +647,7 @@ def validate_title(title: str, min_words: int, max_words: int) -> bool:
     if "?" in title:
         return False
     # Reject comma-separated keyword lists and ampersand joins.
-    if "," in title or "&" in title:
+    if "," in title or "،" in title or "&" in title:
         return False
     # Reject numbered markers ("1. ", "3.1 ", "1: ").
     if re.search(r"\b\d+[.:)]", title):
@@ -643,7 +845,7 @@ def _generate_title(
     max_words: int,
     fallback_max_words: int,
 ) -> str:
-    preview = _first_n_words(content, preview_words)
+    preview = representative_context(content, preview_words)
     if not preview:
         return ""
 
@@ -778,7 +980,7 @@ def generate_batch_titles(
         max_words = SUBSECTION_TITLE_MAX_WORDS
         fallback_max_words = FALLBACK_SUBSECTION_MAX_WORDS
 
-    previews = [_first_n_words(c, preview_words) for c in contents]
+    previews = [representative_context(c, preview_words) for c in contents]
     client = client or _make_client()
 
     titles: list[str] = [""] * len(contents)
@@ -868,7 +1070,8 @@ def _blocklisted(title: str) -> bool:
 
 
 def is_acceptable_title(
-    title: str, content: str, level: str, used_titles: set[str]
+    title: str, content: str, level: str, used_titles: set[str],
+    book_heading: str = "",
 ) -> bool:
     """A title is acceptable when it passes format, blocklist, and exact-dup checks.
 
@@ -882,12 +1085,37 @@ def is_acceptable_title(
         return False
     if _blocklisted(title):
         return False
-    if title in used_titles:
+    if titles_too_similar(title, used_titles):
+        return False
+    # A compact Arabic title is valid when it carries a specific process or
+    # relation; word count alone is never a rejection reason.
+    if _is_arabic(content) and _short_arabic_title_is_too_broad(title, content):
+        return False
+    repeats_heading = book_heading and (
+        _normalize_heading(title) == _normalize_heading(book_heading)
+        or (
+            _is_arabic(title)
+            and _merely_rephrases_arabic_heading(title, book_heading)
+        )
+    )
+    # Reusing the source heading is allowed when that heading already describes
+    # the chunk adequately. Similarity itself is not an error.
+    if repeats_heading and not _book_heading_is_descriptive(book_heading):
+        return False
+    if _is_arabic(title) and _word_count(content) >= 10 and not _arabic_title_is_grounded(
+        title, content, book_heading
+    ):
         return False
     return True
 
 
-def _build_family_prompt(entries: list[tuple[str, str]], before: list[str]) -> str:
+def _unpack_entry(entry) -> tuple[str, str, str]:
+    if len(entry) >= 3:
+        return entry[0], entry[1], entry[2] or "(none)"
+    return entry[0], entry[1], "(none)"
+
+
+def _build_family_prompt(entries, before: list[str]) -> str:
     """Assemble a single-label prompt for a mixed batch of parents + children.
 
     ``entries`` is a list of ``(level, preview)`` in document order where each
@@ -896,8 +1124,10 @@ def _build_family_prompt(entries: list[tuple[str, str]], before: list[str]) -> s
     headers narrower than their section header.
     """
     passages = "\n\n".join(
-        f"{i}. [{level.upper()}] {preview}"
-        for i, (level, preview) in enumerate(entries, 1)
+        f"{i}. [{level.upper()}]\nBOOK HEADING: {heading}\n"
+        f"REPRESENTATIVE CONTENT:\n{preview}"
+        for i, entry in enumerate(entries, 1)
+        for level, preview, heading in [_unpack_entry(entry)]
     )
     seen = "\n".join(f"- {t}" for t in before if t) or "(none yet)"
     return (
@@ -924,7 +1154,7 @@ def _build_family_prompt(entries: list[tuple[str, str]], before: list[str]) -> s
 
 
 def generate_family_batch_titles(
-    entries: list[tuple[str, str]],
+    entries,
     client=None,
     *,
     before: list[str] | None = None,
@@ -940,11 +1170,15 @@ def generate_family_batch_titles(
     """
     if not entries:
         return []
+    unpacked = [_unpack_entry(entry) for entry in entries]
     previews = [
-        _first_n_words(content, _level_params(level)[0])
-        for level, content in entries
+        representative_context(content, _level_params(level)[0])
+        for level, content, _ in unpacked
     ]
-    tagged = [(level, preview) for (level, _), preview in zip(entries, previews)]
+    tagged = [
+        (level, preview, heading)
+        for (level, _, heading), preview in zip(unpacked, previews)
+    ]
 
     client = client or _make_client()
     prompt = _build_family_prompt(tagged, before or [])
@@ -963,7 +1197,7 @@ def generate_family_batch_titles(
     headers = _parse_title_list(raw)
     titles: list[str] = [""] * len(entries)
     for i, header in enumerate(headers[: len(entries)]):
-        level = entries[i][0]
+        level = unpacked[i][0]
         _, min_words, max_words, _ = _level_params(level)
         cleaned = clean_title(header, max_words)
         if validate_title(cleaned, min_words, max_words):
@@ -977,6 +1211,7 @@ def regenerate_title(
     level: str = "section",
     reject: list[str] | None = None,
     used_titles: set[str] | None = None,
+    book_heading: str = "",
 ) -> str:
     """Fix one rejected header with ONE extra LLM call, then a deterministic fallback.
 
@@ -986,7 +1221,7 @@ def regenerate_title(
     label is returned.
     """
     client = client or _make_client()
-    preview = _first_n_words(content, _level_params(level)[0])
+    preview = representative_context(content, _level_params(level)[0])
     _, min_words, max_words, fallback_max = _level_params(level)
     reject = list(dict.fromkeys(t for t in (reject or []) if t))
     used = used_titles or set()
@@ -997,7 +1232,11 @@ def regenerate_title(
     try:
         raw = client.chat(
             _REGENERATE_PROMPT.format(
-                header=header, max_words=max_words, reject=reject_str, content=preview
+                header=header,
+                max_words=max_words,
+                reject=reject_str,
+                content=preview,
+                book_heading=book_heading or "(none)",
             ),
             system_prompt=None,
             temperature=TITLE_TEMPERATURE,
@@ -1009,11 +1248,8 @@ def regenerate_title(
         raw = ""
 
     cleaned = clean_title(raw, max_words)
-    acceptable = (
-        cleaned
-        and validate_title(cleaned, min_words, max_words)
-        and not _blocklisted(cleaned)
-        and cleaned not in used
+    acceptable = bool(cleaned) and is_acceptable_title(
+        cleaned, content, level, used, book_heading
     )
     if acceptable:
         return _finalize(cleaned)
@@ -1067,9 +1303,11 @@ _REVIEW_PROMPT = (
     "- 1-3   Bad header; write a completely new header for the passage "
     "(REPLACE).\n"
     "\n"
-    "A good header: a noun phrase, 2 to 6 words, Title Case, naming the ONE "
-    "concept the passage teaches, and matching the passage rather than a "
-    "sentence fragment pulled out of it.\n"
+    "A good header is preferably 4 to 12 words (never more than 15), names "
+    "the dominant subject and what the passage teaches about it, and is "
+    "supported by the representative content. The source book heading guides "
+    "the topic and may be kept unchanged when it already describes the "
+    "dominant content specifically.\n"
     "\n"
     "A bad header (score 1-3) commonly:\n"
     "- is a phrase lifted verbatim from the passage prose (e.g. \"Yet Another "
@@ -1080,8 +1318,10 @@ _REVIEW_PROMPT = (
     "\"... Predicts\"),\n"
     "- carries trailing noise like a Roman numeral or number (e.g. \"Machine "
     "Learning Overview II\"),\n"
-    "- is generic filler (\"Overview\", \"Introduction\") or does not match "
-    "the passage.\n"
+    "- is generic filler or only a broad category when a specific process, "
+    "function, relation, cause, or result is supported,\n"
+    "- is invented, based on an incidental sentence, or does not cover the "
+    "dominant passage content.\n"
     "\n"
     "The SECTION header must stay broader than its SUBSECTION headers, and "
     "every header in the group must stay distinct from the others.\n"
@@ -1137,7 +1377,7 @@ def _parse_review(raw: str) -> dict[int, tuple[int, str, str]]:
 
 def _verify_title(client, title: str, content: str) -> int | None:
     """Re-score one rewritten header; None when the model reply is unusable."""
-    preview = _first_n_words(content, TITLE_REVIEW_CONTEXT_WORDS)
+    preview = representative_context(content, TITLE_REVIEW_CONTEXT_WORDS)
     try:
         raw = client.chat(
             _VERIFY_PROMPT.format(title=title, content=preview),
@@ -1178,7 +1418,7 @@ def _generate_candidates(
     order.
     """
     min_words, max_words = _review_level_bounds(level)
-    preview = _first_n_words(content, TITLE_REVIEW_CONTEXT_WORDS)
+    preview = representative_context(content, TITLE_REVIEW_CONTEXT_WORDS)
     try:
         raw = client.chat(
             _CANDIDATES_PROMPT.format(header=header, n=n, preview=preview),
@@ -1295,11 +1535,16 @@ def review_titles(parents, children, client=None) -> None:
             entries = []
             for i, (item, level) in enumerate(items, 1):
                 label = "SECTION" if level == "section" else "SUBSECTION"
-                preview = _first_n_words(item.content, TITLE_REVIEW_CONTEXT_WORDS)
+                preview = representative_context(
+                    item.content, TITLE_REVIEW_CONTEXT_WORDS
+                )
+                heading = getattr(item, "book_heading", None) or "(none)"
                 verbatim = title_appears_in_text(item.title or "", item.content)
                 note = " (NOTE: this header text appears verbatim in the passage)" if verbatim else ""
                 entries.append(
-                    f"{i}. {label}: {item.title!r}{note}\n   Passage: {preview}"
+                    f"{i}. {label}: {item.title!r}{note}\n"
+                    f"   Book heading: {heading}\n"
+                    f"   Representative passage: {preview}"
                 )
             prompt = _REVIEW_PROMPT + "\n\n## Passages to review\n\n" + "\n\n".join(entries)
             raw = client.chat(

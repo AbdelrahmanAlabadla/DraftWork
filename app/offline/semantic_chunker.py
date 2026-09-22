@@ -7,7 +7,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any
+from typing import Any, Callable
 
 from app.config import (
     CHILD_MAX_SIZE,
@@ -28,15 +28,15 @@ from app.config import (
 )
 from app.logging_conf import get_logger
 from app.offline.embeddings import cosine_sim, dense_vector, device_name
-from app.offline.parser_items import item_text, page_items, page_number
+from app.offline.parser_items import item_text, item_type, page_items, page_number
 from app.offline.title_generator import (
+    descriptive_fallback,
     generate_batch_titles,
     generate_family_batch_titles,
     is_acceptable_title,
     make_titles_unique,
     make_title_client,
     regenerate_title,
-    review_titles,
 )
 
 logger = get_logger("SEMANTIC_CHUNKER")
@@ -69,12 +69,19 @@ def count_words(text: str) -> int:
 class Paragraph:
     text: str
     page: int | None = None
+    item_type: str = "text"
+    heading_level: int | None = None
+    order: int = 0
+    role: str = "content"
+    strong_boundary: bool = False
 
 
 @dataclass
 class Sentence:
     text: str
     page: int | None = None
+    item_type: str = "text"
+    heading_level: int | None = None
 
 
 @dataclass
@@ -85,6 +92,11 @@ class ParentChunk:
     page_start: int | None
     page_end: int | None
     content: str
+    book_heading: str | None = None
+    heading_level: int | None = None
+    content_role: str = "content"
+    source_items: list[Paragraph] | None = None
+    protected_boundary: bool = False
 
 
 @dataclass
@@ -96,6 +108,57 @@ class ChildChunk:
     page_start: int | None
     page_end: int | None
     content: str
+    book_heading: str | None = None
+    heading_level: int | None = None
+    content_role: str = "content"
+    source_items: list[Paragraph] | None = None
+
+
+_ARABIC_LETTER = r"\u0621-\u064A\u066E-\u06D3\u06FA-\u06FF"
+_MAJOR_HEADING_RE = re.compile(
+    r"^\s*(?:الوحدة|القسم|الفصل|الباب|الدرس|chapter|section|unit|lesson|part)\b"
+    r"|^\s*[\d٠-٩]+\s*(?:الوحدة|القسم|الفصل|الباب)\b"
+    r"|^\s*(?:دليل\s+الدراسة|التقويم|التقييم|مراجعة\s+(?:الوحدة|الفصل))\b",
+    re.IGNORECASE,
+)
+_SPECIAL_ROLE_RE = re.compile(
+    r"^\s*(?:تمرين|تمارين|نشاط|أنشطة|تجربة|اختبر|"
+    r"(?:(?:الوحدة|الفصل|القسم)\s*[\d٠-٩]*\s*)?(?:تقويم|تقييم|مراجعة)|"
+    r"أسئلة\s+(?:ذات|إجابات|مراجعة)|دليل\s+الدراسة|مراجع|المراجع|"
+    r"exercise|activity|review|assessment|evaluation|questions?|"
+    r"references?|bibliography)\b",
+    re.IGNORECASE,
+)
+
+
+def _heading_level(item: dict[str, Any]) -> int | None:
+    value = item.get("lvl", item.get("level"))
+    return value if isinstance(value, int) and value > 0 else None
+
+
+def _layout_label(item: dict[str, Any]) -> str:
+    box = item.get("bBox")
+    return str(box.get("label") or "").lower() if isinstance(box, dict) else ""
+
+
+def _content_role(text: str, kind: str) -> str:
+    if kind == "table":
+        return "table"
+    if _SPECIAL_ROLE_RE.search(text):
+        return "supplementary"
+    return "content"
+
+
+def _is_strong_heading(item: dict[str, Any], text: str) -> bool:
+    """Return whether a parser heading is a reliable structural boundary."""
+    if item_type(item) != "heading":
+        return False
+    if _MAJOR_HEADING_RE.search(text):
+        return True
+    label = _layout_label(item)
+    if label in {"footer", "page_number"}:
+        return False
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -113,12 +176,25 @@ def extract_paragraphs(pages: list[dict[str, Any]]) -> list[Paragraph]:
     Parent chunking then merges consecutive paragraphs purely by similarity.
     """
     paragraphs: list[Paragraph] = []
+    order = 0
     for page in pages:
         page_num = page_number(page)
         for item in page_items(page):
             text = item_text(item)
             if text:
-                paragraphs.append(Paragraph(text=text, page=page_num))
+                kind = item_type(item)
+                paragraphs.append(
+                    Paragraph(
+                        text=text,
+                        page=page_num,
+                        item_type=kind,
+                        heading_level=_heading_level(item),
+                        order=order,
+                        role=_content_role(text, kind),
+                        strong_boundary=_is_strong_heading(item, text),
+                    )
+                )
+                order += 1
     return paragraphs
 
 
@@ -137,7 +213,7 @@ def split_sentence_stream(pages: list[dict[str, Any]]) -> list[Sentence]:
 
 
 def split_sentences(text: str) -> list[str]:
-    """Split plain text into sentences on ``.!?`` + whitespace + capital/quote/digit.
+    """Split Arabic, English and mixed text into semantic sentence/list units.
 
     Guards against known abbreviations (``Dr.``), decimals (``4.91``), and
     figure/equation references (``Figure 1-1.``) that should not end a sentence.
@@ -145,8 +221,16 @@ def split_sentences(text: str) -> list[str]:
     if not text:
         return []
     text = _mask_non_boundary_periods(text)
-    text = re.sub(r"\s+", " ", text).strip()
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'(])", text)
+    # Preserve parser line boundaries when they introduce a bullet, numbered
+    # question, or short heading without terminal punctuation.
+    text = re.sub(
+        r"\s*\n\s*(?=(?:[-*•–—]\s+|[\(\[]?[0-9٠-٩]{1,3}[.)\]:-]\s+))",
+        "\n",
+        text,
+    )
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    starter = rf"(?=[A-Z0-9{_ARABIC_LETTER}\"'\(\[])"
+    parts = re.split(rf"(?<=[.!?؟؛])\s+{starter}|\n+", text)
     out: list[str] = []
     for part in parts:
         part = part.strip()
@@ -210,16 +294,55 @@ def split_parents(
     encode_ms = (time.perf_counter() - t0) * 1000
     t0 = time.perf_counter()
 
+    # In a structurally marked book, explicit unit/section/review headings own
+    # parent boundaries and subordinate headings are left for child splitting.
+    # Documents without such markers retain the semantic/lvl-1 fallback.
+    structured = sum(1 for p in paragraphs if p.strong_boundary) >= 2
     groups: list[list[Paragraph]] = [[paragraphs[0]]]
     for i in range(1, len(paragraphs)):
         sim = cosine_sim(vecs[i - 1], vecs[i])
-        split = sim < threshold
+        current = paragraphs[i]
+        previous = paragraphs[i - 1]
+        structural = current.strong_boundary or (
+            not structured
+            and current.item_type == "heading"
+            and current.heading_level == 1
+            and 1 <= count_words(current.text) <= 12
+        )
+        if structural:
+            marker_re = re.compile(
+                r"^\s*(الوحدة|القسم|الفصل|الباب|chapter|section|unit|part)\s*([\d٠-٩]+)",
+                re.IGNORECASE,
+            )
+            current_marker = marker_re.match(current.text)
+            previous_marker = next(
+                (
+                    marker_re.match(unit.text)
+                    for unit in reversed(groups[-1])
+                    if unit.item_type == "heading" and marker_re.match(unit.text)
+                ),
+                None,
+            )
+            if (
+                current_marker
+                and previous_marker
+                and current_marker.group(1).lower() == previous_marker.group(1).lower()
+                and current_marker.group(2) == previous_marker.group(2)
+            ):
+                structural = False
+        role_boundary = False
+        split = structural or (not structured and sim < threshold)
+        reason = (
+            "heading" if structural else "content_role" if role_boundary
+            else "similarity" if split else "merge"
+        )
         logger.info(
-            "Parent boundary | i=%d | sim=%.4f | threshold=%.2f | action=%s",
+            "Parent boundary | i=%d | sim=%.4f | threshold=%.2f | action=%s | reason=%s",
             i,
             sim,
             threshold,
             "merge" if not split else "split",
+            reason,
         )
         if split:
             groups.append([paragraphs[i]])
@@ -246,6 +369,76 @@ def _group_content(group: list[Paragraph]) -> str:
     return " ".join(p.text for p in group).strip()
 
 
+def _group_heading(group: list[Paragraph]) -> tuple[str | None, int | None]:
+    headings = [unit for unit in group if unit.item_type == "heading"]
+    generic = re.compile(
+        r"^\s*(?:(?:الوحدة|القسم|الفصل|الباب|chapter|section|unit|part)\s*[\d٠-٩]+|"
+        r"[\d٠-٩]+\s*(?:الوحدة|القسم|الفصل|الباب))\s*$",
+        re.IGNORECASE,
+    )
+    for unit in headings:
+        if (
+            not generic.match(unit.text)
+            and not re.match(r"^\s*(?:الشكل|صورة|جدول|figure|table)\b", unit.text, re.IGNORECASE)
+            and count_words(unit.text) <= 15
+            and unit.role == "content"
+        ):
+            return unit.text, unit.heading_level
+    for unit in headings:
+        return unit.text, unit.heading_level
+    return None, None
+
+
+def _group_role(group: list[Paragraph]) -> str:
+    if group and group[0].role != "content":
+        return group[0].role
+    if group and group[0].item_type == "table":
+        return "table"
+    return "content"
+
+
+def _can_merge_parents(left: ParentChunk, right: ParentChunk) -> bool:
+    """Short chunks may merge only within one unprotected content region."""
+    if right.protected_boundary:
+        return False
+    if left.content_role != right.content_role:
+        return False
+    if left.content_role in {"supplementary", "table"}:
+        return False
+    if not left.content or not right.content:
+        return False
+    # The initial semantic walk already embedded every paragraph. Avoid a
+    # second per-parent model call here; require strong lexical continuity as a
+    # conservative additional gate for short-fragment merging.
+    def terms(value: str) -> set[str]:
+        return {
+            token.lower()
+            for token in re.findall(rf"[A-Za-z{_ARABIC_LETTER}]{{3,}}", value)
+        }
+
+    a = terms(left.content[-1200:])
+    b = terms(right.content[:1200])
+    return bool(a and b and len(a & b) / min(len(a), len(b)) >= 0.35)
+
+
+def _merged_parent(left: ParentChunk, right: ParentChunk) -> ParentChunk:
+    units = list(left.source_items or []) + list(right.source_items or [])
+    page_start, page_end = _paragraph_pages(units) if units else _page_range(left, right)
+    return ParentChunk(
+        parent_id=left.parent_id,
+        document_id=left.document_id,
+        title=left.title,
+        page_start=page_start,
+        page_end=page_end,
+        content=f"{left.content} {right.content}".strip(),
+        book_heading=left.book_heading or right.book_heading,
+        heading_level=left.heading_level or right.heading_level,
+        content_role=left.content_role,
+        source_items=units or None,
+        protected_boundary=left.protected_boundary,
+    )
+
+
 def _page_range(*parents: ParentChunk) -> tuple[int | None, int | None]:
     pages = [p.page_start for p in parents if p.page_start is not None]
     pages += [p.page_end for p in parents if p.page_end is not None]
@@ -263,44 +456,28 @@ def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
 
     ``count_tokens`` estimates token counts from words via WORDS_PER_TOKEN.
     """
-    # 1. Drop the tiny ones first.
-    kept = [p for p in parents if count_tokens(p.content) > PARENT_MIN_TOKENS_DROP]
+    # 1. Keep structural/supplementary units even when short; only discard
+    # genuinely unstructured fragments below the floor.
+    kept = [
+        p for p in parents
+        if count_tokens(p.content) > PARENT_MIN_TOKENS_DROP
+        or p.protected_boundary
+        or p.content_role in {"supplementary", "table"}
+    ]
     if not kept:
         return []
 
     # 2. Merge short parents into a neighbour (prefer the previous).
     merged: list[ParentChunk] = []
     for parent in kept:
-        if merged and count_tokens(parent.content) < PARENT_MERGE_TOKENS:
-            prev = merged[-1]
-            page_start, page_end = _page_range(prev, parent)
-            merged[-1] = ParentChunk(
-                parent_id=prev.parent_id,
-                document_id=prev.document_id,
-                title=prev.title,
-                page_start=page_start,
-                page_end=page_end,
-                content=f"{prev.content} {parent.content}".strip(),
-            )
+        if (
+            merged
+            and count_tokens(parent.content) < PARENT_MERGE_TOKENS
+            and _can_merge_parents(merged[-1], parent)
+        ):
+            merged[-1] = _merged_parent(merged[-1], parent)
             continue
         merged.append(parent)
-    # First parent may itself be short; fold the second into it if so.
-    if (
-        len(merged) >= 2
-        and count_tokens(merged[0].content) < PARENT_MERGE_TOKENS
-    ):
-        head = merged[0]
-        nxt = merged[1]
-        page_start, page_end = _page_range(head, nxt)
-        merged[1] = ParentChunk(
-            parent_id=head.parent_id,
-            document_id=head.document_id,
-            title=head.title,
-            page_start=page_start,
-            page_end=page_end,
-            content=f"{head.content} {nxt.content}".strip(),
-        )
-        merged.pop(0)
 
     # 3. Split any parent that exceeds the hard ceiling at sentence boundaries.
     max_parent_words = max(1, int(PARENT_MAX_SIZE / WORDS_PER_TOKEN))
@@ -309,34 +486,56 @@ def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
         if count_words(parent.content) <= max_parent_words:
             final.append(parent)
             continue
-        sents = split_sentences(parent.content)
-        current = ""
-        for sent in sents:
-            candidate = f"{current} {sent}".strip()
-            if current and count_words(candidate) > max_parent_words:
-                page_start, page_end = parent.page_start, parent.page_end
-                final.append(
-                    ParentChunk(
-                        parent_id=str(uuid.uuid4()),
-                        document_id=parent.document_id,
-                        title=None,
-                        page_start=page_start,
-                        page_end=page_end,
-                        content=current,
+        units: list[Paragraph] = []
+        for unit in parent.source_items or [Paragraph(parent.content, parent.page_start)]:
+            if count_words(unit.text) <= max_parent_words:
+                units.append(unit)
+                continue
+            for piece in split_sentences(unit.text):
+                # An OCR paragraph can still contain no punctuation. Fall back
+                # to a bounded word slice while retaining its exact page.
+                words = piece.split()
+                for start in range(0, len(words), max_parent_words):
+                    units.append(
+                        Paragraph(
+                            " ".join(words[start : start + max_parent_words]),
+                            unit.page,
+                            unit.item_type,
+                            unit.heading_level,
+                            unit.order,
+                            unit.role,
+                            unit.strong_boundary and start == 0,
+                        )
                     )
-                )
-                current = sent
-            else:
-                current = candidate
-        if current:
+
+        packed: list[list[Paragraph]] = []
+        current_units: list[Paragraph] = []
+        current_words = 0
+        for unit in units:
+            words = count_words(unit.text)
+            if current_units and current_words + words > max_parent_words:
+                packed.append(current_units)
+                current_units, current_words = [], 0
+            current_units.append(unit)
+            current_words += words
+        if current_units:
+            packed.append(current_units)
+
+        for index, part in enumerate(packed):
+            page_start, page_end = _paragraph_pages(part)
             final.append(
                 ParentChunk(
                     parent_id=str(uuid.uuid4()),
                     document_id=parent.document_id,
                     title=None,
-                    page_start=parent.page_start,
-                    page_end=parent.page_end,
-                    content=current,
+                    page_start=page_start,
+                    page_end=page_end,
+                    content=_group_content(part),
+                    book_heading=parent.book_heading,
+                    heading_level=parent.heading_level,
+                    content_role=parent.content_role,
+                    source_items=part,
+                    protected_boundary=parent.protected_boundary and index == 0,
                 )
             )
     return final
@@ -358,6 +557,7 @@ def build_parents(
         if not content:
             continue
         page_start, page_end = _paragraph_pages(group)
+        heading, heading_level = _group_heading(group)
         parents.append(
             ParentChunk(
                 parent_id=str(uuid.uuid4()),
@@ -366,6 +566,11 @@ def build_parents(
                 page_start=page_start,
                 page_end=page_end,
                 content=content,
+                book_heading=heading,
+                heading_level=heading_level,
+                content_role=_group_role(group),
+                source_items=list(group),
+                protected_boundary=bool(group[0].strong_boundary),
             )
         )
     return _apply_parent_policy(parents)
@@ -459,7 +664,7 @@ def _last_sentence_of(content: str) -> str:
 
 def count_tokens(text: str) -> int:
     """Approximate token count from the word count via WORDS_PER_TOKEN."""
-    return int(count_words(text) / WORDS_PER_TOKEN)
+    return int(count_words(text) * WORDS_PER_TOKEN)
 
 
 # Stray diagram/axis labels that must never survive as a chunk sentence.
@@ -540,7 +745,7 @@ _KEEP_STRUCTURAL_NUMBER_WORDS = frozenset(
 # Plain numbered-list markers such as "1.", "2)" that carry no meaning and
 # should be stripped before embedding. Structural numbers ("Chapter 3",
 # "Section 2.1") and year-like numbers ("in 2020.") are protected.
-_LIST_MARKER_RE = re.compile(r"(?<!\d)(\d{1,2})\s*[.)]\s+")
+_LIST_MARKER_RE = re.compile(r"(?<![\d٠-٩])([\d٠-٩]{1,3})\s*[.)\]:-]\s+")
 
 # Plain bullet/list markers ("- X", "• X", "– X", "— X", "* X") that carry no
 # meaning and should be dropped while keeping the list content that follows.
@@ -601,7 +806,7 @@ def _is_question_sentence(sent: str) -> bool:
     stripped = sent.strip()
     if not _LIST_MARKER_RE.match(stripped):
         return False
-    return stripped.rstrip().endswith("?")
+    return stripped.rstrip().endswith(("?", "؟"))
 
 
 # Short-but-meaningful units that must never be silently dropped: definitions,
@@ -637,7 +842,7 @@ def _meaningful_fragment(text: str) -> bool:
 
 
 def _apply_min_floor(
-    groups: list[str], max_child_words: int
+    groups: list[str], max_child_words: int, protected_prefixes: set[str] | None = None
 ) -> list[str]:
     """Enforce the minimum child size on already-packed groups.
 
@@ -652,18 +857,21 @@ def _apply_min_floor(
     """
     if not groups:
         return []
+    protected_prefixes = protected_prefixes or set()
     out: list[str] = []
     for g in groups:
         tk = count_tokens(g)
+        protected = any(g.startswith(prefix) for prefix in protected_prefixes)
         # Genuine junk at or below the drop floor is discarded; meaningful
         # fragments (definitions / questions / headings) always survive.
-        if tk <= CHILD_MIN_TOKENS_DROP and not _meaningful_fragment(g):
+        if tk <= CHILD_MIN_TOKENS_DROP and not protected and not _meaningful_fragment(g):
             continue
         # Anything else under the merge floor is folded into the previous chunk,
         # but never past the size ceiling.
         if (
             tk <= CHILD_MIN_TOKENS_MERGE
             and out
+            and not protected
             and count_words(out[-1]) + count_words(g) <= max_child_words
         ):
             out[-1] = f"{out[-1]} {g}".strip()
@@ -677,6 +885,25 @@ def _apply_min_floor(
     ):
         out[1] = f"{out[0]} {out[1]}".strip()
         out.pop(0)
+    # Any remaining heading-only fragment belongs with the content that
+    # follows it, never as a standalone retrieval chunk.
+    folded: list[str] = []
+    i = 0
+    while i < len(out):
+        current = out[i]
+        protected = any(current.startswith(prefix) for prefix in protected_prefixes)
+        if (
+            protected
+            and count_words(current) <= 12
+            and i + 1 < len(out)
+            and count_words(current) + count_words(out[i + 1]) <= max_child_words
+        ):
+            folded.append(f"{current} {out[i + 1]}".strip())
+            i += 2
+            continue
+        folded.append(current)
+        i += 1
+    out = folded
     return out
 
 
@@ -732,6 +959,38 @@ def _prepare_child_sentences(text: str) -> list[str]:
     return selected
 
 
+def _prepare_child_sentence_units(parent: ParentChunk) -> list[Sentence]:
+    """Prepare child sentences without losing their parser page provenance."""
+    units = parent.source_items or [Paragraph(parent.content, parent.page_start)]
+    selected: list[Sentence] = []
+    for unit in units:
+        cleaned = strip_list_markers(unit.text)
+        if not cleaned:
+            continue
+        for piece in split_sentences(cleaned):
+            if _is_junk_sentence(piece):
+                continue
+            norm = _normalize_sentence(piece)
+            if selected and _normalize_sentence(selected[-1].text) == norm:
+                continue
+            selected.append(
+                Sentence(piece.strip(), unit.page, unit.item_type, unit.heading_level)
+            )
+    return selected
+
+
+def _is_child_heading(sentence: Sentence) -> bool:
+    if sentence.item_type != "heading" or count_words(sentence.text) > 15:
+        return False
+    return not bool(
+        re.match(
+            r"^\s*(?:الشكل|صورة|جدول|figure|fig\.?|table)\b",
+            sentence.text,
+            re.IGNORECASE,
+        )
+    )
+
+
 def preembed_sentences(parents: list[ParentChunk]) -> dict[str, list[list[float]]]:
     """Embed every child sentence of the whole book in one batched pass.
 
@@ -744,8 +1003,8 @@ def preembed_sentences(parents: list[ParentChunk]) -> dict[str, list[list[float]
     for p in parents:
         if _is_question_parent(p.content):
             continue
-        for s in _prepare_child_sentences(p.content):
-            pairs.append((p.parent_id, s))
+        for s in _prepare_child_sentence_units(p):
+            pairs.append((p.parent_id, s.text))
     if not pairs:
         return {}
     texts = [s for _, s in pairs]
@@ -803,17 +1062,21 @@ def build_children(
                 page_start=parent.page_start,
                 page_end=parent.page_end,
                 content=text.strip(),
+                book_heading=parent.book_heading,
+                heading_level=parent.heading_level,
+                content_role=parent.content_role,
+                source_items=parent.source_items,
             )
         ]
 
-    selected = _prepare_child_sentences(text)
-    if not selected:
+    child_sents = _prepare_child_sentence_units(parent)
+    if not child_sents:
         return []
-
-    child_sents = [Sentence(s, page=None) for s in selected]
 
     max_child_words = _max_child_words()
     current_chunk = child_sents[0].text
+    current_heading_only = _is_child_heading(child_sents[0])
+    current_kind = child_sents[0].item_type
     groups: list[str] = []
 
     enc = time.perf_counter()
@@ -827,9 +1090,50 @@ def build_children(
         count_in_chunk = 0
     for i, next_sent in enumerate(child_sents[1:]):
         candidate = f"{current_chunk} {next_sent.text}"
+        if (
+            current_heading_only
+            and _is_child_heading(next_sent)
+            and count_words(candidate) <= max_child_words
+        ):
+            current_chunk = candidate
+            if vecs is not None:
+                c0, c1 = count_in_chunk, count_in_chunk + 1
+                centroid = [
+                    (a * c0 + b) / c1 for a, b in zip(centroid, vecs[i + 1])
+                ]
+                count_in_chunk = c1
+            continue
+        if _is_child_heading(next_sent) or next_sent.item_type == "table" or (
+            current_kind == "table" and next_sent.item_type != "table"
+        ):
+            groups.append(current_chunk)
+            current_chunk = next_sent.text
+            current_heading_only = _is_child_heading(next_sent)
+            current_kind = next_sent.item_type
+            if vecs is not None:
+                centroid = list(vecs[i + 1])
+                count_in_chunk = 1
+            logger.info(
+                "Child boundary | parent_id=%s | action=split | reason=heading",
+                parent.parent_id,
+            )
+            continue
+        if current_heading_only and count_words(candidate) <= max_child_words:
+            current_chunk = candidate
+            current_heading_only = False
+            current_kind = "content"
+            if vecs is not None:
+                c0, c1 = count_in_chunk, count_in_chunk + 1
+                centroid = [
+                    (a * c0 + b) / c1 for a, b in zip(centroid, vecs[i + 1])
+                ]
+                count_in_chunk = c1
+            continue
         if count_words(candidate) > max_child_words:
             groups.append(current_chunk)
             current_chunk = next_sent.text
+            current_heading_only = False
+            current_kind = next_sent.item_type
             if vecs is not None:
                 centroid = list(vecs[i + 1])
                 count_in_chunk = 1
@@ -853,6 +1157,7 @@ def build_children(
         )
         if sim >= SIMILARITY_THRESHOLD_CHILD:
             current_chunk = candidate
+            current_kind = "content"
             if vecs is not None:
                 c0, c1 = count_in_chunk, count_in_chunk + 1
                 centroid = [
@@ -862,6 +1167,8 @@ def build_children(
         else:
             groups.append(current_chunk)
             current_chunk = next_sent.text
+            current_heading_only = False
+            current_kind = next_sent.item_type
             if vecs is not None:
                 centroid = list(vecs[i + 1])
                 count_in_chunk = 1
@@ -873,7 +1180,10 @@ def build_children(
     # groups are still disjoint. Doing this before the overlap step prevents a
     # carried-forward sentence from being duplicated when a fragment is folded
     # into a chunk that already received it as overlap.
-    floored = _apply_min_floor(groups, max_child_words)
+    heading_prefixes = {
+        s.text for s in child_sents if s.item_type == "heading"
+    }
+    floored = _apply_min_floor(groups, max_child_words, heading_prefixes)
 
     # Overlap: carry exactly the last sentence of the previous child forward
     # into the next child (adds continuity for retrieval). The cap stays strict:
@@ -914,12 +1224,30 @@ def build_children(
     )
 
     children: list[ChildChunk] = []
-    body_pages = _dispatch_pages(
-        [b for b in filtered if b], parent.page_start, parent.page_end
-    )
-    for body, (s_page, e_page) in zip(
-        [b for b in filtered if b], body_pages
-    ):
+    nonempty = [b for b in filtered if b]
+    for body in nonempty:
+        body_sents = [s for s in child_sents if s.text in body]
+        pages = [s.page for s in body_sents if s.page is not None]
+        s_page = min(pages) if pages else parent.page_start
+        e_page = max(pages) if pages else parent.page_end
+        def contributes(unit: Paragraph) -> bool:
+            if unit.text in body:
+                return True
+            cleaned = strip_list_markers(unit.text)
+            return any(piece in body for piece in split_sentences(cleaned))
+
+        source_items = [unit for unit in (parent.source_items or []) if contributes(unit)]
+        child_heading, child_heading_level = _group_heading(source_items)
+        child_heading = child_heading or parent.book_heading
+        child_heading_level = child_heading_level or parent.heading_level
+        heading_item = next(
+            (unit for unit in source_items if unit.text == child_heading), None
+        )
+        child_role = parent.content_role
+        if any(unit.item_type == "table" for unit in source_items):
+            child_role = "table"
+        elif heading_item and _SPECIAL_ROLE_RE.search(heading_item.text):
+            child_role = "supplementary"
         children.append(
             ChildChunk(
                 child_id=str(uuid.uuid4()),
@@ -929,6 +1257,10 @@ def build_children(
                 page_start=s_page,
                 page_end=e_page,
                 content=body.strip(),
+                book_heading=child_heading,
+                heading_level=child_heading_level,
+                content_role=child_role,
+                source_items=source_items or None,
             )
         )
     return children
@@ -1014,7 +1346,8 @@ def verify_chunk_invariants(chunks: dict[str, Any]) -> list[str]:
 
 
 def _label_families(
-    parents: list[ParentChunk], children: list[ChildChunk], client=None
+    parents: list[ParentChunk], children: list[ChildChunk], client=None,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> None:
     """Label sections and their subsections, one LLM call per batch of families.
 
@@ -1041,29 +1374,41 @@ def _label_families(
     recent: list[str] = []
 
     for start in range(0, len(parents), TITLE_BATCH_SIZE):
+        if check_cancelled:
+            check_cancelled()
         batch = parents[start : start + TITLE_BATCH_SIZE]
-        entries: list[tuple[str, str]] = []
+        entries: list[tuple[str, str, str | None]] = []
         owners: list[tuple[str, ParentChunk | ChildChunk]] = []
         for p in batch:
-            entries.append(("section", p.content))
+            entries.append(("section", p.content, p.book_heading))
             owners.append(("section", p))
             for c in by_parent.get(p.parent_id, []):
-                entries.append(("subsection", c.content))
+                entries.append(("subsection", c.content, c.book_heading))
                 owners.append(("subsection", c))
 
         titles = generate_family_batch_titles(
             entries, client=client, before=recent[-TITLE_CONTEXT_RECENT:]
         )
+        if check_cancelled:
+            check_cancelled()
         for (level, item), title in zip(owners, titles):
-            if not (title and is_acceptable_title(title, item.content, level, used)):
+            if not (
+                title
+                and is_acceptable_title(
+                    title, item.content, level, used, item.book_heading or ""
+                )
+            ):
                 title = regenerate_title(
                     client=client,
                     content=item.content,
                     level=level,
                     reject=[title] if title else [],
                     used_titles=used,
+                    book_heading=item.book_heading or "",
                 )
-            if title and is_acceptable_title(title, item.content, level, used):
+            if title and is_acceptable_title(
+                title, item.content, level, used, item.book_heading or ""
+            ):
                 item.title = title
                 used.add(title)
                 recent.append(title)
@@ -1077,8 +1422,76 @@ def _label_families(
                 )
 
 
+
+def _enforce_title_invariants(
+    parents: list[ParentChunk], children: list[ChildChunk], client=None,
+    check_cancelled: Callable[[], None] | None = None,
+) -> None:
+    """Final document-wide grounding/uniqueness pass after optional review."""
+    client = client or make_title_client()
+    used: set[str] = set()
+    child_counts = Counter(c.parent_id for c in children)
+    items: list[tuple[str, ParentChunk | ChildChunk]] = []
+    for parent in parents:
+        items.append(("section", parent))
+        items.extend(
+            ("subsection", child)
+            for child in children
+            if child.parent_id == parent.parent_id and child_counts[child.parent_id] > 1
+        )
+
+    for index, (level, item) in enumerate(items, 1):
+        if check_cancelled:
+            check_cancelled()
+        if item.title and is_acceptable_title(
+            item.title,
+            item.content,
+            level,
+            used,
+            item.book_heading or "",
+        ):
+            used.add(item.title)
+            continue
+        regenerated = regenerate_title(
+            client=client,
+            content=item.content,
+            level=level,
+            reject=[item.title] if item.title else [],
+            used_titles=used,
+            book_heading=item.book_heading or "",
+        )
+        if regenerated and is_acceptable_title(
+            regenerated,
+            item.content,
+            level,
+            used,
+            item.book_heading or "",
+        ):
+            item.title = regenerated
+            used.add(regenerated)
+            continue
+        if level == "subsection":
+            item.title = None
+            continue
+        emergency = clean = descriptive_fallback(
+            item.content,
+            item.book_heading or "",
+            index=index,
+            max_words=FALLBACK_SECTION_MAX_WORDS,
+        )
+        suffix = 2
+        while emergency in used:
+            emergency = f"{clean} {suffix}"
+            suffix += 1
+        item.title = emergency
+        used.add(emergency)
+
+
 def build_semantic_structure(
-    pages: list[dict[str, Any]], document_id: str
+    pages: list[dict[str, Any]], document_id: str,
+    *,
+    on_stage: Callable[[str], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Generate the semantic section/subsection structure for a document.
 
@@ -1088,17 +1501,28 @@ def build_semantic_structure(
     t0 = time.perf_counter()
     logger.info("Semantic chunking started | document_id=%s", document_id)
 
+    def checkpoint(stage: str | None = None) -> None:
+        if is_cancelled and is_cancelled():
+            from app.offline.pipeline import PipelineCancelled
+            raise PipelineCancelled("Document processing was cancelled")
+        if stage and on_stage:
+            on_stage(stage)
+
     # PHASE 1 - chunking only (no LLM). Parents are built first, then each
     # parent is immediately chunked into its child units, in document order.
+    checkpoint("detecting_headings")
     parents = build_parents(split_parents(pages), document_id)
     logger.info("Parents generated | count=%d", len(parents))
 
     # Embed every sentence of the whole book ONCE, then split each parent's
     # children by comparing the precomputed vectors (no per-sentence model calls).
+    checkpoint("chunking")
     sentence_vecs = preembed_sentences(parents)
+    checkpoint()
 
     children: list[ChildChunk] = []
     for parent in parents:
+        checkpoint()
         children.extend(
             build_children(parent, sentence_vecs=sentence_vecs.get(parent.parent_id))
         )
@@ -1116,7 +1540,15 @@ def build_semantic_structure(
     )
 
     # PHASE 2 - titles only (LLM): one call per batch of parent families.
-    _label_families(parents, children)
+    checkpoint("generating_titles")
+    title_client = make_title_client()
+    _label_families(parents, children, client=title_client, check_cancelled=checkpoint)
+    _enforce_title_invariants(
+        parents, children, client=title_client, check_cancelled=checkpoint
+    )
+    checkpoint()
+    if any(not p.title for p in parents):
+        raise ValueError("Title generation left a parent without a title")
 
     elapsed = time.perf_counter() - t0
     logger.info(
@@ -1137,6 +1569,19 @@ def build_semantic_structure(
         parent_subtitles.setdefault(c.parent_id, []).append(c.title)
         child_order_map[c.child_id] = len(parent_subtitles[c.parent_id]) - 1
 
+    def source_metadata(items: list[Paragraph] | None) -> list[dict[str, Any]]:
+        return [
+            {
+                "type": item.item_type,
+                "page": item.page,
+                "heading_level": item.heading_level,
+                "order": item.order,
+                "role": item.role,
+                "text": item.text,
+            }
+            for item in (items or [])
+        ]
+
     return {
         "parents": [
             {
@@ -1149,6 +1594,10 @@ def build_semantic_structure(
                 "page_start": p.page_start,
                 "page_end": p.page_end,
                 "content": p.content,
+                "book_heading": p.book_heading,
+                "heading_level": p.heading_level,
+                "content_role": p.content_role,
+                "source_items": source_metadata(p.source_items),
             }
             for p in parents
         ],
@@ -1167,6 +1616,10 @@ def build_semantic_structure(
                 "page_start": c.page_start,
                 "page_end": c.page_end,
                 "content": c.content,
+                "book_heading": c.book_heading,
+                "heading_level": c.heading_level,
+                "content_role": c.content_role,
+                "source_items": source_metadata(c.source_items),
             }
             for c in children
         ],

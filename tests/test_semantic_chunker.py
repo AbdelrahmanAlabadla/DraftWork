@@ -46,16 +46,17 @@ def _patch_titles(monkeypatch):
     monkeypatch.setattr(
         "app.offline.semantic_chunker.generate_family_batch_titles",
         lambda entries, client=None, *, before=None: [
-            "ST" if level == "section" else "CT" for level, _ in entries
+            "ST" if entry[0] == "section" else "CT" for entry in entries
         ],
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.is_acceptable_title",
-        lambda title, content, level, used_titles: bool(title),
+        lambda title, content, level, used_titles, book_heading="": bool(title),
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.regenerate_title",
-        lambda client=None, content="", level="section", reject=None, used_titles=None: "RT",
+        lambda client=None, content="", level="section", reject=None,
+        used_titles=None, book_heading="": "RT",
     )
 
 
@@ -87,6 +88,27 @@ def test_split_sentences_basic_and_abbreviations():
         "The model works.",
     ]
     assert split_sentences("Dr. Smith left.") == ["Dr. Smith left."]
+
+
+def test_split_sentences_handles_arabic_and_mixed_punctuation():
+    text = "تكتشف المستقبلات المؤثرات. ثم تنقل الإشارات العصبية؟ Next sentence."
+    assert split_sentences(text) == [
+        "تكتشف المستقبلات المؤثرات.",
+        "ثم تنقل الإشارات العصبية؟",
+        "Next sentence.",
+    ]
+
+
+def test_extract_paragraphs_preserves_parser_metadata():
+    pages = [_page([{"type": "heading", "value": "القسم 1", "lvl": 2}, _table("A | B")], 7)]
+    parts = extract_paragraphs(pages)
+    assert parts[0].item_type == "heading"
+    assert parts[0].heading_level == 2
+    assert parts[0].strong_boundary is True
+    assert parts[0].page == 7
+    assert parts[0].order == 0
+    assert parts[1].item_type == "table"
+    assert parts[1].role == "table"
 
 
 def test_split_sentences_guards_decimal():
@@ -153,6 +175,37 @@ def test_split_parents_all_similar_single_group(monkeypatch):
     pages = [_page([_body("Alpha one."), _body("Alpha two."), _body("Alpha three.")])]
     monkeypatch.setattr(sc, "dense_vector", lambda texts: [list(E)] * len(texts))
     assert len(split_parents(pages, threshold=0.5)) == 1
+
+
+def test_arabic_book_headings_override_high_semantic_similarity(monkeypatch):
+    pages = [
+        _page([_heading("الوحدة 6"), _body("مقدمة الجهاز العصبي.")], 21),
+        _page([_heading("القسم 1"), _heading("تركيب الجهاز العصبي"), _body("تتكون الخلية العصبية من أجزاء.")], 23),
+        _page([_heading("2 القسم"), _heading("تنظيم الجهاز العصبي"), _body("ينقسم الجهاز العصبي إلى قسمين.")], 29),
+    ]
+    monkeypatch.setattr(sc, "dense_vector", lambda texts: [list(E)] * len(texts))
+    groups = split_parents(pages, threshold=0.5)
+    assert len(groups) == 3
+    assert groups[1][0].text == "القسم 1"
+    assert groups[2][0].text == "2 القسم"
+
+
+def test_build_children_uses_real_source_pages(monkeypatch):
+    source = [
+        Paragraph("عنوان فرعي", 7, "heading", 2, 1),
+        Paragraph("الجملة الأولى تشرح المفهوم.", 7, "text", None, 2),
+        Paragraph("الجملة الثانية تكمل الشرح.", 8, "text", None, 3),
+    ]
+    parent = ParentChunk(
+        "p", "d", None, 7, 8, " ".join(p.text for p in source),
+        book_heading="عنوان القسم", source_items=source,
+    )
+    monkeypatch.setattr(sc, "CHILD_MIN_TOKENS_DROP", 0)
+    monkeypatch.setattr(sc, "CHILD_MIN_TOKENS_MERGE", 0)
+    children = build_children(parent, sentence_vecs=[list(E)] * 3)
+    assert children[0].page_start == 7
+    assert children[0].page_end == 8
+    assert children[0].book_heading == "عنوان فرعي"
 
 
 def test_split_parents_logs_boundary_decision(monkeypatch, caplog):
@@ -400,7 +453,7 @@ def test_label_families_titles_multi_child_children(monkeypatch):
     calls = []
 
     def fake_batch(entries, client=None, *, before=None):
-        calls.append([level for level, _ in entries])
+        calls.append([entry[0] for entry in entries])
         return ["ST", "CT", "CT", "ST"]
 
     parents = [
@@ -418,11 +471,12 @@ def test_label_families_titles_multi_child_children(monkeypatch):
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.is_acceptable_title",
-        lambda title, content, level, used_titles: bool(title),
+        lambda title, content, level, used_titles, book_heading="": bool(title),
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.regenerate_title",
-        lambda client=None, content="", level="section", reject=None, used_titles=None: "RT",
+        lambda client=None, content="", level="section", reject=None,
+        used_titles=None, book_heading="": "RT",
     )
 
     sc._label_families(parents, children)

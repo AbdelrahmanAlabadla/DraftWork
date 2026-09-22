@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from app.language import detect_language
 from app.logging_conf import get_logger, set_request_id
 from app.offline.chunk_report import save_chunk_report
 from app.offline.cleaner import clean_pages
 from app.offline.dump_outputs import save_chunk_dump, save_parse_dump
 from app.offline.embeddings import embed_texts
 from app.offline.parser import LlamaParser
+from app.offline.parser_items import item_text, page_items
 from app.offline.semantic_chunker import (
     build_semantic_structure,
     verify_chunk_invariants,
@@ -24,12 +26,18 @@ class PipelineError(RuntimeError):
     pass
 
 
+class PipelineCancelled(PipelineError):
+    pass
+
+
 def run_pipeline(
     file_path: str | Path,
     document_id: str,
     *,
     session_id: str | None = None,
     job_id: str | None = None,
+    on_stage: Callable[[str], None] | None = None,
+    is_cancelled: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Execute PDF parsing, cleaning, chunking, embedding, and indexing."""
     set_request_id(document_id)
@@ -42,11 +50,19 @@ def run_pipeline(
     logger.info("=" * 70)
     logger.info("OFFLINE PIPELINE STARTED | document_id=%s | file=%s", document_id, path.name)
 
+    def checkpoint(stage: str | None = None) -> None:
+        if is_cancelled and is_cancelled():
+            raise PipelineCancelled("Document processing was cancelled")
+        if stage and on_stage:
+            on_stage(stage)
+
     try:
         # --- Stage 1: Parse ---------------------------------------------------
+        checkpoint("extracting")
         t0 = time.perf_counter()
         raw_pages = LlamaParser().parse(path)
         timings["parsing"] = time.perf_counter() - t0
+        checkpoint()
 
         # --- Stage 1a: Exact raw parse dump (for inspection) -----------------
         t0 = time.perf_counter()
@@ -60,9 +76,32 @@ def run_pipeline(
         if not pages:
             raise PipelineError("Cleaning removed all content")
 
+        checkpoint("detecting_language")
+        sample_parts: list[str] = []
+        sample_length = 0
+        for page in pages:
+            for item in page_items(page):
+                text = item_text(item)
+                if not text:
+                    continue
+                remaining = 20000 - sample_length
+                if remaining <= 0:
+                    break
+                sample_parts.append(text[:remaining])
+                sample_length += min(len(text), remaining)
+            if sample_length >= 20000:
+                break
+        detect_language(" ".join(sample_parts))
+        checkpoint()
+
         # --- Stage 3: Semantic structure generation (parents + children) ----
         t0 = time.perf_counter()
-        chunks = build_semantic_structure(pages, document_id)
+        chunks = build_semantic_structure(
+            pages,
+            document_id,
+            on_stage=on_stage,
+            is_cancelled=is_cancelled,
+        )
         timings["chunking"] = time.perf_counter() - t0
         parents = chunks["parents"]
         children = chunks["children"]
@@ -104,7 +143,9 @@ def run_pipeline(
         # --- Stage 4: Embed children only (retrieval units) ------------------
         t0 = time.perf_counter()
         child_texts = [c["content"] for c in children]
+        checkpoint()
         embeddings = embed_texts(child_texts)
+        checkpoint()
         timings["embeddings"] = time.perf_counter() - t0
         if len(embeddings) != len(children):
             raise PipelineError(
@@ -114,11 +155,13 @@ def run_pipeline(
         # --- Stage 5: Store children in Qdrant -------------------------------
         t0 = time.perf_counter()
         store = VectorStore()
+        checkpoint()
         store.ensure_collection()
         store.delete_document(document_id, session_id=session_id)
         vectors_uploaded = store.upsert(
             children, embeddings, session_id=session_id, job_id=job_id
         )
+        checkpoint()
         timings["qdrant_upload"] = time.perf_counter() - t0
 
         # --- Stage 6: Persist parent structure (sections) to JSON ------------

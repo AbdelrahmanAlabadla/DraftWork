@@ -10,13 +10,20 @@ from __future__ import annotations
 import base64
 import binascii
 import io
+import re
 from pathlib import Path
 from typing import Any
 
 from fpdf import FPDF
 from fpdf.enums import MethodReturnValue
 
-from app.exports.common import RESPONSE_LINE_TEXT, group_exam_sections, response_line_count
+from app.exports.common import (
+    RESPONSE_LINE_TEXT,
+    exam_document_language,
+    group_exam_sections,
+    response_line_count,
+)
+from app.language import detect_language
 
 PAGE_MARGIN_MM = 12.7  # exactly 0.5 inch
 FOOTER_Y_MM = -9.5
@@ -141,8 +148,18 @@ def _register_math_font() -> bool:
     return True
 
 
-def _align(pdf: "_ExamPDF") -> str:
-    return "R" if pdf.rtl else "L"
+_SCRIPT_LETTER_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u0600-\u06ff]")
+
+
+def _text_is_rtl(text: object, fallback: bool = False) -> bool:
+    value = str(text or "")
+    if not _SCRIPT_LETTER_RE.search(value):
+        return fallback
+    return detect_language(value) == "ar"
+
+
+def _align(pdf: "_ExamPDF", text: object = "") -> str:
+    return "R" if _text_is_rtl(text, pdf.rtl) else "L"
 
 
 def _text_height(pdf: _ExamPDF, text: str, width: float, line_height: float = LINE_HEIGHT) -> float:
@@ -234,22 +251,24 @@ def _draw_section_heading(pdf: _ExamPDF, label: str, minimum_after: float = 12) 
     pdf.set_draw_color(*RULE)
     pdf.set_text_color(*ACCENT)
     pdf.set_font(BODY_FONT, "B", 11)
-    pdf.cell(0, 7, _latin(label), border="B", fill=True, align=_align(pdf))
+    pdf.cell(0, 7, _latin(label), border="B", fill=True, align=_align(pdf, label))
     pdf.ln(9)
     pdf.set_text_color(*INK)
 
 
 def _draw_question_stem(pdf: _ExamPDF, number: int, text: str, minimum_after: float = 0) -> None:
-    marker = f"{number}. " if pdf.rtl else f"Q{number}. "
+    rtl = _text_is_rtl(text, pdf.rtl)
+    marker = f"{number}. " if rtl else f"Q{number}. "
     stem = marker + _clean(text, "(missing question text)")
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     height = _text_height(pdf, stem, pdf.epw)
     pdf.ensure_space(height + minimum_after)
-    pdf.multi_cell(0, LINE_HEIGHT, stem, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+    pdf.multi_cell(0, LINE_HEIGHT, stem, align=_align(pdf, text), new_x="LEFT", new_y="NEXT")
 
 
 def _draw_mcq_option(pdf: _ExamPDF, letter: str, option: object, width: float) -> float:
-    text = f"{_clean(option)} .{letter}" if pdf.rtl else f"{letter}. {_clean(option)}"
+    rtl = _text_is_rtl(option, pdf.rtl)
+    text = f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}"
     pdf.set_font(BODY_FONT, "", 9.6)
     return _text_height(pdf, text, width - 2, 5.0)
 
@@ -274,18 +293,21 @@ def _draw_mcq(pdf: _ExamPDF, item: dict[str, Any]) -> None:
             pdf.ensure_space(row_h)
             row_y = pdf.get_y()
             for col, (letter, option) in enumerate(pair):
-                x = pdf.l_margin + col * (col_w + gutter)
+                visual_col = 1 - col if pdf.rtl else col
+                x = pdf.l_margin + visual_col * (col_w + gutter)
                 pdf.set_xy(x + 2, row_y)
-                opt_text = f"{_clean(option)} .{letter}" if pdf.rtl else f"{letter}. {_clean(option)}"
-                pdf.multi_cell(col_w - 2, 5.0, _latin(opt_text), align=_align(pdf), new_x="LEFT", new_y="NEXT")
+                rtl = _text_is_rtl(option, pdf.rtl)
+                opt_text = f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}"
+                pdf.multi_cell(col_w - 2, 5.0, _latin(opt_text), align=_align(pdf, option), new_x="LEFT", new_y="NEXT")
             pdf.set_y(row_y + row_h)
     else:
         for letter, option in options:
-            opt_text = f"{_clean(option)} .{letter}" if pdf.rtl else f"{letter}. {_clean(option)}"
+            rtl = _text_is_rtl(option, pdf.rtl)
+            opt_text = f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}"
             height = _draw_mcq_option(pdf, str(letter), option, pdf.epw - 4) + 0.8
             pdf.ensure_space(height)
             pdf.set_x(pdf.l_margin + 4)
-            pdf.multi_cell(pdf.epw - 4, 5.0, _latin(opt_text), align=_align(pdf), new_x="LEFT", new_y="NEXT")
+            pdf.multi_cell(pdf.epw - 4, 5.0, _latin(opt_text), align=_align(pdf, option), new_x="LEFT", new_y="NEXT")
             pdf.ln(0.8)
     pdf.ln(2.2)
 
@@ -331,8 +353,10 @@ def _draw_true_false(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     choices_compact = (
         "(   ) صح   (   ) خطأ" if pdf.rtl else "(   ) True   (   ) False"
     )
-    marker = f"{item['number']}. " if pdf.rtl else f"Q{item['number']}. "
-    statement = marker + _clean(item['text'], '(missing statement)')
+    raw_statement = _clean(item['text'], '(missing statement)')
+    statement_rtl = _text_is_rtl(raw_statement, pdf.rtl)
+    marker = f"{item['number']}. " if statement_rtl else f"Q{item['number']}. "
+    statement = marker + raw_statement
     answer_w = 28.0
     text_w = pdf.epw - answer_w - 3
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
@@ -340,14 +364,14 @@ def _draw_true_false(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     if height > LINE_HEIGHT + 0.1:
         full_height = _text_height(pdf, statement, pdf.epw)
         pdf.ensure_space(full_height + 7)
-        pdf.multi_cell(pdf.epw, LINE_HEIGHT, statement, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+        pdf.multi_cell(pdf.epw, LINE_HEIGHT, statement, align=_align(pdf, raw_statement), new_x="LEFT", new_y="NEXT")
         pdf.set_font(BODY_FONT, "", 9.5)
         pdf.cell(0, 5, choices_wide, align="L" if pdf.rtl else "R")
         pdf.ln(8)
         return
     pdf.ensure_space(height + 2)
     y = pdf.get_y()
-    pdf.multi_cell(text_w, LINE_HEIGHT, statement, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+    pdf.multi_cell(text_w, LINE_HEIGHT, statement, align=_align(pdf, raw_statement), new_x="LEFT", new_y="NEXT")
     pdf.set_xy(pdf.l_margin + text_w + 3, y)
     pdf.set_font(BODY_FONT, "", 9.5)
     pdf.cell(answer_w, LINE_HEIGHT, choices_compact, align="R")
@@ -369,8 +393,10 @@ def _draw_open_ended(
     item: dict[str, Any],
     qtype: str,
 ) -> None:
-    marker = f"{item['number']}. " if pdf.rtl else f"Q{item['number']}. "
-    text = marker + _clean(item['text'], '(missing question text)')
+    raw_text = _clean(item['text'], '(missing question text)')
+    text_rtl = _text_is_rtl(raw_text, pdf.rtl)
+    marker = f"{item['number']}. " if text_rtl else f"Q{item['number']}. "
+    text = marker + raw_text
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     stem_h = _text_height(pdf, text, pdf.epw)
     line_count = response_line_count(qtype)
@@ -383,7 +409,7 @@ def _draw_open_ended(
         block_height if block_height <= usable_page_height
         else stem_h + ANSWER_LINE_HEIGHT + 2
     )
-    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_text), new_x="LEFT", new_y="NEXT")
     pdf.ln(1)
     _draw_answer_lines(pdf, line_count)
     pdf.ln(2.5)
@@ -392,13 +418,14 @@ def _draw_open_ended(
 
 def _draw_definition(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     marker = f"{item['number']}. "
-    term = marker + _clean(item.get("text"), "(missing term)") + ": "
+    raw_term = _clean(item.get("text"), "(missing term)")
+    term = marker + raw_term + ": "
     line = "_" * 54
     text = term + line
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     height = _text_height(pdf, text, pdf.epw)
     pdf.ensure_space(height + 4)
-    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_term), new_x="LEFT", new_y="NEXT")
     pdf.ln(4)
 
 
@@ -420,11 +447,12 @@ def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
 
 
 def _draw_word_problem(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    text = f"{item['number']}. " + _clean(item.get("text"), "(missing question text)")
+    raw_text = _clean(item.get("text"), "(missing question text)")
+    text = f"{item['number']}. " + raw_text
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     stem_h = _text_height(pdf, text, pdf.epw)
     pdf.ensure_space(stem_h + ANSWER_LINE_HEIGHT + 2)
-    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_text), new_x="LEFT", new_y="NEXT")
     pdf.ln(1)
     _draw_answer_lines(pdf, response_line_count("word_problem"))
     pdf.ln(2.5)
@@ -480,26 +508,29 @@ def _draw_student_exam(
 
 
 def _answer_text(item: dict[str, Any], language: str = "en") -> str:
+    from app.exports.common import ANSWER_LABELS_BY_LANG
+
+    labels = ANSWER_LABELS_BY_LANG.get(language, ANSWER_LABELS_BY_LANG["en"])
     qtype = item["qtype"]
     if qtype == "mcq":
-        return _clean(item.get("correct_answer"), "No answer supplied")
+        return _clean(item.get("correct_answer"), labels["missing"])
     if qtype == "true_false":
         from app.online.models import tf_answer_label
 
-        raw = _clean(item.get("answer"), "No answer supplied")
+        raw = _clean(item.get("answer"), labels["missing"])
         if raw.lower() in {"true", "false"}:
             return tf_answer_label(raw, language)
         return raw
     if qtype == "fill_in_the_blank":
-        return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or "No answer supplied"
+        return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or labels["missing"]
     if qtype in {"equation", "word_problem"}:
         steps = [_clean(step) for step in (item.get("solution_steps") or []) if _clean(step)]
-        final = _clean(item.get("final_answer"), "No final answer supplied")
+        final = _clean(item.get("final_answer"), labels["missing_final"])
         return " → ".join([*steps, final])
-    answer = _clean(item.get("reference_answer"), "No reference answer supplied")
+    answer = _clean(item.get("reference_answer"), labels["missing_reference"])
     key_points = [_clean(point) for point in (item.get("key_points") or []) if _clean(point)]
     if key_points:
-        separator = " | نقاط رئيسية: " if language == "ar" else " | Key points: "
+        separator = f" | {labels['key_points']}: "
         answer += separator + "; ".join(key_points)
     return answer
 
@@ -525,12 +556,14 @@ def _draw_answer_key(
     for section in sections:
         _draw_section_heading(pdf, section["label"], minimum_after=11)
         for item in section["items"]:
-            marker = f"{item['number']}. " if pdf.rtl else f"Q{item['number']}. "
-            text = marker + _answer_text(item, language=pdf.language)
+            answer = _answer_text(item, language=pdf.language)
+            answer_rtl = pdf.rtl if item["qtype"] == "mcq" else _text_is_rtl(answer, pdf.rtl)
+            marker = f"{item['number']}. " if answer_rtl else f"Q{item['number']}. "
+            text = marker + answer
             pdf.set_font(BODY_FONT, "", 9.5)
             height = _text_height(pdf, text, pdf.epw, 5.0)
             pdf.ensure_space(height + 2)
-            pdf.multi_cell(0, 5.0, text, align=_align(pdf), new_x="LEFT", new_y="NEXT")
+            pdf.multi_cell(0, 5.0, text, align=_align(pdf, answer), new_x="LEFT", new_y="NEXT")
             pdf.ln(1.5)
 
 
@@ -540,7 +573,7 @@ def _render_model_pdf(
     """Render one model as either a student exam or a standalone answer key."""
     global _UNICODE_OUTPUT, BODY_FONT
     metadata = dict(metadata or {})
-    language = str(metadata.get("document_language") or "en")
+    language = exam_document_language(exam, metadata)
     has_arabic = _register_arabic_font()
     has_math = _register_math_font()
     try:
@@ -548,7 +581,9 @@ def _render_model_pdf(
         pdf.alias_nb_pages()
         questions = exam.get("questions") or {}
         needs_math_font = any(questions.get(qtype) for qtype in ("equation", "word_problem"))
-        if pdf.rtl and has_arabic:
+        content_blob = f"{metadata.get('exam_title', '')} {exam.get('questions', '')}"
+        needs_arabic_font = pdf.rtl or detect_language(content_blob) == "ar"
+        if needs_arabic_font and has_arabic:
             BODY_FONT = ARABIC_FONT
             _UNICODE_OUTPUT = True
             pdf.add_font(ARABIC_FONT, "", str(FONT_DIR / "Amiri-Regular.ttf"))

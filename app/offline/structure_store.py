@@ -30,6 +30,10 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
     children = structure.get("children", [])
     sections = []
     for parent in structure.get("parents", []):
+        if not str(parent.get("title") or "").strip():
+            raise ValueError(
+                f"Refusing to persist parent {parent.get('parent_id')} without a title"
+            )
         parent_children = [
             c for c in children if c["parent_id"] == parent["parent_id"]
         ]
@@ -54,6 +58,10 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
                 "title": c.get("title"),
                 "page_start": c.get("page_start"),
                 "page_end": c.get("page_end"),
+                "book_heading": c.get("book_heading"),
+                "heading_level": c.get("heading_level"),
+                "content_role": c.get("content_role"),
+                "source_items": c.get("source_items", []),
                 "order": i,
             }
             for i, c in enumerate(shown)
@@ -72,6 +80,10 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
                 "child_count": child_count,
                 "page_start": parent.get("page_start"),
                 "page_end": parent.get("page_end"),
+                "book_heading": parent.get("book_heading"),
+                "heading_level": parent.get("heading_level"),
+                "content_role": parent.get("content_role"),
+                "source_items": parent.get("source_items", []),
                 "subsections": subsections,
             }
         )

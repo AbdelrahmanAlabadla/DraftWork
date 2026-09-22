@@ -511,6 +511,51 @@ def get_job(job_id: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def cancel_job(job_id: str) -> dict[str, Any]:
+    """Atomically cancel an active job and return its final database state."""
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute("SELECT * FROM jobs WHERE id = %s FOR UPDATE", (job_id,))
+            job = cursor.fetchone()
+            if job is None:
+                raise ResourceNotFound("Job not found")
+            if job["status"] in {"queued", "running", "retrying"}:
+                cursor.execute(
+                    """UPDATE jobs
+                       SET status = 'cancelled', stage = 'cancelled',
+                           error_code = 'USER_CANCELLED',
+                           error_message = 'Cancelled by user',
+                           worker_id = NULL, heartbeat_at = NULL,
+                           finished_at = CURRENT_TIMESTAMP,
+                           updated_at = CURRENT_TIMESTAMP
+                       WHERE id = %s
+                       RETURNING *""",
+                    (job_id,),
+                )
+                job = cursor.fetchone()
+                if job and job["type"] == "document_ingestion":
+                    cursor.execute(
+                        """UPDATE documents
+                           SET status = 'cancelled', active_index_job_id = NULL,
+                               error_code = 'USER_CANCELLED',
+                               error_message = 'Processing cancelled by user',
+                               updated_at = CURRENT_TIMESTAMP
+                           WHERE id = %s
+                             AND status IN ('uploading', 'queued', 'processing')""",
+                        (job["document_id"],),
+                    )
+        conn.commit()
+    return dict(job)
+
+
+def job_is_cancelled(job_id: str) -> bool:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT status FROM jobs WHERE id = %s", (job_id,))
+            row = cursor.fetchone()
+    return row is None or row[0] == "cancelled"
+
+
 def mark_job_dispatched(job_id: str) -> None:
     with db.connection() as conn:
         with conn.cursor() as cursor:
@@ -643,9 +688,21 @@ def retry_job(job_id: str, error_code: str, error_message: str) -> None:
 
 def complete_ingestion_job(
     job_id: str, *, structure_storage_key: str, stats: dict[str, Any]
-) -> None:
+) -> bool:
     with db.connection() as conn:
         with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE jobs SET status = 'completed', stage = 'completed',
+                          progress = 100, result_data = %s,
+                          finished_at = CURRENT_TIMESTAMP,
+                          updated_at = CURRENT_TIMESTAMP
+                   WHERE id = %s AND status = 'running'
+                   RETURNING document_id""",
+                (Jsonb({"document_id": stats.get("document_id")}), job_id),
+            )
+            if cursor.fetchone() is None:
+                conn.commit()
+                return False
             cursor.execute(
                 """UPDATE documents d
                    SET status = 'ready', structure_storage_key = %s,
@@ -656,24 +713,29 @@ def complete_ingestion_job(
                    WHERE j.id = %s AND d.id = j.document_id""",
                 (structure_storage_key, job_id, Jsonb(stats), job_id),
             )
-            cursor.execute(
-                """UPDATE jobs SET status = 'completed', stage = 'completed',
-                          progress = 100, result_data = %s,
-                          finished_at = CURRENT_TIMESTAMP,
-                          updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s""",
-                (Jsonb({"document_id": stats.get("document_id")}), job_id),
-            )
         conn.commit()
+    return True
 
 
 def complete_generation_job(
     job_id: str, *, exam_id: str, document_id: str, session_id: str,
     status: str, exams: list[dict[str, Any]], warnings: list[str],
     metadata: dict[str, Any], evaluation: dict[str, Any],
-) -> None:
+) -> bool:
     with db.connection() as conn:
         with conn.cursor() as cursor:
+            cursor.execute(
+                """UPDATE jobs SET status = 'completed', stage = 'completed',
+                          progress = 100, result_data = %s,
+                          finished_at = CURRENT_TIMESTAMP,
+                          updated_at = CURRENT_TIMESTAMP
+                   WHERE id = %s AND status = 'running'
+                   RETURNING id""",
+                (Jsonb({"exam_id": exam_id}), job_id),
+            )
+            if cursor.fetchone() is None:
+                conn.commit()
+                return False
             cursor.execute(
                 """INSERT INTO exams (
                        id, session_id, user_id, document_id, job_id, status,
@@ -686,15 +748,8 @@ def complete_generation_job(
                     session_id,
                 ),
             )
-            cursor.execute(
-                """UPDATE jobs SET status = 'completed', stage = 'completed',
-                          progress = 100, result_data = %s,
-                          finished_at = CURRENT_TIMESTAMP,
-                          updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s""",
-                (Jsonb({"exam_id": exam_id}), job_id),
-            )
         conn.commit()
+    return True
 
 
 def fail_job(job_id: str, error_code: str, error_message: str) -> None:
@@ -706,17 +761,18 @@ def fail_job(job_id: str, error_code: str, error_message: str) -> None:
                           error_code = %s, error_message = %s,
                           finished_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s""",
+                   WHERE id = %s AND status IN ('running', 'retrying')
+                   RETURNING type, document_id""",
                 (error_code, safe_message, job_id),
             )
-            cursor.execute(
-                """UPDATE documents d SET status = 'failed', error_code = %s,
-                          error_message = %s, updated_at = CURRENT_TIMESTAMP
-                   FROM jobs j
-                   WHERE j.id = %s AND j.type = 'document_ingestion'
-                     AND d.id = j.document_id""",
-                (error_code, safe_message, job_id),
-            )
+            failed = cursor.fetchone()
+            if failed and failed[0] == "document_ingestion":
+                cursor.execute(
+                    """UPDATE documents SET status = 'failed', error_code = %s,
+                              error_message = %s, updated_at = CURRENT_TIMESTAMP
+                       WHERE id = %s""",
+                    (error_code, safe_message, failed[1]),
+                )
         conn.commit()
 
 

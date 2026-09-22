@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional, TypedDict
+from typing import Any, Callable, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 
@@ -38,6 +38,23 @@ class ExamState(TypedDict):
     # --- Warnings / Result ----------------------------------------------
     warnings: list[str]
     error: Optional[str]
+    progress_callback: Optional[Callable[[str, int], None]]
+
+
+def _with_progress(node, stage: str, progress: int, *, after_repair: bool = False):
+    """Report the real graph step before running a node."""
+    def wrapped(state: ExamState):
+        callback = state.get("progress_callback")
+        if callback:
+            current_stage = stage
+            current_progress = progress
+            if after_repair and state.get("pending_revalidation_ids"):
+                current_stage = "validating_updates"
+                current_progress = 95
+            callback(current_stage, current_progress)
+        return node(state)
+
+    return wrapped
 
 
 def build_exam_graph() -> StateGraph:
@@ -52,13 +69,21 @@ def build_exam_graph() -> StateGraph:
 
     builder = StateGraph(ExamState)
 
-    builder.add_node("receive_request", receive_request)
+    builder.add_node("receive_request", _with_progress(receive_request, "analyzing_request", 5))
     builder.add_node("retrieve_context", retrieve_context)
-    builder.add_node("plan_exams", plan_exams)
-    builder.add_node("repair_plan", repair_plan)
-    builder.add_node("generate_exams", generate_exams_node)
-    builder.add_node("validate_generated_questions", validate_generated_questions)
-    builder.add_node("repair_invalid_questions", repair_invalid_questions)
+    builder.add_node("plan_exams", _with_progress(plan_exams, "planning_exam", 25))
+    builder.add_node("repair_plan", _with_progress(repair_plan, "planning_exam", 25))
+    builder.add_node("generate_exams", _with_progress(generate_exams_node, "generating_exam", 50))
+    builder.add_node(
+        "validate_generated_questions",
+        _with_progress(
+            validate_generated_questions, "validating_exam", 75, after_repair=True
+        ),
+    )
+    builder.add_node(
+        "repair_invalid_questions",
+        _with_progress(repair_invalid_questions, "repairing_exam", 90),
+    )
     builder.add_node("assemble_exams", assemble_exams_node)
 
     builder.set_entry_point("receive_request")

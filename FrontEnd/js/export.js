@@ -1,6 +1,7 @@
 import { state } from "./state.js";
 import { BASE } from "./api.js";
 import { authHeaders } from "./auth.js";
+import { localizedError, t } from "./i18n.js";
 
 const EXPORT_ARCHIVE_NAME = "SmartExam_Export.zip";
 let pendingDocumentKind = null;
@@ -19,6 +20,28 @@ function setStatus(type, msg) {
 export function initExport() {
   const wrap = document.getElementById("exportWrap");
   const btn = document.getElementById("exportBtn");
+  const toggleAll = document.getElementById("exportModelToggleAll");
+
+  function updateToggleAll() {
+    const checkboxes = [...document.querySelectorAll(
+      "#exportModelList input[type='checkbox']"
+    )];
+    const allSelected = checkboxes.length > 0 && checkboxes.every((item) => item.checked);
+    toggleAll.textContent = t(allSelected ? "export.clear_all" : "export.select_all");
+  }
+
+  toggleAll.addEventListener("click", () => {
+    const checkboxes = [...document.querySelectorAll(
+      "#exportModelList input[type='checkbox']"
+    )];
+    const selectAll = !checkboxes.every((item) => item.checked);
+    checkboxes.forEach((item) => { item.checked = selectAll; });
+    document.getElementById("exportModelError").textContent = "";
+    updateToggleAll();
+  });
+
+  document.getElementById("exportModelList").addEventListener("change", updateToggleAll);
+  document.addEventListener("draftwork:language-changed", updateToggleAll);
 
   btn.addEventListener("click", (e) => {
     e.stopPropagation();
@@ -32,7 +55,7 @@ export function initExport() {
     item.addEventListener("click", () => {
       wrap.classList.remove("open");
       if (!state.examId) {
-        setStatus("error", "Generate an exam before exporting.");
+        setStatus("error", t("status.export_requires_exam"));
         return;
       }
       const kind = item.dataset.export;
@@ -46,7 +69,7 @@ export function initExport() {
     )].map((input) => Number(input.value));
     if (!selected.length) {
       document.getElementById("exportModelError").textContent =
-        "Select at least one model.";
+        t("status.select_model");
       return;
     }
     const kind = pendingDocumentKind;
@@ -64,7 +87,7 @@ function availableModelNumbers() {
 function beginDocumentExport(kind) {
   const models = availableModelNumbers();
   if (!models.length) {
-    setStatus("error", "Generate an exam before exporting.");
+    setStatus("error", t("status.export_requires_exam"));
     return;
   }
   if (models.length === 1) {
@@ -82,26 +105,36 @@ function beginDocumentExport(kind) {
       checkbox.type = "checkbox";
       checkbox.value = String(modelNumber);
       const text = document.createElement("span");
-      text.textContent = `Model ${modelNumber}`;
+      text.textContent = t("export.model", { n: modelNumber });
       label.append(checkbox, text);
       return label;
     })
   );
+  updateExportToggleLabel();
   document.getElementById("exportModelDialog").showModal();
+}
+
+function updateExportToggleLabel() {
+  const checkboxes = [...document.querySelectorAll(
+    "#exportModelList input[type='checkbox']"
+  )];
+  const allSelected = checkboxes.length > 0 && checkboxes.every((item) => item.checked);
+  document.getElementById("exportModelToggleAll").textContent =
+    t(allSelected ? "export.clear_all" : "export.select_all");
 }
 
 async function exportDocumentArchive(kind, modelNumbers) {
   const label = kind.toUpperCase();
-  setStatus("loading", `Creating ${label} export...`);
+  setStatus("loading", t("status.creating_export", { kind: label }));
   try {
     await triggerDownload(
       `/exams/${state.examId}/export/${kind}`,
       EXPORT_ARCHIVE_NAME,
       { model_numbers: modelNumbers }
     );
-    setStatus("success", `${label} ZIP downloaded.`);
+    setStatus("success", t("status.export_downloaded", { kind: label }));
   } catch (e) {
-    setStatus("error", e.message);
+    setStatus("error", localizedError(e.message, "status.export_failed", { status: "" }));
   }
 }
 
@@ -115,10 +148,12 @@ async function triggerDownload(path, filename, body = null) {
   options.credentials = "same-origin";
   const res = await fetch(`${BASE}${path}`, options);
   if (!res.ok) {
-    let detail = `Export failed (HTTP ${res.status}).`;
+    let detail = t("status.export_failed", { status: res.status });
     try {
       const body = await res.json();
-      if (body.detail) detail = body.detail;
+      if (body.detail) detail = localizedError(
+        body.detail, "status.export_failed", { status: res.status }
+      );
     } catch (_) { /* keep default */ }
     throw new Error(detail);
   }

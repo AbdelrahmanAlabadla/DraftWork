@@ -13,6 +13,7 @@ from billiard.exceptions import SoftTimeLimitExceeded
 from celery import Task
 
 from app import config
+from app.cleanup import _delete_pipeline_artifacts
 from app.api import evaluation_store, repositories
 from app.deadlines import DeadlineExceeded, deadline
 from app.file_storage import get_file_storage
@@ -20,7 +21,8 @@ from app.file_validation import InvalidPdfError, validate_pdf
 from app.jobs.celery_app import celery_app
 from app.cleanup import run_cleanup
 from app.logging_conf import get_logger, set_job_context, set_request_id
-from app.offline.pipeline import run_pipeline
+from app.offline.pipeline import PipelineCancelled, run_pipeline
+from app.offline.vector_store import VectorStore
 from app.online.exam_builder import generate_exams
 from app.metrics import increment, observe
 
@@ -114,15 +116,27 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
 
     storage = get_file_storage()
     try:
-        repositories.update_job_progress(job_id, "parsing_and_indexing", 10)
+        repositories.update_job_progress(job_id, "validating", 5)
         with _heartbeat(job_id):
             with storage.materialize(str(document["source_storage_key"])) as source_path:
                 validate_pdf(source_path)
+                if repositories.job_is_cancelled(job_id):
+                    raise PipelineCancelled("Document processing was cancelled")
                 summary = run_pipeline(
                     source_path,
                     str(document["id"]),
                     session_id=str(document["session_id"]),
                     job_id=job_id,
+                    on_stage=lambda stage: repositories.update_job_progress(
+                        job_id, stage, {
+                            "extracting": 15,
+                            "detecting_language": 30,
+                            "detecting_headings": 40,
+                            "chunking": 50,
+                            "generating_titles": 75,
+                        }.get(stage, 10),
+                    ),
+                    is_cancelled=lambda: repositories.job_is_cancelled(job_id),
                 )
 
         structure_path = Path(str(summary["structure_file"]))
@@ -132,9 +146,13 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
             f"jobs/{job_id}/structure.json"
         )
         storage.put_json(structure_key, structure)
-        repositories.complete_ingestion_job(
+        if repositories.job_is_cancelled(job_id):
+            raise PipelineCancelled("Document processing was cancelled")
+        completed = repositories.complete_ingestion_job(
             job_id, structure_storage_key=structure_key, stats=summary
         )
+        if completed is False:
+            return {"job_id": job_id, "status": "cancelled"}
         increment("genexam_jobs", type="document_ingestion", status="completed")
         observe("genexam_job_duration_seconds", time.perf_counter() - started, type="document_ingestion")
         logger.info(
@@ -147,6 +165,9 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
             },
         )
         return {"job_id": job_id, "status": "completed"}
+    except PipelineCancelled:
+        increment("genexam_jobs", type="document_ingestion", status="cancelled")
+        return {"job_id": job_id, "status": "cancelled"}
     except InvalidPdfError as exc:
         repositories.fail_job(job_id, "INVALID_FILE", str(exc))
         increment("genexam_jobs", type="document_ingestion", status="failed")
@@ -194,7 +215,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
     set_job_context(job_id, str(document["id"]))
 
     try:
-        repositories.update_job_progress(job_id, "generating", 10)
+        repositories.update_job_progress(job_id, "analyzing_request", 5)
         tasks = [tuple(item) for item in request_data["tasks"]]
         with _heartbeat(job_id):
             with deadline(config.GENERATION_TIMEOUT_SECONDS, "Exam generation"):
@@ -206,7 +227,13 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                     str(request_data["difficulty"]),
                     session_id=str(job["session_id"]),
                     index_job_id=str(document["active_index_job_id"]),
+                    progress_callback=lambda stage, progress: repositories.update_job_progress(
+                        job_id, stage, progress
+                    ),
                 )
+        if repositories.job_is_cancelled(job_id):
+            increment("genexam_jobs", type="exam_generation", status="cancelled")
+            return {"job_id": job_id, "status": "cancelled"}
         exams = result.get("exams") or []
         if not any(exam.get("questions") for exam in exams):
             raise RuntimeError("; ".join(result.get("warnings") or []) or "No questions generated")
@@ -215,7 +242,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         metadata = dict(request_data.get("metadata") or {})
         metadata["document_language"] = result.get("document_language") or "en"
         status = str(result.get("status") or "partial")
-        repositories.complete_generation_job(
+        completed = repositories.complete_generation_job(
             job_id,
             exam_id=exam_id,
             document_id=str(document["id"]),
@@ -226,6 +253,9 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             metadata=metadata,
             evaluation=dict(result.get("eval") or {}),
         )
+        if completed is False:
+            increment("genexam_jobs", type="exam_generation", status="cancelled")
+            return {"job_id": job_id, "status": "cancelled"}
         try:
             evaluation_store.save_evaluation(
                 exam_id=exam_id,
@@ -267,14 +297,33 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         return {"job_id": job_id, "status": "failed"}
 
 
+@celery_app.task(name="genexam.cleanup_cancelled_document", ignore_result=True)
+def cleanup_cancelled_document(document_id: str, session_id: str) -> dict[str, int]:
+    """Remove regenerable artifacts left by a cancelled ingestion job."""
+    deleted_vectors = VectorStore().delete_document(
+        document_id, session_id=session_id, raise_errors=True
+    )
+    deleted_files = get_file_storage().delete_tree(
+        f"sessions/{session_id}/documents/{document_id}"
+    )
+    deleted_files += _delete_pipeline_artifacts(document_id)
+    logger.info(
+        "Cancelled ingestion artifacts removed | document_id=%s | files=%d | vectors=%d",
+        document_id,
+        deleted_files,
+        deleted_vectors,
+    )
+    return {"files": deleted_files, "vectors": deleted_vectors}
+
+
 @celery_app.task(name="genexam.recover_stale_jobs")
 def recover_stale_jobs() -> dict[str, int]:
     stale = repositories.recover_stale_jobs(config.JOB_STALE_AFTER_SECONDS)
     for job in stale:
         if job["type"] == "document_ingestion":
-            ingest_document.delay(str(job["id"]))
+            ingest_document.apply_async(args=[str(job["id"])], task_id=str(job["id"]))
         elif job["type"] == "exam_generation":
-            generate_exam.delay(str(job["id"]))
+            generate_exam.apply_async(args=[str(job["id"])], task_id=str(job["id"]))
     return {"requeued": len(stale)}
 
 
@@ -284,9 +333,9 @@ def dispatch_undispatched_jobs() -> dict[str, int]:
     dispatched = 0
     for job in queued:
         if job["type"] == "document_ingestion":
-            ingest_document.delay(str(job["id"]))
+            ingest_document.apply_async(args=[str(job["id"])], task_id=str(job["id"]))
         elif job["type"] == "exam_generation":
-            generate_exam.delay(str(job["id"]))
+            generate_exam.apply_async(args=[str(job["id"])], task_id=str(job["id"]))
         else:
             continue
         repositories.mark_job_dispatched(str(job["id"]))

@@ -115,6 +115,34 @@ def _model_and_metadata() -> tuple[dict, dict]:
     return record["exams"][0], record["metadata"]
 
 
+def _arabic_model_and_metadata() -> tuple[dict, dict]:
+    return (
+        {
+            "model_number": 1,
+            "document_language": "ar",
+            "questions": {
+                "mcq": [{
+                    "question_id": "ar_mcq_1",
+                    "question": "ما دور المستقبلات الحسية في اكتشاف المؤثرات؟",
+                    "options": {
+                        "A": "استقبال المؤثرات",
+                        "B": "هضم الغذاء",
+                        "C": "إنتاج الطاقة فقط",
+                        "D": "تخزين الماء",
+                    },
+                    "correct_answer": "A",
+                }],
+                "short_answer": [{
+                    "question_id": "ar_short_1",
+                    "question": "فسر انتقال السيال العصبي إلى الجهاز العصبي المركزي.",
+                    "reference_answer": "ينتقل السيال عبر الخلايا العصبية الحسية.",
+                }],
+            },
+        },
+        {"exam_title": "اختبار الجهاز العصبي", "class_name": "الصف الثاني عشر"},
+    )
+
+
 def test_pdf_export_produces_separate_exam_and_answer_documents():
     exam, metadata = _model_and_metadata()
     exam_bytes = render_exam_pdf(exam, metadata)
@@ -250,6 +278,44 @@ def test_docx_answer_file_contains_answers_without_student_sections():
     assert RESPONSE_LINE_TEXT not in document_xml
 
 
+def test_arabic_pdf_uses_exam_language_when_metadata_has_no_language():
+    pypdf = pytest.importorskip("pypdf")
+    exam, metadata = _arabic_model_and_metadata()
+    pdf_bytes = render_exam_pdf(exam, metadata)
+    text = "\n".join(
+        page.extract_text() or ""
+        for page in pypdf.PdfReader(io.BytesIO(pdf_bytes)).pages
+    )
+    # Depending on the installed PDF text extractor, shaped RTL runs may be
+    # returned in either logical or visual character order.
+    title = "اختبار الجهاز العصبي"
+    section = "أسئلة الاختيار من متعدد"
+    assert title in text or title[::-1] in text
+    assert section in text or section[::-1] in text
+    assert "صح" not in text  # no English/Arabic true-false scaffold was added
+
+
+def test_arabic_docx_marks_paragraphs_and_runs_rtl():
+    exam, metadata = _arabic_model_and_metadata()
+    docx_bytes = render_exam_docx(exam, metadata)
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    assert "اختبار الجهاز العصبي" in document_xml
+    assert "أسئلة الاختيار من متعدد" in document_xml
+    assert "w:bidi" in document_xml
+    assert "w:rtl" in document_xml
+    assert 'w:val="right"' in document_xml
+
+
+def test_english_docx_remains_ltr():
+    exam, metadata = _model_and_metadata()
+    document = render_exam_docx(exam, metadata)
+    with zipfile.ZipFile(io.BytesIO(document)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    assert "w:bidi" not in document_xml
+    assert "w:rtl" not in document_xml
+
+
 def test_browser_preview_uses_structured_student_and_key_layout():
     from pathlib import Path
 
@@ -258,10 +324,50 @@ def test_browser_preview_uses_structured_student_and_key_layout():
     main_js = (root / "FrontEnd/js/main.js").read_text(encoding="utf-8")
     assert "marked.parse" not in preview_js
     assert 'short_answer: 3, equation: 3, word_problem: 5, essay: 22' in preview_js
-    assert "buildAnswerKey(exam, labels)" in preview_js
+    assert "buildAnswerKey(exam, labels, language, examLabels)" in preview_js
     assert "item.correct_answer" in preview_js
     assert "addResponseLines(question" in preview_js
     assert "renderExamOutput(data.exams, data.metadata || {})" in main_js
+
+
+def test_frontend_markdown_copy_is_questions_first_and_uses_toast():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    preview_js = (root / "FrontEnd/js/exam-view.js").read_text(encoding="utf-8")
+    html = (root / "FrontEnd/index.html").read_text(encoding="utf-8")
+    css = (root / "FrontEnd/css/styles.css").read_text(encoding="utf-8")
+    assert 'const questions = ["# Questions"]' in preview_js
+    assert 'const answers = ["# Answers"]' in preview_js
+    assert preview_js.index('const questions = ["# Questions"]') < preview_js.index(
+        'const answers = ["# Answers"]'
+    )
+    assert "buildQuestionsFirstMarkdown(exams, metadata)" in preview_js
+    assert 'id="copyToast"' in html
+    assert "3000" in preview_js
+    assert ".copy-toast.show" in css
+
+
+def test_frontend_has_content_direction_and_localized_dynamic_statuses():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    preview_js = (root / "FrontEnd/js/exam-view.js").read_text(encoding="utf-8")
+    topics_js = (root / "FrontEnd/js/topics.js").read_text(encoding="utf-8")
+    i18n = (root / "FrontEnd/js/i18n.js").read_text(encoding="utf-8")
+    upload = (root / "FrontEnd/js/upload.js").read_text(encoding="utf-8")
+    export = (root / "FrontEnd/js/export.js").read_text(encoding="utf-8")
+    assert "applyContentDirection" in preview_js
+    assert "applyContentDirection(stitle" in topics_js
+    for key in (
+        "status.uploading", "stage.generating_titles", "status.generation_failed",
+        "status.creating_export", "status.export_downloaded", "saved.loading",
+    ):
+        assert i18n.count(f'"{key}"') == 2
+    assert 'setUploadStage("uploading")' in upload
+    assert "status.processing_pdf" not in i18n
+    assert "parsing_and_indexing" not in upload
+    assert 't("status.creating_export"' in export
 
 
 def test_frontend_question_type_order_and_word_problem_naming():

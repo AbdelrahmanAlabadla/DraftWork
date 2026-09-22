@@ -1,5 +1,5 @@
 import { state } from "./state.js";
-import { computeSelectAllLabel } from "./select_all.js";
+import { applyContentDirection, t } from "./i18n.js";
 
 export function initTopics() {
   document.getElementById("selectAllBtn").addEventListener("click", toggleSelectAll);
@@ -7,7 +7,9 @@ export function initTopics() {
 
 function setSelectAllLabel() {
   const btn = document.getElementById("selectAllBtn");
-  btn.textContent = computeSelectAllLabel(state.selectedChildren.size, countAllCheckboxes());
+  const total = countAllCheckboxes();
+  btn.textContent = state.selectedChildren.size >= total && total > 0
+    ? t("sections.unselect_all") : t("sections.select_all");
 }
 
 function countAllCheckboxes() {
@@ -58,7 +60,8 @@ export function renderSectionsTree(data) {
     srow.appendChild(sbox);
     const stitle = document.createElement("span");
     stitle.className = "section-title";
-    stitle.textContent = section.title || "Untitled";
+    stitle.textContent = section.title || t("sections.title_unavailable");
+    applyContentDirection(stitle, stitle.textContent);
     srow.appendChild(stitle);
     node.appendChild(srow);
 
@@ -76,7 +79,8 @@ export function renderSectionsTree(data) {
       lrow.appendChild(cbox);
       const ctitle = document.createElement("span");
       ctitle.className = "subsection-title";
-      ctitle.textContent = sub.title || "Untitled";
+      ctitle.textContent = sub.title || t("sections.title_unavailable");
+      applyContentDirection(ctitle, ctitle.textContent);
       lrow.appendChild(ctitle);
       slist.appendChild(lrow);
     });
@@ -131,10 +135,8 @@ function refreshSectionState(tree, si) {
 }
 
 function toggleSelectAll() {
-  const selectAll = computeSelectAllLabel(
-    state.selectedChildren.size, countAllCheckboxes()
-  ) === "Unselect All Titles";
-  applySelectAll(!selectAll);
+  const total = countAllCheckboxes();
+  applySelectAll(!(total > 0 && state.selectedChildren.size >= total));
 }
 
 function applySelectAll(select) {
@@ -159,6 +161,10 @@ function applySelectAll(select) {
 
 function updateSectionsCount() {
   document.getElementById("sectionsCount").textContent =
-    `${state.selectedChildren.size} selected`;
+    t("sections.selected", { n: state.selectedChildren.size });
   setSelectAllLabel();
 }
+
+document.addEventListener("draftwork:language-changed", () => {
+  if (document.getElementById("sectionsTree")?.children.length) updateSectionsCount();
+});
