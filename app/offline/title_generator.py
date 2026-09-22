@@ -27,6 +27,7 @@ from app.config import (
     TITLE_TEMPERATURE,
 )
 from app.llm.factory import create_llm_client
+from app.language import arabic_comparison_key, detect_language
 from app.logging_conf import get_logger
 from app.offline.title_nlp import first_noun_chunk, is_noun_phrase, title_appears_in_text
 
@@ -234,6 +235,8 @@ _FAMILY_BATCH_RULE = (
     "- Every header must be DIFFERENT from every other header.\n"
     "- A SUBSECTION header must never equal or generalize its SECTION header.\n"
     "- Base each header mainly on the representative content of its own passage.\n"
+    "- Write each header in that passage's REQUIRED TITLE LANGUAGE. English "
+    "technical abbreviations may remain inside an Arabic header when needed.\n"
     "- Use BOOK HEADING as a topic anchor. Return it unchanged only when it is "
     "already specific and fully describes the dominant content.\n"
     "- Reject a broad category when the content supports a specific process, "
@@ -265,6 +268,7 @@ _REGENERATE_PROMPT = (
     "header. The previous attempt ({header!r}) was rejected and must not be "
     "reused.\n"
     "Rules:\n"
+    "- Write the header in {language}. Do not switch to another language.\n"
     "- Prefer 4 to 12 words and use at most {max_words} words.\n"
     "- State the dominant subject plus the function, process, relation, cause, "
     "result, or distinction taught about it.\n"
@@ -465,11 +469,13 @@ def _merely_rephrases_arabic_heading(title: str, book_heading: str) -> bool:
 
 
 def descriptive_fallback(
-    content: str, book_heading: str = "", index: int = 1, max_words: int = 15
+    content: str, book_heading: str = "", index: int = 1, max_words: int = 15,
+    language: str | None = None,
 ) -> str:
     """Build a grounded emergency label; never return ``Untitled``/blank."""
     heading = clean_title(re.sub(r"<[^>]+>|[*_#]", "", book_heading), max_words)
-    if _is_arabic(content):
+    expected = language or detect_language(content)
+    if expected == "ar":
         words = [
             word for word in _normalize_heading(content).split()
             if len(word) >= 3 and word not in _ARABIC_TITLE_STOP
@@ -1055,6 +1061,24 @@ _FILLER_PREFIXES: tuple[str, ...] = (
     "guide to",
 )
 
+_WEAK_TITLE_START_RE = re.compile(
+    r"^\s*(?:قال|يقول|عن|روي\s+عن|رواه|رضي\s+الله|"
+    r"(?:درس|lesson|chapter|section|unit)\s*[\d٠-٩]+|أكمل|اكمل|أجب|اجب|"
+    r"أفكر|افكر|أتأمل|اتأمل|أقرأ|اقرأ|أبحث|ابحث|أحدد|احدد|أقيم|اقيم|"
+    r"أضع|اضع|أنظم|انظم|أثري|اثري|أقارن|اقارن|أستنتج|استنتج|أناقش|"
+    r"اناقش|أكتب|اكتب|اختر|اختار|حدد|read|answer|complete|choose|discuss)\b",
+    re.IGNORECASE,
+)
+
+
+def _weak_or_citation_title(title: str) -> bool:
+    stripped = title.strip()
+    if not stripped:
+        return True
+    if stripped.startswith((">", "[", "{", "◇", "◆", "🔹", "•")):
+        return True
+    return bool(_WEAK_TITLE_START_RE.match(arabic_comparison_key(stripped)))
+
 
 def _blocklisted(title: str) -> bool:
     """True when a title is a bare filler heading or starts with a filler prefix."""
@@ -1069,9 +1093,18 @@ def _blocklisted(title: str) -> bool:
     return False
 
 
+def title_matches_language(title: str, expected_language: str) -> bool:
+    """Require the title's dominant script to match the requested language."""
+    arabic = len(re.findall(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", title or ""))
+    latin = len(re.findall(r"[A-Za-z\u00C0-\u024F]", title or ""))
+    if expected_language == "ar":
+        return arabic > 0 and arabic >= latin * 2
+    return latin > 0 and latin >= arabic * 2
+
+
 def is_acceptable_title(
     title: str, content: str, level: str, used_titles: set[str],
-    book_heading: str = "",
+    book_heading: str = "", expected_language: str | None = None,
 ) -> bool:
     """A title is acceptable when it passes format, blocklist, and exact-dup checks.
 
@@ -1085,7 +1118,12 @@ def is_acceptable_title(
         return False
     if _blocklisted(title):
         return False
+    if _weak_or_citation_title(title):
+        return False
     if titles_too_similar(title, used_titles):
+        return False
+    expected_language = expected_language or detect_language(content)
+    if not title_matches_language(title, expected_language):
         return False
     # A compact Arabic title is valid when it carries a specific process or
     # relation; word count alone is never a rejection reason.
@@ -1109,10 +1147,16 @@ def is_acceptable_title(
     return True
 
 
-def _unpack_entry(entry) -> tuple[str, str, str]:
-    if len(entry) >= 3:
-        return entry[0], entry[1], entry[2] or "(none)"
-    return entry[0], entry[1], "(none)"
+def _unpack_entry(entry) -> tuple[str, str, str, str]:
+    level = entry[0]
+    content = entry[1]
+    heading = (entry[2] or "(none)") if len(entry) >= 3 else "(none)"
+    language = (
+        entry[3]
+        if len(entry) >= 4 and entry[3] in {"ar", "en"}
+        else detect_language(content)
+    )
+    return level, content, heading, language
 
 
 def _build_family_prompt(entries, before: list[str]) -> str:
@@ -1125,9 +1169,10 @@ def _build_family_prompt(entries, before: list[str]) -> str:
     """
     passages = "\n\n".join(
         f"{i}. [{level.upper()}]\nBOOK HEADING: {heading}\n"
+        f"REQUIRED TITLE LANGUAGE: {'Arabic' if language == 'ar' else 'English'}\n"
         f"REPRESENTATIVE CONTENT:\n{preview}"
         for i, entry in enumerate(entries, 1)
-        for level, preview, heading in [_unpack_entry(entry)]
+        for level, preview, heading, language in [_unpack_entry(entry)]
     )
     seen = "\n".join(f"- {t}" for t in before if t) or "(none yet)"
     return (
@@ -1173,11 +1218,11 @@ def generate_family_batch_titles(
     unpacked = [_unpack_entry(entry) for entry in entries]
     previews = [
         representative_context(content, _level_params(level)[0])
-        for level, content, _ in unpacked
+        for level, content, _, _ in unpacked
     ]
     tagged = [
-        (level, preview, heading)
-        for (level, _, heading), preview in zip(unpacked, previews)
+        (level, preview, heading, language)
+        for (level, _, heading, language), preview in zip(unpacked, previews)
     ]
 
     client = client or _make_client()
@@ -1201,7 +1246,9 @@ def generate_family_batch_titles(
         _, min_words, max_words, _ = _level_params(level)
         cleaned = clean_title(header, max_words)
         if validate_title(cleaned, min_words, max_words):
-            titles[i] = _finalize(cleaned)
+            finalized = _finalize(cleaned)
+            if title_matches_language(finalized, unpacked[i][3]):
+                titles[i] = finalized
     return titles
 
 
@@ -1212,6 +1259,7 @@ def regenerate_title(
     reject: list[str] | None = None,
     used_titles: set[str] | None = None,
     book_heading: str = "",
+    expected_language: str | None = None,
 ) -> str:
     """Fix one rejected header with ONE extra LLM call, then a deterministic fallback.
 
@@ -1228,6 +1276,7 @@ def regenerate_title(
     recent = list(dict.fromkeys(reject + sorted(used)))[: TITLE_CONTEXT_RECENT]
     reject_str = ", ".join(f"{t!r}" for t in recent) or "(none)"
     header = reject[0] if reject else "the previous attempt"
+    expected_language = expected_language or detect_language(content)
 
     try:
         raw = client.chat(
@@ -1237,6 +1286,7 @@ def regenerate_title(
                 reject=reject_str,
                 content=preview,
                 book_heading=book_heading or "(none)",
+                language="Arabic" if expected_language == "ar" else "English",
             ),
             system_prompt=None,
             temperature=TITLE_TEMPERATURE,
@@ -1249,11 +1299,18 @@ def regenerate_title(
 
     cleaned = clean_title(raw, max_words)
     acceptable = bool(cleaned) and is_acceptable_title(
-        cleaned, content, level, used, book_heading
+        cleaned, content, level, used, book_heading, expected_language
     )
     if acceptable:
         return _finalize(cleaned)
     label = _safe_fallback(content, fallback_max)
+    if not title_matches_language(label, expected_language):
+        label = descriptive_fallback(
+            content,
+            book_heading,
+            max_words=fallback_max,
+            language=expected_language,
+        )
     if label and label not in used:
         return label
     return cleaned
