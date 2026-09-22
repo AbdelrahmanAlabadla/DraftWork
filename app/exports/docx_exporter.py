@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import binascii
 import io
+import re
 from typing import Any
 
 from docx import Document
@@ -15,12 +16,15 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Mm, Pt, RGBColor
 
 from app.exports.common import (
+    ANSWER_LABELS_BY_LANG,
     HEADER_LABELS_BY_LANG,
     RESPONSE_LINE_TEXT,
     TRUE_FALSE_CHOICES_BY_LANG,
+    exam_document_language,
     group_exam_sections,
     response_line_count,
 )
+from app.language import detect_language
 
 PAGE_MARGIN_IN = 0.5
 CONTENT_WIDTH_IN = 7.27  # A4 width (8.27in) minus two 0.5in margins
@@ -40,6 +44,23 @@ def _set_paragraph_rtl(paragraph) -> None:
     p_pr = paragraph._p.get_or_add_pPr()
     if p_pr.find(qn("w:bidi")) is None:
         p_pr.append(OxmlElement("w:bidi"))
+
+
+_SCRIPT_LETTER_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u0600-\u06ff]")
+
+
+def _set_content_direction(paragraph, text: object, fallback_rtl: bool) -> bool:
+    """Apply paragraph bidi/alignment from its text, with exam language fallback."""
+    value = str(text or "")
+    rtl = detect_language(value) == "ar" if _SCRIPT_LETTER_RE.search(value) else fallback_rtl
+    if rtl:
+        _set_paragraph_rtl(paragraph)
+        # In a bidi Word paragraph, LEFT is the logical start edge, which is
+        # rendered on the physical right. RIGHT would mirror to the left.
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    else:
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    return rtl
 
 
 def _clean(value: object, fallback: str = "") -> str:
@@ -82,6 +103,14 @@ def _set_run_font(
     cs_size.set(qn("w:val"), str(int(size * 2)))
     run.font.size = Pt(size)
     run.font.color.rgb = color
+    if detect_language(run.text or "") == "ar":
+        if r_pr.find(qn("w:rtl")) is None:
+            r_pr.append(OxmlElement("w:rtl"))
+        lang = r_pr.find(qn("w:lang"))
+        if lang is None:
+            lang = OxmlElement("w:lang")
+            r_pr.append(lang)
+        lang.set(qn("w:bidi"), "ar-SA")
     if bold is not None:
         run.bold = bold
         b_cs = OxmlElement("w:bCs")
@@ -315,7 +344,7 @@ def _add_exam_header(doc: Document, metadata: dict[str, Any], model_number: int,
         _shade_paragraph(para, "F6F8FB")
         if rtl:
             _set_paragraph_rtl(para)
-            para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
         run = para.add_run(f"{label}: ")
         _set_run_font(run, size=8, bold=True, color=MUTED)
         run = para.add_run(value)
@@ -326,7 +355,7 @@ def _add_exam_header(doc: Document, metadata: dict[str, Any], model_number: int,
     student.paragraph_format.space_after = Pt(5)
     if rtl:
         _set_paragraph_rtl(student)
-        student.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        student.alignment = WD_ALIGN_PARAGRAPH.LEFT
         run = student.add_run("_" * 38)
         _set_run_font(run, size=9.5)
         run = student.add_run("        " + labels["student_name"])
@@ -363,11 +392,11 @@ def _add_question_stem(doc: Document, item: dict[str, Any], rtl: bool = False) -
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(2)
     p.paragraph_format.keep_with_next = True
-    if rtl:
-        _set_paragraph_rtl(p)
-    run = p.add_run(f"{item['number']}. " if rtl else f"Q{item['number']}. ")
+    text = _clean(item.get("text"), "(missing question text)")
+    content_rtl = _set_content_direction(p, text, rtl)
+    run = p.add_run(f"{item['number']}. " if content_rtl else f"Q{item['number']}. ")
     _set_run_font(run, bold=True)
-    run = p.add_run(_clean(item.get("text"), "(missing question text)"))
+    run = p.add_run(text)
     _set_run_font(run, bold=True)
 
 
@@ -381,22 +410,23 @@ def _add_mcq(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
         _set_table_geometry(table, [CONTENT_WIDTH_IN / 2] * 2)
         _remove_table_borders(table)
         for index, (letter, option) in enumerate(options):
-            cell = table.cell(index // 2, index % 2)
+            column = 1 - (index % 2) if rtl else index % 2
+            cell = table.cell(index // 2, column)
             cell.text = ""
             p = cell.paragraphs[0]
             p.paragraph_format.space_after = Pt(0)
-            if rtl:
-                _set_paragraph_rtl(p)
-            run = p.add_run(f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}")
+            option_text = _clean(option)
+            content_rtl = _set_content_direction(p, option_text, rtl)
+            run = p.add_run(f"{option_text} .{letter}" if content_rtl else f"{letter}. {option_text}")
             _set_run_font(run, size=9.5)
     else:
         for letter, option in options:
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Inches(0.18)
             p.paragraph_format.space_after = Pt(1)
-            if rtl:
-                _set_paragraph_rtl(p)
-            run = p.add_run(f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}")
+            option_text = _clean(option)
+            content_rtl = _set_content_direction(p, option_text, rtl)
+            run = p.add_run(f"{option_text} .{letter}" if content_rtl else f"{letter}. {option_text}")
             _set_run_font(run, size=9.5)
     spacer = doc.add_paragraph()
     spacer.paragraph_format.space_after = Pt(2)
@@ -442,11 +472,11 @@ def _add_answer_lines(doc: Document, count: int) -> None:
 def _add_definition(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(7)
-    if rtl:
-        _set_paragraph_rtl(p)
+    term = _clean(item.get("text"), "(missing term)")
+    _set_content_direction(p, term, rtl)
     run = p.add_run(f"{item['number']}. ")
     _set_run_font(run, bold=True)
-    run = p.add_run(_clean(item.get("text"), "(missing term)") + ": ")
+    run = p.add_run(term + ": ")
     _set_run_font(run, bold=True)
     run = p.add_run("_" * 58)
     _set_run_font(run, size=9, color=RGBColor(71, 85, 105))
@@ -477,35 +507,36 @@ def _add_word_problem(doc: Document, item: dict[str, Any], rtl: bool = False) ->
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(2)
     p.paragraph_format.keep_with_next = True
-    if rtl:
-        _set_paragraph_rtl(p)
+    text = _clean(item.get("text"), "(missing question text)")
+    _set_content_direction(p, text, rtl)
     run = p.add_run(f"{item['number']}. ")
     _set_run_font(run, bold=True)
-    run = p.add_run(_clean(item.get("text"), "(missing question text)"))
+    run = p.add_run(text)
     _set_run_font(run, bold=True)
     _add_answer_lines(doc, response_line_count("word_problem"))
 
 
 def _answer_text(item: dict[str, Any], language: str = "en") -> str:
+    labels = ANSWER_LABELS_BY_LANG.get(language, ANSWER_LABELS_BY_LANG["en"])
     qtype = item["qtype"]
     if qtype == "mcq":
-        return _clean(item.get("correct_answer"), "No answer supplied")
+        return _clean(item.get("correct_answer"), labels["missing"])
     if qtype == "true_false":
         from app.online.models import tf_answer_label
 
-        raw = _clean(item.get("answer"), "No answer supplied")
+        raw = _clean(item.get("answer"), labels["missing"])
         if raw.lower() in {"true", "false"}:
             return tf_answer_label(raw, language)
         return raw
     if qtype == "fill_in_the_blank":
-        return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or "No answer supplied"
+        return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or labels["missing"]
     if qtype in {"equation", "word_problem"}:
         steps = [_clean(step) for step in (item.get("solution_steps") or []) if _clean(step)]
-        final = _clean(item.get("final_answer"), "No final answer supplied")
+        final = _clean(item.get("final_answer"), labels["missing_final"])
         return " → ".join([*steps, final])
-    answer = _clean(item.get("reference_answer"), "No reference answer supplied")
+    answer = _clean(item.get("reference_answer"), labels["missing_reference"])
     points = [_clean(point) for point in (item.get("key_points") or []) if _clean(point)]
-    return answer + ((" | Key points: " + "; ".join(points)) if points else "")
+    return answer + ((f" | {labels['key_points']}: " + "; ".join(points)) if points else "")
 
 
 def _render_student_sections(doc: Document, sections: list[dict[str, Any]], language: str = "en") -> None:
@@ -530,13 +561,16 @@ def _render_student_sections(doc: Document, sections: list[dict[str, Any]], lang
                 p = doc.add_paragraph()
                 p.paragraph_format.space_after = Pt(4)
                 p.paragraph_format.keep_with_next = choices_below
-                if rtl:
-                    _set_paragraph_rtl(p)
-                run = p.add_run(f"{item['number']}. {statement}" if rtl else f"Q{item['number']}. {statement}")
+                content_rtl = _set_content_direction(p, statement, rtl)
+                run = p.add_run(f"{item['number']}. {statement}" if content_rtl else f"Q{item['number']}. {statement}")
                 _set_run_font(run, bold=True)
                 if choices_below:
                     choices = doc.add_paragraph()
-                    choices.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    if rtl:
+                        _set_paragraph_rtl(choices)
+                        choices.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    else:
+                        choices.alignment = WD_ALIGN_PARAGRAPH.RIGHT
                     choices.paragraph_format.space_after = Pt(4)
                     run = choices.add_run(tf_choices)
                     _set_run_font(run, size=9.5)
@@ -583,11 +617,12 @@ def _render_answer_key(
         for item in section["items"]:
             p = doc.add_paragraph()
             p.paragraph_format.space_after = Pt(2)
-            if rtl:
-                _set_paragraph_rtl(p)
-            run = p.add_run(f"{item['number']}. " if rtl else f"Q{item['number']}. ")
+            answer = _answer_text(item, language=language)
+            direction_text = "إجابة" if rtl and item["qtype"] == "mcq" else answer
+            content_rtl = _set_content_direction(p, direction_text, rtl)
+            run = p.add_run(f"{item['number']}. " if content_rtl else f"Q{item['number']}. ")
             _set_run_font(run, size=9.5, bold=True)
-            run = p.add_run(_answer_text(item, language=language))
+            run = p.add_run(answer)
             _set_run_font(run, size=9.5)
 
 
@@ -596,7 +631,7 @@ def render_exam_docx(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
     doc = Document()
     _configure_styles(doc)
     metadata = dict(metadata or {})
-    language = str(metadata.get("document_language") or "en")
+    language = exam_document_language(exam, metadata)
     if exam.get("questions"):
         model_number = int(exam.get("model_number") or 1)
         title = _clean(metadata.get("exam_title") or exam.get("title"), "Examination")
@@ -616,7 +651,7 @@ def render_answers_docx(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes
     doc = Document()
     _configure_styles(doc)
     metadata = dict(metadata or {})
-    language = str(metadata.get("document_language") or "en")
+    language = exam_document_language(exam, metadata)
     if exam.get("questions"):
         model_number = int(exam.get("model_number") or 1)
         title = _clean(metadata.get("exam_title") or exam.get("title"), "Examination")

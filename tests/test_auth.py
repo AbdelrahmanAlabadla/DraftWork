@@ -81,7 +81,10 @@ def test_auth_pages_and_account_controls_are_present():
     dialog_js = open("FrontEnd/js/my-exams-dialog.js", encoding="utf-8").read()
     assert 'document.addEventListener("draftwork:open-my-exams"' in dialog_js
     assert "loadExamIntoPreview(exam.exam_id)" in dialog_js
-    assert "There is no exam made yet." in dialog_js
+    assert 't("saved.none")' in dialog_js
+    i18n_js = open("FrontEnd/js/i18n.js", encoding="utf-8").read()
+    assert '"saved.none": "There is no exam made yet."' in i18n_js
+    assert '"saved.none": "لا توجد امتحانات منشأة بعد."' in i18n_js
     assert not Path("FrontEnd/my-exams.html").exists()
     assert not Path("FrontEnd/js/my-exams.js").exists()
 

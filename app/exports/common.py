@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.language import detect_language
 from app.online.models import TYPE_LABELS, TYPE_ORDER
 
 # Printed order follows the supplied exam model while staying limited to the
@@ -66,6 +67,21 @@ HEADER_LABELS_BY_LANG = {
         "student_name": "اسم الطالب: ",
         "class_suffix": "الصف: ",
         "answer_key": "مفتاح الإجابة - نسخة {n}",
+    },
+}
+
+ANSWER_LABELS_BY_LANG = {
+    "en": {
+        "missing": "No answer supplied",
+        "missing_final": "No final answer supplied",
+        "missing_reference": "No reference answer supplied",
+        "key_points": "Key points",
+    },
+    "ar": {
+        "missing": "لم تُرفق إجابة",
+        "missing_final": "لم تُرفق إجابة نهائية",
+        "missing_reference": "لم تُرفق إجابة نموذجية",
+        "key_points": "النقاط الرئيسية",
     },
 }
 
@@ -132,6 +148,33 @@ def document_export_filenames(
     ext = extension.lower().lstrip(".")
     base = f"{prefix}_Model_{int(model_number)}"
     return f"{base}.{ext}", f"Answers_{base}.{ext}"
+
+
+def exam_document_language(exam: dict[str, Any], metadata: dict[str, Any]) -> str:
+    """Resolve export direction from persisted language, then actual content."""
+    explicit = str(
+        exam.get("document_language") or metadata.get("document_language") or ""
+    ).lower()
+    if explicit in {"ar", "en"}:
+        return explicit
+
+    values: list[str] = [
+        str(metadata.get("exam_title") or ""),
+        str(exam.get("title") or ""),
+    ]
+
+    def collect(value: object) -> None:
+        if isinstance(value, dict):
+            for nested in value.values():
+                collect(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                collect(nested)
+        elif isinstance(value, str):
+            values.append(value)
+
+    collect(exam.get("questions") or {})
+    return detect_language(" ".join(values))
 
 
 def flatten_exam_items(questions: dict[str, Any]) -> list[dict[str, Any]]:
