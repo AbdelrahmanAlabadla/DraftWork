@@ -51,12 +51,12 @@ def _patch_titles(monkeypatch):
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.is_acceptable_title",
-        lambda title, content, level, used_titles, book_heading="": bool(title),
+        lambda title, content, level, used_titles, book_heading="", expected_language=None: bool(title),
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.regenerate_title",
         lambda client=None, content="", level="section", reject=None,
-        used_titles=None, book_heading="": "RT",
+        used_titles=None, book_heading="", expected_language=None: "RT",
     )
 
 
@@ -109,6 +109,39 @@ def test_extract_paragraphs_preserves_parser_metadata():
     assert parts[0].order == 0
     assert parts[1].item_type == "table"
     assert parts[1].role == "table"
+
+
+def test_quote_introduction_is_demoted_and_kept_with_quote():
+    pages = [_page([
+        _heading("قال المؤلف:"),
+        _body("«العلم أساس تقدم المجتمعات.»"),
+        _body("يوضح النص أثر العلم في بناء المجتمع وتقدمه."),
+    ])]
+    parts = extract_paragraphs(pages)
+    assert parts[0].item_type == "text"
+    assert parts[0].heading_decision == "content"
+    assert "quotation_introduction" in parts[0].heading_reasons
+    assert parts[0].atomic_id
+    assert parts[0].atomic_id == parts[1].atomic_id == parts[2].atomic_id
+
+
+def test_instruction_heading_candidate_is_demoted():
+    parts = extract_paragraphs(
+        [_page([_heading("أفكر وأستنتج:"), _body("أشرح الفكرة في الفقرة التالية بالتفصيل.")])]
+    )
+    assert parts[0].item_type == "text"
+    assert "instruction_or_exercise" in parts[0].heading_reasons
+
+
+def test_descriptive_colon_heading_can_remain_subsection():
+    parts = extract_paragraphs(
+        [_page([
+            {"type": "heading", "value": "سنن الفطرة: مفهومها وأهميتها", "md": "**سنن الفطرة: مفهومها وأهميتها**"},
+            _body("تشرح الفقرة مفهوم سنن الفطرة وأثرها في حياة المسلم والمحافظة على النظافة."),
+        ])]
+    )
+    assert parts[0].item_type == "heading"
+    assert parts[0].heading_decision == "subsection_heading"
 
 
 def test_split_sentences_guards_decimal():
@@ -240,6 +273,20 @@ def test_build_parents_no_overlap_between_adjacent_parents(monkeypatch):
     # each word belongs to exactly one parent
     joined = " ".join(contents)
     assert joined.split() == ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine"]
+
+
+def test_oversized_parent_rebalances_tiny_trailing_activity(monkeypatch):
+    monkeypatch.setattr(sc, "PARENT_MAX_SIZE", 100)
+    monkeypatch.setattr(sc, "PARENT_MERGE_TOKENS", 30)
+    monkeypatch.setattr(sc, "PARENT_MIN_TOKENS_DROP", 0)
+    group = [
+        Paragraph(" ".join(["alpha"] * 35), 1),
+        Paragraph(" ".join(["beta"] * 35), 2),
+        Paragraph(" ".join(["activity"] * 10), 3),
+    ]
+    parents = build_parents([group], "d1")
+    assert len(parents) == 2
+    assert [len(parent.content.split()) for parent in parents] == [35, 45]
 
 
 # ---------------------------------------------------------------------------
@@ -471,12 +518,12 @@ def test_label_families_titles_multi_child_children(monkeypatch):
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.is_acceptable_title",
-        lambda title, content, level, used_titles, book_heading="": bool(title),
+        lambda title, content, level, used_titles, book_heading="", expected_language=None: bool(title),
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.regenerate_title",
         lambda client=None, content="", level="section", reject=None,
-        used_titles=None, book_heading="": "RT",
+        used_titles=None, book_heading="", expected_language=None: "RT",
     )
 
     sc._label_families(parents, children)

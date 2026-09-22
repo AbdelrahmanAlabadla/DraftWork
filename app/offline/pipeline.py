@@ -91,7 +91,7 @@ def run_pipeline(
                 sample_length += min(len(text), remaining)
             if sample_length >= 20000:
                 break
-        detect_language(" ".join(sample_parts))
+        document_language = detect_language(" ".join(sample_parts))
         checkpoint()
 
         # --- Stage 3: Semantic structure generation (parents + children) ----
@@ -99,6 +99,7 @@ def run_pipeline(
         chunks = build_semantic_structure(
             pages,
             document_id,
+            document_language=document_language,
             on_stage=on_stage,
             is_cancelled=is_cancelled,
         )
@@ -191,6 +192,7 @@ def run_pipeline(
         "total_parents": len(parents),
         "total_children": len(children),
         "vectors_stored": vectors_uploaded,
+        "document_language": document_language,
         "structure_file": str(structures_path),
         "chunk_report_file": str(chunk_report_path),
         "chunk_dump_file": str(chunk_dump_path),
