@@ -15,20 +15,21 @@ from pathlib import Path
 from typing import Any
 
 from fpdf import FPDF
-from fpdf.enums import MethodReturnValue
+from fpdf.enums import MethodReturnValue, TextDirection
 
 from app.exports.common import (
-    RESPONSE_LINE_TEXT,
+    expand_fill_blank_text,
     exam_document_language,
     group_exam_sections,
     response_line_count,
 )
 from app.language import detect_language
+from app.exports.math_renderer import render_math
 
 PAGE_MARGIN_MM = 12.7  # exactly 0.5 inch
 FOOTER_Y_MM = -9.5
 BODY_FONT = "helvetica"
-ARABIC_FONT = "Amiri"
+ARABIC_FONT = "Tajawal"
 MATH_FONT = "DejaVuSans"
 FONT_DIR = Path(__file__).parent / "fonts"
 BODY_SIZE = 10.5
@@ -119,8 +120,8 @@ class _ExamPDF(FPDF):
 def _register_arabic_font() -> bool:
     """Check the bundled Amiri TTFs load correctly. Returns False when
     unavailable so the exporter degrades to Helvetica instead of failing."""
-    regular = FONT_DIR / "Amiri-Regular.ttf"
-    bold = FONT_DIR / "Amiri-Bold.ttf"
+    regular = FONT_DIR / "Tajawal-Regular.ttf"
+    bold = FONT_DIR / "Tajawal-Bold.ttf"
     if not (regular.is_file() and bold.is_file()):
         return False
 
@@ -188,6 +189,44 @@ def _draw_logo(pdf: _ExamPDF, data_url: object, x: float, y: float) -> None:
         return
 
 
+def _draw_free_field(
+    pdf: _ExamPDF,
+    x: float,
+    y: float,
+    width: float,
+    label: str,
+    value: object,
+    *,
+    rtl: bool,
+    size: float = 8.5,
+) -> None:
+    """Draw a label and value/blank line without a box or shaded background."""
+    label_text = f"{label}:"
+    clean_value = _clean(value)
+    pdf.set_font(BODY_FONT, "B", size)
+    label_w = min(width * 0.46, pdf.get_string_width(label_text) + 2.5)
+    value_w = max(8.0, width - label_w - 1.5)
+    pdf.set_text_color(*MUTED)
+    if rtl:
+        pdf.set_xy(x + width - label_w, y)
+        pdf.cell(label_w, 5.5, label_text, align="R")
+        value_x = x
+    else:
+        pdf.set_xy(x, y)
+        pdf.cell(label_w, 5.5, label_text, align="L")
+        value_x = x + label_w + 1.5
+
+    pdf.set_font(BODY_FONT, "", size)
+    pdf.set_text_color(*INK)
+    if clean_value:
+        pdf.set_xy(value_x, y)
+        pdf.cell(value_w, 5.5, clean_value, align="R" if rtl else "L")
+    else:
+        line_y = y + 4.8
+        pdf.set_draw_color(*RULE)
+        pdf.line(value_x + 0.8, line_y, value_x + value_w - 0.8, line_y)
+
+
 def _draw_exam_header(pdf: _ExamPDF, metadata: dict[str, Any], model_number: int) -> None:
     from app.exports.common import HEADER_LABELS_BY_LANG
 
@@ -213,35 +252,45 @@ def _draw_exam_header(pdf: _ExamPDF, metadata: dict[str, Any], model_number: int
     pdf.set_y(max(pdf.get_y() + 7, y + 17))
 
     meta_values = [
-        (labels["class"], _field(metadata.get("class_name"), 9)),
-        (labels["duration"], _field(metadata.get("duration"), 7)),
-        (labels["date"], _field(metadata.get("exam_date"), 9)),
-        (labels["teacher"], _field(metadata.get("teacher_name"), 9)),
+        (labels["duration"], metadata.get("duration")),
+        (labels["teacher"], metadata.get("teacher_name")),
+        (labels["date"], metadata.get("exam_date")),
     ]
     col_w = pdf.epw / len(meta_values)
-    pdf.set_fill_color(246, 248, 251)
-    pdf.set_draw_color(*RULE)
-    for label, value in meta_values:
-        x, cell_y = pdf.get_x(), pdf.get_y()
-        pdf.rect(x, cell_y, col_w, 8, style="DF")
-        pdf.set_xy(x + 1.5, cell_y + 1.3)
-        pdf.set_font(BODY_FONT, "B", 7.2)
-        pdf.set_text_color(*MUTED)
-        pdf.cell(12.5, 5.2, f"{label}:")
-        pdf.set_font(BODY_FONT, "", 8.5)
-        pdf.set_text_color(*INK)
-        pdf.cell(col_w - 15, 5.2, _latin(value))
-        pdf.set_xy(x + col_w, cell_y)
-    pdf.set_y(pdf.get_y() + 9.5)
+    meta_y = pdf.get_y()
+    for index, (label, value) in enumerate(meta_values):
+        visual_col = len(meta_values) - 1 - index if pdf.rtl else index
+        _draw_free_field(
+            pdf,
+            pdf.l_margin + visual_col * col_w,
+            meta_y,
+            col_w - 3,
+            label,
+            value,
+            rtl=pdf.rtl,
+            size=8.2,
+        )
+    pdf.set_y(meta_y + 8)
 
-    pdf.set_font(BODY_FONT, "", 9.5)
     student_w = pdf.epw * 0.67
     if pdf.rtl:
-        pdf.cell(pdf.epw - student_w, 7, labels["class_suffix"] + "_" * 12, align="R")
-        pdf.cell(student_w, 7, "_" * 34 + labels["student_name"], align="R")
+        _draw_free_field(
+            pdf, pdf.l_margin, pdf.get_y(), pdf.epw - student_w - 3,
+            labels["class"], metadata.get("class_name"), rtl=True, size=9.5,
+        )
+        _draw_free_field(
+            pdf, pdf.l_margin + pdf.epw - student_w, pdf.get_y(), student_w,
+            labels["student_name"].rstrip(": "), None, rtl=True, size=9.5,
+        )
     else:
-        pdf.cell(student_w, 7, labels["student_name"] + "_" * 34)
-        pdf.cell(pdf.epw - student_w, 7, labels["class_suffix"] + "_" * 12)
+        _draw_free_field(
+            pdf, pdf.l_margin, pdf.get_y(), student_w - 3,
+            labels["student_name"].rstrip(": "), None, rtl=False, size=9.5,
+        )
+        _draw_free_field(
+            pdf, pdf.l_margin + student_w, pdf.get_y(), pdf.epw - student_w,
+            labels["class"], metadata.get("class_name"), rtl=False, size=9.5,
+        )
     pdf.ln(9)
 
 
@@ -267,10 +316,55 @@ def _draw_question_stem(pdf: _ExamPDF, number: int, text: str, minimum_after: fl
 
 
 def _draw_mcq_option(pdf: _ExamPDF, letter: str, option: object, width: float) -> float:
-    rtl = _text_is_rtl(option, pdf.rtl)
-    text = f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}"
+    text = _clean(option)
     pdf.set_font(BODY_FONT, "", 9.6)
-    return _text_height(pdf, text, width - 2, 5.0)
+    return _text_height(pdf, text, width - 11, 5.0)
+
+
+def _draw_mcq_option_at(
+    pdf: _ExamPDF,
+    x: float,
+    y: float,
+    width: float,
+    letter: str,
+    option: object,
+) -> float:
+    """Render the Latin marker separately so bidi cannot move it after Arabic."""
+    option_text = _clean(option)
+    row_rtl = pdf.rtl
+    marker_w = 9.0
+    gap = 1.5
+    text_w = width - marker_w - gap
+    height = _draw_mcq_option(pdf, letter, option_text, width)
+    marker_x = x + text_w + gap if row_rtl else x
+    text_x = x if row_rtl else x + marker_w + gap
+
+    pdf.set_xy(marker_x, y)
+    pdf.set_font(BODY_FONT, "B", 9.6)
+    # Arabic text shaping must not reorder a Latin marker from ``A.`` to
+    # ``.A``. Keep the marker LTR, then restore automatic shaping for the
+    # option text so Arabic and mixed formulas retain their own direction.
+    shaping_enabled = pdf.text_shaping is not None
+    if shaping_enabled:
+        pdf.set_text_shaping(True, direction=TextDirection.LTR)
+    try:
+        pdf.cell(marker_w, 5.0, f"{letter}.", align="R" if row_rtl else "L")
+    finally:
+        if shaping_enabled:
+            pdf.set_text_shaping(True)
+    pdf.set_xy(text_x, y)
+    pdf.set_font(BODY_FONT, "", 9.6)
+    pdf.multi_cell(
+        text_w,
+        5.0,
+        option_text,
+        # The row starts on the exam's logical side. The shaping engine still
+        # preserves the option text's own bidi order (for example n = c / v).
+        align="R" if row_rtl else "L",
+        new_x="LEFT",
+        new_y="NEXT",
+    )
+    return height
 
 
 def _draw_mcq(pdf: _ExamPDF, item: dict[str, Any]) -> None:
@@ -295,19 +389,17 @@ def _draw_mcq(pdf: _ExamPDF, item: dict[str, Any]) -> None:
             for col, (letter, option) in enumerate(pair):
                 visual_col = 1 - col if pdf.rtl else col
                 x = pdf.l_margin + visual_col * (col_w + gutter)
-                pdf.set_xy(x + 2, row_y)
-                rtl = _text_is_rtl(option, pdf.rtl)
-                opt_text = f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}"
-                pdf.multi_cell(col_w - 2, 5.0, _latin(opt_text), align=_align(pdf, option), new_x="LEFT", new_y="NEXT")
+                _draw_mcq_option_at(pdf, x + 2, row_y, col_w - 2, str(letter), option)
             pdf.set_y(row_y + row_h)
     else:
         for letter, option in options:
-            rtl = _text_is_rtl(option, pdf.rtl)
-            opt_text = f"{_clean(option)} .{letter}" if rtl else f"{letter}. {_clean(option)}"
             height = _draw_mcq_option(pdf, str(letter), option, pdf.epw - 4) + 0.8
             pdf.ensure_space(height)
-            pdf.set_x(pdf.l_margin + 4)
-            pdf.multi_cell(pdf.epw - 4, 5.0, _latin(opt_text), align=_align(pdf, option), new_x="LEFT", new_y="NEXT")
+            row_y = pdf.get_y()
+            _draw_mcq_option_at(
+                pdf, pdf.l_margin + 4, row_y, pdf.epw - 4, str(letter), option
+            )
+            pdf.set_y(row_y + height)
             pdf.ln(0.8)
     pdf.ln(2.2)
 
@@ -342,49 +434,79 @@ def _draw_word_bank(pdf: _ExamPDF, words: list[str]) -> None:
 def _draw_fill_blank(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     # The blank is part of the question stem.  Do not add a second ruled line
     # between fill-in-the-blank questions.
-    _draw_question_stem(pdf, item["number"], item["text"])
+    printed_item = dict(item)
+    printed_item["text"] = expand_fill_blank_text(item.get("text"))
+    _draw_question_stem(pdf, printed_item["number"], printed_item["text"])
     pdf.ln(4)
 
 
 def _draw_true_false(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    from app.exports.common import TRUE_FALSE_CHOICES_BY_LANG
-
-    choices_wide = TRUE_FALSE_CHOICES_BY_LANG.get(pdf.language, TRUE_FALSE_CHOICES_BY_LANG["en"])
-    choices_compact = (
-        "(   ) صح   (   ) خطأ" if pdf.rtl else "(   ) True   (   ) False"
-    )
     raw_statement = _clean(item['text'], '(missing statement)')
     statement_rtl = _text_is_rtl(raw_statement, pdf.rtl)
     marker = f"{item['number']}. " if statement_rtl else f"Q{item['number']}. "
     statement = marker + raw_statement
-    answer_w = 28.0
-    text_w = pdf.epw - answer_w - 3
+    choices = ("صح", "خطأ") if pdf.rtl else ("True", "False")
+    choices_w = 40.0 if pdf.rtl else 43.0
+    gutter = 3.0
+    max_statement_w = pdf.epw - choices_w - gutter
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    height = _text_height(pdf, statement, text_w)
-    if height > LINE_HEIGHT + 0.1:
-        full_height = _text_height(pdf, statement, pdf.epw)
-        pdf.ensure_space(full_height + 7)
-        pdf.multi_cell(pdf.epw, LINE_HEIGHT, statement, align=_align(pdf, raw_statement), new_x="LEFT", new_y="NEXT")
+    statement_w = min(
+        max_statement_w,
+        max(42.0, pdf.get_string_width(statement) + 3.0),
+    )
+    statement_lines = pdf.multi_cell(
+        statement_w,
+        LINE_HEIGHT,
+        statement,
+        dry_run=True,
+        output=MethodReturnValue.LINES,
+    )
+    height = _text_height(pdf, statement, statement_w)
+    pdf.ensure_space(height + 4)
+    row_y = pdf.get_y()
+    if pdf.rtl:
+        statement_x = pdf.w - pdf.r_margin - statement_w
+    else:
+        statement_x = pdf.l_margin
+    pdf.set_xy(statement_x, row_y)
+    pdf.multi_cell(
+        statement_w,
+        LINE_HEIGHT,
+        statement,
+        align=_align(pdf, raw_statement),
+        new_x="LEFT",
+        new_y="NEXT",
+    )
+    half = choices_w / 2
+    choices_y = row_y + max(0.0, height - LINE_HEIGHT)
+    last_line = statement_lines[-1] if statement_lines else statement
+    last_line_w = min(statement_w, pdf.get_string_width(last_line))
+    if pdf.rtl:
+        last_line_start = statement_x + statement_w - last_line_w
+        choices_x = max(pdf.l_margin, last_line_start - gutter - choices_w)
+    else:
+        last_line_end = statement_x + last_line_w
+        choices_x = min(
+            pdf.w - pdf.r_margin - choices_w,
+            last_line_end + gutter,
+        )
+    for index, label in enumerate(choices):
+        visual_index = 1 - index if pdf.rtl else index
+        pdf.set_xy(choices_x + visual_index * half, choices_y)
         pdf.set_font(BODY_FONT, "", 9.5)
-        pdf.cell(0, 5, choices_wide, align="L" if pdf.rtl else "R")
-        pdf.ln(8)
-        return
-    pdf.ensure_space(height + 2)
-    y = pdf.get_y()
-    pdf.multi_cell(text_w, LINE_HEIGHT, statement, align=_align(pdf, raw_statement), new_x="LEFT", new_y="NEXT")
-    pdf.set_xy(pdf.l_margin + text_w + 3, y)
-    pdf.set_font(BODY_FONT, "", 9.5)
-    pdf.cell(answer_w, LINE_HEIGHT, choices_compact, align="R")
-    pdf.set_y(y + height + 3)
+        pdf.cell(half, LINE_HEIGHT, f"{label} (   )", align="R" if pdf.rtl else "L")
+    pdf.set_y(row_y + max(height, LINE_HEIGHT) + 3)
 
 
-def _draw_answer_lines(pdf: _ExamPDF, count: int) -> None:
+def _draw_answer_lines(pdf: _ExamPDF, count: int, *, rtl: bool = False) -> None:
     for _ in range(count):
         pdf.ensure_space(ANSWER_LINE_HEIGHT)
-        pdf.set_x(pdf.l_margin + 4)
-        pdf.set_font(BODY_FONT, "", 9)
-        pdf.set_text_color(71, 85, 105)
-        pdf.cell(pdf.epw - 4, ANSWER_LINE_HEIGHT, RESPONSE_LINE_TEXT)
+        y = pdf.get_y() + ANSWER_LINE_HEIGHT - 1.2
+        start_x = pdf.l_margin if rtl else pdf.l_margin + 4
+        end_x = pdf.w - pdf.r_margin - (4 if rtl else 0)
+        pdf.set_draw_color(71, 85, 105)
+        pdf.set_line_width(0.18)
+        pdf.line(start_x, y, end_x, y)
         pdf.ln(ANSWER_LINE_HEIGHT)
 
 
@@ -411,7 +533,7 @@ def _draw_open_ended(
     )
     pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_text), new_x="LEFT", new_y="NEXT")
     pdf.ln(1)
-    _draw_answer_lines(pdf, line_count)
+    _draw_answer_lines(pdf, line_count, rtl=text_rtl)
     pdf.ln(2.5)
     pdf.set_text_color(*INK)
 
@@ -420,28 +542,77 @@ def _draw_definition(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     marker = f"{item['number']}. "
     raw_term = _clean(item.get("text"), "(missing term)")
     term = marker + raw_term + ": "
-    line = "_" * 54
-    text = term + line
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    height = _text_height(pdf, text, pdf.epw)
+    term_rtl = _text_is_rtl(raw_term, pdf.rtl)
+    term_w = min(pdf.epw * 0.38, max(28.0, pdf.get_string_width(term) + 3.0))
+    line_gap = 3.0
+    line_w = pdf.epw - term_w - line_gap
+    height = _text_height(pdf, term, term_w)
     pdf.ensure_space(height + 4)
-    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_term), new_x="LEFT", new_y="NEXT")
+    row_y = pdf.get_y()
+    if term_rtl:
+        term_x = pdf.w - pdf.r_margin - term_w
+        line_start = pdf.l_margin
+        line_end = term_x - line_gap
+    else:
+        term_x = pdf.l_margin
+        line_start = term_x + term_w + line_gap
+        line_end = pdf.w - pdf.r_margin
+    pdf.set_xy(term_x, row_y)
+    pdf.multi_cell(
+        term_w,
+        LINE_HEIGHT,
+        term,
+        align="R" if term_rtl else "L",
+        new_x="LEFT",
+        new_y="NEXT",
+    )
+    line_y = row_y + min(height, LINE_HEIGHT) - 1.0
+    pdf.set_draw_color(71, 85, 105)
+    pdf.set_line_width(0.18)
+    pdf.line(line_start, line_y, line_end, line_y)
+    pdf.set_y(row_y + height)
     pdf.ln(4)
 
 
 def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     equation = _clean(item.get("text"), "(missing equation)")
-    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     number_gutter = 12.0
     equation_width = pdf.epw - (2 * number_gutter)
-    equation_h = _text_height(pdf, equation, equation_width)
+    rendered = render_math(equation)
+    if rendered:
+        natural_w = rendered.width_px / 220 * 25.4
+        natural_h = rendered.height_px / 220 * 25.4
+        draw_w = min(equation_width, natural_w)
+        scale = draw_w / natural_w if natural_w else 1.0
+        equation_h = max(LINE_HEIGHT, natural_h * scale)
+    else:
+        pdf.set_font(BODY_FONT, "B", BODY_SIZE)
+        equation_h = _text_height(pdf, equation, equation_width)
     pdf.ensure_space(equation_h + ANSWER_LINE_HEIGHT + 4)
     y = pdf.get_y()
-    pdf.cell(number_gutter, LINE_HEIGHT, f"{item['number']}.")
-    pdf.set_xy(pdf.l_margin + number_gutter, y)
-    pdf.multi_cell(equation_width, LINE_HEIGHT, equation, align="C", new_x="LEFT", new_y="NEXT")
+    number_x = pdf.w - pdf.r_margin - number_gutter if pdf.rtl else pdf.l_margin
+    pdf.set_xy(number_x, y)
+    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
+    pdf.cell(number_gutter, LINE_HEIGHT, f"{item['number']}.", align="R" if pdf.rtl else "L")
+    if rendered:
+        stream = io.BytesIO(rendered.png)
+        stream.name = "equation.png"
+        image_x = pdf.l_margin + number_gutter + (equation_width - draw_w) / 2
+        pdf.image(stream, x=image_x, y=y, w=draw_w, h=equation_h)
+        pdf.set_y(y + equation_h)
+    else:
+        pdf.set_xy(pdf.l_margin + number_gutter, y)
+        pdf.multi_cell(
+            equation_width,
+            LINE_HEIGHT,
+            equation,
+            align="C",
+            new_x="LEFT",
+            new_y="NEXT",
+        )
     pdf.ln(1)
-    _draw_answer_lines(pdf, response_line_count("equation"))
+    _draw_answer_lines(pdf, response_line_count("equation"), rtl=pdf.rtl)
     pdf.ln(2.5)
     pdf.set_text_color(*INK)
 
@@ -454,7 +625,7 @@ def _draw_word_problem(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     pdf.ensure_space(stem_h + ANSWER_LINE_HEIGHT + 2)
     pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_text), new_x="LEFT", new_y="NEXT")
     pdf.ln(1)
-    _draw_answer_lines(pdf, response_line_count("word_problem"))
+    _draw_answer_lines(pdf, response_line_count("word_problem"), rtl=_text_is_rtl(raw_text, pdf.rtl))
     pdf.ln(2.5)
     pdf.set_text_color(*INK)
 
@@ -586,8 +757,8 @@ def _render_model_pdf(
         if needs_arabic_font and has_arabic:
             BODY_FONT = ARABIC_FONT
             _UNICODE_OUTPUT = True
-            pdf.add_font(ARABIC_FONT, "", str(FONT_DIR / "Amiri-Regular.ttf"))
-            pdf.add_font(ARABIC_FONT, "B", str(FONT_DIR / "Amiri-Bold.ttf"))
+            pdf.add_font(ARABIC_FONT, "", str(FONT_DIR / "Tajawal-Regular.ttf"))
+            pdf.add_font(ARABIC_FONT, "B", str(FONT_DIR / "Tajawal-Bold.ttf"))
             if has_math:
                 pdf.add_font(MATH_FONT, "", str(FONT_DIR / "DejaVuSans.ttf"))
                 pdf.add_font(MATH_FONT, "B", str(FONT_DIR / "DejaVuSans-Bold.ttf"))

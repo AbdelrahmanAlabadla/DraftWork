@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import io
 import zipfile
+import xml.etree.ElementTree as ET
 
 import pytest
 
 pytest.importorskip("fpdf")
 pytest.importorskip("docx")
 
-from app.exports.common import RESPONSE_LINE_TEXT, flatten_exam_items, group_exam_sections
+from app.exports.common import (
+    RESPONSE_LINE_TEXT,
+    expand_fill_blank_text,
+    flatten_exam_items,
+    group_exam_sections,
+)
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
 from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
 
@@ -175,8 +181,9 @@ def test_pdf_student_copy_has_metadata_and_no_reference_answer_leak():
     assert "speed = distance" not in student
     assert "Do your best!" not in student
     assert student.count("Computer Science Final Examination") == 1
-    # 3 Why + 3 Equation + 5 Word Problem + 22 Essay lines.
-    assert student.count(RESPONSE_LINE_TEXT) == 33
+    # Open questions remain present; writing lines are drawn as PDF rules so
+    # they are direction-neutral and do not appear as extractable underscores.
+    assert "Why is cache useful?" in student
 
 
 def test_pdf_answer_file_contains_answers_without_student_exam():
@@ -206,7 +213,8 @@ def test_pdf_keeps_each_essay_writing_area_with_its_question():
     pages = pypdf.PdfReader(io.BytesIO(render_exam_pdf(exam, {"exam_title": "Essay test"}))).pages
     page_texts = [page.extract_text() or "" for page in pages]
     second_page = next(text for text in page_texts if "Explain the second topic." in text)
-    assert second_page.count(RESPONSE_LINE_TEXT) == 22
+    assert len(pages) == 2
+    assert "Explain the second topic." in second_page
 
 
 def test_pdf_unknown_model_empty_questions_produces_no_pages():
@@ -307,6 +315,72 @@ def test_arabic_docx_marks_paragraphs_and_runs_rtl():
     assert 'w:val="right"' in document_xml
 
 
+def test_export_fill_blank_adds_four_writing_characters():
+    assert expand_fill_blank_text("Complete ____ now") == "Complete ________ now"
+    assert expand_fill_blank_text("أكمل ----- هنا") == "أكمل --------- هنا"
+
+
+def test_arabic_docx_separates_mcq_markers_and_uses_tajawal():
+    exam, metadata = _arabic_model_and_metadata()
+    exam["questions"]["mcq"][0]["options"]["B"] = "n = c / v"
+    docx_bytes = render_exam_docx(exam, metadata)
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+    assert '<w:t>A.</w:t>' in document_xml
+    assert "استقبال المؤثرات .A" not in document_xml
+    formula = document_xml.index("n = c / v")
+    marker = document_xml.index("<w:t>B.</w:t>")
+    assert formula < marker
+    marker_properties = document_xml[marker - 400:marker]
+    assert '<w:bidi w:val="0"/>' in marker_properties
+    assert '<w:rtl w:val="0"/>' in marker_properties
+    assert 'w:jc w:val="right"' in document_xml[formula - 500:formula]
+    assert 'w:ascii="Tajawal"' in document_xml
+    assert "F6F8FB" not in document_xml
+    response_line = document_xml.index(RESPONSE_LINE_TEXT)
+    assert '<w:bidi/>' in document_xml[response_line - 500:response_line]
+    assert 'w:right="230"' in document_xml[response_line - 500:response_line]
+
+
+def test_docx_definition_uses_a_long_flexible_answer_line():
+    exam, metadata = _model_and_metadata()
+    docx_bytes = render_exam_docx(exam, metadata)
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        root = ET.fromstring(archive.read("word/document.xml"))
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    definition_table = next(
+        table for table in root.findall(".//w:tbl", ns)
+        if "Operating system" in "".join(table.itertext())
+    )
+    cells = definition_table.findall("./w:tr/w:tc", ns)
+    assert len(cells) == 2
+    widths = [int(cell.find("./w:tcPr/w:tcW", ns).get(f"{{{ns['w']}}}w")) for cell in cells]
+    assert widths[1] > widths[0] * 2
+    assert cells[1].find(".//w:pBdr/w:bottom", ns) is not None
+
+
+def test_arabic_docx_places_true_false_choices_after_statement():
+    exam, metadata = _arabic_model_and_metadata()
+    statement = "يعلم الله تعالى كل شيء."
+    exam["questions"]["true_false"] = [{
+        "question_id": "ar_tf_1",
+        "statement": statement,
+        "answer": "True",
+    }]
+    docx_bytes = render_exam_docx(exam, metadata)
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        document_xml = archive.read("word/document.xml")
+    root = ET.fromstring(document_xml)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    tf_table = next(
+        table for table in root.findall(".//w:tbl", ns)
+        if statement in "".join(table.itertext())
+    )
+    cells = tf_table.findall("./w:tr/w:tc", ns)
+    assert "صح" in "".join(cells[0].itertext())
+    assert statement in "".join(cells[1].itertext())
+
+
 def test_english_docx_remains_ltr():
     exam, metadata = _model_and_metadata()
     document = render_exam_docx(exam, metadata)
@@ -314,6 +388,35 @@ def test_english_docx_remains_ltr():
         document_xml = archive.read("word/document.xml").decode("utf-8")
     assert "w:bidi" not in document_xml
     assert "w:rtl" not in document_xml
+
+
+def test_equations_are_rendered_as_math_images_in_pdf_and_docx():
+    exam = {
+        "model_number": 1,
+        "questions": {
+            "equation": [{
+                "question_id": "model1_equation_math",
+                "equation": "sin θc = n2/n1؛ n1 = 1.50؛ n2 = 1.00",
+                "solution_steps": ["sin θc = 1.00 / 1.50"],
+                "final_answer": "θc = 41.8°",
+            }],
+        },
+    }
+    source = exam["questions"]["equation"][0]["equation"]
+    pdf_bytes = render_exam_pdf(exam, {"exam_title": "Math test"})
+    pypdf = pytest.importorskip("pypdf")
+    pdf_text = "\n".join(
+        page.extract_text() or ""
+        for page in pypdf.PdfReader(io.BytesIO(pdf_bytes)).pages
+    )
+    assert source not in pdf_text
+
+    docx_bytes = render_exam_docx(exam, {"exam_title": "Math test"})
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+        media = [name for name in archive.namelist() if name.startswith("word/media/")]
+    assert source not in document_xml
+    assert media
 
 
 def test_browser_preview_uses_structured_student_and_key_layout():
@@ -328,6 +431,28 @@ def test_browser_preview_uses_structured_student_and_key_layout():
     assert "item.correct_answer" in preview_js
     assert "addResponseLines(question" in preview_js
     assert "renderExamOutput(data.exams, data.metadata || {})" in main_js
+
+
+def test_browser_preview_matches_export_header_tf_blanks_and_math_layout():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    preview_js = (root / "FrontEnd/js/exam-view.js").read_text(encoding="utf-8")
+    math_js = (root / "FrontEnd/js/math-renderer.js").read_text(encoding="utf-8")
+    html = (root / "FrontEnd/index.html").read_text(encoding="utf-8")
+    css = (root / "FrontEnd/css/styles.css").read_text(encoding="utf-8")
+
+    assert 'const grid = element("div", "preview-meta-row")' in preview_js
+    assert "[labels.className, metadata.class_name]" not in preview_js
+    assert '"preview-student-name"' in preview_js
+    assert '"preview-student-class"' in preview_js
+    assert 'blank + blank[0].repeat(4)' in preview_js
+    assert 'stem.appendChild(element("span", "preview-tf-choices"' in preview_js
+    assert "renderEquation(equation, value)" in preview_js
+    assert "window.katex.render" in math_js
+    assert "toMathLatex" in math_js
+    assert "katex@0.18.7/dist/katex.min.js" in html
+    assert ".preview-equation-text .katex-display" in css
 
 
 def test_frontend_markdown_copy_is_questions_first_and_uses_toast():
