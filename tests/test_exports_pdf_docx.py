@@ -433,6 +433,28 @@ def test_browser_preview_uses_structured_student_and_key_layout():
     assert "renderExamOutput(data.exams, data.metadata || {})" in main_js
 
 
+def test_browser_preview_matches_export_header_tf_blanks_and_math_layout():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    preview_js = (root / "FrontEnd/js/exam-view.js").read_text(encoding="utf-8")
+    math_js = (root / "FrontEnd/js/math-renderer.js").read_text(encoding="utf-8")
+    html = (root / "FrontEnd/index.html").read_text(encoding="utf-8")
+    css = (root / "FrontEnd/css/styles.css").read_text(encoding="utf-8")
+
+    assert 'const grid = element("div", "preview-meta-row")' in preview_js
+    assert "[labels.className, metadata.class_name]" not in preview_js
+    assert '"preview-student-name"' in preview_js
+    assert '"preview-student-class"' in preview_js
+    assert 'blank + blank[0].repeat(4)' in preview_js
+    assert 'stem.appendChild(element("span", "preview-tf-choices"' in preview_js
+    assert "renderEquation(equation, value)" in preview_js
+    assert "window.katex.render" in math_js
+    assert "toMathLatex" in math_js
+    assert "katex@0.18.7/dist/katex.min.js" in html
+    assert ".preview-equation-text .katex-display" in css
+
+
 def test_frontend_markdown_copy_is_questions_first_and_uses_toast():
     from pathlib import Path
 

@@ -1,5 +1,6 @@
 import { state } from "./state.js";
 import { applyContentDirection, t } from "./i18n.js";
+import { renderEquation } from "./math-renderer.js";
 
 // Mirrors app.exports.common so screen, PDF, and DOCX use one visual contract.
 const RESPONSE_LINE = "_".repeat(92);
@@ -77,6 +78,12 @@ function clean(value, fallback = "") {
   return text || fallback;
 }
 
+function expandFillBlankText(value) {
+  return String(value ?? "").replace(/_{3,}|-{3,}/g, (blank) => (
+    blank + blank[0].repeat(4)
+  ));
+}
+
 function sectionItems(questions, qtype) {
   const section = questions?.[qtype];
   if (qtype === "fill_in_the_blank") return section?.items || [];
@@ -97,24 +104,33 @@ function addTitleBlock(paper, exam, metadata, language, labels) {
   paper.appendChild(header);
 
   const fields = [
-    [labels.className, metadata.class_name],
     [labels.duration, metadata.duration],
-    [labels.date, metadata.exam_date],
     [labels.teacher, metadata.teacher_name],
+    [labels.date, metadata.exam_date],
   ];
-  const grid = element("div", "preview-meta-grid");
+  const grid = element("div", "preview-meta-row");
   fields.forEach(([label, value]) => {
     const field = element("div", "preview-meta-field");
     field.appendChild(element("strong", "", `${label}:`));
-    const fieldValue = clean(value, "_________");
-    field.appendChild(contentElement("span", "", fieldValue, language));
+    const fieldValue = clean(value);
+    field.appendChild(contentElement(
+      "span",
+      fieldValue ? "preview-meta-value" : "preview-meta-blank",
+      fieldValue,
+      language,
+    ));
     grid.appendChild(field);
   });
   paper.appendChild(grid);
 
   const student = element("div", "preview-student-row");
-  student.appendChild(element("span", "", `${labels.studentName}: ${"_".repeat(34)}`));
-  student.appendChild(element("span", "", `${labels.className}: ${"_".repeat(12)}`));
+  [[labels.studentName, "preview-student-name"], [labels.className, "preview-student-class"]]
+    .forEach(([label, className]) => {
+      const field = element("div", `preview-student-field ${className}`);
+      field.appendChild(element("strong", "", `${label}:`));
+      field.appendChild(element("span", "preview-meta-blank"));
+      student.appendChild(field);
+    });
   paper.appendChild(student);
 }
 
@@ -165,10 +181,11 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
 
   items.forEach((item, index) => {
     const question = element("section", `preview-question preview-${qtype}`);
-    const text = qtype === "true_false" ? item.statement
+    let text = qtype === "true_false" ? item.statement
       : qtype === "definition" ? item.term
       : qtype === "equation" ? item.equation
       : item.question;
+    if (qtype === "fill_in_the_blank") text = expandFillBlankText(text);
 
     if (qtype === "definition") {
       const row = element("div", "preview-definition-row");
@@ -181,8 +198,18 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
       const row = element("div", "preview-equation-row");
       row.appendChild(element("strong", "preview-equation-number", `${index + 1}.`));
       const value = clean(text, examLabels.missingQuestion);
-      row.appendChild(contentElement("div", "preview-equation-text", value, language));
+      const equation = element("div", "preview-equation-text");
+      renderEquation(equation, value);
+      row.appendChild(equation);
       question.appendChild(row);
+    } else if (qtype === "true_false") {
+      const stem = element("div", "preview-question-stem preview-tf-row");
+      const value = clean(text, examLabels.missingQuestion);
+      applyContentDirection(stem, value, language);
+      stem.appendChild(element("strong", "", language === "ar" ? `${index + 1}. ` : `Q${index + 1}. `));
+      stem.appendChild(document.createTextNode(value));
+      stem.appendChild(element("span", "preview-tf-choices", examLabels.trueFalse));
+      question.appendChild(stem);
     } else if (qtype === "word_problem") {
       addPlainNumberedStem(question, index + 1, text, language, examLabels.missingQuestion);
     } else {
@@ -196,8 +223,6 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
         options.appendChild(contentElement("div", "preview-option", optionText, language));
       });
       question.appendChild(options);
-    } else if (qtype === "true_false") {
-      question.appendChild(element("div", "preview-tf-choices", examLabels.trueFalse));
     } else if (["short_answer", "equation", "word_problem", "essay"].includes(qtype)) {
       addResponseLines(question, RESPONSE_LINE_COUNTS[qtype]);
     }

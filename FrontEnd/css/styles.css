@@ -731,41 +731,63 @@
       font-size: 13px;
     }
 
-    .preview-meta-grid {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+    .preview-meta-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 24px;
       margin-bottom: 10px;
-      border: 1px solid #b4beca;
-      background: #f6f8fb;
     }
 
     .preview-meta-field {
-      min-width: 0;
-      padding: 7px 9px;
-      border-right: 1px solid #b4beca;
-      font-size: 10px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .preview-meta-field:last-child {
-      border-right: 0;
+      display: flex;
+      align-items: baseline;
+      flex: 1 1 0;
+      gap: 7px;
+      min-width: 110px;
+      font-size: 12px;
     }
 
     .preview-meta-field strong {
       color: #64748b;
-      margin-right: 5px;
+      flex: 0 0 auto;
+    }
+
+    .preview-meta-value,
+    .preview-meta-blank {
+      min-width: 0;
+      flex: 1 1 auto;
+      padding-inline: 3px;
+      border-bottom: 1px solid #b4beca;
+    }
+
+    .preview-meta-blank {
+      height: 1em;
     }
 
     .preview-student-row {
       display: flex;
-      justify-content: space-between;
+      align-items: baseline;
       gap: 18px;
       margin: 0 4px 14px;
       color: #1f2937;
       font-size: 12px;
+    }
+
+    .preview-student-field {
+      display: flex;
+      align-items: baseline;
+      gap: 7px;
       white-space: nowrap;
+    }
+
+    .preview-student-name {
+      flex: 1 1 auto;
+    }
+
+    .preview-student-class {
+      flex: 0 1 32%;
+      min-width: 130px;
     }
 
     .preview-section-heading {
@@ -826,6 +848,11 @@
       overflow-wrap: anywhere;
     }
 
+    .preview-equation-text .katex-display {
+      margin: 0;
+      overflow: auto hidden;
+    }
+
     .preview-equation,
     .preview-word_problem {
       margin-bottom: 17px;
@@ -868,10 +895,11 @@
     }
 
     .preview-tf-choices {
-      margin-top: 4px;
-      text-align: right;
+      display: inline-block;
+      margin-inline-start: 14px;
       font-size: 13px;
       font-weight: 400;
+      white-space: nowrap;
     }
 
     .preview-response-lines {
@@ -932,23 +960,20 @@
         font-size: 20px;
       }
 
-      .preview-meta-grid {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }
-
-      .preview-meta-field:nth-child(2) {
-        border-right: 0;
-      }
-
-      .preview-meta-field:nth-child(-n + 2) {
-        border-bottom: 1px solid #b4beca;
+      .preview-meta-row {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 7px;
       }
 
       .preview-student-row {
         align-items: flex-start;
         flex-direction: column;
         gap: 5px;
-        white-space: normal;
+      }
+
+      .preview-student-field {
+        width: 100%;
       }
 
       .preview-options {
