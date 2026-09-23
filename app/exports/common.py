@@ -102,6 +102,18 @@ WORD_PROBLEM_RESPONSE_LINES = 5
 ESSAY_RESPONSE_LINES = 22
 RESPONSE_LINE_TEXT = "_" * 92
 
+_FILL_BLANK_RE = re.compile(r"_{3,}|-{3,}")
+
+
+def expand_fill_blank_text(text: object, extra: int = 4) -> str:
+    """Make printed fill-in blanks easier to write in without changing content."""
+    value = str(text or "")
+
+    def expand(match: re.Match[str]) -> str:
+        return match.group(0) + (match.group(0)[0] * extra)
+
+    return _FILL_BLANK_RE.sub(expand, value)
+
 _UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _FILENAME_WHITESPACE = re.compile(r"\s+")
 _WINDOWS_RESERVED_NAMES = {

@@ -20,15 +20,18 @@ from app.exports.common import (
     HEADER_LABELS_BY_LANG,
     RESPONSE_LINE_TEXT,
     TRUE_FALSE_CHOICES_BY_LANG,
+    expand_fill_blank_text,
     exam_document_language,
     group_exam_sections,
     response_line_count,
 )
 from app.language import detect_language
+from app.exports.math_renderer import render_math
 
 PAGE_MARGIN_IN = 0.5
 CONTENT_WIDTH_IN = 7.27  # A4 width (8.27in) minus two 0.5in margins
 FONT_NAME = "Arial"
+ARABIC_FONT_NAME = "Tajawal"
 INK = RGBColor(31, 41, 55)
 MUTED = RGBColor(100, 116, 139)
 SECTION_FILL = "E8EEF5"
@@ -44,6 +47,27 @@ def _set_paragraph_rtl(paragraph) -> None:
     p_pr = paragraph._p.get_or_add_pPr()
     if p_pr.find(qn("w:bidi")) is None:
         p_pr.append(OxmlElement("w:bidi"))
+
+
+def _set_marker_ltr(paragraph, run) -> None:
+    """Keep a Latin option marker as ``A.`` inside an Arabic document."""
+    p_pr = paragraph._p.get_or_add_pPr()
+    bidi = p_pr.find(qn("w:bidi"))
+    if bidi is None:
+        bidi = OxmlElement("w:bidi")
+        p_pr.append(bidi)
+    bidi.set(qn("w:val"), "0")
+    r_pr = run._element.get_or_add_rPr()
+    rtl = r_pr.find(qn("w:rtl"))
+    if rtl is None:
+        rtl = OxmlElement("w:rtl")
+        r_pr.append(rtl)
+    rtl.set(qn("w:val"), "0")
+    lang = r_pr.find(qn("w:lang"))
+    if lang is None:
+        lang = OxmlElement("w:lang")
+        r_pr.append(lang)
+    lang.set(qn("w:val"), "en-US")
 
 
 _SCRIPT_LETTER_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u0600-\u06ff]")
@@ -89,13 +113,15 @@ def _set_run_font(
     italic: bool | None = None,
     color: RGBColor = INK,
 ) -> None:
-    run.font.name = FONT_NAME
+    run_is_arabic = detect_language(run.text or "") == "ar"
+    font_name = ARABIC_FONT_NAME if run_is_arabic else FONT_NAME
+    run.font.name = font_name
     r_pr = run._element.get_or_add_rPr()
     r_fonts = r_pr.rFonts
-    r_fonts.set(qn("w:ascii"), FONT_NAME)
-    r_fonts.set(qn("w:hAnsi"), FONT_NAME)
+    r_fonts.set(qn("w:ascii"), font_name)
+    r_fonts.set(qn("w:hAnsi"), font_name)
     # Complex-script font so Arabic glyphs use the same face and size.
-    r_fonts.set(qn("w:cs"), FONT_NAME)
+    r_fonts.set(qn("w:cs"), font_name)
     cs_size = r_pr.find(qn("w:szCs"))
     if cs_size is None:
         cs_size = OxmlElement("w:szCs")
@@ -103,7 +129,7 @@ def _set_run_font(
     cs_size.set(qn("w:val"), str(int(size * 2)))
     run.font.size = Pt(size)
     run.font.color.rgb = color
-    if detect_language(run.text or "") == "ar":
+    if run_is_arabic:
         if r_pr.find(qn("w:rtl")) is None:
             r_pr.append(OxmlElement("w:rtl"))
         lang = r_pr.find(qn("w:lang"))
@@ -330,49 +356,59 @@ def _add_exam_header(doc: Document, metadata: dict[str, Any], model_number: int,
     _set_run_font(run, size=9, color=MUTED)
 
     fields = [
-        (labels["class"], _clean(metadata.get("class_name"), "_________")),
         (labels["duration"], _clean(metadata.get("duration"), "_______")),
-        (labels["date"], _clean(metadata.get("exam_date"), "_________")),
         (labels["teacher"], _clean(metadata.get("teacher_name"), "_________")),
+        (labels["date"], _clean(metadata.get("exam_date"), "_________")),
     ]
-    meta = doc.add_table(rows=1, cols=4)
-    widths = [CONTENT_WIDTH_IN / 4] * 4
+    meta = doc.add_table(rows=1, cols=3)
+    widths = [CONTENT_WIDTH_IN / 3] * 3
     _set_table_geometry(meta, widths)
-    for cell, (label, value) in zip(meta.rows[0].cells, fields):
+    _remove_table_borders(meta)
+    for index, (label, value) in enumerate(fields):
+        visual_col = len(fields) - 1 - index if rtl else index
+        cell = meta.cell(0, visual_col)
         cell.text = ""
         para = cell.paragraphs[0]
-        _shade_paragraph(para, "F6F8FB")
         if rtl:
             _set_paragraph_rtl(para)
             para.alignment = WD_ALIGN_PARAGRAPH.LEFT
         run = para.add_run(f"{label}: ")
         _set_run_font(run, size=8, bold=True, color=MUTED)
-        run = para.add_run(value)
+        blank = value.startswith("_")
+        run = para.add_run(("\u00a0" * len(value)) if blank else value)
         _set_run_font(run, size=8.5)
+        if blank:
+            run.font.underline = True
 
-    student = doc.add_paragraph()
-    student.paragraph_format.space_before = Pt(3)
-    student.paragraph_format.space_after = Pt(5)
+    student = doc.add_table(rows=1, cols=2)
+    student_widths = (
+        [CONTENT_WIDTH_IN * 0.32, CONTENT_WIDTH_IN * 0.68]
+        if rtl else [CONTENT_WIDTH_IN * 0.68, CONTENT_WIDTH_IN * 0.32]
+    )
+    _set_table_geometry(student, student_widths)
+    _remove_table_borders(student)
+    student_fields = [
+        (labels["student_name"].rstrip(": "), 38),
+        (labels["class"], _clean(metadata.get("class_name"), "_" * 14)),
+    ]
     if rtl:
-        _set_paragraph_rtl(student)
-        student.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        run = student.add_run("_" * 38)
+        student_fields.reverse()
+    for cell, (label, value) in zip(student.rows[0].cells, student_fields):
+        cell.text = ""
+        para = cell.paragraphs[0]
+        para.paragraph_format.space_before = Pt(3)
+        para.paragraph_format.space_after = Pt(5)
+        if rtl:
+            _set_paragraph_rtl(para)
+            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        run = para.add_run(f"{label}: ")
         _set_run_font(run, size=9.5)
-        run = student.add_run("        " + labels["student_name"])
+        blank = isinstance(value, int) or str(value).startswith("_")
+        blank_length = value if isinstance(value, int) else len(str(value))
+        run = para.add_run("\u00a0" * blank_length if blank else str(value))
         _set_run_font(run, size=9.5)
-        run = student.add_run("_" * 14)
-        _set_run_font(run, size=9.5)
-        run = student.add_run("        " + labels["class_suffix"])
-        _set_run_font(run, size=9.5)
-    else:
-        run = student.add_run(labels["student_name"])
-        _set_run_font(run, size=9.5)
-        run = student.add_run("_" * 38)
-        _set_run_font(run, size=9.5)
-        run = student.add_run("        " + labels["class_suffix"])
-        _set_run_font(run, size=9.5)
-        run = student.add_run("_" * 14)
-        _set_run_font(run, size=9.5)
+        if blank:
+            run.font.underline = True
 
 
 def _add_section_heading(doc: Document, label: str, *, page_break_before: bool = False, rtl: bool = False) -> None:
@@ -383,7 +419,8 @@ def _add_section_heading(doc: Document, label: str, *, page_break_before: bool =
     p.paragraph_format.right_indent = Pt(4)
     if rtl:
         _set_paragraph_rtl(p)
-    p.add_run(label)
+    run = p.add_run(label)
+    _set_run_font(run, size=11, bold=True, color=RGBColor(51, 65, 85))
     _shade_paragraph(p, SECTION_FILL)
     _paragraph_bottom_border(p, color=RULE, size="5")
 
@@ -406,27 +443,59 @@ def _add_mcq(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
     two_column = options and all(len(_clean(option)) <= 90 for _, option in options)
     if two_column:
         rows = (len(options) + 1) // 2
-        table = doc.add_table(rows=rows, cols=2)
-        _set_table_geometry(table, [CONTENT_WIDTH_IN / 2] * 2)
+        marker_w = 0.34
+        text_w = (CONTENT_WIDTH_IN / 2) - marker_w
+        widths = [text_w, marker_w, text_w, marker_w] if rtl else [marker_w, text_w, marker_w, text_w]
+        table = doc.add_table(rows=rows, cols=4)
+        _set_table_geometry(table, widths)
         _remove_table_borders(table)
         for index, (letter, option) in enumerate(options):
-            column = 1 - (index % 2) if rtl else index % 2
-            cell = table.cell(index // 2, column)
-            cell.text = ""
-            p = cell.paragraphs[0]
+            pair_position = index % 2
+            if rtl:
+                marker_col = 3 if pair_position == 0 else 1
+                text_col = marker_col - 1
+            else:
+                marker_col = 0 if pair_position == 0 else 2
+                text_col = marker_col + 1
+            marker = table.cell(index // 2, marker_col)
+            content = table.cell(index // 2, text_col)
+            marker.text = ""
+            content.text = ""
+            marker_p = marker.paragraphs[0]
+            marker_p.paragraph_format.space_after = Pt(0)
+            marker_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = marker_p.add_run(f"{letter}.")
+            _set_run_font(run, size=9.5, bold=True)
+            if rtl:
+                _set_marker_ltr(marker_p, run)
+            p = content.paragraphs[0]
             p.paragraph_format.space_after = Pt(0)
             option_text = _clean(option)
             content_rtl = _set_content_direction(p, option_text, rtl)
-            run = p.add_run(f"{option_text} .{letter}" if content_rtl else f"{letter}. {option_text}")
+            if rtl and not content_rtl:
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            run = p.add_run(option_text)
             _set_run_font(run, size=9.5)
     else:
         for letter, option in options:
-            p = doc.add_paragraph()
-            p.paragraph_format.left_indent = Inches(0.18)
+            widths = [CONTENT_WIDTH_IN - 0.34, 0.34] if rtl else [0.34, CONTENT_WIDTH_IN - 0.34]
+            table = doc.add_table(rows=1, cols=2)
+            _set_table_geometry(table, widths, indent_dxa=180)
+            _remove_table_borders(table)
+            marker_col, text_col = (1, 0) if rtl else (0, 1)
+            marker_p = table.cell(0, marker_col).paragraphs[0]
+            marker_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = marker_p.add_run(f"{letter}.")
+            _set_run_font(run, size=9.5, bold=True)
+            if rtl:
+                _set_marker_ltr(marker_p, run)
+            p = table.cell(0, text_col).paragraphs[0]
             p.paragraph_format.space_after = Pt(1)
             option_text = _clean(option)
             content_rtl = _set_content_direction(p, option_text, rtl)
-            run = p.add_run(f"{option_text} .{letter}" if content_rtl else f"{letter}. {option_text}")
+            if rtl and not content_rtl:
+                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            run = p.add_run(option_text)
             _set_run_font(run, size=9.5)
     spacer = doc.add_paragraph()
     spacer.paragraph_format.space_after = Pt(2)
@@ -455,10 +524,15 @@ def _add_word_bank(doc: Document, words: list[str], language: str = "en") -> Non
     _set_run_font(run, size=9.5)
 
 
-def _add_answer_lines(doc: Document, count: int) -> None:
+def _add_answer_lines(doc: Document, count: int, *, rtl: bool = False) -> None:
     for index in range(count):
         p = doc.add_paragraph()
-        p.paragraph_format.left_indent = Inches(0.16)
+        if rtl:
+            _set_paragraph_rtl(p)
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.right_indent = Inches(0.16)
+        else:
+            p.paragraph_format.left_indent = Inches(0.16)
         p.paragraph_format.space_before = Pt(0)
         p.paragraph_format.space_after = Pt(0 if index < count - 1 else 3)
         p.paragraph_format.line_spacing = Pt(16)
@@ -470,16 +544,28 @@ def _add_answer_lines(doc: Document, count: int) -> None:
 
 
 def _add_definition(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
-    p = doc.add_paragraph()
-    p.paragraph_format.space_after = Pt(7)
     term = _clean(item.get("text"), "(missing term)")
-    _set_content_direction(p, term, rtl)
-    run = p.add_run(f"{item['number']}. ")
+    term_rtl = detect_language(term) == "ar" if _SCRIPT_LETTER_RE.search(term) else rtl
+    label_width = 2.35
+    line_width = CONTENT_WIDTH_IN - label_width
+    widths = [line_width, label_width] if term_rtl else [label_width, line_width]
+    table = doc.add_table(rows=1, cols=2)
+    _set_table_geometry(table, widths)
+    _remove_table_borders(table)
+    label_col, line_col = (1, 0) if term_rtl else (0, 1)
+    label_p = table.cell(0, label_col).paragraphs[0]
+    label_p.paragraph_format.space_after = Pt(0)
+    _set_content_direction(label_p, term, rtl)
+    run = label_p.add_run(f"{item['number']}. ")
     _set_run_font(run, bold=True)
-    run = p.add_run(term + ": ")
+    run = label_p.add_run(term + ":")
     _set_run_font(run, bold=True)
-    run = p.add_run("_" * 58)
-    _set_run_font(run, size=9, color=RGBColor(71, 85, 105))
+    line_p = table.cell(0, line_col).paragraphs[0]
+    line_p.paragraph_format.space_after = Pt(0)
+    line_p.add_run("\u00a0")
+    _paragraph_bottom_border(line_p, color=RULE, size="5")
+    spacer = doc.add_paragraph()
+    spacer.paragraph_format.space_after = Pt(3)
 
 
 def _add_equation(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
@@ -498,9 +584,18 @@ def _add_equation(doc: Document, item: dict[str, Any], rtl: bool = False) -> Non
     equation.paragraph_format.space_after = Pt(0)
     if rtl:
         _set_paragraph_rtl(equation)
-    run = equation.add_run(_clean(item.get("text"), "(missing equation)"))
-    _set_run_font(run, bold=True)
-    _add_answer_lines(doc, response_line_count("equation"))
+    equation_text = _clean(item.get("text"), "(missing equation)")
+    rendered = render_math(equation_text)
+    if rendered:
+        natural_width = rendered.width_px / 220
+        picture_width = min(CONTENT_WIDTH_IN - 0.9, max(0.35, natural_width))
+        stream = io.BytesIO(rendered.png)
+        stream.name = "equation.png"
+        equation.add_run().add_picture(stream, width=Inches(picture_width))
+    else:
+        run = equation.add_run(equation_text)
+        _set_run_font(run, bold=True)
+    _add_answer_lines(doc, response_line_count("equation"), rtl=rtl)
 
 
 def _add_word_problem(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
@@ -513,7 +608,7 @@ def _add_word_problem(doc: Document, item: dict[str, Any], rtl: bool = False) ->
     _set_run_font(run, bold=True)
     run = p.add_run(text)
     _set_run_font(run, bold=True)
-    _add_answer_lines(doc, response_line_count("word_problem"))
+    _add_answer_lines(doc, response_line_count("word_problem"), rtl=rtl)
 
 
 def _answer_text(item: dict[str, Any], language: str = "en") -> str:
@@ -557,28 +652,33 @@ def _render_student_sections(doc: Document, sections: list[dict[str, Any]], lang
                 _add_mcq(doc, item, rtl=rtl)
             elif qtype == "true_false":
                 statement = _clean(item.get("text"))
-                choices_below = len(statement) > 80
-                p = doc.add_paragraph()
-                p.paragraph_format.space_after = Pt(4)
-                p.paragraph_format.keep_with_next = choices_below
-                content_rtl = _set_content_direction(p, statement, rtl)
-                run = p.add_run(f"{item['number']}. {statement}" if content_rtl else f"Q{item['number']}. {statement}")
+                statement_width = CONTENT_WIDTH_IN - 1.7
+                choice_width = 1.7
+                widths = [choice_width, statement_width] if rtl else [statement_width, choice_width]
+                table = doc.add_table(rows=1, cols=2)
+                _set_table_geometry(table, widths)
+                _remove_table_borders(table)
+                statement_col, choice_col = (1, 0) if rtl else (0, 1)
+                table.cell(0, choice_col).vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
+
+                statement_p = table.cell(0, statement_col).paragraphs[0]
+                statement_p.paragraph_format.space_after = Pt(4)
+                content_rtl = _set_content_direction(statement_p, statement, rtl)
+                marker = f"{item['number']}. " if content_rtl else f"Q{item['number']}. "
+                run = statement_p.add_run(marker)
                 _set_run_font(run, bold=True)
-                if choices_below:
-                    choices = doc.add_paragraph()
-                    if rtl:
-                        _set_paragraph_rtl(choices)
-                        choices.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    else:
-                        choices.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                    choices.paragraph_format.space_after = Pt(4)
-                    run = choices.add_run(tf_choices)
-                    _set_run_font(run, size=9.5)
-                else:
-                    run = p.add_run("     " + tf_choices)
-                    _set_run_font(run, size=9.5)
+                run = statement_p.add_run(statement)
+                _set_run_font(run, bold=True)
+
+                choices_p = table.cell(0, choice_col).paragraphs[0]
+                choices_p.paragraph_format.space_after = Pt(4)
+                _set_content_direction(choices_p, tf_choices, rtl)
+                run = choices_p.add_run(tf_choices)
+                _set_run_font(run, size=9.5)
             elif qtype == "fill_in_the_blank":
-                _add_question_stem(doc, item, rtl=rtl)
+                printed_item = dict(item)
+                printed_item["text"] = expand_fill_blank_text(item.get("text"))
+                _add_question_stem(doc, printed_item, rtl=rtl)
             elif qtype == "definition":
                 _add_definition(doc, item, rtl=rtl)
             elif qtype == "equation":
@@ -587,7 +687,7 @@ def _render_student_sections(doc: Document, sections: list[dict[str, Any]], lang
                 _add_word_problem(doc, item, rtl=rtl)
             else:
                 _add_question_stem(doc, item, rtl=rtl)
-                _add_answer_lines(doc, response_line_count(qtype))
+                _add_answer_lines(doc, response_line_count(qtype), rtl=rtl)
 
 
 def _render_answer_key(
