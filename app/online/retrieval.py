@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from app.config import GENERATION_CONTEXT_TOKENS
+from app.config import GENERATION_CONTEXT_TOKENS, PLANNER_CONTEXT_TOKENS
 from app.language import detect_language
 from app.logging_conf import get_logger
 from app.offline.vector_store import VectorStore
@@ -53,12 +53,13 @@ def _build_tree_context(children: list[dict]) -> str:
 def build_planner_context(
     children: list[dict], snippet_tokens: int | None = None
 ) -> str:
-    """Return the full selected chunk content for planning.
+    """Return selected chunk content for the single full-context planning call.
 
     ``snippet_tokens`` remains accepted for compatibility but no longer truncates
-    each selected chunk.
+    each selected chunk. The complete rendered selection has one deployment-wide
+    cap so a request cannot exceed the configured prompt budget.
     """
-    return _build_tree_context(children)
+    return _first_tokens(_build_tree_context(children), PLANNER_CONTEXT_TOKENS)
 
 
 def retrieve_selected(

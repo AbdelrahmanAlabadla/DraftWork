@@ -7,6 +7,31 @@ from pydantic import BaseModel, ConfigDict, Field, create_model
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
 
+ReasoningMode = Literal[
+    "conceptual_recall",
+    "conceptual_reasoning",
+    "calculation",
+    "symbolic_manipulation",
+    "law_or_theorem_application",
+    "derivation_relationship",
+    "logical_proof_reasoning",
+    "representation_interpretation",
+    "comparison_prediction",
+    "error_analysis",
+    "estimation_reasonableness",
+]
+
+QuestionType = Literal[
+    "mcq",
+    "fill_in_the_blank",
+    "true_false",
+    "definition",
+    "why",
+    "equation",
+    "word_problem",
+    "essay",
+]
+
 
 class StrictOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -56,10 +81,60 @@ def strict_json_schema(model: type[BaseModel]) -> dict:
 
 
 class PlanItem(StrictOutputModel):
+    slot_id: str = Field(min_length=1)
     source_chunk_id: str = Field(min_length=1)
+    support_chunk_ids: list[str]
     topic: str = Field(min_length=1)
     concept: str = Field(min_length=1)
+    canonical_skill: str = Field(min_length=1, max_length=160)
+    knowledge_focus: str = Field(min_length=1, max_length=200)
+    student_work_product: str = Field(min_length=1, max_length=160)
+    relationship: str | None
+    target: str = Field(min_length=1)
+    task_operation: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
+    given_conditions: list[NonEmptyString] = Field(max_length=12)
+    scenario_family: str | None = Field(max_length=160)
+    required_givens: list[NonEmptyString] = Field(max_length=12)
+    text_answerable: bool
+    reasoning_mode: ReasoningMode
+    difficulty: Literal["easy", "medium", "hard"]
     idea_to_test: str = Field(min_length=1)
+
+
+class QuestionTypeAssessment(StrictOutputModel):
+    support: Literal["supported", "limited", "unsupported"]
+    task_operations: list[str] = Field(max_length=16)
+    form_guidance: str = Field(min_length=1, max_length=320)
+    evidence_chunk_ids: list[str] = Field(max_length=8)
+
+
+class QuestionTypeAssessments(StrictOutputModel):
+    mcq: QuestionTypeAssessment
+    fill_in_the_blank: QuestionTypeAssessment
+    true_false: QuestionTypeAssessment
+    definition: QuestionTypeAssessment
+    why: QuestionTypeAssessment
+    equation: QuestionTypeAssessment
+    word_problem: QuestionTypeAssessment
+    essay: QuestionTypeAssessment
+
+
+class AssessmentProfile(StrictOutputModel):
+    subject: str = Field(min_length=1, max_length=120)
+    domain: Literal["STEM", "NON_STEM"]
+    domains: list[str] = Field(min_length=1, max_length=4)
+    educational_level: str = Field(min_length=1, max_length=160)
+    assessment_style: str = Field(min_length=1, max_length=320)
+    question_types: QuestionTypeAssessments
+    unsupported_visual_tasks: list[str] = Field(max_length=8)
+
+
+class PlanningIssue(StrictOutputModel):
+    question_type: QuestionType
+    requested_count: int = Field(ge=1)
+    supported_count: int = Field(ge=0)
+    reason: str = Field(min_length=1, max_length=400)
+    suggested_question_types: list[QuestionType] = Field(max_length=3)
 
 
 class MCQOptions(StrictOutputModel):
@@ -69,35 +144,52 @@ class MCQOptions(StrictOutputModel):
     D: str = Field(min_length=1)
 
 
+class SolutionCertificate(StrictOutputModel):
+    """Internal, non-rendered certificate for a quantitative STEM answer."""
+
+    method: str = Field(min_length=1)
+    important_givens: list[NonEmptyString]
+    calculation_steps: list[NonEmptyString] = Field(min_length=1)
+    final_answer: str = Field(min_length=1)
+    units: str = ""
+    matching_correct_option: Literal["A", "B", "C", "D"] | None = None
+    verification_method: str = Field(min_length=1)
+
+
 class MCQQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     question: str = Field(min_length=1)
     options: MCQOptions
     correct_answer: Literal["A", "B", "C", "D"]
+    solution_certificate: SolutionCertificate | None = None
 
 
 class TrueFalseQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     statement: str = Field(min_length=1)
     answer: Literal["True", "False"]
+    solution_certificate: SolutionCertificate | None = None
 
 
 class FITBQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
-    question: str = Field(min_length=1)
-    answers: list[NonEmptyString] = Field(min_length=1, max_length=2)
+    stem: str = Field(min_length=1)
+    distractor_1: str = Field(min_length=1)
+    distractor_2: str = Field(min_length=1)
 
 
-class ShortAnswerQuestion(StrictOutputModel):
+class WhyQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     question: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class DefinitionQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     term: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class EquationQuestion(StrictOutputModel):
@@ -105,6 +197,7 @@ class EquationQuestion(StrictOutputModel):
     equation: str = Field(min_length=1)
     solution_steps: list[NonEmptyString] = Field(min_length=1)
     final_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class WordProblemQuestion(StrictOutputModel):
@@ -112,6 +205,7 @@ class WordProblemQuestion(StrictOutputModel):
     question: str = Field(min_length=1)
     solution_steps: list[NonEmptyString] = Field(min_length=1)
     final_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class EssayQuestion(StrictOutputModel):
@@ -119,11 +213,15 @@ class EssayQuestion(StrictOutputModel):
     question: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
     key_points: list[NonEmptyString] = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
-class FITBWordBank(StrictOutputModel):
-    correct_terms: list[NonEmptyString]
-    distractors: list[NonEmptyString] = Field(min_length=2, max_length=2)
+class MCQTaskUnsuitable(StrictOutputModel):
+    """A planned task that cannot honestly support a strong four-option MCQ."""
+
+    slot_id: str = Field(min_length=1)
+    failure_code: Literal["mcq_task_unsuitable"]
+    reason: str = Field(min_length=1)
 
 
 class ValidatorVerdict(StrictOutputModel):
@@ -138,7 +236,90 @@ class ValidatorVerdict(StrictOutputModel):
         "FIX_QUESTION_AND_ANSWER",
     ]
     fields_to_fix: list[str]
+    failure_code: Literal[
+        "pass",
+        "incorrect_result",
+        "incomplete_solution",
+        "missing_units",
+        "invalid_or_extraneous_solution",
+        "unsupported_given",
+        "missing_required_given",
+        "visual_dependency",
+        "question_type_operation_mismatch",
+        "task_drift",
+        "mcq_task_unsuitable",
+        "ambiguous_or_structural",
+        "other",
+    ]
+    expected_results: list[str]
     reason: str
+    expected_fix: str
+    independent_solution: SolutionCertificate | None = None
+    certificate_valid: bool | None = None
+    first_incorrect_step: str | None = None
+
+
+class QuantitativeValidatorVerdict(ValidatorVerdict):
+    """Quantitative verdicts always include independently checked work."""
+
+    independent_solution: SolutionCertificate
+    certificate_valid: bool
+
+
+class GlobalExamVerdict(StrictOutputModel):
+    """Compact exam-level verdict; PASS rows intentionally carry no explanation."""
+
+    question_id: str = Field(min_length=1)
+    action: Literal[
+        "PASS",
+        "FIX_QUESTION",
+        "FIX_ANSWER",
+        "FIX_OPTIONS",
+        "FIX_QUESTION_AND_ANSWER",
+    ]
+    failure_code: Literal[
+        "pass",
+        "duplicate_or_repetition",
+        "answer_pattern_imbalance",
+        "language_quality",
+        "terminology_inconsistency",
+        "question_type_operation_mismatch",
+        "weak_distractors",
+        "ambiguous_or_structural",
+        "other",
+    ]
+    conflicting_question_ids: list[str]
+    fields_to_fix: list[str]
+    reason: str
+    expected_fix: str
+
+
+class GlobalConflictGroup(StrictOutputModel):
+    question_ids: list[NonEmptyString] = Field(min_length=2)
+    issue_type: Literal[
+        "conceptual_duplicate",
+        "scenario_repetition",
+        "givens_target_repetition",
+        "formula_target_repetition",
+        "other_repetition",
+    ]
+    reason: str = Field(min_length=1)
+
+
+class ExamQualityFinding(StrictOutputModel):
+    code: Literal[
+        "topic_skill_diversity",
+        "true_false_answer_pattern",
+        "arabic_language_quality",
+        "terminology_notation_consistency",
+        "equation_word_problem_roles",
+        "distractor_quality",
+        "exam_consistency",
+        "other",
+    ]
+    severity: Literal["warning", "error"]
+    question_ids: list[str]
+    reason: str = Field(min_length=1)
     expected_fix: str
 
 
@@ -146,45 +327,52 @@ class RepairMCQQuestion(StrictOutputModel):
     question: str = Field(min_length=1)
     options: MCQOptions
     correct_answer: Literal["A", "B", "C", "D"]
+    solution_certificate: SolutionCertificate | None = None
 
 
 class RepairTrueFalseQuestion(StrictOutputModel):
     statement: str = Field(min_length=1)
     answer: Literal["True", "False"]
+    solution_certificate: SolutionCertificate | None = None
 
 
 class RepairFITBQuestion(StrictOutputModel):
-    question: str = Field(min_length=1)
-    answers: list[NonEmptyString] = Field(min_length=1, max_length=2)
-    word_bank: list[NonEmptyString]
+    stem: str = Field(min_length=1)
+    distractor_1: str = Field(min_length=1)
+    distractor_2: str = Field(min_length=1)
 
 
-class RepairShortAnswerQuestion(StrictOutputModel):
+class RepairWhyQuestion(StrictOutputModel):
     question: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class RepairDefinitionQuestion(StrictOutputModel):
     term: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class RepairEquationQuestion(StrictOutputModel):
     equation: str = Field(min_length=1)
     solution_steps: list[NonEmptyString] = Field(min_length=1)
     final_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class RepairWordProblemQuestion(StrictOutputModel):
     question: str = Field(min_length=1)
     solution_steps: list[NonEmptyString] = Field(min_length=1)
     final_answer: str = Field(min_length=1)
+    solution_certificate: SolutionCertificate | None = None
 
 
 class RepairEssayQuestion(StrictOutputModel):
     question: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
     key_points: list[NonEmptyString]
+    solution_certificate: SolutionCertificate | None = None
 
 
 _GENERATION_ITEMS: dict[str, type[StrictOutputModel]] = {
@@ -192,7 +380,7 @@ _GENERATION_ITEMS: dict[str, type[StrictOutputModel]] = {
     "true_false": TrueFalseQuestion,
     "fill_in_the_blank": FITBQuestion,
     "definition": DefinitionQuestion,
-    "short_answer": ShortAnswerQuestion,
+    "why": WhyQuestion,
     "equation": EquationQuestion,
     "word_problem": WordProblemQuestion,
     "essay": EssayQuestion,
@@ -203,7 +391,7 @@ _REPAIR_QUESTIONS: dict[str, type[StrictOutputModel]] = {
     "true_false": RepairTrueFalseQuestion,
     "fill_in_the_blank": RepairFITBQuestion,
     "definition": RepairDefinitionQuestion,
-    "short_answer": RepairShortAnswerQuestion,
+    "why": RepairWhyQuestion,
     "equation": RepairEquationQuestion,
     "word_problem": RepairWordProblemQuestion,
     "essay": RepairEssayQuestion,
@@ -219,6 +407,10 @@ def _bounded_list(item_type, count: int):
     return Annotated[list[item_type], Field(min_length=count, max_length=count)]
 
 
+def _up_to_list(item_type, count: int):
+    return Annotated[list[item_type], Field(max_length=count)]
+
+
 def _generation_item_model(qtype: str, slot_ids: list[str]):
     base = _GENERATION_ITEMS[qtype]
     return create_model(
@@ -230,6 +422,18 @@ def _generation_item_model(qtype: str, slot_ids: list[str]):
 
 def generation_response_model(qtype: str, slot_ids: list[str]):
     item_model = _generation_item_model(qtype, slot_ids)
+    if qtype == "mcq":
+        unsuitable_model = create_model(
+            "MCQTaskUnsuitableForSlots",
+            __base__=MCQTaskUnsuitable,
+            slot_id=(_literal(slot_ids), ...),
+        )
+        return create_model(
+            f"{item_model.__name__}Response",
+            __base__=StrictOutputModel,
+            questions=(_up_to_list(item_model, len(slot_ids)), ...),
+            unsuitable_tasks=(_up_to_list(unsuitable_model, len(slot_ids)), ...),
+        )
     return create_model(
         f"{item_model.__name__}Response",
         __base__=StrictOutputModel,
@@ -251,14 +455,6 @@ def objective_bundle_response_model(
     return create_model("ObjectiveBundleResponse", __base__=StrictOutputModel, **fields)
 
 
-def fitb_word_bank_response_model(count: int):
-    return create_model(
-        "FITBWordBankResponse",
-        __base__=FITBWordBank,
-        correct_terms=(_bounded_list(NonEmptyString, count), ...),
-    )
-
-
 def fitb_items_response_model(slot_ids: list[str]):
     item_model = _generation_item_model("fill_in_the_blank", slot_ids)
     return create_model(
@@ -271,14 +467,20 @@ def fitb_items_response_model(slot_ids: list[str]):
 def planner_response_model(
     tasks: list[tuple[str, int]], num_models: int, chunk_ids: list[str]
 ):
+    slot_ids = [
+        f"m{model_number}_{qtype}_{index}"
+        for model_number in range(1, num_models + 1)
+        for qtype, count in tasks
+        for index in range(1, count + 1)
+    ]
     plan_item = create_model(
         "GroundedPlanItem",
         __base__=PlanItem,
+        slot_id=(_literal(slot_ids), ...),
         source_chunk_id=(_literal(chunk_ids), ...),
+        support_chunk_ids=(list[_literal(chunk_ids)], ...),
     )
-    item_fields = {
-        qtype: (_bounded_list(plan_item, count), ...) for qtype, count in tasks
-    }
+    item_fields = {qtype: (_up_to_list(plan_item, count), ...) for qtype, count in tasks}
     plan_items = create_model(
         "GroundedPlanItems", __base__=StrictOutputModel, **item_fields
     )
@@ -291,6 +493,8 @@ def planner_response_model(
     return create_model(
         "GroundedExamPlanResponse",
         __base__=StrictOutputModel,
+        assessment_profile=(AssessmentProfile, ...),
+        planning_issues=(list[PlanningIssue], ...),
         exams=(_bounded_list(plan, num_models), ...),
     )
 
@@ -301,6 +505,7 @@ def plan_repair_response_model(slot_ids: list[str], chunk_ids: list[str]):
         __base__=PlanItem,
         slot_id=(_literal(slot_ids), ...),
         source_chunk_id=(_literal(chunk_ids), ...),
+        support_chunk_ids=(list[_literal(chunk_ids)], ...),
     )
     return create_model(
         "PlanSlotRepairResponse",
@@ -309,24 +514,33 @@ def plan_repair_response_model(slot_ids: list[str], chunk_ids: list[str]):
     )
 
 
-def plan_fill_response_model(count: int):
-    return create_model(
-        "PlanFillResponse",
-        __base__=StrictOutputModel,
-        questions=(_bounded_list(PlanItem, count), ...),
-    )
-
-
-def validator_response_model(question_ids: list[str]):
+def validator_response_model(question_ids: list[str], *, quantitative: bool = False):
+    base = QuantitativeValidatorVerdict if quantitative else ValidatorVerdict
     verdict = create_model(
         "ValidatorVerdictForQuestions",
-        __base__=ValidatorVerdict,
+        __base__=base,
         question_id=(_literal(question_ids), ...),
     )
     return create_model(
         "ValidatorResponse",
         __base__=StrictOutputModel,
         verdicts=(_bounded_list(verdict, len(question_ids)), ...),
+    )
+
+
+def global_exam_review_response_model(question_ids: list[str]):
+    verdict = create_model(
+        "GlobalExamVerdictForQuestions",
+        __base__=GlobalExamVerdict,
+        question_id=(_literal(question_ids), ...),
+        conflicting_question_ids=(list[_literal(question_ids)], ...),
+    )
+    return create_model(
+        "GlobalExamReviewResponse",
+        __base__=StrictOutputModel,
+        verdicts=(_bounded_list(verdict, len(question_ids)), ...),
+        conflict_groups=(list[GlobalConflictGroup], ...),
+        exam_quality_findings=(list[ExamQualityFinding], ...),
     )
 
 
