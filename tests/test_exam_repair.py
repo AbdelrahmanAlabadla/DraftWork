@@ -53,7 +53,7 @@ def test_correct_untouched_no_calls(monkeypatch):
 
 
 def test_missing_fills_exact_amount(monkeypatch):
-    """short_answer missing 1 of 2 -> generate ONLY 1 new question."""
+    """why missing 1 of 2 -> generate ONLY 1 new question."""
     calls = []
 
     def _fake_gen(qtype, planned, *a, **k):
@@ -62,9 +62,9 @@ def test_missing_fills_exact_amount(monkeypatch):
         return [{"question": f"new {qtype} {i}", "reference_answer": "ans"} for i in range(len(planned))], []
 
     monkeypatch.setattr(eb, "_generate_type_from_plan", _fake_gen)
-    questions = {"short_answer": [{"question": "orig sa", "reference_answer": "ans"}]}
-    tasks = [("short_answer", 2)]
-    plan_items = {"short_answer": [
+    questions = {"why": [{"question": "orig sa", "reference_answer": "ans"}]}
+    tasks = [("why", 2)]
+    plan_items = {"why": [
         {"topic": "x", "concept_to_test": "c1"},
         {"topic": "x", "concept_to_test": "c2"},
     ]}
@@ -73,10 +73,10 @@ def test_missing_fills_exact_amount(monkeypatch):
         questions, tasks, plan_items, "", "easy", 1, set(), [], [],
         max_passes=2, appended_by_type=appended,
     )
-    assert len(questions["short_answer"]) == 2
-    assert questions["short_answer"][0]["question"] == "orig sa"  # original preserved
-    assert calls == [("short_answer", 1)]  # ONLY 1 generated
-    assert appended == {"short_answer": 1}
+    assert len(questions["why"]) == 2
+    assert questions["why"][0]["question"] == "orig sa"  # original preserved
+    assert calls == [("why", 1)]  # ONLY 1 generated
+    assert appended == {"why": 1}
 
 
 def test_shortfall_rejections_reach_model_overall_and_persistence(monkeypatch):
@@ -164,8 +164,11 @@ def test_fitb_missing_regenerated_full(monkeypatch):
     def _fake_fitb(count, planned, *a, **k):
         captured["planned"] = planned
         captured["eval_stats"] = k.get("eval_stats")
-        return {"word_bank": [f"t{i}" for i in range(3)] + ["d1", "d2"], "items": [
-            {"question": f"___ {i}", "answers": [f"t{i}"], "slot_id": planned[i]["slot_id"]}
+        answers = ["alpha", "beta", "gamma"]
+        distractors = [["delta", "epsilon"], ["zeta", "eta"], ["theta", "iota"]]
+        return {"word_bank": [*answers, *[v for pair in distractors for v in pair]], "items": [
+            {"question": f"The term is ________ for item {i}.", "answers": [answers[i]],
+             "distractors": distractors[i], "slot_id": planned[i]["slot_id"]}
             for i in range(3)]}, []
 
     monkeypatch.setattr(eb, "_generate_fitb_type", _fake_fitb)
@@ -183,16 +186,64 @@ def test_fitb_missing_regenerated_full(monkeypatch):
     assert captured["eval_stats"] is stats
 
 
+def test_fitb_shortfall_replaces_only_failed_slot_after_bounded_stem_retries(monkeypatch):
+    existing = [
+        {"slot_id": f"m1_fill_in_the_blank_{index}", "question": f"Clue word {word} ________.",
+         "answers": [word], "distractors": ["theta", "lambda"]}
+        for index, word in enumerate(["alpha", "beta", "gamma", "delta"], start=1)
+    ]
+    questions = {"fill_in_the_blank": {
+        "items": existing,
+        "word_bank": ["alpha", "beta", "gamma", "delta", "theta", "lambda"],
+    }}
+    plans = {"fill_in_the_blank": [
+        {"slot_id": f"m1_fill_in_the_blank_{index}", "fitb_entry_id": f"fitb_{word}",
+         "fitb_answer": word}
+        for index, word in enumerate(["alpha", "beta", "gamma", "delta", "epsilon"], start=1)
+    ]}
+    calls = []
+
+    def fake_generate(_count, planned, *args, **kwargs):
+        calls.append(planned[0]["fitb_entry_id"])
+        if planned[0]["fitb_entry_id"] != "fitb_zeta":
+            return {"word_bank": [], "items": []}, ["invalid_structure"]
+        return {"word_bank": ["zeta", "theta", "lambda"], "items": [{
+            "slot_id": "m1_fill_in_the_blank_5", "fitb_entry_id": "fitb_zeta",
+            "question": "Final grounded clue ________.", "answers": ["zeta"],
+            "distractors": ["theta", "lambda"],
+        }]}, []
+
+    replaced = []
+    def replace(slot_id, current, reason):
+        replaced.append((slot_id, current["fitb_entry_id"], reason))
+        return {**current, "fitb_entry_id": "fitb_zeta", "fitb_answer": "zeta"}
+
+    monkeypatch.setattr(eb, "_generate_fitb_type", fake_generate)
+    eb._repair_shortfalls(
+        questions, [("fill_in_the_blank", 5)], plans, "", "easy", 1,
+        set(), [], [], max_passes=2, fitb_entry_replacer=replace,
+    )
+
+    assert [item["slot_id"] for item in questions["fill_in_the_blank"]["items"]] == [
+        f"m1_fill_in_the_blank_{index}" for index in range(1, 6)
+    ]
+    assert replaced[0][:2] == ("m1_fill_in_the_blank_5", "fitb_epsilon")
+    assert calls == ["fitb_epsilon", "fitb_epsilon", "fitb_zeta"]
+    assert len(questions["fill_in_the_blank"]["word_bank"]) == 7
+    assert "zeta" in questions["fill_in_the_blank"]["word_bank"]
+    assert "epsilon" not in questions["fill_in_the_blank"]["word_bank"]
+
+
 def test_persistent_shortfall_warns(monkeypatch):
     def _fake_gen(*a, **k):
         return [], ["still failing"]
 
     monkeypatch.setattr(eb, "_generate_type_from_plan", _fake_gen)
     questions = {}
-    tasks = [("short_answer", 2)]
+    tasks = [("why", 2)]
     warnings = eb._repair_shortfalls(questions, tasks, {}, "", "easy", 1, set(), [], [], max_passes=2)
     assert any("short" in w for w in warnings)
-    assert len(questions.get("short_answer", [])) == 0
+    assert len(questions.get("why", [])) == 0
 
 
 def test_split_valid_invalid_detects_bad_key_points():

@@ -1,4 +1,4 @@
-"""Two-stage FITB generation: Word Bank first (auto-fixed), then blanks."""
+"""FITB generation from authoritative catalog-bank entries."""
 from __future__ import annotations
 
 import pytest
@@ -7,193 +7,166 @@ from app.online import exam_builder as eb
 
 
 class FakeLLM:
-    """Returns queued responses per chat_json call."""
-
     def __init__(self, responses):
         self.responses = list(responses)
         self.calls: list[str] = []
 
     def chat_json(self, user_prompt, **kwargs):
         self.calls.append(user_prompt)
-        r = self.responses.pop(0)
-        if isinstance(r, Exception):
-            raise r
-        return r
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 @pytest.fixture()
 def fake_llm(monkeypatch):
-    holder = {}
-
     def install(responses):
         llm = FakeLLM(responses)
         monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: llm)
-        holder["llm"] = llm
         return llm
+    return install
 
-    yield install
+
+def _plans(answers):
+    return [
+        {
+            "slot_id": f"m1_fill_in_the_blank_{index}",
+            "fitb_entry_id": f"fitb_{index}",
+            "fitb_answer": answer,
+            "clue_basis": f"clue for {answer}",
+        }
+        for index, answer in enumerate(answers, start=1)
+    ]
 
 
-def test_autofit_pads_short_bank():
-    # 4 correct terms + only 1 distractor -> padded to exactly count+2
-    bank = eb._autofit_word_bank(["CPU", "RAM", "ROM", "GPU", "cache"], 4)
-    assert len(bank) == 6
-    assert bank[:4] == ["CPU", "RAM", "ROM", "GPU"]
+def _generated(stems, distractors):
+    return {"items": [
+        {
+            "slot_id": f"m1_fill_in_the_blank_{index}",
+            "stem": stem,
+            "distractor_1": distractors[index - 1][0],
+            "distractor_2": distractors[index - 1][1],
+        }
+        for index, stem in enumerate(stems, start=1)
+    ]}
+
+
+def test_autofit_rejects_short_grounded_bank():
+    assert eb._autofit_word_bank(["CPU", "RAM", "ROM", "GPU", "cache"], 4) == []
 
 
 def test_autofit_trims_oversized_bank():
     terms = ["a1", "a2", "a3", "a4"]
-    extras = ["d1", "d2", "d3", "junk"]
-    bank = eb._autofit_word_bank(terms + extras, 4)
-    assert len(bank) == 6
-    assert set(bank[:4]) == set(terms)
-    # Last two surviving entries become the distractors.
+    bank = eb._autofit_word_bank([*terms, "d1", "d2", "d3", "junk"], 4)
+    assert bank[:4] == terms
     assert set(bank[4:]) == {"d3", "junk"}
 
 
-def test_autofit_dedupes_and_rejects_too_few_terms():
-    assert eb._autofit_word_bank(["cpu", "CPU", " ram ", "rom"], 4) == []
-    ok = eb._autofit_word_bank(["t1", "t2", "T1", "t3", "t4"], 4)
-    assert len(ok) == 6 and len({t.lower() for t in ok}) == 6
+def test_generator_returns_only_stem_and_distractors_and_code_assembles_answers(fake_llm):
+    answers = ["processor", "memory"]
+    distractors = [["controller", "register"], ["cache", "storage"]]
+    llm = fake_llm([_generated([
+        "The component that executes instructions is the ________.",
+        "Temporary working data is held in ________.",
+    ], distractors)])
 
-
-def test_two_stage_happy_path(fake_llm):
-    llm = fake_llm([
-        {"correct_terms": ["CPU", "RAM", "ROM", "GPU"],
-         "distractors": ["printer", "monitor"]},
-        {"items": [
-            {"question": "The ________ runs programs.", "answers": ["CPU"]},
-            {"question": "________ stores running state.", "answers": ["RAM"]},
-            {"question": "Boot code lives in ________.", "answers": ["ROM"]},
-            {"question": "A ________ renders images.", "answers": ["GPU"]},
-        ]},
-    ])
     section, warnings = eb._generate_fitb_type(
-        4, [{"concept_to_test": str(i)} for i in range(4)],
-        "context about hardware", "easy", 1, [], []
+        2, _plans(answers), "hardware evidence", "easy", 1, [], []
     )
-    assert section is not None
-    assert len(section["items"]) == 4
-    assert len(section["word_bank"]) == 6
+
     assert warnings == []
-    # Two LLM calls: bank prompt first, items prompt second.
+    assert len(llm.calls) == 1
+    assert "Never return or replace the answer" in llm.calls[0]
+    assert [item["answers"] for item in section["items"]] == [["processor"], ["memory"]]
+    assert [item["fitb_entry_id"] for item in section["items"]] == ["fitb_1", "fitb_2"]
+    assert len(section["word_bank"]) == 4
+    assert set(section["word_bank"]) == {
+        "processor", "memory", "controller", "register"
+    }
+    assert all(item["distractors"] == ["controller", "register"] for item in section["items"])
+
+
+def test_one_bad_fitb_slot_does_not_discard_four_valid_slots(fake_llm):
+    plans = _plans(["alpha", "beta", "gamma", "delta", "epsilon"])
+    valid_stems = [
+        "First grounded clue ________.",
+        "Second grounded clue ________.",
+        "Third grounded clue ________.",
+        "Fourth grounded clue ________.",
+    ]
+    first = _generated(
+        [*valid_stems, "Broken numeric clue 123 ________."],
+        [["zeta", "eta"] for _ in range(5)],
+    )
+    bad_retry = {"items": [{
+        "slot_id": "m1_fill_in_the_blank_5",
+        "stem": "Still broken 456 ________.",
+        "distractor_1": "zeta",
+        "distractor_2": "eta",
+    }]}
+    fake_llm([first, bad_retry, bad_retry])
+
+    section, warnings = eb._generate_fitb_type(
+        5, plans, "grounded evidence", "easy", 1, [], []
+    )
+
+    assert [item["slot_id"] for item in section["items"]] == [
+        f"m1_fill_in_the_blank_{index}" for index in range(1, 5)
+    ]
+    assert len(section["word_bank"]) == 6
+    assert any("4/5 generated" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("count", [1, 3, 5])
+def test_shared_word_bank_is_always_n_plus_two(count):
+    answer_terms = ["alpha", "beta", "gamma", "delta", "epsilon"]
+    items = [
+        {"answers": [answer_terms[index]], "distractors": ["theta", "lambda"]}
+        for index in range(count)
+    ]
+
+    bank = eb._synchronize_fitb_shared_bank(items)
+
+    assert len(bank) == count + 2
+    assert all(item["distractors"] == ["theta", "lambda"] for item in items)
+
+
+def test_retry_keeps_authoritative_answer_and_retries_only_stem_and_distractors(fake_llm):
+    llm = fake_llm([
+        _generated(["The processor is 123 ________."], [["controller", "register"]]),
+        _generated(["The component that executes instructions is the ________."],
+                   [["controller", "register"]]),
+    ])
+
+    section, warnings = eb._generate_fitb_type(
+        1, _plans(["processor"]), "hardware evidence", "easy", 1, [], []
+    )
+
     assert len(llm.calls) == 2
-    assert "correct answer TERMS" in llm.calls[0]
-    assert "Fixed Word Bank" in llm.calls[1]
-    # The fixed bank appears verbatim in the stage-2 prompt.
-    assert all(t in llm.calls[1] for t in ("CPU", "RAM", "printer"))
+    assert section["items"][0]["answers"] == ["processor"]
+    assert any("invalid_structure" in warning for warning in warnings)
 
 
-def test_stage1_retry_only_refetches_bank(fake_llm):
+def test_alias_or_duplicate_distractors_are_rejected_then_retried(fake_llm):
     llm = fake_llm([
-        {"correct_terms": ["only", "two"], "distractors": []},   # too few -> retry
-        {"correct_terms": ["CPU", "RAM", "ROM", "GPU"],
-         "distractors": ["x1", "x2"]},
-        {"items": [{"question": f"Q{i} ________.", "answers": ["CPU"]}
-                   for i in range(4)]},                            # short set
+        _generated(["The component is the ________."], [["Processor", "controller"]]),
+        _generated(["The component is the ________."], [["controller", "register"]]),
     ])
-    section, _ = eb._generate_fitb_type(
-        4, [{"concept_to_test": str(i)} for i in range(4)], "ctx", "easy", 1, [], []
-    )
-    # Stage A retried once (2 calls), then stage B ran.
-    assert len([c for c in llm.calls if "TERMS" in c]) == 2
-    assert section is not None or True  # stage B may keep partial/short set
 
-
-def test_items_kept_even_if_count_short_with_warning(fake_llm):
-    fake_llm([
-        {"correct_terms": ["CPU", "RAM", "ROM", "GPU"],
-         "distractors": ["p", "m"]},
-        {"items": [
-            {"question": "The ________ runs programs.", "answers": ["CPU"]},
-            {"question": "________ holds state.", "answers": ["RAM"]},
-        ]},
-    ])
     section, warnings = eb._generate_fitb_type(
-        4, [{"concept_to_test": str(i)} for i in range(4)], "ctx", "easy", 1, [], []
+        1, _plans(["processor"]), "hardware evidence", "easy", 1, [], []
     )
-    assert section is not None
-    # Short-but-valid set is accepted immediately (no wasted retries).
-    assert len(section["items"]) == 2
+
+    assert section["items"][0]["distractors"] == ["controller", "register"]
+    assert any("invalid distractors" in warning for warning in warnings)
 
 
-def test_items_rejected_when_answer_not_in_bank_then_partial(fake_llm):
-    fake_llm([
-        {"correct_terms": ["CPU", "RAM", "ROM", "GPU"],
-         "distractors": ["p", "m"]},
-        {"items": [{"question": "Bad ________.", "answers": ["NOT_IN_BANK"]}]},
-        {"items": [{"question": "The ________ runs programs.", "answers": ["CPU"]}]},
-    ])
+def test_invalid_catalog_answer_never_reaches_generator(fake_llm):
+    llm = fake_llm([])
     section, warnings = eb._generate_fitb_type(
-        4, [{"concept_to_test": str(i)} for i in range(4)], "ctx", "easy", 1, [], []
+        1, _plans(["E = hv"]), "physics evidence", "easy", 1, [], []
     )
-    assert section is not None
-    assert section["items"][0]["answers"] == ["CPU"]
-    assert any("rejected" in w for w in warnings)
-
-
-def test_bundle_excludes_fitb_for_separate_generation(monkeypatch, fake_llm):
-    """MCQ/TF stay together while FITB is generated in its own call path."""
-    llm = fake_llm([
-        {"questions": [{"question": "MCQ one?", "options":
-                        {"A": "a", "B": "b", "C": "c", "D": "d"},
-                        "correct_answer": "A"}]},
-        {"statements": []},
-        {"correct_terms": ["CPU", "RAM", "ROM", "GPU"],
-         "distractors": ["p", "m"]},
-        {"items": [{"question": "The ________ computes.", "answers": ["CPU"]}]},
-    ])
-
-    # Bundle builds a combined MCQ+TF prompt; provide TF empty output too.
-    def multi_response(self=None):
-        pass
-
-    class SeqLLM(FakeLLM):
-        def chat_json(self, user_prompt, **kw):
-            self.calls.append(user_prompt)
-            r = self.responses.pop(0)
-            if "TERMS" in user_prompt:
-                return self.responses.pop(1) if False else r
-            return r
-
-    # Simpler: craft responses keyed by prompt content.
-    responses_by_marker = {
-        "TERMS": {"correct_terms": ["CPU", "RAM", "ROM", "GPU"],
-                  "distractors": ["p", "m"]},
-        "Fixed Word Bank": {"items": [
-            {"question": "The ________ computes.", "answers": ["CPU"]}]},
-        "default": {"mcq": {"questions": [{
-            "question": "MCQ one?", "options":
-                {"A": "a", "B": "b", "C": "c", "D": "d"},
-            "correct_answer": "A"}]},
-            "true_false": {"statements": []}},
-    }
-
-    class KeyedLLM:
-        def __init__(self):
-            self.calls = []
-
-        def chat_json(self, user_prompt, **kw):
-            self.calls.append(user_prompt)
-            for marker, resp in responses_by_marker.items():
-                if marker in user_prompt:
-                    return resp
-            return responses_by_marker["default"]
-
-    monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: KeyedLLM())
-
-    planned = {
-        "mcq": [{}],
-        "true_false": [],
-        "fill_in_the_blank": [{}, {}, {}, {}],
-    }
-    bundle, _warnings = eb._generate_obj_bundle(
-        planned, "hardware context", "easy", 1, [], set(), []
-    )
-    assert "fill_in_the_blank" not in bundle
-    fitb, _ = eb._generate_fitb_type(
-        4, planned["fill_in_the_blank"], "hardware context", "easy", 1, [], []
-    )
-    assert fitb is not None
-    assert len(fitb["word_bank"]) == 6
-    assert fitb["items"][0]["answers"] == ["CPU"]
+    assert section is None
+    assert llm.calls == []
+    assert any("invalid or duplicate answers" in warning for warning in warnings)
