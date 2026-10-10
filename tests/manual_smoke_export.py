@@ -18,7 +18,7 @@ exam = {
                               "items": [{"question_id": "model1_fill_in_the_blank_1",
                                          "question": "The ___ computes.",
                                          "answers": ["CPU"]}]},
-        "short_answer": [{"question_id": "model1_short_answer_1",
+        "why": [{"question_id": "model1_why_1",
                           "question": "Why do we cache?",
                           "reference_answer": "TEACHER ONLY"}],
         "definition": [{"question_id": "model1_definition_1",

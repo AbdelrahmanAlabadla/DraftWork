@@ -46,8 +46,8 @@ def _stored_record() -> dict:
                             "answers": ["CPU"],
                         }],
                     },
-                    "short_answer": [{
-                        "question_id": "model1_short_answer_1",
+                    "why": [{
+                        "question_id": "model1_why_1",
                         "question": "Why is cache useful?",
                         "reference_answer": "It speeds up repeated access.",
                     }],
@@ -95,7 +95,7 @@ def test_flatten_items_structure():
     items = flatten_exam_items(_stored_record()["exams"][0]["questions"])
     assert [i["qtype"] for i in items] == [
         "mcq", "fill_in_the_blank", "true_false", "definition",
-        "short_answer", "equation", "word_problem", "essay"]
+        "why", "equation", "word_problem", "essay"]
     assert [i["number"] for i in items] == list(range(1, 9))
     mcq = items[0]
     assert mcq["options"]["A"] == "Central Processing Unit"
@@ -111,9 +111,17 @@ def test_print_sections_follow_reference_order_and_restart_numbers():
     sections = group_exam_sections(_stored_record()["exams"][0]["questions"])
     assert [section["qtype"] for section in sections] == [
         "mcq", "fill_in_the_blank", "true_false", "definition",
-        "short_answer", "equation", "word_problem", "essay"]
+        "why", "equation", "word_problem", "essay"]
     assert all(section["items"][0]["number"] == 1 for section in sections)
     assert sections[1]["word_bank"] == ["CPU", "RAM", "ROM", "GPU"]
+
+
+def test_arabic_export_label_for_why():
+    sections = group_exam_sections({
+        "why": [{"question": "لماذا ينتقل السيال العصبي؟", "reference_answer": "للتواصل العصبي."}],
+    }, language="ar")
+    assert len(sections) == 1
+    assert sections[0]["qtype"] == "why"
 
 
 def _model_and_metadata() -> tuple[dict, dict]:
@@ -138,8 +146,8 @@ def _arabic_model_and_metadata() -> tuple[dict, dict]:
                     },
                     "correct_answer": "A",
                 }],
-                "short_answer": [{
-                    "question_id": "ar_short_1",
+                "why": [{
+                    "question_id": "ar_why_1",
                     "question": "فسر انتقال السيال العصبي إلى الجهاز العصبي المركزي.",
                     "reference_answer": "ينتقل السيال عبر الخلايا العصبية الحسية.",
                 }],
@@ -269,8 +277,8 @@ def test_docx_has_page_number_only_and_visible_open_answer_lines():
     assert "It speeds up repeated access." not in document_xml
     assert "Do your best!" not in document_xml
     assert "PAGE" in footer_xml and "NUMPAGES" in footer_xml
-    # 3 Why + 3 Equation + 5 Word Problem + 22 Essay lines.
-    assert document_xml.count("_" * 92) == 33
+    # 3 Why + 5 Equation + 5 Word Problem + 22 Essay lines.
+    assert document_xml.count("_" * 92) == 35
 
 
 def test_docx_answer_file_contains_answers_without_student_sections():
@@ -372,13 +380,15 @@ def test_arabic_docx_places_true_false_choices_after_statement():
         document_xml = archive.read("word/document.xml")
     root = ET.fromstring(document_xml)
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    tf_table = next(
-        table for table in root.findall(".//w:tbl", ns)
-        if statement in "".join(table.itertext())
+    paragraphs = root.findall(".//w:p", ns)
+    statement_index = next(
+        index for index, paragraph in enumerate(paragraphs)
+        if statement in "".join(paragraph.itertext())
     )
-    cells = tf_table.findall("./w:tr/w:tc", ns)
-    assert "صح" in "".join(cells[0].itertext())
-    assert statement in "".join(cells[1].itertext())
+    assert "صح" in "".join(paragraphs[statement_index + 1].itertext())
+    assert all(statement not in "".join(table.itertext()) for table in root.findall(".//w:tbl", ns))
+    assert paragraphs[statement_index].find("./w:pPr/w:bidi", ns) is not None
+    assert paragraphs[statement_index + 1].find("./w:pPr/w:bidi", ns) is not None
 
 
 def test_english_docx_remains_ltr():
@@ -426,7 +436,7 @@ def test_browser_preview_uses_structured_student_and_key_layout():
     preview_js = (root / "FrontEnd/js/exam-view.js").read_text(encoding="utf-8")
     main_js = (root / "FrontEnd/js/main.js").read_text(encoding="utf-8")
     assert "marked.parse" not in preview_js
-    assert 'short_answer: 3, equation: 3, word_problem: 5, essay: 22' in preview_js
+    assert 'why: 3, equation: 5, word_problem: 5, essay: 22' in preview_js
     assert "buildAnswerKey(exam, labels, language, examLabels)" in preview_js
     assert "item.correct_answer" in preview_js
     assert "addResponseLines(question" in preview_js

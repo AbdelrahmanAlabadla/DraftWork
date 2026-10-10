@@ -22,7 +22,7 @@ EXPORT_TYPE_LABELS = {
     "fill_in_the_blank": "Fill in the Blank",
     "true_false": "True / False",
     "definition": "Define",
-    "short_answer": "Why Questions",
+    "why": "Why Questions",
     "equation": "Solve the equations and show your steps.",
     "word_problem": "Solve the word problems and show your steps.",
     "essay": "Essay",
@@ -35,7 +35,7 @@ EXPORT_TYPE_LABELS_BY_LANG = {
         "fill_in_the_blank": "أكمل الفراغ",
         "true_false": "صح / خطأ",
         "definition": "تعريف",
-        "short_answer": "علل",
+        "why": "علّل",
         "equation": "حل المعادلات وأظهر خطواتك.",
         "word_problem": "حل المسائل الكلامية وأظهر خطواتك.",
         "essay": "مقال",
@@ -96,13 +96,24 @@ TEACHER_ONLY_FIELDS = (
 
 # One response-space contract shared by PDF, DOCX, and the browser preview.
 # Keeping these values here prevents the three representations from drifting.
-SHORT_ANSWER_RESPONSE_LINES = 3
-EQUATION_RESPONSE_LINES = 3
+WHY_RESPONSE_LINES = 3
+EQUATION_RESPONSE_LINES = 5
 WORD_PROBLEM_RESPONSE_LINES = 5
 ESSAY_RESPONSE_LINES = 22
 RESPONSE_LINE_TEXT = "_" * 92
 
 _FILL_BLANK_RE = re.compile(r"_{3,}|-{3,}")
+_EQUATION_TASK_RE = re.compile(
+    r"\b(?:calculate|determine|rearrange|solve|derive|prove|show|establish|compare|"
+    r"evaluate|interpret|find)\b|"
+    r"(?:احسب|حدد|أوجد|اوجد|حل|اشتق|أثبت|اثبت|بيّن|بين|قارن|قيّم|فسر)",
+    re.IGNORECASE,
+)
+
+
+def is_complete_equation_prompt(value: object) -> bool:
+    """Whether an equation field contains an instructional question, not only math."""
+    return bool(_EQUATION_TASK_RE.search(str(value or "")))
 
 
 def expand_fill_blank_text(text: object, extra: int = 4) -> str:
@@ -126,7 +137,7 @@ _WINDOWS_RESERVED_NAMES = {
 def response_line_count(qtype: str) -> int:
     """Return the fixed number of student writing lines for an open question."""
     return {
-        "short_answer": SHORT_ANSWER_RESPONSE_LINES,
+        "why": WHY_RESPONSE_LINES,
         "equation": EQUATION_RESPONSE_LINES,
         "word_problem": WORD_PROBLEM_RESPONSE_LINES,
         "essay": ESSAY_RESPONSE_LINES,
@@ -198,7 +209,7 @@ def flatten_exam_items(questions: dict[str, Any]) -> list[dict[str, Any]]:
       options / correct_answer        (mcq)
       answer                          (true_false)
       answers / word_bank             (fill_in_the_blank)
-      reference_answer / key_points   (short_answer, essay — teacher only)
+      reference_answer / key_points   (why, essay — teacher only)
     }
     """
     items: list[dict[str, Any]] = []
@@ -251,7 +262,7 @@ def flatten_exam_items(questions: dict[str, Any]) -> list[dict[str, Any]]:
                     str(step) for step in (q.get("solution_steps") or []) if str(step).strip()
                 ]
                 item["final_answer"] = str(q.get("final_answer") or "")
-            else:  # short_answer / essay
+            else:  # why / essay
                 item["text"] = str(q.get("question") or "")
                 item["reference_answer"] = str(q.get("reference_answer") or "")
                 if qtype == "essay":
