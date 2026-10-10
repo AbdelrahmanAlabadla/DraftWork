@@ -4,7 +4,6 @@ import json
 import socket
 import threading
 import time
-import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -22,12 +21,64 @@ from app.jobs.celery_app import celery_app
 from app.cleanup import run_cleanup
 from app.logging_conf import get_logger, set_job_context, set_request_id
 from app.offline.pipeline import PipelineCancelled, run_pipeline
+from app.offline.parser import ParserError
 from app.offline.vector_store import VectorStore
 from app.online.exam_builder import generate_exams
 from app.metrics import increment, observe
 
 
 logger = get_logger("WORKER")
+
+
+@celery_app.task(name="genexam.warmup_embeddings", ignore_result=True)
+def warmup_embeddings() -> dict[str, str]:
+    """Load BGE-M3 inside a ready Celery child, never in the prefork parent."""
+    from app.offline.embeddings import device_name, warmup
+
+    warmup()
+    device = device_name()
+    logger.info("Embedding worker warmup task completed | device=%s", device)
+    return {"status": "ready", "device": device}
+
+
+def _section_question_count(section: Any) -> int:
+    if isinstance(section, dict):
+        return len(section.get("items") or [])
+    return len(section or []) if isinstance(section, list) else 0
+
+
+def _question_shortage_warnings(
+    result: dict[str, Any], tasks: list[tuple[str, int]], num_models: int
+) -> list[dict[str, Any]]:
+    lifecycle = result.get("slot_lifecycle") or {}
+    generated: dict[str, int] = {}
+    for record in lifecycle.values():
+        if record.get("terminal_status") == "finalized":
+            qtype = str(record.get("question_type") or "")
+            generated[qtype] = generated.get(qtype, 0) + 1
+    if not lifecycle:
+        for exam in result.get("exams") or []:
+            for qtype, section in (exam.get("questions") or {}).items():
+                generated[qtype] = generated.get(qtype, 0) + _section_question_count(section)
+    warnings: list[dict[str, Any]] = []
+    for qtype, count_per_model in tasks:
+        requested = int(count_per_model) * int(num_models)
+        produced = int(generated.get(qtype, 0))
+        if produced >= requested:
+            continue
+        missing = requested - produced
+        warnings.append({
+            "type": "question_shortage",
+            "question_type": qtype,
+            "requested_count": requested,
+            "generated_count": produced,
+            "missing_count": missing,
+            "requested": requested,
+            "generated": produced,
+            "missing": missing,
+            "reason": "missing_questions",
+        })
+    return warnings
 
 
 class TrackedJobTask(Task):
@@ -57,6 +108,10 @@ def _error_code(exc: BaseException) -> str:
         seen.add(id(current))
         if isinstance(current, (TimeoutError, SoftTimeLimitExceeded)):
             return "TIMEOUT"
+        if isinstance(current, ParserError) and str(current).startswith(
+            "Invalid LlamaParse JSON:"
+        ):
+            return "PARSER_RESPONSE_INVALID"
         name = type(current).__name__.lower()
         if name.startswith("deepseek") or "connection" in name or "network" in name:
             return "PROVIDER_UNAVAILABLE"
@@ -70,6 +125,18 @@ def _public_error_message(exc: BaseException, operation: str) -> str:
         return f"{operation} timed out"
     if code == "PROVIDER_UNAVAILABLE":
         return "The configured AI provider is temporarily unavailable"
+    if code == "PARSER_RESPONSE_INVALID":
+        current: BaseException | None = exc
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            message = str(current)
+            prefix = "Invalid LlamaParse JSON:"
+            if message.startswith(prefix):
+                reason = message[len(prefix):].strip()
+                return f"Document parser response was invalid: {reason}"[:500]
+            current = current.__cause__ or current.__context__
+        return "Document parser response was invalid"
     return f"{operation} failed"
 
 
@@ -127,6 +194,7 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
                     str(document["id"]),
                     session_id=str(document["session_id"]),
                     job_id=job_id,
+                    file_sha256_value=str(document.get("sha256") or "") or None,
                     on_stage=lambda stage: repositories.update_job_progress(
                         job_id, stage, {
                             "extracting": 15,
@@ -208,6 +276,14 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         return {"job_id": job_id, "status": (existing or {}).get("status", "missing")}
 
     request_data = dict(job.get("request_data") or {})
+    exam_id = str(
+        request_data.get("exam_id")
+        or repositories.get_exam_id_for_job(job_id)
+        or ""
+    )
+    if not exam_id:
+        repositories.fail_job(job_id, "EXAM_NOT_FOUND", "Pre-created exam record is missing")
+        return {"job_id": job_id, "status": "failed"}
     document = repositories.get_document(str(job["document_id"]))
     if document is None:
         repositories.fail_job(job_id, "DOCUMENT_NOT_FOUND", "Document record is missing")
@@ -227,8 +303,25 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                     str(request_data["difficulty"]),
                     session_id=str(job["session_id"]),
                     index_job_id=str(document["active_index_job_id"]),
+                    processed_document_key=str(
+                        (document.get("stats") or {}).get("processed_document_key") or ""
+                    ) or None,
+                    domain_type=str(
+                        (document.get("stats") or {}).get("domain_type") or ""
+                    ) or None,
+                    subject=str(
+                        (document.get("stats") or {}).get("subject") or ""
+                    ) or None,
                     progress_callback=lambda stage, progress: repositories.update_job_progress(
                         job_id, stage, progress
+                    ),
+                    audit_callback=lambda stage, event_type, payload: (
+                        repositories.append_exam_audit_event(
+                            exam_id,
+                            stage=stage,
+                            event_type=event_type,
+                            payload=payload,
+                        )
                     ),
                 )
         if repositories.job_is_cancelled(job_id):
@@ -238,10 +331,65 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         if not any(exam.get("questions") for exam in exams):
             raise RuntimeError("; ".join(result.get("warnings") or []) or "No questions generated")
 
-        exam_id = f"exam_{uuid.uuid4().hex[:12]}"
+        shortage_warnings = _question_shortage_warnings(
+            result, tasks, int(request_data["num_models"])
+        )
+        persisted_warnings: list[Any] = [
+            *list(result.get("warnings") or []),
+            *shortage_warnings,
+        ]
+        if shortage_warnings:
+            repositories.append_exam_audit_event(
+                exam_id,
+                stage="finalization",
+                event_type="question_shortage",
+                payload={"warnings": shortage_warnings},
+            )
         metadata = dict(request_data.get("metadata") or {})
         metadata["document_language"] = result.get("document_language") or "en"
-        status = str(result.get("status") or "partial")
+        metadata["quality_summary"] = dict(result.get("quality_summary") or {})
+        metadata["question_shortages"] = shortage_warnings
+        metadata["generation_audit"] = {
+            "invalid_questions": list(result.get("invalid_questions") or []),
+            "unrepairable_plan_slots": list(result.get("unrepairable_plan_slots") or []),
+            "semantic_identities": list(result.get("semantic_identities") or []),
+            "duplicate_repair_history": list(result.get("duplicate_repair_history") or []),
+            "plan_review_history": list(result.get("plan_review_history") or []),
+            "plan_review_attempts": int(result.get("plan_review_attempts") or 0),
+            "duplicate_repair_rounds": int(result.get("duplicate_repair_rounds") or 0),
+            "duplicate_replacement_attempts": dict(
+                result.get("duplicate_replacement_attempts") or {}
+            ),
+            "validation_repair_history": list(result.get("validation_repair_history") or []),
+            "repair_manifest": list(result.get("repair_manifest") or []),
+            "repair_replacement_memory": dict(result.get("repair_replacement_memory") or {}),
+            "final_unresolved_slots": list(result.get("final_unresolved_slots") or []),
+            "initial_global_reviews": list(result.get("initial_global_reviews") or []),
+            "final_global_reviews": list(result.get("final_global_reviews") or []),
+            "exam_quality_findings": list(result.get("exam_quality_findings") or []),
+            "duplicate_reports": list(result.get("duplicate_reports") or []),
+            "duplicate_similarity_distributions": list(
+                result.get("duplicate_similarity_distributions") or []
+            ),
+            "assessment_catalog_key": result.get("assessment_catalog_key"),
+            "assessment_catalog_cache_hit": result.get("assessment_catalog_cache_hit"),
+            "assessment_compiler_cache_hit": result.get("assessment_compiler_cache_hit"),
+            "assessment_catalog_usage": result.get("assessment_catalog_usage") or {},
+            "slot_lifecycle": dict(result.get("slot_lifecycle") or {}),
+            "developer_diagnostics": list(result.get("developer_diagnostics") or []),
+            "mcq_task_reassignments": list(result.get("mcq_task_reassignments") or []),
+        }
+        for invalid in result.get("invalid_questions") or []:
+            logger.warning(
+                "Question omitted from public exam | slot_id=%s | failure_code=%s | reason=%s",
+                invalid.get("slot_id"), invalid.get("failure_code"), invalid.get("reason"),
+            )
+        for missing in result.get("unrepairable_plan_slots") or []:
+            logger.warning(
+                "Plan slot omitted from public exam | slot_id=%s | failure_code=%s | reason=%s",
+                missing.get("slot_id"), missing.get("failure_code"), missing.get("reason"),
+            )
+        status = "partial" if shortage_warnings or not result.get("complete") else "complete"
         completed = repositories.complete_generation_job(
             job_id,
             exam_id=exam_id,
@@ -249,7 +397,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             session_id=str(job["session_id"]),
             status="complete" if status == "complete" else "partial",
             exams=exams,
-            warnings=list(result.get("warnings") or []),
+            warnings=persisted_warnings,
             metadata=metadata,
             evaluation=dict(result.get("eval") or {}),
         )
@@ -277,7 +425,12 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             },
         )
-        return {"job_id": job_id, "status": "completed", "exam_id": exam_id}
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "exam_id": exam_id,
+            "exam_status": status,
+        }
     except (DeadlineExceeded, SoftTimeLimitExceeded) as exc:
         repositories.fail_job(job_id, "TIMEOUT", "Generation exceeded its configured time limit")
         increment("genexam_jobs", type="exam_generation", status="failed")

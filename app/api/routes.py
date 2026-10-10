@@ -12,12 +12,10 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.api import storage as registry
-from app.api import evaluation_store, exam_store, repositories
+from app.api import evaluation_store, repositories
 from app import db
 from app.config import (
     CELERY_BROKER_URL,
-    MAX_MODELS_PER_GENERATION,
-    MAX_QUESTIONS_PER_GENERATION,
     MAX_UPLOAD_BYTES,
     QDRANT_URL,
     QDRANT_API_KEY,
@@ -28,8 +26,6 @@ from app.config import (
 from app.logging_conf import get_logger, set_request_id
 from app.offline.pipeline import PipelineError, run_pipeline
 from app.offline.structure_store import load_structure
-from app.online.exam_builder import generate_exams
-from app.online.eval_stats import section_items
 from app.file_storage import get_file_storage
 from app.metrics import (
     collect_runtime_metrics,
@@ -43,24 +39,6 @@ from app import config
 logger = get_logger("API")
 
 router = APIRouter()
-
-# Question types supported.
-_SUPPORTED_COUNTS = {
-    "mcq": "mcq",
-    "tf": "true_false",
-    "fitb": "fill_in_the_blank",
-    "definition": "definition",
-    "why": "short_answer",
-    "equation": "equation",
-    "word_problem": "word_problem",
-    "essay": "essay",
-}
-_VALID_QTYPES = frozenset(_SUPPORTED_COUNTS.values())
-
-_VALID_DIFFICULTIES = frozenset({"easy", "medium", "hard", "mix"})
-_NUM_MODELS_MIN = 1
-_NUM_MODELS_MAX = MAX_MODELS_PER_GENERATION
-
 
 @router.get("/api/v1/eval-summary")
 @router.get("/api/v1/api/eval-summary", include_in_schema=False)
@@ -328,171 +306,10 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
     }
 
 
-@router.post("/generate")
-def generate(body: GenerateRequest) -> dict[str, Any]:
-    document_id = body.document_id
-    if not document_id:
-        raise HTTPException(
-            status_code=400,
-            detail="document_id is required. Upload a PDF first.",
-        )
-    if not registry.get_document(document_id):
-        raise HTTPException(status_code=404, detail=f"Unknown document_id: {document_id}")
-
-    if not body.child_ids:
-        raise HTTPException(
-            status_code=400,
-            detail="Please choose at least one section topic to generate the exam.",
-        )
-
-    set_request_id(document_id)
-
-    tasks: list[tuple[str, int]] = []
-    if body.question_type is not None:
-        qtype = body.question_type
-        count = body.number_of_questions
-        if qtype not in _VALID_QTYPES:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Unsupported question_type '{qtype}'. Supported: "
-                    f"{', '.join(sorted(_VALID_QTYPES))}"
-                ),
-            )
-        if not count:
-            raise HTTPException(status_code=400, detail="number_of_questions is required with question_type")
-        tasks.append((qtype, count))
-    else:
-        for key, qtype in _SUPPORTED_COUNTS.items():
-            count = getattr(body, f"{key}_count") or 0
-            if count > 0:
-                tasks.append((qtype, count))
-
-    if not tasks:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No supported question types requested. Supported: MCQ, True/False, "
-                "Fill in the Blank, Definition, Why Questions, Equation, Word Problem, and Essay."
-            ),
-        )
-    if sum(count for _, count in tasks) > MAX_QUESTIONS_PER_GENERATION:
-        raise HTTPException(
-            status_code=400,
-            detail=f"A generation may request at most {MAX_QUESTIONS_PER_GENERATION} questions.",
-        )
-
-    num_models = body.num_models if body.num_models is not None else 1
-    if not isinstance(num_models, int) or not (
-        _NUM_MODELS_MIN <= num_models <= _NUM_MODELS_MAX
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"num_models must be an integer between {_NUM_MODELS_MIN} and "
-                f"{_NUM_MODELS_MAX}."
-            ),
-        )
-
-    difficulty = body.difficulty or "easy"
-    difficulty = difficulty.lower() if isinstance(difficulty, str) else difficulty
-    if difficulty not in _VALID_DIFFICULTIES:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Unsupported difficulty '{difficulty}'. Supported: "
-                f"{sorted(_VALID_DIFFICULTIES)}"
-            ),
-        )
-
-    t_total = time.perf_counter()
-    result = generate_exams(
-        document_id, tasks, num_models, body.child_ids, difficulty
+@router.post("/generate", include_in_schema=False)
+def generate(_body: GenerateRequest) -> dict[str, Any]:
+    """Retired synchronous endpoint; online generation runs through exam jobs."""
+    raise HTTPException(
+        status_code=410,
+        detail="Synchronous generation was retired. Use POST /documents/{document_id}/exam-jobs.",
     )
-    exams = result["exams"]
-    warnings = result["warnings"]
-    eval_stats = result.get("eval") or {}
-    document_language = result.get("document_language") or "en"
-    complete = bool(result.get("complete"))
-    status = result.get("status") or ("complete" if complete else "partial")
-    missing_slot_ids = result.get("missing_slot_ids") or []
-
-    total_elapsed = time.perf_counter() - t_total
-
-    if not any(exam["questions"] for exam in exams):
-        detail = "; ".join(warnings) or "No questions could be generated."
-        raise HTTPException(status_code=500, detail=detail)
-
-    metadata = {
-        key: value.strip() if isinstance(value, str) else value
-        for key, value in {
-            "exam_title": body.exam_title,
-            "class_name": body.class_name,
-            "duration": body.duration,
-            "exam_date": body.exam_date,
-            "teacher_name": body.teacher_name,
-            "footer_message": body.footer_message,
-            "left_logo_data": body.left_logo_data,
-            "right_logo_data": body.right_logo_data,
-        }.items()
-        if value
-    }
-    metadata["document_language"] = document_language
-    exam_id = exam_store.save_exam(
-        exams,
-        warnings,
-        document_id=document_id,
-        metadata=metadata,
-    )
-
-    # Evaluation history is deliberately best-effort.  The generated exam is
-    # already available to every export path before PostgreSQL is attempted.
-    try:
-        evaluation_store.save_evaluation(
-            exam_id=exam_id,
-            eval_stats=eval_stats,
-            models_count=num_models,
-            questions_requested_per_model=sum(count for _, count in tasks),
-        )
-    except Exception as exc:
-        logger.warning(
-            "Evaluation telemetry was not saved | exam_id=%s | database_error=%s: %s",
-            exam_id,
-            type(exc).__name__,
-            exc,
-            exc_info=True,
-        )
-
-    logger.info(
-        "Exam generation completed | document_id=%s | exam_id=%s | models=%d | difficulty=%s | types=%s | "
-        "total_questions=%d | total_time=%.2fs | success=%s | status=%s | missing_slots=%s",
-        document_id,
-        exam_id,
-        num_models,
-        difficulty,
-        list(exams[0]["questions"].keys()),
-        sum(
-            len(section_items(section))
-            for exam in exams
-            for section in exam["questions"].values()
-        ),
-        total_elapsed,
-        complete,
-        status,
-        missing_slot_ids,
-    )
-
-    return {
-        "exam_id": exam_id,
-        "document_id": document_id,
-        "num_models": num_models,
-        "difficulty": difficulty,
-        "document_language": document_language,
-        "metadata": metadata,
-        "exams": exams,
-        "warnings": warnings,
-        "eval": eval_stats,
-        "complete": complete,
-        "status": status,
-        "missing_slot_ids": missing_slot_ids,
-    }

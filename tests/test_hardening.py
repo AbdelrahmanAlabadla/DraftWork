@@ -247,6 +247,23 @@ def test_wrapped_parser_timeout_maps_to_timeout():
     ) == "Document processing timed out"
 
 
+def test_parser_schema_failure_persists_a_specific_safe_reason():
+    parser_error = ParserError(
+        "Invalid LlamaParse JSON: Unsupported LlamaParse item type 'audio'; "
+        "expected heading, text, table"
+    )
+    pipeline_error = PipelineError(str(parser_error))
+    pipeline_error.__cause__ = parser_error
+
+    assert task_module._error_code(pipeline_error) == "PARSER_RESPONSE_INVALID"
+    assert task_module._public_error_message(
+        pipeline_error, "Document processing"
+    ) == (
+        "Document parser response was invalid: Unsupported LlamaParse item type "
+        "'audio'; expected heading, text, table"
+    )
+
+
 @pytest.mark.skipif(not supports_deadlines(), reason="SIGALRM deadline requires Linux main thread")
 def test_generation_deadline_interrupts_running_task(monkeypatch):
     job = {

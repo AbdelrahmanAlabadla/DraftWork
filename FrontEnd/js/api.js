@@ -1,5 +1,5 @@
 import { authHeaders } from "./auth.js";
-import { localizedError } from "./i18n.js";
+import { localizedError, t } from "./i18n.js";
 
 export const BASE = "/api/v1";
 
@@ -66,9 +66,19 @@ export class JobCancelledError extends Error {
   }
 }
 
+export class JobNotFoundError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "JobNotFoundError";
+  }
+}
+
 export async function waitForJob(jobId, onProgress = () => {}) {
   while (true) {
-    const { ok, data } = await getJSON(`/jobs/${jobId}`);
+    const { ok, status, data } = await getJSON(`/jobs/${jobId}`);
+    if (status === 404) {
+      throw new JobNotFoundError(t("status.job_not_found"));
+    }
     if (!ok) throw new Error(localizedError(data.detail, "status.job_read_failed"));
     onProgress(data);
     if (data.status === "completed") return data;

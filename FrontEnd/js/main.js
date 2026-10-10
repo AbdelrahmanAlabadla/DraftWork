@@ -3,6 +3,7 @@ import {
   deleteJSON, getJSON, postJSON, waitForJob,
 } from "./api.js";
 import { state } from "./state.js";
+import { examResourcePath, renderPartialExamWarning, resolveExamId } from "./exam-lifecycle.js";
 import { examStageLabel, initI18n, localizedError, t } from "./i18n.js";
 import { initUpload } from "./upload.js";
 import { initSettings } from "./settings.js";
@@ -41,6 +42,7 @@ function fileToDataUrl(inputId) {
 
 function renderGeneratedExam(data) {
   renderExamOutput(data.exams, data.metadata || {});
+  renderPartialExamWarning(data);
 }
 
 function initGenerate() {
@@ -50,14 +52,28 @@ function initGenerate() {
   const examOutput = document.getElementById("examOutput");
   let cancellationRequested = false;
   let generationCompleted = false;
+  let generationFailed = false;
 
   function renderGenerationProgress(stage, progress) {
+    genStatus.classList.remove("failed");
     genStatus.dataset.stage = stage;
     genStatus.dataset.progress = String(progress);
     const message = document.getElementById("genStatusMsg");
     if (message) message.textContent = t("status.exam_progress", {
       stage: examStageLabel(stage), progress,
     });
+  }
+
+  function renderGenerationFailure(message) {
+    generationFailed = true;
+    genStatus.dataset.stage = "failed";
+    genStatus.dataset.progress = "";
+    genStatus.classList.add("show", "failed");
+    genStatus.classList.remove("complete");
+    const statusMessage = document.getElementById("genStatusMsg");
+    if (statusMessage) {
+      statusMessage.textContent = t("status.generation_failed", { detail: message });
+    }
   }
 
   document.addEventListener("draftwork:language-changed", () => {
@@ -110,9 +126,10 @@ function initGenerate() {
     btn.disabled = true;
     cancellationRequested = false;
     generationCompleted = false;
+    generationFailed = false;
     state.generationJobId = null;
     genStatus.classList.add("show");
-    genStatus.classList.remove("complete");
+    genStatus.classList.remove("complete", "failed");
     renderGenerationProgress("analyzing_request", 5);
     stopBtn.classList.add("show");
     stopBtn.disabled = false;
@@ -170,8 +187,8 @@ function initGenerate() {
         const job = await waitForJob(data.job_id, (current) => {
           renderGenerationProgress(current.stage, current.progress);
         });
-        const examId = job.result?.exam_id;
-        const examResponse = await getJSON(`/exams/${examId}`);
+        const examId = resolveExamId(data, job);
+        const examResponse = await getJSON(examResourcePath(examId));
         if (!examResponse.ok) {
           throw new Error(localizedError(
             examResponse.data.detail, "status.load_exam_failed"
@@ -191,18 +208,20 @@ function initGenerate() {
         }
       } else {
         if (status < 500) completeIdempotentOperation(operation);
-        alert(t("status.generation_failed", {
-          detail: localizedError(data.detail, "status.unknown_error"),
-        }));
+        const message = localizedError(data.detail, "status.unknown_error");
+        renderGenerationFailure(message);
+        alert(t("status.generation_failed", { detail: message }));
       }
     } catch (e) {
       if (!(cancellationRequested || e instanceof JobCancelledError)) {
-        alert(localizedError(e.message, "status.fastapi_unreachable"));
+        const message = localizedError(e.message, "status.fastapi_unreachable");
+        renderGenerationFailure(message);
+        alert(message);
       }
     } finally {
       state.generationJobId = null;
       btn.disabled = false;
-      if (!generationCompleted) genStatus.classList.remove("show");
+      if (!(generationCompleted || generationFailed)) genStatus.classList.remove("show");
       stopBtn.classList.remove("show");
       stopBtn.disabled = false;
     }

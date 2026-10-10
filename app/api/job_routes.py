@@ -53,7 +53,7 @@ _SUPPORTED_COUNTS = {
     "tf": "true_false",
     "fitb": "fill_in_the_blank",
     "definition": "definition",
-    "why": "short_answer",
+    "why": "why",
     "equation": "equation",
     "word_problem": "word_problem",
     "essay": "essay",
@@ -376,9 +376,15 @@ def create_exam_job(
             job_service.enqueue_generation(str(job["id"]))
             repositories.mark_job_dispatched(str(job["id"]))
         except Exception:
+            repositories.fail_job(
+                str(job["id"]),
+                "QUEUE_UNAVAILABLE",
+                "Background job queue is unavailable",
+            )
             raise HTTPException(status_code=503, detail="Background job queue is unavailable")
     return {
         "job_id": str(job["id"]),
+        "exam_id": str(job.get("exam_id") or (job.get("request_data") or {}).get("exam_id") or "") or None,
         "document_id": str(document_id),
         "status": str(job.get("status") or "queued"),
         "idempotency_replayed": reused,
@@ -437,6 +443,7 @@ def cancel_job(
         )
     return {
         "job_id": str(job["id"]),
+        "exam_id": str((job.get("request_data") or {}).get("exam_id") or "") or None,
         "document_id": str(job["document_id"]) if job.get("document_id") else None,
         "status": job["status"],
         "stage": job["stage"],
@@ -454,6 +461,19 @@ def get_exam(
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
     return record
+
+
+@router.get("/exams/{exam_id}/audit-events")
+def get_exam_audit_events(
+    exam_id: str,
+    session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
+) -> dict[str, Any]:
+    try:
+        events = repositories.list_exam_audit_events(exam_id, session_id, user_id)
+    except repositories.ResourceNotFound as exc:
+        raise _http_not_found(exc)
+    return {"exam_id": exam_id, "events": events}
 
 
 def _owned_exam(
