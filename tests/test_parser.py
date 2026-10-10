@@ -68,6 +68,43 @@ def test_parser_returns_json_pages(monkeypatch, tmp_path):
     assert validate_pages(result) == {"heading": 1, "text": 1, "table": 1}
 
 
+def test_parser_ignores_image_items_and_preserves_text(monkeypatch, tmp_path):
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"pdf")
+    pages = [{
+        "page": 1,
+        "items": [
+            {"type": "heading", "value": "Optics"},
+            {"type": "image", "value": {"id": "figure-1"}},
+            {"type": "text", "value": "Light refracts at a boundary."},
+        ],
+    }]
+    _install_llama_parse(monkeypatch, {"pages": pages, "error": None})
+
+    result = LlamaParser().parse(pdf)
+
+    assert result == [{
+        "page": 1,
+        "items": [
+            {"type": "heading", "value": "Optics"},
+            {"type": "text", "value": "Light refracts at a boundary."},
+        ],
+    }]
+    assert validate_pages(result) == {"heading": 1, "text": 1, "table": 0}
+
+
+def test_parser_still_rejects_unknown_non_visual_item_type(monkeypatch, tmp_path):
+    pdf = tmp_path / "sample.pdf"
+    pdf.write_bytes(b"pdf")
+    _install_llama_parse(monkeypatch, {
+        "pages": [{"page": 1, "items": [{"type": "audio", "value": "x"}]}],
+        "error": None,
+    })
+
+    with pytest.raises(ParserError, match="Unsupported LlamaParse item type 'audio'"):
+        LlamaParser().parse(pdf)
+
+
 @pytest.mark.parametrize(
     "payload",
     [

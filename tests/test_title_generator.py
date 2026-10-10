@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from app.logging_conf import configure_logging
 
 configure_logging("WARNING")
@@ -20,6 +23,10 @@ class _FakeClient:
         self.calls = []
 
     def chat(self, prompt, system_prompt=None, temperature=None, max_tokens=None, timeout=None):
+        self.calls.append(prompt)
+        return self._responder(prompt)
+
+    def chat_structured(self, prompt, **_kwargs):
         self.calls.append(prompt)
         return self._responder(prompt)
 
@@ -354,6 +361,99 @@ def test_generate_family_batch_titles_one_call_mixed_levels():
     assert len(client.calls) == 1
     assert "[SECTION]" in client.calls[0]
     assert "[SUBSECTION]" in client.calls[0]
+
+
+def test_title_client_is_always_deepseek(monkeypatch):
+    sentinel = object()
+    monkeypatch.setattr(tg, "DeepSeekClient", lambda: sentinel)
+
+    assert tg.make_title_client() is sentinel
+
+
+@pytest.mark.parametrize("subject", ["mathematics", "physics"])
+def test_title_generation_returns_stem_source_metadata_in_same_call(subject):
+    client = _FakeClient(lambda _prompt: {
+        "domain_type": "stem", "subject": subject,
+        "titles": ["Linear Equation Modeling", "Force and Motion Relations"],
+    })
+    entries = [
+        ("section", "Linear equations model unknown quantities in algebra."),
+        ("section", "Newton's laws relate force, mass, and acceleration."),
+    ]
+    result = tg.generate_family_batch_titles(
+        entries, client, classification_entries=entries
+    )
+    assert result["domain_type"] == "stem"
+    assert result["subject"] == subject
+    assert result["titles"] == ["Linear Equation Modeling", "Force and Motion Relations"]
+    assert len(client.calls) == 1
+
+
+def test_title_generation_returns_non_stem_source_metadata_in_same_call():
+    client = _FakeClient(lambda _prompt: {
+        "domain_type": "non_stem", "subject": "history",
+        "titles": ["Industrial Revolution Causes"],
+    })
+    entries = [("section", "Economic and social causes of the Industrial Revolution.")]
+    result = tg.generate_family_batch_titles(
+        entries, client, classification_entries=entries
+    )
+    assert result["domain_type"] == "non_stem"
+    assert result["subject"] == "history"
+    assert len(client.calls) == 1
+
+
+def test_source_classification_context_keeps_every_chunk_but_caps_each_excerpt(monkeypatch):
+    monkeypatch.setattr(tg, "TITLE_CLASSIFICATION_CONTEXT_WORDS", 3)
+    client = _FakeClient(lambda _prompt: {
+        "domain_type": "stem",
+        "subject": "computer_science",
+        "titles": ["Data Representation"],
+    })
+    entries = [("section", "title passage")]
+    classification_entries = [
+        ("section", "alpha one two hidden-a"),
+        ("subsection", "beta one two hidden-b"),
+        ("section", "gamma one two hidden-c"),
+    ]
+
+    tg.generate_family_batch_titles(
+        entries, client, classification_entries=classification_entries
+    )
+
+    prompt = client.calls[0]
+    assert prompt.count("SOURCE EXCERPT:") == 3
+    assert "[BEGINNING] alpha" in prompt
+    assert "[BEGINNING] beta" in prompt
+    assert "[BEGINNING] gamma" in prompt
+    assert " two" not in prompt
+    assert "classification evidence only" in prompt
+
+
+def test_source_classification_provider_failure_is_not_hidden():
+    class FailingClient:
+        def chat_structured(self, *_args, **_kwargs):
+            raise ConnectionError("provider unavailable")
+
+    entries = [("section", "Data representation in computer systems")]
+    with pytest.raises(ConnectionError, match="provider unavailable"):
+        tg.generate_family_batch_titles(
+            entries,
+            FailingClient(),
+            classification_entries=entries,
+        )
+
+
+def test_title_domain_type_accepts_only_binary_values():
+    model = tg.title_generation_response_model(1)
+    for value in ("stem", "non_stem"):
+        assert model.model_validate({
+            "domain_type": value, "subject": "mathematics", "titles": ["Linear Equations"],
+        }).domain_type == value
+    with pytest.raises(ValidationError):
+        model.model_validate({
+            "domain_type": "mixed", "subject": "mathematics", "titles": ["Linear Equations"],
+        })
 
 
 def test_family_prompt_includes_book_heading_and_representative_context():

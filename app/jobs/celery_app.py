@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from celery import Celery
+from celery.signals import worker_ready
 
 from app import config
 
@@ -45,3 +46,11 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_ready.connect(weak=False)
+def schedule_embedding_warmup(sender=None, **_kwargs) -> None:
+    """Queue CUDA warmup only after the worker can accept normal tasks."""
+    if config.CELERY_TASK_ALWAYS_EAGER:
+        return
+    celery_app.send_task("genexam.warmup_embeddings")

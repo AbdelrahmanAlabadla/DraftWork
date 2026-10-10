@@ -111,7 +111,7 @@ def test_exact_mixed_generation_snapshot_and_no_shortfall():
         ("mcq", 15),
         ("true_false", 5),
         ("fill_in_the_blank", 10),
-        ("short_answer", 5),
+        ("why", 5),
     ]
     stats = create_pipeline_eval(tasks, 1)
     questions = {
@@ -128,9 +128,9 @@ def test_exact_mixed_generation_snapshot_and_no_shortfall():
                 for i in range(1, 11)
             ],
         },
-        "short_answer": [
+        "why": [
             {
-                "question_id": f"model1_short_answer_{i}",
+                "question_id": f"model1_why_{i}",
                 "question": "Q?",
                 "reference_answer": "A.",
             }

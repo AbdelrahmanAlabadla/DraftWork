@@ -98,6 +98,21 @@ def test_retrieve_selected_returns_structured_context(monkeypatch):
     assert "Body A." in out["context"]
 
 
+def test_retrieve_selected_retains_context_beyond_old_3000_token_cap(monkeypatch):
+    content = " ".join(f"word{i}" for i in range(3500))
+
+    class Store:
+        def get_by_child_ids(self, document_id, child_ids):
+            return [_child("c1", "Section A", None, content)]
+
+    monkeypatch.setattr("app.online.retrieval.VectorStore", Store)
+    out = retrieve_selected("doc", ["c1"])
+
+    assert out["error"] is None
+    assert "word3499" in out["context"]
+    assert "word3499" in out["planner_context"]
+
+
 def test_retrieve_selected_no_chunks_returns_error(monkeypatch):
     class Store:
         def get_by_child_ids(self, document_id, child_ids):

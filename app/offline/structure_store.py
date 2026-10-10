@@ -90,6 +90,8 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
 
     payload = {
         "document_id": document_id,
+        "domain_type": structure.get("domain_type"),
+        "subject": structure.get("subject"),
         "section_count": len(sections),
         "child_count": len(structure.get("children", [])),
         "sections": sections,
