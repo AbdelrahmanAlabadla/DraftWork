@@ -84,9 +84,15 @@ def test_generation_limits_match_agreed_configuration():
     assert config.GENERATION_REQUESTS_PER_MINUTE == 2
 
 
-def test_generation_task_has_seven_minute_hard_timeout():
-    assert generate_exam.time_limit == 420
-    assert generate_exam.soft_time_limit == 410
+def test_generation_task_has_800_second_hard_timeout():
+    assert generate_exam.time_limit == 800
+    assert generate_exam.soft_time_limit == 790
+
+
+def test_online_llm_parallelism_defaults_are_bounded_to_five():
+    assert config.MAX_PARALLEL_GENERATION_CALLS == 5
+    assert config.MAX_PARALLEL_VALIDATOR_CALLS == 5
+    assert config.DEEPSEEK_CONCURRENCY_LIMIT == 5
 
 
 def test_ingestion_task_does_not_limit_downstream_pipeline_runtime():

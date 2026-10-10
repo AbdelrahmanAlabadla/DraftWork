@@ -24,10 +24,21 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
-      DEEPSEEK_CONCURRENCY_LIMIT: ${DEEPSEEK_CONCURRENCY_LIMIT:-4}
+      DEEPSEEK_CONCURRENCY_LIMIT: ${DEEPSEEK_CONCURRENCY_LIMIT:-5}
+      MAX_PARALLEL_GENERATION_CALLS: ${MAX_PARALLEL_GENERATION_CALLS:-5}
+      MAX_PARALLEL_VALIDATOR_CALLS: ${MAX_PARALLEL_VALIDATOR_CALLS:-5}
       DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: ${DEEPSEEK_MAX_STRUCTURED_ATTEMPTS:-3}
       DEEPSEEK_MAX_TRANSIENT_RETRIES: ${DEEPSEEK_MAX_TRANSIENT_RETRIES:-2}
       DEEPSEEK_RETRY_BASE_SECONDS: ${DEEPSEEK_RETRY_BASE_SECONDS:-1.0}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      STEM_REVIEW_MODEL: ${STEM_REVIEW_MODEL:-gpt-6-luna}
+      STEM_REVIEW_REASONING_EFFORT: ${STEM_REVIEW_REASONING_EFFORT:-medium}
+      OPENAI_INPUT_COST_PER_MTOK: ${OPENAI_INPUT_COST_PER_MTOK:-0.10}
+      OPENAI_CACHED_INPUT_COST_PER_MTOK: ${OPENAI_CACHED_INPUT_COST_PER_MTOK:-0.01}
+      OPENAI_OUTPUT_COST_PER_MTOK: ${OPENAI_OUTPUT_COST_PER_MTOK:-0.50}
+      PLANNER_CONTEXT_TOKENS: ${PLANNER_CONTEXT_TOKENS:-120000}
+      GENERATION_CONTEXT_TOKENS: ${GENERATION_CONTEXT_TOKENS:-120000}
     volumes:
       - ./data:/app/data
     depends_on:
@@ -49,7 +60,7 @@ services:
     init: true
     command: ["celery", "-A", "app.jobs.celery_app:celery_app", "worker", "--beat", "--loglevel=INFO", "--pool=prefork", "--concurrency=1"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import os, psutil, sys; alive = any(p.pid != os.getpid() and 'celery' in ' '.join(p.info.get('cmdline') or []) and 'worker' in (p.info.get('cmdline') or []) for p in psutil.process_iter(['cmdline'])); sys.exit(0 if alive else 1)"]
+      test: ["CMD-SHELL", "nvidia-smi -L >/dev/null 2>&1 && python -c \"import os, psutil, sys; alive = any(p.pid != os.getpid() and 'celery' in ' '.join(p.info.get('cmdline') or []) and 'worker' in (p.info.get('cmdline') or []) for p in psutil.process_iter(['cmdline'])); sys.exit(0 if alive else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -69,8 +80,25 @@ services:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
       DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
       DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
+      DEEPSEEK_CONCURRENCY_LIMIT: ${DEEPSEEK_CONCURRENCY_LIMIT:-5}
+      MAX_PARALLEL_GENERATION_CALLS: ${MAX_PARALLEL_GENERATION_CALLS:-5}
+      MAX_PARALLEL_VALIDATOR_CALLS: ${MAX_PARALLEL_VALIDATOR_CALLS:-5}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      STEM_REVIEW_MODEL: ${STEM_REVIEW_MODEL:-gpt-6-luna}
+      STEM_REVIEW_REASONING_EFFORT: ${STEM_REVIEW_REASONING_EFFORT:-medium}
+      OPENAI_INPUT_COST_PER_MTOK: ${OPENAI_INPUT_COST_PER_MTOK:-0.10}
+      OPENAI_CACHED_INPUT_COST_PER_MTOK: ${OPENAI_CACHED_INPUT_COST_PER_MTOK:-0.01}
+      OPENAI_OUTPUT_COST_PER_MTOK: ${OPENAI_OUTPUT_COST_PER_MTOK:-0.50}
+      EMBEDDING_DEVICE: cuda
+      EMBEDDING_REQUIRE_CUDA: "true"
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-64}
+      HF_HOME: /home/app/.cache/huggingface
+      TRANSFORMERS_CACHE: /home/app/.cache/huggingface/hub
+      PLANNER_CONTEXT_TOKENS: ${PLANNER_CONTEXT_TOKENS:-120000}
+      GENERATION_CONTEXT_TOKENS: ${GENERATION_CONTEXT_TOKENS:-120000}
       PARSING_TIMEOUT_SECONDS: 120
-      GENERATION_TIMEOUT_SECONDS: 420
+      GENERATION_TIMEOUT_SECONDS: 800
       JOB_HEARTBEAT_SECONDS: 30
       JOB_STALE_AFTER_SECONDS: 480
     volumes:
@@ -85,7 +113,16 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      model-cache-init:
+        condition: service_completed_successfully
     restart: unless-stopped
+
+  model-cache-init:
+    image: alpine:3.22
+    command: ["sh", "-c", "chown -R 10001:10001 /cache"]
+    volumes:
+      - huggingface-cache:/cache
+    restart: "no"
 
   migrate:
     build:
@@ -118,7 +155,7 @@ services:
     restart: unless-stopped
 
   qdrant:
-    image: qdrant/qdrant:v1.15.5
+    image: qdrant/qdrant:v1.18.0
     container_name: genexam-qdrant
     ports:
       - "${QDRANT_PORT:-6333}:6333"

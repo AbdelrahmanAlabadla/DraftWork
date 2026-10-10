@@ -21,6 +21,7 @@ from app.exports.common import (
     expand_fill_blank_text,
     exam_document_language,
     group_exam_sections,
+    is_complete_equation_prompt,
     response_line_count,
 )
 from app.language import detect_language
@@ -351,7 +352,9 @@ def _draw_mcq_option_at(
         pdf.cell(marker_w, 5.0, f"{letter}.", align="R" if row_rtl else "L")
     finally:
         if shaping_enabled:
-            pdf.set_text_shaping(True)
+            pdf.set_text_shaping(
+                True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR
+            )
     pdf.set_xy(text_x, y)
     pdf.set_font(BODY_FONT, "", 9.6)
     pdf.multi_cell(
@@ -446,23 +449,15 @@ def _draw_true_false(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     marker = f"{item['number']}. " if statement_rtl else f"Q{item['number']}. "
     statement = marker + raw_statement
     choices = ("صح", "خطأ") if pdf.rtl else ("True", "False")
-    choices_w = 40.0 if pdf.rtl else 43.0
+    choices_w = 28.0 if pdf.rtl else 32.0
     gutter = 3.0
-    max_statement_w = pdf.epw - choices_w - gutter
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    statement_w = min(
-        max_statement_w,
-        max(42.0, pdf.get_string_width(statement) + 3.0),
-    )
-    statement_lines = pdf.multi_cell(
-        statement_w,
-        LINE_HEIGHT,
-        statement,
-        dry_run=True,
-        output=MethodReturnValue.LINES,
-    )
+    inline_statement_w = pdf.epw - choices_w - gutter
+    inline = pdf.get_string_width(statement) + 3.0 <= inline_statement_w
+    statement_w = inline_statement_w if inline else pdf.epw
     height = _text_height(pdf, statement, statement_w)
-    pdf.ensure_space(height + 4)
+    controls_height = 0 if inline else LINE_HEIGHT
+    pdf.ensure_space(height + controls_height + 4)
     row_y = pdf.get_y()
     if pdf.rtl:
         statement_x = pdf.w - pdf.r_margin - statement_w
@@ -478,24 +473,18 @@ def _draw_true_false(pdf: _ExamPDF, item: dict[str, Any]) -> None:
         new_y="NEXT",
     )
     half = choices_w / 2
-    choices_y = row_y + max(0.0, height - LINE_HEIGHT)
-    last_line = statement_lines[-1] if statement_lines else statement
-    last_line_w = min(statement_w, pdf.get_string_width(last_line))
-    if pdf.rtl:
-        last_line_start = statement_x + statement_w - last_line_w
-        choices_x = max(pdf.l_margin, last_line_start - gutter - choices_w)
+    if inline:
+        choices_y = row_y
+        choices_x = pdf.l_margin if pdf.rtl else statement_x + statement_w + gutter
     else:
-        last_line_end = statement_x + last_line_w
-        choices_x = min(
-            pdf.w - pdf.r_margin - choices_w,
-            last_line_end + gutter,
-        )
+        choices_y = row_y + height
+        choices_x = pdf.l_margin if pdf.rtl else pdf.w - pdf.r_margin - choices_w
     for index, label in enumerate(choices):
         visual_index = 1 - index if pdf.rtl else index
         pdf.set_xy(choices_x + visual_index * half, choices_y)
         pdf.set_font(BODY_FONT, "", 9.5)
         pdf.cell(half, LINE_HEIGHT, f"{label} (   )", align="R" if pdf.rtl else "L")
-    pdf.set_y(row_y + max(height, LINE_HEIGHT) + 3)
+    pdf.set_y(row_y + height + controls_height + 3)
 
 
 def _draw_answer_lines(pdf: _ExamPDF, count: int, *, rtl: bool = False) -> None:
@@ -579,7 +568,8 @@ def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     equation = _clean(item.get("text"), "(missing equation)")
     number_gutter = 12.0
     equation_width = pdf.epw - (2 * number_gutter)
-    rendered = render_math(equation)
+    complete_prompt = is_complete_equation_prompt(equation)
+    rendered = None if complete_prompt else render_math(equation)
     if rendered:
         natural_w = rendered.width_px / 220 * 25.4
         natural_h = rendered.height_px / 220 * 25.4
@@ -607,7 +597,7 @@ def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
             equation_width,
             LINE_HEIGHT,
             equation,
-            align="C",
+            align=_align(pdf, equation) if complete_prompt else "C",
             new_x="LEFT",
             new_y="NEXT",
         )
@@ -651,7 +641,7 @@ def _draw_student_exam(
         if section["qtype"] == "essay" and section_index > 0:
             pdf.add_page()
         minimum_after = 22 if section["qtype"] in {
-            "short_answer", "equation", "word_problem", "essay"
+            "why", "equation", "word_problem", "essay"
         } else 18
         _draw_section_heading(pdf, section["label"], minimum_after=minimum_after)
         if section["qtype"] == "fill_in_the_blank":
@@ -767,7 +757,9 @@ def _render_model_pdf(
                 except Exception:
                     pass
             try:
-                pdf.set_text_shaping(True)
+                pdf.set_text_shaping(
+                    True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR
+                )
             except Exception:
                 pass
         elif needs_math_font and has_math:

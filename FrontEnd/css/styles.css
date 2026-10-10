@@ -1009,6 +1009,16 @@
       display: none;
     }
 
+    .gen-status.failed {
+      color: var(--danger);
+      background: rgba(231, 76, 60, 0.08);
+      border-color: rgba(231, 76, 60, 0.28);
+    }
+
+    .gen-status.failed .gen-spinner {
+      display: none;
+    }
+
     .stop-generation-btn {
       display: none;
       margin-inline-start: auto;
@@ -1852,6 +1862,16 @@ html[dir="rtl"] .toggle.on::after {
   font-size: 13px;
 }
 .my-exams-dialog-status[data-kind="error"] { color: #ffb4b4; }
+
+.exam-partial-warning {
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid rgba(217, 154, 50, 0.45);
+  border-radius: 10px;
+  background: rgba(217, 154, 50, 0.1);
+  color: var(--text);
+  line-height: 1.55;
+}
 
 @media (max-width: 860px) {
   .auth-shell {

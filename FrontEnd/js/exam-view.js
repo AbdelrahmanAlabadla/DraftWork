@@ -4,10 +4,11 @@ import { renderEquation } from "./math-renderer.js";
 
 // Mirrors app.exports.common so screen, PDF, and DOCX use one visual contract.
 const RESPONSE_LINE = "_".repeat(92);
-const RESPONSE_LINE_COUNTS = { short_answer: 3, equation: 3, word_problem: 5, essay: 22 };
+const RESPONSE_LINE_COUNTS = { why: 3, equation: 5, word_problem: 5, essay: 22 };
+const EQUATION_TASK_RE = /\b(?:calculate|determine|rearrange|solve|derive|prove|show|establish|compare|evaluate|interpret|find)\b|(?:احسب|حدد|أوجد|اوجد|حل|اشتق|أثبت|اثبت|بيّن|بين|قارن|قيّم|فسر)/i;
 const SECTION_ORDER = [
   "mcq", "fill_in_the_blank", "true_false", "definition",
-  "short_answer", "equation", "word_problem", "essay",
+  "why", "equation", "word_problem", "essay",
 ];
 const SECTION_LABELS = {
   en: {
@@ -15,7 +16,7 @@ const SECTION_LABELS = {
     fill_in_the_blank: "Fill in the Blank",
     true_false: "True / False",
     definition: "Define",
-    short_answer: "Why Questions",
+    why: "Why Questions",
     equation: "Solve the equations and show your steps.",
     word_problem: "Solve the word problems and show your steps.",
     essay: "Essay",
@@ -25,7 +26,7 @@ const SECTION_LABELS = {
     fill_in_the_blank: "أكمل الفراغ",
     true_false: "صح / خطأ",
     definition: "تعريف",
-    short_answer: "علل",
+    why: "علّل",
     equation: "حل المعادلات وأظهر خطواتك.",
     word_problem: "حل المسائل الكلامية وأظهر خطواتك.",
     essay: "مقال",
@@ -199,7 +200,12 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
       row.appendChild(element("strong", "preview-equation-number", `${index + 1}.`));
       const value = clean(text, examLabels.missingQuestion);
       const equation = element("div", "preview-equation-text");
-      renderEquation(equation, value);
+      if (EQUATION_TASK_RE.test(value)) {
+        equation.textContent = value;
+        applyContentDirection(equation, value, language);
+      } else {
+        renderEquation(equation, value);
+      }
       row.appendChild(equation);
       question.appendChild(row);
     } else if (qtype === "true_false") {
@@ -223,7 +229,7 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
         options.appendChild(contentElement("div", "preview-option", optionText, language));
       });
       question.appendChild(options);
-    } else if (["short_answer", "equation", "word_problem", "essay"].includes(qtype)) {
+    } else if (["why", "equation", "word_problem", "essay"].includes(qtype)) {
       addResponseLines(question, RESPONSE_LINE_COUNTS[qtype]);
     }
     paper.appendChild(question);

@@ -64,12 +64,11 @@ DEEPSEEK_BASE_URL: str = (
     _env("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     or "https://api.deepseek.com"
 )
-# V4.1 Flash's official API identifier is the only accepted DeepSeek model.
 DEEPSEEK_MODEL: str = _env("DEEPSEEK_MODEL", "deepseek-flash") or "deepseek-flash"
-if LLM_PROVIDER == "deepseek" and DEEPSEEK_MODEL != "deepseek-flash":
-    raise ValueError("DEEPSEEK_MODEL must be 'deepseek-flash'")
+if LLM_PROVIDER == "deepseek" and DEEPSEEK_MODEL not in {"deepseek-flash", "deepseek-v4-pro"}:
+    raise ValueError("DEEPSEEK_MODEL must be 'deepseek-flash' or 'deepseek-v4-pro'")
 DEEPSEEK_CONCURRENCY_LIMIT: int = max(
-    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "4") or "4")
+    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "5") or "5")
 )
 DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: int = max(
     1, min(3, int(_env("DEEPSEEK_MAX_STRUCTURED_ATTEMPTS", "3") or "3"))
@@ -80,11 +79,28 @@ DEEPSEEK_MAX_TRANSIENT_RETRIES: int = max(
 DEEPSEEK_RETRY_BASE_SECONDS: float = max(
     0.0, float(_env("DEEPSEEK_RETRY_BASE_SECONDS", "1.0") or "1.0")
 )
+OPENAI_API_KEY: str | None = _env("OPENAI_API_KEY")
+OPENAI_BASE_URL: str = (
+    _env("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    or "https://api.openai.com/v1"
+)
+STEM_REVIEW_MODEL: str = _env("STEM_REVIEW_MODEL", "gpt-6-luna") or "gpt-6-luna"
+STEM_REVIEW_REASONING_EFFORT: str = (
+    _env("STEM_REVIEW_REASONING_EFFORT", "medium") or "medium"
+).lower()
+if STEM_REVIEW_REASONING_EFFORT != "medium":
+    raise ValueError("STEM_REVIEW_REASONING_EFFORT must be 'medium'")
 ACTIVE_LLM_MODEL: str = DEEPSEEK_MODEL if LLM_PROVIDER == "deepseek" else LMS_MODEL
 # Keep validator requests small enough that local models reliably return one
 # verdict per question.  Missing IDs are retried once in an even smaller request.
 VALIDATOR_BATCH_SIZE: int = max(
     1, int(_env("VALIDATOR_BATCH_SIZE", "8") or "8")
+)
+MAX_PARALLEL_GENERATION_CALLS: int = max(
+    1, min(5, int(_env("MAX_PARALLEL_GENERATION_CALLS", "5") or "5"))
+)
+MAX_PARALLEL_VALIDATOR_CALLS: int = max(
+    1, min(5, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "5") or "5"))
 )
 TITLE_MODEL: str = _env("TITLE_MODEL", "mistralai/mistral-7b-instruct-v0.3") or "mistralai/mistral-7b-instruct-v0.3"
 # Base URL used ONLY by the title-generation client (section/subsection
@@ -94,6 +110,46 @@ TITLE_LMS_URL: str = _env("TITLE_LMS_URL", "http://127.0.0.1:1234/v1") or "http:
 
 EMBEDDING_MODEL: str = _env("EMBEDDING_MODEL", "BAAI/bge-m3") or "BAAI/bge-m3"
 EMBEDDING_DIM: int = int(_env("EMBEDDING_DIM", "1024") or "1024")
+EMBEDDING_DEVICE: str = (_env("EMBEDDING_DEVICE", "auto") or "auto").lower()
+if EMBEDDING_DEVICE not in {"auto", "cuda", "cpu"}:
+    raise ValueError("EMBEDDING_DEVICE must be auto, cuda, or cpu")
+EMBEDDING_REQUIRE_CUDA: bool = _env_bool("EMBEDDING_REQUIRE_CUDA", False)
+EMBEDDING_BATCH_SIZE: int = max(
+    1, int(_env("EMBEDDING_BATCH_SIZE", "64") or "64")
+)
+
+# Content-addressed pipeline/cache versions.  Bump the narrowest version whose
+# output contract changed.  The embedding fingerprint also contains the model
+# name and vector dimension, so changing either invalidates processed artifacts.
+PARSER_PIPELINE_VERSION: str = _env("PARSER_PIPELINE_VERSION", "llamaparse-v1") or "llamaparse-v1"
+CHUNKER_PIPELINE_VERSION: str = _env("CHUNKER_PIPELINE_VERSION", "semantic-v3") or "semantic-v3"
+EMBEDDING_PIPELINE_VERSION: str = _env("EMBEDDING_PIPELINE_VERSION", "dense-sparse-v1") or "dense-sparse-v1"
+ASSESSMENT_CATALOG_VERSION: str = _env("ASSESSMENT_CATALOG_VERSION", "catalog-v5-fitb-bank") or "catalog-v5-fitb-bank"
+ASSESSMENT_COMPILER_VERSION: str = (
+    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v3-atomic-task-ontology")
+    or "compiler-v3-atomic-task-ontology"
+)
+PROCESSED_DOCUMENT_CACHE_DIR: str = (
+    _env("PROCESSED_DOCUMENT_CACHE_DIR", "data/processed_documents")
+    or "data/processed_documents"
+)
+ASSESSMENT_CATALOG_CACHE_DIR: str = (
+    _env("ASSESSMENT_CATALOG_CACHE_DIR", "data/assessment_catalogs")
+    or "data/assessment_catalogs"
+)
+CATALOG_MAX_TASKS: int = max(16, int(_env("CATALOG_MAX_TASKS", "48") or "48"))
+DUPLICATE_EMBEDDING_THRESHOLD: float = float(
+    _env("DUPLICATE_EMBEDDING_THRESHOLD", "0.80") or "0.80"
+)
+DUPLICATE_TOP_NEIGHBOURS: int = max(
+    1, int(_env("DUPLICATE_TOP_NEIGHBOURS", "2") or "2")
+)
+MAX_DUPLICATE_REPAIR_ROUNDS: int = max(
+    1, min(3, int(_env("MAX_DUPLICATE_REPAIR_ROUNDS", "2") or "2"))
+)
+MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT: int = max(
+    1, min(2, int(_env("MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT", "2") or "2"))
+)
 
 UPLOAD_DIR: str = _env("UPLOAD_DIR", "data/uploads") or "data/uploads"
 REGISTRY_FILE: str = _env("REGISTRY_FILE", "data/documents.json") or "data/documents.json"
@@ -157,6 +213,15 @@ DEEPSEEK_CACHED_INPUT_COST_PER_MTOK: float = max(
 DEEPSEEK_OUTPUT_COST_PER_MTOK: float = max(
     0.0, float(_env("DEEPSEEK_OUTPUT_COST_PER_MTOK", "0") or "0")
 )
+OPENAI_INPUT_COST_PER_MTOK: float = max(
+    0.0, float(_env("OPENAI_INPUT_COST_PER_MTOK", "0.10") or "0.10")
+)
+OPENAI_CACHED_INPUT_COST_PER_MTOK: float = max(
+    0.0, float(_env("OPENAI_CACHED_INPUT_COST_PER_MTOK", "0.01") or "0.01")
+)
+OPENAI_OUTPUT_COST_PER_MTOK: float = max(
+    0.0, float(_env("OPENAI_OUTPUT_COST_PER_MTOK", "0.50") or "0.50")
+)
 MAX_CHILD_IDS_PER_GENERATION: int = max(
     1, int(_env("MAX_CHILD_IDS_PER_GENERATION", "1000") or "1000")
 )
@@ -177,7 +242,7 @@ PARSING_TIMEOUT_SECONDS: int = max(
     1, int(_env("PARSING_TIMEOUT_SECONDS", "120") or "120")
 )
 GENERATION_TIMEOUT_SECONDS: int = max(
-    1, int(_env("GENERATION_TIMEOUT_SECONDS", "420") or "420")
+    1, int(_env("GENERATION_TIMEOUT_SECONDS", "800") or "800")
 )
 JOB_HEARTBEAT_SECONDS: int = max(5, int(_env("JOB_HEARTBEAT_SECONDS", "30") or "30"))
 JOB_STALE_AFTER_SECONDS: int = max(
@@ -309,25 +374,22 @@ def validate_runtime_config() -> None:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
 
 # --- Online exam planning --------------------------------------------------
-# The planner LLM receives a LIGHTWEIGHT context per selected child chunk:
-# the chunk title plus only this many leading tokens of its text. It decides
-# WHAT each question should test (question_type / topic / concept_to_test) but
-# never writes the question. Actual question generation keeps using the FULL
-# selected child-chunk content.
+# Compatibility setting retained for callers of build_planner_context that still
+# pass a snippet length. The assessment-aware planner now reads the full selected
+# chunks once; the retrieval helper intentionally does not truncate per chunk.
 PLANNER_SNIPPET_TOKENS: int = int(_env("PLANNER_SNIPPET_TOKENS", "100") or "100")
 
-# Total cap on the whole planner context (all section/chunk titles + snippets) in
-# TOKENS. The planner request must stay inside the model context window; without
-# this cap many chunks quickly overflow it and the server returns a 500.
+# Maximum selected-content budget for the single full-context planner prompt.
+# The planner still receives the selected material once, without per-chunk
+# truncation; the cap applies to the complete rendered selection.
 PLANNER_CONTEXT_TOKENS: int = int(
-    _env("PLANNER_CONTEXT_TOKENS", "4000") or "4000"
+    _env("PLANNER_CONTEXT_TOKENS", "120000") or "120000"
 )
 
-# Cap on the FULL generation context (selected child content) in TOKENS. The
-# question generator receives this whole context, so keeping it bounded prevents
-# oversized prompts that overflow the model's context window (500s).
+# Maximum fallback selected-content context retained in pipeline state. Normal
+# generation and validation use only each plan item's assigned evidence.
 GENERATION_CONTEXT_TOKENS: int = int(
-    _env("GENERATION_CONTEXT_TOKENS", "3000") or "3000"
+    _env("GENERATION_CONTEXT_TOKENS", "120000") or "120000"
 )
 
 # --- Semantic structure generation (offline) ------------------------------
@@ -402,6 +464,14 @@ TITLE_BATCH_SIZE: int = int(_env("TITLE_BATCH_SIZE", "4") or "4")
 # How many of the most recent accepted titles are shown to the LLM in each
 # family-batch call so it avoids reusing a heading seen just before.
 TITLE_CONTEXT_RECENT: int = int(_env("TITLE_CONTEXT_RECENT", "12") or "12")
+
+# Words retained from every ordered chunk in the first title request's
+# document-level STEM/subject context. Every chunk remains represented, while
+# bounding each excerpt prevents large textbooks from producing a 30k-100k
+# classification prefix before title generation begins.
+TITLE_CLASSIFICATION_CONTEXT_WORDS: int = max(
+    20, int(_env("TITLE_CLASSIFICATION_CONTEXT_WORDS", "48") or "48")
+)
 
 # Descriptive navigation-label bounds. Prompts prefer 4-12 words while 15 is
 # retained as an absolute guard against sentence-length output.

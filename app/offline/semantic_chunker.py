@@ -591,7 +591,7 @@ def split_parents(
             "atomic_quote" if same_atomic_unit else "heading" if structural else "content_role" if role_boundary
             else "similarity" if split else "merge"
         )
-        logger.info(
+        logger.debug(
             "Parent boundary | i=%d | sim=%.4f | threshold=%.2f | action=%s | reason=%s",
             i,
             sim,
@@ -1406,7 +1406,7 @@ def build_children(
             if vecs is not None:
                 centroid = list(vecs[i + 1])
                 count_in_chunk = 1
-            logger.info(
+            logger.debug(
                 "Child boundary | parent_id=%s | action=split | reason=heading",
                 parent.parent_id,
             )
@@ -1442,7 +1442,7 @@ def build_children(
             next_embedding = dense_vector([next_sent.text])[0]
             sim = cosine_sim(current_embedding, next_embedding)
 
-        logger.info(
+        logger.debug(
             "Child boundary | parent_id=%s | sim=%.3f | threshold=%.2f | action=%s | reason=%s",
             parent.parent_id,
             sim,
@@ -1647,7 +1647,7 @@ def _label_families(
     parents: list[ParentChunk], children: list[ChildChunk], client=None,
     check_cancelled: Callable[[], None] | None = None,
     document_language: str | None = None,
-) -> None:
+) -> dict[str, str]:
     """Label sections and their subsections, one LLM call per batch of families.
 
     Families are processed in document order, ``TITLE_BATCH_SIZE`` parents per
@@ -1661,7 +1661,7 @@ def _label_families(
     parent -- they are never labeled.
     """
     if not parents:
-        return
+        return {}
     by_parent: dict[str, list[ChildChunk]] = {p.parent_id: [] for p in parents}
     child_counts = Counter(c.parent_id for c in children)
     for c in children:
@@ -1671,12 +1671,25 @@ def _label_families(
     client = client or make_title_client()
     used: set[str] = set()
     recent: list[str] = []
+    classification_entries: list[tuple[str, str, str | None, str]] = []
+    for parent in parents:
+        parent.language = _resolved_chunk_language(parent.content, document_language)
+        classification_entries.append(
+            ("section", parent.content, parent.book_heading, parent.language)
+        )
+        for child in by_parent.get(parent.parent_id, []):
+            child.language = _resolved_chunk_language(child.content, document_language)
+            classification_entries.append(
+                ("subsection", child.content, child.book_heading, child.language)
+            )
+    source_metadata: dict[str, str] = {}
 
+    family_batches: list[
+        tuple[list[tuple[str, str, str | None, str]], list[tuple[str, ParentChunk | ChildChunk]]]
+    ] = []
     for start in range(0, len(parents), TITLE_BATCH_SIZE):
-        if check_cancelled:
-            check_cancelled()
         batch = parents[start : start + TITLE_BATCH_SIZE]
-        entries: list[tuple[str, str, str | None]] = []
+        entries: list[tuple[str, str, str | None, str]] = []
         owners: list[tuple[str, ParentChunk | ChildChunk]] = []
         for p in batch:
             p.language = _resolved_chunk_language(p.content, document_language)
@@ -1686,13 +1699,16 @@ def _label_families(
                 c.language = _resolved_chunk_language(c.content, document_language)
                 entries.append(("subsection", c.content, c.book_heading, c.language))
                 owners.append(("subsection", c))
+        family_batches.append((entries, owners))
 
-        titles = generate_family_batch_titles(
-            entries, client=client, before=recent[-TITLE_CONTEXT_RECENT:]
-        )
-        if check_cancelled:
-            check_cancelled()
-        for (level, item), title in zip(owners, titles):
+    regeneration_calls = 0
+
+    def apply_titles(
+        owners: list[tuple[str, ParentChunk | ChildChunk]], titles: list[str]
+    ) -> None:
+        nonlocal regeneration_calls
+
+        def accept(level: str, item: ParentChunk | ChildChunk, title: str) -> bool:
             if not (
                 title
                 and is_acceptable_title(
@@ -1704,34 +1720,103 @@ def _label_families(
                     item.language,
                 )
             ):
-                title = regenerate_title(
-                    client=client,
-                    content=item.content,
-                    level=level,
-                    reject=[title] if title else [],
-                    used_titles=used,
-                    book_heading=item.book_heading or "",
-                    expected_language=item.language,
-                )
-            if title and is_acceptable_title(
+                return False
+            item.title = title
+            used.add(title)
+            recent.append(title)
+            cid = getattr(item, "child_id", getattr(item, "parent_id", ""))
+            logger.info(
+                "%s title | id=%s | words=%d | title=%s",
+                level.title(),
+                cid,
+                count_words(item.content),
                 title,
-                item.content,
-                level,
-                used,
-                item.book_heading or "",
-                item.language,
-            ):
-                item.title = title
-                used.add(title)
-                recent.append(title)
-                cid = getattr(item, "child_id", getattr(item, "parent_id", ""))
-                logger.info(
-                    "%s title | id=%s | words=%d | title=%s",
-                    level.title(),
-                    cid,
-                    count_words(item.content),
-                    title,
+            )
+            return True
+
+        rejected: list[tuple[str, ParentChunk | ChildChunk, str]] = []
+        for (level, item), title in zip(owners, titles):
+            if not accept(level, item, title):
+                rejected.append((level, item, title))
+
+        if not rejected:
+            return
+        regeneration_calls += len(rejected)
+        used_snapshot = set(used)
+
+        def regenerate(entry: tuple[str, ParentChunk | ChildChunk, str]) -> str:
+            level, item, rejected_title = entry
+            return regenerate_title(
+                client=client,
+                content=item.content,
+                level=level,
+                reject=[rejected_title] if rejected_title else [],
+                used_titles=used_snapshot,
+                book_heading=item.book_heading or "",
+                expected_language=item.language,
+            )
+
+        repair_workers = min(max(1, TITLE_PARALLELISM), len(rejected))
+        with ThreadPoolExecutor(max_workers=repair_workers) as executor:
+            regenerated = list(executor.map(regenerate, rejected))
+        for (level, item, _rejected_title), title in zip(rejected, regenerated):
+            accept(level, item, title)
+
+    # The first batch also classifies the complete source and must finish before
+    # ordinary title batches. Subsequent independent DeepSeek calls run in
+    # bounded waves, then their results are applied in document order.
+    first_entries, first_owners = family_batches[0]
+    if check_cancelled:
+        check_cancelled()
+    title_result = generate_family_batch_titles(
+        first_entries,
+        client=client,
+        before=[],
+        classification_entries=classification_entries,
+    )
+    if not isinstance(title_result, dict):
+        raise ValueError("Title generation did not return source metadata")
+    source_metadata = {
+        "domain_type": str(title_result.get("domain_type") or ""),
+        "subject": str(title_result.get("subject") or ""),
+    }
+    if source_metadata["domain_type"] not in {"stem", "non_stem"} or not re.fullmatch(
+        r"[a-z][a-z0-9_]*", source_metadata["subject"]
+    ):
+        raise ValueError("Title generation returned invalid source metadata")
+    apply_titles(first_owners, list(title_result.get("titles") or []))
+
+    remaining = family_batches[1:]
+    worker_count = max(1, TITLE_PARALLELISM)
+    for wave_start in range(0, len(remaining), worker_count):
+        if check_cancelled:
+            check_cancelled()
+        wave = remaining[wave_start : wave_start + worker_count]
+        before = recent[-TITLE_CONTEXT_RECENT:]
+        with ThreadPoolExecutor(max_workers=min(worker_count, len(wave))) as executor:
+            futures = [
+                executor.submit(
+                    generate_family_batch_titles,
+                    entries,
+                    client,
+                    before=before,
                 )
+                for entries, _owners in wave
+            ]
+            wave_results = [future.result() for future in futures]
+        for (_entries, owners), result in zip(wave, wave_results):
+            titles = list(result) if isinstance(result, list) else []
+            apply_titles(owners, titles)
+        if check_cancelled:
+            check_cancelled()
+
+    logger.info(
+        "Title labeling calls | batches=%d | regenerations=%d | parallelism=%d",
+        len(family_batches),
+        regeneration_calls,
+        worker_count,
+    )
+    return source_metadata
 
 
 
@@ -1860,8 +1945,9 @@ def build_semantic_structure(
 
     # PHASE 2 - titles only (LLM): one call per batch of parent families.
     checkpoint("generating_titles")
+    title_started = time.perf_counter()
     title_client = make_title_client()
-    _label_families(
+    title_metadata = _label_families(
         parents,
         children,
         client=title_client,
@@ -1876,6 +1962,13 @@ def build_semantic_structure(
         document_language=document_language,
     )
     checkpoint()
+    logger.info(
+        "Title generation completed | parents=%d | children=%d | batches=%d | time=%.2fs",
+        len(parents),
+        len(children),
+        (len(parents) + TITLE_BATCH_SIZE - 1) // TITLE_BATCH_SIZE,
+        time.perf_counter() - title_started,
+    )
     if any(not p.title for p in parents):
         raise ValueError("Title generation left a parent without a title")
 
@@ -1918,6 +2011,8 @@ def build_semantic_structure(
         ]
 
     return {
+        "domain_type": title_metadata["domain_type"],
+        "subject": title_metadata["subject"],
         "parents": [
             {
                 "parent_id": p.parent_id,

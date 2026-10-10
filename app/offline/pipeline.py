@@ -12,6 +12,13 @@ from app.offline.dump_outputs import save_chunk_dump, save_parse_dump
 from app.offline.embeddings import embed_texts
 from app.offline.parser import LlamaParser
 from app.offline.parser_items import item_text, page_items
+from app.offline.processed_cache import (
+    file_sha256,
+    load_processed_document,
+    materialize_for_document,
+    processed_document_key,
+    save_processed_document,
+)
 from app.offline.semantic_chunker import (
     build_semantic_structure,
     verify_chunk_invariants,
@@ -38,6 +45,7 @@ def run_pipeline(
     job_id: str | None = None,
     on_stage: Callable[[str], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    file_sha256_value: str | None = None,
 ) -> dict[str, Any]:
     """Execute PDF parsing, cleaning, chunking, embedding, and indexing."""
     set_request_id(document_id)
@@ -47,6 +55,8 @@ def run_pipeline(
 
     t_pipeline = time.perf_counter()
     timings: dict[str, float] = {}
+    content_sha256 = (file_sha256_value or file_sha256(path)).lower()
+    processed_key = processed_document_key(content_sha256)
     logger.info("=" * 70)
     logger.info("OFFLINE PIPELINE STARTED | document_id=%s | file=%s", document_id, path.name)
 
@@ -55,6 +65,47 @@ def run_pipeline(
             raise PipelineCancelled("Document processing was cancelled")
         if stage and on_stage:
             on_stage(stage)
+
+    cached = load_processed_document(content_sha256)
+    if cached is not None:
+        checkpoint("reusing_processed_document")
+        t0 = time.perf_counter()
+        chunks = materialize_for_document(cached["structure"], document_id)
+        embeddings = list(cached["embeddings"])
+        children = chunks.get("children") or []
+        parents = chunks.get("parents") or []
+        if len(children) != len(embeddings):
+            raise PipelineError("Cached processed document has mismatched chunks and embeddings")
+        store = VectorStore()
+        store.ensure_collection()
+        store.delete_document(document_id, session_id=session_id)
+        vectors_uploaded = store.upsert(
+            children, embeddings, session_id=session_id, job_id=job_id
+        )
+        structures_path = save_structure(document_id, chunks)
+        timings["cache_restore"] = time.perf_counter() - t0
+        metadata = dict(cached.get("metadata") or {})
+        total = time.perf_counter() - t_pipeline
+        return {
+            "document_id": document_id,
+            "filename": path.name,
+            "file_sha256": content_sha256,
+            "processed_document_key": processed_key,
+            "processing_versions": cached.get("processing_versions") or {},
+            "processed_cache_hit": True,
+            "total_pages": int(metadata.get("total_pages") or 0),
+            "total_parents": len(parents),
+            "total_children": len(children),
+            "vectors_stored": vectors_uploaded,
+            "document_language": metadata.get("document_language") or "en",
+            "domain_type": metadata.get("domain_type") or "",
+            "subject": metadata.get("subject") or "",
+            "structure_file": str(structures_path),
+            "chunk_report_file": "",
+            "chunk_dump_file": "",
+            "timings": {k: round(v, 3) for k, v in timings.items()},
+            "total_time": round(total, 3),
+        }
 
     try:
         # --- Stage 1: Parse ---------------------------------------------------
@@ -153,6 +204,18 @@ def run_pipeline(
                 f"Embedding count mismatch: {len(embeddings)} vs {len(children)}"
             )
 
+        save_processed_document(
+            content_sha256,
+            structure=chunks,
+            embeddings=embeddings,
+            metadata={
+                "total_pages": len(pages),
+                "document_language": document_language,
+                "domain_type": chunks["domain_type"],
+                "subject": chunks["subject"],
+            },
+        )
+
         # --- Stage 5: Store children in Qdrant -------------------------------
         t0 = time.perf_counter()
         store = VectorStore()
@@ -188,11 +251,16 @@ def run_pipeline(
     summary = {
         "document_id": document_id,
         "filename": path.name,
+        "file_sha256": content_sha256,
+        "processed_document_key": processed_key,
+        "processed_cache_hit": False,
         "total_pages": len(pages),
         "total_parents": len(parents),
         "total_children": len(children),
         "vectors_stored": vectors_uploaded,
         "document_language": document_language,
+        "domain_type": chunks["domain_type"],
+        "subject": chunks["subject"],
         "structure_file": str(structures_path),
         "chunk_report_file": str(chunk_report_path),
         "chunk_dump_file": str(chunk_dump_path),

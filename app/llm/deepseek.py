@@ -72,11 +72,17 @@ class DeepSeekSchemaError(DeepSeekError):
 
 
 class DeepSeekValidationError(DeepSeekError):
-    pass
+    def __init__(self, message: str, *, partial_output: str = "", reason: str = ""):
+        super().__init__(message)
+        self.partial_output = partial_output
+        self.reason = reason
 
 
 class DeepSeekIncompleteError(DeepSeekError):
-    pass
+    def __init__(self, message: str, *, partial_output: str = "", reason: str = ""):
+        super().__init__(message)
+        self.partial_output = partial_output
+        self.reason = reason
 
 
 def _run_sync(awaitable: Awaitable[T]) -> T:
@@ -93,16 +99,17 @@ class DeepSeekClient:
     """DeepSeek Responses API client with schema validation and bounded retries."""
 
     supports_agent_structured_output = True
+    supports_temperature = True
     provider_name = "deepseek"
     _concurrency = threading.BoundedSemaphore(DEEPSEEK_CONCURRENCY_LIMIT)
 
-    def __init__(self) -> None:
+    def __init__(self, *, model: str | None = None) -> None:
         if not DEEPSEEK_API_KEY:
             raise DeepSeekConfigurationError(
                 "DEEPSEEK_API_KEY is required when LLM_PROVIDER=deepseek"
             )
         self.url = DEEPSEEK_BASE_URL.rstrip("/")
-        self.model = DEEPSEEK_MODEL
+        self.model = str(model or DEEPSEEK_MODEL)
         self.api_key = DEEPSEEK_API_KEY
         self.last_usage: dict[str, int | str] | None = None
 
@@ -164,7 +171,20 @@ class DeepSeekClient:
 
     @staticmethod
     def _reasoning_effort(agent: str) -> str:
-        return "high" if agent in {"planner", "validator"} else "none"
+        if agent == "planner":
+            # The planner still receives deliberate reasoning, but "high" consumed most of
+            # the 25k structured-output allowance before emitting the plan on large selections.
+            return "low"
+        if agent.startswith("global_validator"):
+            # The full registry already externalizes the comparison task. Even
+            # medium reasoning consumed the entire 12k allowance before emitting
+            # structured JSON in a real 28-question run.
+            return "none"
+        if agent == "repairer":
+            return "low"
+        if agent == "plan_reviewer":
+            return "low"
+        return "high" if agent == "validator" else "none"
 
     @staticmethod
     def _token_budget(agent: str, item_count: int, operation: str) -> tuple[int, int]:
@@ -177,6 +197,8 @@ class DeepSeekClient:
             return min(32000, max(8192, count * 256)), 32000
         if agent == "validator":
             return min(32000, max(8192, count * 512)), 32000
+        if agent.startswith("global_validator"):
+            return min(12000, max(4096, count * 320)), 20000
         if agent == "repairer":
             return min(16000, max(4096, count * 512)), 16000
         return min(8000, max(2048, count * 320)), 8000
@@ -326,6 +348,7 @@ class DeepSeekClient:
         expected_id_field: str | None = None,
         system_prompt: str | None = None,
         temperature: float = 0.1,
+        max_tokens: int | None = None,
         timeout: int = 600,
     ) -> object:
         try:
@@ -333,12 +356,21 @@ class DeepSeekClient:
         except ValueError as exc:
             raise DeepSeekSchemaError(str(exc)) from exc
         safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", schema_name)[:64] or "response"
-        max_tokens, token_ceiling = self._token_budget(agent, item_count, operation)
+        default_tokens, token_ceiling = self._token_budget(agent, item_count, operation)
+        max_tokens = max(1, int(max_tokens or default_tokens))
+        token_ceiling = max(token_ceiling, max_tokens)
         reasoning_effort = self._reasoning_effort(agent)
         previous_output = ""
         failure_reason = ""
 
-        for attempt in range(1, DEEPSEEK_MAX_STRUCTURED_ATTEMPTS + 1):
+        attempt_limit = (
+            1 if (
+                (agent == "planner" and operation == "initial_planner")
+                or agent in {"assessment_compiler", "duplicate_judge"}
+            )
+            else DEEPSEEK_MAX_STRUCTURED_ATTEMPTS
+        )
+        for attempt in range(1, attempt_limit + 1):
             current_input = (
                 prompt
                 if attempt == 1
@@ -354,7 +386,7 @@ class DeepSeekClient:
                 safe_name,
                 reasoning_effort,
                 attempt,
-                DEEPSEEK_MAX_STRUCTURED_ATTEMPTS,
+                attempt_limit,
                 max_tokens,
             )
             try:
@@ -369,13 +401,12 @@ class DeepSeekClient:
                     if part
                 )
                 request_started = time.perf_counter()
-                response = await self._request_with_backoff(
+                request_kwargs = dict(
                     timeout=timeout,
                     model=self.model,
                     instructions=structured_instructions,
                     input=current_input,
                     reasoning={"effort": reasoning_effort},
-                    temperature=temperature,
                     max_output_tokens=max_tokens,
                     text={
                         "format": {
@@ -386,6 +417,9 @@ class DeepSeekClient:
                         }
                     },
                 )
+                if self.supports_temperature:
+                    request_kwargs["temperature"] = temperature
+                response = await self._request_with_backoff(**request_kwargs)
             except BadRequestError as exc:
                 message = str(exc)
                 if "schema" in message.lower() or "text.format" in message.lower():
@@ -407,20 +441,28 @@ class DeepSeekClient:
                 failure_reason = f"response incomplete: {reason}"
                 if reason == "max_output_tokens":
                     max_tokens = min(token_ceiling, max_tokens * 2)
-                if attempt == DEEPSEEK_MAX_STRUCTURED_ATTEMPTS:
-                    raise DeepSeekIncompleteError(failure_reason)
+                if attempt == attempt_limit:
+                    raise DeepSeekIncompleteError(
+                        failure_reason,
+                        partial_output=previous_output,
+                        reason=reason,
+                    )
                 continue
             if status == "failed":
                 error = getattr(response, "error", None)
                 code = str(getattr(error, "code", "unknown") or "unknown")
                 failure_reason = f"response failed: {code}"
-                if attempt == DEEPSEEK_MAX_STRUCTURED_ATTEMPTS:
+                if attempt == attempt_limit:
                     raise DeepSeekError(failure_reason)
                 continue
             if status and status != "completed":
                 failure_reason = f"unexpected response status: {status}"
-                if attempt == DEEPSEEK_MAX_STRUCTURED_ATTEMPTS:
-                    raise DeepSeekIncompleteError(failure_reason)
+                if attempt == attempt_limit:
+                    raise DeepSeekIncompleteError(
+                        failure_reason,
+                        partial_output=previous_output,
+                        reason=status,
+                    )
                 continue
 
             try:
@@ -430,10 +472,12 @@ class DeepSeekClient:
                 return value
             except (ValidationError, json.JSONDecodeError, DeepSeekValidationError) as exc:
                 failure_reason = str(exc)
-                if attempt == DEEPSEEK_MAX_STRUCTURED_ATTEMPTS:
+                if attempt == attempt_limit:
                     raise DeepSeekValidationError(
                         "DeepSeek structured output failed local Pydantic validation "
-                        f"after {DEEPSEEK_MAX_STRUCTURED_ATTEMPTS} attempts: {failure_reason}"
+                        f"after {attempt_limit} attempts: {failure_reason}",
+                        partial_output=previous_output,
+                        reason="schema_validation",
                     ) from exc
 
         raise DeepSeekValidationError("DeepSeek structured output failed")
@@ -452,10 +496,9 @@ class DeepSeekClient:
         expected_id_field: str | None = None,
         system_prompt: str | None = None,
         temperature: float = 0.1,
-        max_tokens: int = 4096,
+        max_tokens: int | None = None,
         timeout: int = 600,
     ) -> object:
-        del max_tokens
         return _run_sync(
             self.achat_structured(
                 prompt,
@@ -469,6 +512,7 @@ class DeepSeekClient:
                 expected_id_field=expected_id_field,
                 system_prompt=system_prompt,
                 temperature=temperature,
+                max_tokens=max_tokens,
                 timeout=timeout,
             )
         )

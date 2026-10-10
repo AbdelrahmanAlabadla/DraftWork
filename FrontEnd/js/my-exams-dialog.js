@@ -1,4 +1,5 @@
 import { getJSON } from "./api.js";
+import { renderPartialExamWarning } from "./exam-lifecycle.js";
 import { renderExamOutput } from "./exam-view.js";
 import { state } from "./state.js";
 import { applyContentDirection, localizedError, t, uiLang } from "./i18n.js";
@@ -19,6 +20,7 @@ export async function loadExamIntoPreview(examId) {
   }
   state.examId = examId;
   renderExamOutput(saved.data.exams, saved.data.metadata || {});
+  renderPartialExamWarning(saved.data);
   const url = new URL(window.location.href);
   url.searchParams.set("exam", examId);
   window.history.replaceState({}, "", url);

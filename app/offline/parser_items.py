@@ -4,6 +4,10 @@ from typing import Any
 
 
 EXPECTED_ITEM_TYPES = ("heading", "text", "table")
+# LlamaParse may emit visual layout records alongside textual JSON items.
+# DraftWork does not consume image bytes yet, so these records are deliberately
+# removed at the parser boundary while their surrounding text/captions remain.
+IGNORED_ITEM_TYPES = ("image",)
 
 
 class ParserSchemaError(ValueError):
@@ -76,6 +80,8 @@ def validate_pages(pages: list[dict[str, Any]]) -> dict[str, int]:
         for item in page_items(page):
             total_items += 1
             kind = item_type(item)
+            if kind in IGNORED_ITEM_TYPES:
+                continue
             if kind not in counts:
                 raise ParserSchemaError(
                     f"Unsupported LlamaParse item type {kind!r}; "
@@ -87,3 +93,21 @@ def validate_pages(pages: list[dict[str, Any]]) -> dict[str, int]:
     if total_items == 0:
         raise ParserSchemaError("LlamaParse pages contain no JSON items")
     return counts
+
+
+def filter_supported_items(
+    pages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Drop known non-text layout records after schema validation."""
+    filtered: list[dict[str, Any]] = []
+    ignored = {kind: 0 for kind in IGNORED_ITEM_TYPES}
+    for page in pages:
+        kept: list[dict[str, Any]] = []
+        for item in page_items(page):
+            kind = item_type(item)
+            if kind in ignored:
+                ignored[kind] += 1
+                continue
+            kept.append(item)
+        filtered.append({**page, "items": kept})
+    return filtered, {kind: count for kind, count in ignored.items() if count}

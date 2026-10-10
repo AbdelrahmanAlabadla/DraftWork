@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from typing import Any, Literal
+
+from pydantic import Field, create_model
 
 from app.config import (
     FALLBACK_SECTION_MAX_WORDS,
@@ -14,9 +17,8 @@ from app.config import (
     SUBSECTION_TITLE_MIN_WORDS,
     TITLE_MAX_ATTEMPTS,
     TITLE_MAX_TOKENS,
-    TITLE_LMS_URL,
-    TITLE_MODEL,
     TITLE_BLOCKLIST,
+    TITLE_CLASSIFICATION_CONTEXT_WORDS,
     TITLE_CONTEXT_RECENT,
     TITLE_REVIEW_CONTEXT_WORDS,
     TITLE_REVIEW_ENABLED,
@@ -26,12 +28,27 @@ from app.config import (
     TITLE_REVIEW_RETRIES,
     TITLE_TEMPERATURE,
 )
-from app.llm.factory import create_llm_client
+from app.llm.client import request_structured
+from app.llm.deepseek import DeepSeekClient
+from app.llm.schemas import StrictOutputModel
 from app.language import arabic_comparison_key, detect_language
 from app.logging_conf import get_logger
 from app.offline.title_nlp import first_noun_chunk, is_noun_phrase, title_appears_in_text
 
 logger = get_logger("TITLE_GENERATOR")
+
+
+class TitleSourceMetadata(StrictOutputModel):
+    domain_type: Literal["stem", "non_stem"]
+    subject: str = Field(min_length=1, max_length=80, pattern=r"^[a-z][a-z0-9_]*$")
+
+
+def title_generation_response_model(title_count: int):
+    return create_model(
+        "TitleGenerationResponse",
+        __base__=TitleSourceMetadata,
+        titles=(list[str], Field(min_length=title_count, max_length=title_count)),
+    )
 
 # --- Prompt templates -------------------------------------------------------
 
@@ -806,13 +823,8 @@ def _safe_fallback(content: str, max_words: int, min_words: int = 2) -> str:
 
 
 def _make_client():
-    # Titles always run with reasoning off: qwen3-class models otherwise burn
-    # the small title token budget on thinking and return an empty message.
-    return create_llm_client(
-        local_url=TITLE_LMS_URL,
-        local_model=TITLE_MODEL,
-        local_reasoning="off",
-    )
+    """Create the dedicated DeepSeek client used for every title request."""
+    return DeepSeekClient()
 
 
 def generate_section_title(client=None, content: str = "") -> str:
@@ -1159,7 +1171,7 @@ def _unpack_entry(entry) -> tuple[str, str, str, str]:
     return level, content, heading, language
 
 
-def _build_family_prompt(entries, before: list[str]) -> str:
+def _build_family_prompt(entries, before: list[str], *, structured_output: bool = False) -> str:
     """Assemble a single-label prompt for a mixed batch of parents + children.
 
     ``entries`` is a list of ``(level, preview)`` in document order where each
@@ -1175,6 +1187,18 @@ def _build_family_prompt(entries, before: list[str]) -> str:
         for level, preview, heading, language in [_unpack_entry(entry)]
     )
     seen = "\n".join(f"- {t}" for t in before if t) or "(none yet)"
+    output_rule = (
+        "Produce exactly one title for every passage and place the titles in the JSON titles array "
+        "in passage order. Do not number the title strings."
+        if structured_output else _FAMILY_BATCH_RULE
+    )
+    self_check = (
+        _FAMILY_BATCH_SELF_CHECK.replace(
+            "Return ONLY the numbered list of headers.",
+            "Return the headers only through the requested JSON titles array.",
+        )
+        if structured_output else _FAMILY_BATCH_SELF_CHECK
+    )
     return (
         _TITLE_CORE
         + "\n\n"
@@ -1190,9 +1214,9 @@ def _build_family_prompt(entries, before: list[str]) -> str:
         "these):\n"
         + seen
         + "\n\n"
-        + _FAMILY_BATCH_RULE
+        + output_rule
         + "\n\n"
-        + _FAMILY_BATCH_SELF_CHECK
+        + self_check
         + "\n\n## Passages\n"
         + passages
     )
@@ -1203,7 +1227,8 @@ def generate_family_batch_titles(
     client=None,
     *,
     before: list[str] | None = None,
-) -> list[str]:
+    classification_entries=None,
+) -> list[str] | dict[str, Any]:
     """Label a mixed batch of parent + child passages in ONE LLM call.
 
     ``entries`` is a flat list of ``(level, content)`` in document order, where
@@ -1226,20 +1251,66 @@ def generate_family_batch_titles(
     ]
 
     client = client or _make_client()
-    prompt = _build_family_prompt(tagged, before or [])
+    prompt = _build_family_prompt(
+        tagged, before or [], structured_output=classification_entries is not None
+    )
     try:
-        raw = client.chat(
-            prompt,
-            system_prompt=None,
-            temperature=TITLE_TEMPERATURE,
-            max_tokens=max(600, len(entries) * 60),
-            timeout=1800,
-        )
-    except Exception as exc:  # noqa: BLE001 - title failure must not break pipeline
+        if classification_entries is not None:
+            classification_context = "\n\n".join(
+                "SOURCE EXCERPT: "
+                + representative_context(
+                    _unpack_entry(entry)[1], TITLE_CLASSIFICATION_CONTEXT_WORDS
+                )
+                for entry in classification_entries
+            )
+            prompt += (
+                "\n\n## Overall source classification\n"
+                "Classify the complete ordered source context below once for the document. "
+                "domain_type must be exactly stem or non_stem; never return mixed. Use stem for "
+                "mathematics, physics, chemistry, biology, engineering, computer science, and "
+                "closely related quantitative or natural-science material. Return subject as a "
+                "concise lowercase snake_case normalized subject such as mathematics, physics, "
+                "chemistry, biology, computer_science, history, religion, literature, or business.\n\n"
+                "Return only a JSON object with top-level domain_type, subject, and titles. titles "
+                "must contain exactly one title for every numbered passage in the current title batch, "
+                "in the same order. The source excerpts below are classification evidence only; do not "
+                "create titles for them.\n\n## Complete ordered source context\n"
+                + classification_context
+            )
+            raw = request_structured(
+                client,
+                prompt,
+                response_model=title_generation_response_model(len(entries)),
+                schema_name="source_titles_and_domain",
+                agent="title_generator",
+                operation="title_generation",
+                item_count=len(entries),
+                temperature=TITLE_TEMPERATURE,
+                max_tokens=max(600, len(entries) * 60),
+                timeout=1800,
+            )
+        else:
+            raw = client.chat(
+                prompt,
+                system_prompt=None,
+                temperature=TITLE_TEMPERATURE,
+                max_tokens=max(600, len(entries) * 60),
+                timeout=1800,
+            )
+    except Exception as exc:  # noqa: BLE001 - ordinary title batches retain fallback behavior
         logger.warning("Family batch title error: %s: %s", type(exc).__name__, exc)
-        raw = ""
+        if classification_entries is not None:
+            # This request owns required document metadata. Preserve the real
+            # provider/schema exception so the job retry and UI do not replace
+            # it with the misleading "invalid source metadata" message.
+            raise
+        raw = {} if classification_entries is not None else ""
 
-    headers = _parse_title_list(raw)
+    headers = (
+        list(raw.get("titles") or [])
+        if isinstance(raw, dict)
+        else _parse_title_list(raw)
+    )
     titles: list[str] = [""] * len(entries)
     for i, header in enumerate(headers[: len(entries)]):
         level = unpacked[i][0]
@@ -1249,6 +1320,12 @@ def generate_family_batch_titles(
             finalized = _finalize(cleaned)
             if title_matches_language(finalized, unpacked[i][3]):
                 titles[i] = finalized
+    if classification_entries is not None:
+        return {
+            "domain_type": str(raw.get("domain_type") or "") if isinstance(raw, dict) else "",
+            "subject": str(raw.get("subject") or "") if isinstance(raw, dict) else "",
+            "titles": titles,
+        }
     return titles
 
 

@@ -94,3 +94,20 @@ def test_clerk_loading_does_not_block_main_ui_boot():
     assert "await initAuthNavigation()" not in main
     assert "initAuthNavigation().catch" in main
     assert "window.__dwBooted = true" in main
+
+
+def test_generation_ui_stops_polling_state_after_a_missing_or_failed_job():
+    api_js = open("FrontEnd/js/api.js", encoding="utf-8").read()
+    main_js = open("FrontEnd/js/main.js", encoding="utf-8").read()
+    styles = open("FrontEnd/css/styles.css", encoding="utf-8").read()
+
+    assert "class JobNotFoundError" in api_js
+    assert "status === 404" in api_js
+    assert "throw new JobNotFoundError" in api_js
+    assert "renderGenerationFailure" in main_js
+    assert "generationFailed" in main_js
+    assert "if (!(generationCompleted || generationFailed))" in main_js
+    assert ".gen-status.failed .gen-spinner" in styles
+    assert '"exam_stage.checking_duplicates"' in open(
+        "FrontEnd/js/i18n.js", encoding="utf-8"
+    ).read()

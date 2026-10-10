@@ -45,9 +45,14 @@ def _patch_titles(monkeypatch):
     monkeypatch.setattr("app.offline.semantic_chunker.make_title_client", lambda: object())
     monkeypatch.setattr(
         "app.offline.semantic_chunker.generate_family_batch_titles",
-        lambda entries, client=None, *, before=None: [
-            "ST" if entry[0] == "section" else "CT" for entry in entries
-        ],
+        lambda entries, client=None, *, before=None, classification_entries=None: (
+            {
+                "domain_type": "stem", "subject": "mathematics",
+                "titles": ["ST" if entry[0] == "section" else "CT" for entry in entries],
+            }
+            if classification_entries is not None
+            else ["ST" if entry[0] == "section" else "CT" for entry in entries]
+        ),
     )
     monkeypatch.setattr(
         "app.offline.semantic_chunker.is_acceptable_title",
@@ -244,7 +249,7 @@ def test_build_children_uses_real_source_pages(monkeypatch):
 def test_split_parents_logs_boundary_decision(monkeypatch, caplog):
     pages = [_page([_body("Alpha one."), _body("Beta two.")])]
     monkeypatch.setattr(sc, "dense_vector", lambda texts: [_keyword_vec(t) for t in texts])
-    with caplog.at_level("INFO", logger="SEMANTIC_CHUNKER"):
+    with caplog.at_level("DEBUG", logger="SEMANTIC_CHUNKER"):
         split_parents(pages, threshold=0.2)
     assert any("Parent boundary" in r.message for r in caplog.records)
 
@@ -419,7 +424,7 @@ def test_build_children_splits_on_similarity_break_with_full_chunk(monkeypatch, 
         parent_id="p1", document_id="d", title=None, page_start=1, page_end=1,
         content=f"{A} {B} {Cc}",
     )
-    with caplog.at_level("INFO", logger="SEMANTIC_CHUNKER"):
+    with caplog.at_level("DEBUG", logger="SEMANTIC_CHUNKER"):
         children = build_children(parent)
     # A->B sim 0 (break), B->C sim 0 (break) => 3 children
     assert len(children) == 3
@@ -482,6 +487,8 @@ def test_build_semantic_structure_shape(monkeypatch):
     result = build_semantic_structure(pages, "doc-1")
     assert result["parents"]
     assert result["children"]
+    assert result["domain_type"] == "stem"
+    assert result["subject"] == "mathematics"
     parent_ids = {p["parent_id"] for p in result["parents"]}
     for child in result["children"]:
         assert child["parent_id"] in parent_ids
@@ -499,9 +506,12 @@ def test_label_families_titles_multi_child_children(monkeypatch):
     # child stays suppressed (title None) and is not sent to the LLM.
     calls = []
 
-    def fake_batch(entries, client=None, *, before=None):
+    def fake_batch(entries, client=None, *, before=None, classification_entries=None):
         calls.append([entry[0] for entry in entries])
-        return ["ST", "CT", "CT", "ST"]
+        titles = ["ST", "CT", "CT", "ST"]
+        if classification_entries is not None:
+            return {"domain_type": "non_stem", "subject": "history", "titles": titles}
+        return titles
 
     parents = [
         ParentChunk("p1", "d1", None, 1, 1, "Alpha phrase one."),
@@ -526,7 +536,7 @@ def test_label_families_titles_multi_child_children(monkeypatch):
         used_titles=None, book_heading="", expected_language=None: "RT",
     )
 
-    sc._label_families(parents, children)
+    metadata = sc._label_families(parents, children)
 
     assert calls == [["section", "subsection", "subsection", "section"]]
     assert parents[0].title == "ST"
@@ -535,6 +545,101 @@ def test_label_families_titles_multi_child_children(monkeypatch):
     # single-child parent's child is not labeled
     assert children[2].title is None
     assert parents[1].title == "ST"
+    assert metadata == {"domain_type": "non_stem", "subject": "history"}
+
+
+def test_label_families_runs_remaining_deepseek_batches_in_parallel(monkeypatch):
+    import threading
+    import time
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_batch(entries, client=None, *, before=None, classification_entries=None):
+        nonlocal active, max_active
+        if classification_entries is not None:
+            return {
+                "domain_type": "stem",
+                "subject": "mathematics",
+                "titles": [f"Title {entries[0][1]}"],
+            }
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return [f"Title {entries[0][1]}"]
+
+    parents = [
+        ParentChunk(f"p{i}", "d1", None, i, i, f"content-{i}")
+        for i in range(1, 6)
+    ]
+    monkeypatch.setattr(sc, "TITLE_BATCH_SIZE", 1)
+    monkeypatch.setattr(sc, "TITLE_PARALLELISM", 4)
+    monkeypatch.setattr(sc, "generate_family_batch_titles", fake_batch)
+    monkeypatch.setattr(sc, "make_title_client", lambda: object())
+    monkeypatch.setattr(sc, "is_acceptable_title", lambda *args, **kwargs: True)
+
+    metadata = sc._label_families(parents, [])
+
+    assert metadata == {"domain_type": "stem", "subject": "mathematics"}
+    assert max_active > 1
+    assert [parent.title for parent in parents] == [
+        f"Title content-{i}" for i in range(1, 6)
+    ]
+
+
+def test_label_families_runs_rejected_title_repairs_in_parallel(monkeypatch):
+    import threading
+    import time
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_batch(entries, client=None, *, before=None, classification_entries=None):
+        return {
+            "domain_type": "non_stem",
+            "subject": "history",
+            "titles": ["Rejected"] * len(entries),
+        }
+
+    def fake_regenerate(
+        client=None, content="", level="section", reject=None,
+        used_titles=None, book_heading="", expected_language=None,
+    ):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return f"Fixed {content}"
+
+    parents = [
+        ParentChunk(f"p{i}", "d1", None, i, i, f"content-{i}")
+        for i in range(1, 5)
+    ]
+    monkeypatch.setattr(sc, "TITLE_BATCH_SIZE", 4)
+    monkeypatch.setattr(sc, "TITLE_PARALLELISM", 4)
+    monkeypatch.setattr(sc, "generate_family_batch_titles", fake_batch)
+    monkeypatch.setattr(sc, "regenerate_title", fake_regenerate)
+    monkeypatch.setattr(sc, "make_title_client", lambda: object())
+    monkeypatch.setattr(
+        sc,
+        "is_acceptable_title",
+        lambda title, *args, **kwargs: title.startswith("Fixed "),
+    )
+
+    sc._label_families(parents, [])
+
+    assert max_active > 1
+    assert [parent.title for parent in parents] == [
+        f"Fixed content-{i}" for i in range(1, 5)
+    ]
 
 
 def test_generate_section_titles_parallel_preserves_order(monkeypatch):

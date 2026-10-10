@@ -23,6 +23,7 @@ from app.exports.common import (
     expand_fill_blank_text,
     exam_document_language,
     group_exam_sections,
+    is_complete_equation_prompt,
     response_line_count,
 )
 from app.language import detect_language
@@ -580,12 +581,15 @@ def _add_equation(doc: Document, item: dict[str, Any], rtl: bool = False) -> Non
     run = number.add_run(f"{item['number']}.")
     _set_run_font(run, bold=True)
     equation = equation_cell.paragraphs[0]
-    equation.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    complete_prompt = is_complete_equation_prompt(item.get("text"))
+    equation.alignment = WD_ALIGN_PARAGRAPH.RIGHT if rtl else (
+        WD_ALIGN_PARAGRAPH.LEFT if complete_prompt else WD_ALIGN_PARAGRAPH.CENTER
+    )
     equation.paragraph_format.space_after = Pt(0)
     if rtl:
         _set_paragraph_rtl(equation)
     equation_text = _clean(item.get("text"), "(missing equation)")
-    rendered = render_math(equation_text)
+    rendered = None if complete_prompt else render_math(equation_text)
     if rendered:
         natural_width = rendered.width_px / 220
         picture_width = min(CONTENT_WIDTH_IN - 0.9, max(0.35, natural_width))
@@ -652,17 +656,9 @@ def _render_student_sections(doc: Document, sections: list[dict[str, Any]], lang
                 _add_mcq(doc, item, rtl=rtl)
             elif qtype == "true_false":
                 statement = _clean(item.get("text"))
-                statement_width = CONTENT_WIDTH_IN - 1.7
-                choice_width = 1.7
-                widths = [choice_width, statement_width] if rtl else [statement_width, choice_width]
-                table = doc.add_table(rows=1, cols=2)
-                _set_table_geometry(table, widths)
-                _remove_table_borders(table)
-                statement_col, choice_col = (1, 0) if rtl else (0, 1)
-                table.cell(0, choice_col).vertical_alignment = WD_ALIGN_VERTICAL.BOTTOM
-
-                statement_p = table.cell(0, statement_col).paragraphs[0]
-                statement_p.paragraph_format.space_after = Pt(4)
+                statement_p = doc.add_paragraph()
+                statement_p.paragraph_format.space_after = Pt(0)
+                statement_p.paragraph_format.keep_with_next = True
                 content_rtl = _set_content_direction(statement_p, statement, rtl)
                 marker = f"{item['number']}. " if content_rtl else f"Q{item['number']}. "
                 run = statement_p.add_run(marker)
@@ -670,9 +666,10 @@ def _render_student_sections(doc: Document, sections: list[dict[str, Any]], lang
                 run = statement_p.add_run(statement)
                 _set_run_font(run, bold=True)
 
-                choices_p = table.cell(0, choice_col).paragraphs[0]
+                choices_p = doc.add_paragraph()
                 choices_p.paragraph_format.space_after = Pt(4)
                 _set_content_direction(choices_p, tf_choices, rtl)
+                choices_p.alignment = WD_ALIGN_PARAGRAPH.LEFT if rtl else WD_ALIGN_PARAGRAPH.RIGHT
                 run = choices_p.add_run(tf_choices)
                 _set_run_font(run, size=9.5)
             elif qtype == "fill_in_the_blank":

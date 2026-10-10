@@ -13,7 +13,7 @@ TYPE_LABELS = {
     "true_false": "True / False",
     "fill_in_the_blank": "Fill in the Blank",
     "definition": "Define",
-    "short_answer": "Why Questions",
+    "why": "Why Questions",
     "equation": "Solve the equations and show your steps.",
     "word_problem": "Solve the word problems and show your steps.",
     "essay": "Essay",
@@ -26,7 +26,7 @@ TYPE_LABELS_BY_LANG = {
         "true_false": "صح / خطأ",
         "fill_in_the_blank": "أكمل الفراغ",
         "definition": "تعريف",
-        "short_answer": "علل",
+        "why": "علّل",
         "equation": "معادلة",
         "word_problem": "سؤال كلامي",
         "essay": "مقال",
@@ -54,7 +54,7 @@ TYPE_ORDER = [
     "fill_in_the_blank",
     "true_false",
     "definition",
-    "short_answer",
+    "why",
     "equation",
     "word_problem",
     "essay",
@@ -63,7 +63,6 @@ TYPE_ORDER = [
 # Phrases that reference the source of information; questions containing any of
 # these are treated as invalid and re-generated.
 FORBIDDEN_PHRASES = (
-    "according to the",
     "as shown in",
     "as discussed",
     "the following example",
@@ -108,11 +107,35 @@ def _keep_slot_id(normalized: dict[str, Any], item: dict[str, Any]) -> dict[str,
     slot = _clean_str(item.get("slot_id"))
     if slot:
         normalized["slot_id"] = slot
+    fitb_entry_id = _clean_str(item.get("fitb_entry_id"))
+    if fitb_entry_id:
+        normalized["fitb_entry_id"] = fitb_entry_id
+    certificate = item.get("solution_certificate")
+    if isinstance(certificate, dict):
+        method = _clean_str(certificate.get("method"))
+        givens = certificate.get("important_givens")
+        steps = certificate.get("calculation_steps")
+        final_answer = _clean_str(certificate.get("final_answer"))
+        verification = _clean_str(certificate.get("verification_method"))
+        if (
+            method and isinstance(givens, list) and isinstance(steps, list) and steps
+            and final_answer and verification
+        ):
+            matching = _clean_str(certificate.get("matching_correct_option")).upper() or None
+            normalized["solution_certificate"] = {
+                "method": method,
+                "important_givens": [_clean_str(value) for value in givens if _clean_str(value)],
+                "calculation_steps": [_clean_str(value) for value in steps if _clean_str(value)],
+                "final_answer": final_answer,
+                "units": _clean_str(certificate.get("units")),
+                "matching_correct_option": matching if matching in {"A", "B", "C", "D"} else None,
+                "verification_method": verification,
+            }
     return normalized
 
 
 def _normalize_mcq(item: dict[str, Any]) -> dict[str, Any] | None:
-    question = _clean_str(item.get("question") or item.get("question_text"))
+    question = _clean_str(item.get("question"))
     if not question:
         return None
     options_raw = item.get("options")
@@ -139,7 +162,7 @@ def _normalize_mcq(item: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _normalize_true_false(item: dict[str, Any]) -> dict[str, Any] | None:
-    statement = _clean_str(item.get("statement") or item.get("question_text") or item.get("question"))
+    statement = _clean_str(item.get("statement"))
     if not statement:
         return None
     answer = item.get("answer")
@@ -154,11 +177,9 @@ def _normalize_true_false(item: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
-def _normalize_short_answer(item: dict[str, Any]) -> dict[str, Any] | None:
-    question = _clean_str(item.get("question") or item.get("question_text"))
-    reference = _clean_str(
-        item.get("reference_answer") or item.get("model_answer") or item.get("answer")
-    )
+def _normalize_why(item: dict[str, Any]) -> dict[str, Any] | None:
+    question = _clean_str(item.get("question"))
+    reference = _clean_str(item.get("reference_answer"))
     if not question or not reference:
         return None
     return _keep_slot_id({"question": question, "reference_answer": reference}, item)
@@ -166,9 +187,7 @@ def _normalize_short_answer(item: dict[str, Any]) -> dict[str, Any] | None:
 
 def _normalize_definition(item: dict[str, Any]) -> dict[str, Any] | None:
     term = _clean_str(item.get("term"))
-    reference = _clean_str(
-        item.get("reference_answer") or item.get("definition") or item.get("answer")
-    )
+    reference = _clean_str(item.get("reference_answer"))
     if not term or not reference:
         return None
     return _keep_slot_id({"term": term, "reference_answer": reference}, item)
@@ -179,14 +198,12 @@ def _normalize_calculation(
 ) -> dict[str, Any] | None:
     text = _clean_str(item.get(text_field))
     raw_steps = item.get("solution_steps")
-    if isinstance(raw_steps, str):
-        raw_steps = [raw_steps]
     steps = (
         [_clean_str(step) for step in raw_steps if _clean_str(step)]
         if isinstance(raw_steps, list)
         else []
     )
-    final_answer = _clean_str(item.get("final_answer") or item.get("answer"))
+    final_answer = _clean_str(item.get("final_answer"))
     if not text or not steps or not final_answer:
         return None
     return _keep_slot_id(
@@ -203,10 +220,8 @@ def _normalize_word_problem(item: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _normalize_essay(item: dict[str, Any]) -> dict[str, Any] | None:
-    question = _clean_str(item.get("question") or item.get("question_text"))
-    reference = _clean_str(
-        item.get("reference_answer") or item.get("model_answer") or item.get("answer")
-    )
+    question = _clean_str(item.get("question"))
+    reference = _clean_str(item.get("reference_answer"))
     if not question or not reference:
         return None
     key_points_raw = item.get("key_points")
@@ -225,28 +240,33 @@ def _normalize_essay(item: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def normalize_fitb_item(item: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize a single fill-in-the-blank item (1 or 2 ordered blanks)."""
-    question = _clean_str(item.get("question") or item.get("question_text"))
+    """Normalize one textual blank plus its two item-specific distractors."""
+    question = _clean_str(item.get("question"))
     if not question:
         return None
     raw_answers = item.get("answers")
-    if raw_answers is None:
-        raw_answers = item.get("answer")
     if isinstance(raw_answers, str):
         raw_answers = [raw_answers]
     answers: list[str] = []
     if isinstance(raw_answers, list):
         answers = [_clean_str(a) for a in raw_answers if _clean_str(a)]
-    if not (1 <= len(answers) <= 2):
+    raw_distractors = item.get("distractors")
+    distractors = (
+        [_clean_str(value) for value in raw_distractors if _clean_str(value)]
+        if isinstance(raw_distractors, list) else []
+    )
+    if len(answers) != 1 or len(distractors) != 2:
         return None
-    return _keep_slot_id({"question": question, "answers": answers}, item)
+    return _keep_slot_id({
+        "question": question, "answers": answers, "distractors": distractors,
+    }, item)
 
 
 _NORMALIZERS = {
     "mcq": _normalize_mcq,
     "true_false": _normalize_true_false,
     "definition": _normalize_definition,
-    "short_answer": _normalize_short_answer,
+    "why": _normalize_why,
     "equation": _normalize_equation,
     "word_problem": _normalize_word_problem,
     "essay": _normalize_essay,

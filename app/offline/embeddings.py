@@ -8,7 +8,12 @@ from typing import Any
 
 import torch
 
-from app.config import EMBEDDING_MODEL
+from app.config import (
+    EMBEDDING_BATCH_SIZE,
+    EMBEDDING_DEVICE,
+    EMBEDDING_MODEL,
+    EMBEDDING_REQUIRE_CUDA,
+)
 from app.logging_conf import get_logger
 
 logger = get_logger("EMBEDDING")
@@ -20,12 +25,14 @@ _DEVICE: str | None = None
 
 _model = None
 _model_lock = threading.Lock()
+_warmup_lock = threading.Lock()
+_warmed = False
 
 # Cap for paragraph/sentence embedding batches in one call to the embedder.
 _DENSE_BATCH_MAX = 512
 
 # Batch size for GPU embedding passes (parents, sentences and stored children).
-_EMBED_BATCH_SIZE = 64
+_EMBED_BATCH_SIZE = EMBEDDING_BATCH_SIZE
 
 
 def device_name() -> str:
@@ -35,26 +42,64 @@ def device_name() -> str:
 def _get_device() -> str:
     global _DEVICE
     if _DEVICE is None:
-        _DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        cuda_available = torch.cuda.is_available()
+        if EMBEDDING_REQUIRE_CUDA and not cuda_available:
+            raise RuntimeError(
+                "CUDA is required for embeddings, but PyTorch cannot access a CUDA GPU"
+            )
+        if EMBEDDING_DEVICE == "cuda":
+            if not cuda_available:
+                raise RuntimeError(
+                    "EMBEDDING_DEVICE=cuda, but PyTorch cannot access a CUDA GPU"
+                )
+            _DEVICE = "cuda"
+        elif EMBEDDING_DEVICE == "cpu":
+            if EMBEDDING_REQUIRE_CUDA:
+                raise RuntimeError(
+                    "EMBEDDING_DEVICE=cpu conflicts with EMBEDDING_REQUIRE_CUDA=true"
+                )
+            _DEVICE = "cpu"
+        else:
+            _DEVICE = "cuda" if cuda_available else "cpu"
+        logger.info(
+            "Embedding device selected | requested=%s | selected=%s | "
+            "cuda_available=%s | require_cuda=%s | batch_size=%d",
+            EMBEDDING_DEVICE,
+            _DEVICE,
+            cuda_available,
+            EMBEDDING_REQUIRE_CUDA,
+            _EMBED_BATCH_SIZE,
+        )
     return _DEVICE
 
 
 def warmup() -> None:
     """Preload the embedding model and warm the tokenizer/GPU kernels.
 
-    Called from the API startup so the first pipeline request does not pay
-    model download / load time. Runs a single tiny encode to force tokenizer
-    and CUDA kernel initialization inside the already-loaded model.
+    Runs inside a Celery child after the worker is ready. Lazy loading remains
+    the fallback for deployments that do not schedule the warmup task.
+
+    The separate lock/state prevent a warmup task and a first real embedding
+    call in the same process from running two initialization encodes. Model
+    construction itself is independently protected by ``_model_lock``.
     """
-    model = get_model()
-    _ = model.encode(
-        ["The quick brown fox jumps over the lazy dog"],
-        batch_size=1,
-        max_length=512,
-        return_dense=True,
-        return_sparse=True,
-        return_colbert_vecs=False,
-    )
+    global _warmed
+    if _warmed:
+        return
+    with _warmup_lock:
+        if _warmed:
+            return
+        model = get_model()
+        _ = model.encode(
+            ["The quick brown fox jumps over the lazy dog"],
+            batch_size=1,
+            max_length=512,
+            return_dense=True,
+            return_sparse=True,
+            return_colbert_vecs=False,
+        )
+        _warmed = True
+        logger.info("Embedding warmup completed | device=%s", _get_device())
 
 
 def dense_vector(texts: list[str], max_length: int = 512) -> list[list[float]]:
@@ -170,7 +215,14 @@ def embed_texts(
         results.append(
             {
                 "dense": dense[i].tolist(),
-                "sparse": dict(sparse[i]) if sparse is not None else {},
+                # BGE-M3 emits NumPy scalar keys/weights (commonly float16 on
+                # CUDA). Normalize them at the boundary so cache JSON and the
+                # Qdrant client both receive ordinary Python numeric values.
+                "sparse": (
+                    {int(token_id): float(weight) for token_id, weight in sparse[i].items()}
+                    if sparse is not None
+                    else {}
+                ),
             }
         )
 

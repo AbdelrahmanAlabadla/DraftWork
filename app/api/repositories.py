@@ -364,6 +364,8 @@ def create_generation_job(
     idempotency_key: str | None = None, request_hash: str | None = None,
 ) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
+    exam_id = f"exam_{uuid.uuid4().hex[:12]}"
+    durable_request = {**request_data, "exam_id": exam_id}
     now = datetime.now(timezone.utc)
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
@@ -378,9 +380,10 @@ def create_generation_job(
                     (session_id, idempotency_key),
                 )
                 cursor.execute(
-                    """SELECT i.request_hash, j.*
+                    """SELECT i.request_hash, j.*, e.id AS exam_id
                        FROM idempotency_records i
                        JOIN jobs j ON j.id = i.job_id
+                       JOIN exams e ON e.job_id = j.id
                        WHERE i.session_id = %s AND i.endpoint = 'create_exam_job'
                          AND i.idempotency_key = %s
                          AND i.expires_at > CURRENT_TIMESTAMP""",
@@ -448,9 +451,33 @@ def create_generation_job(
                    ) VALUES (%s, %s, %s, 'exam_generation', 'queued',
                              'queued', 0, %s, 2)
                    RETURNING *""",
-                (job_id, session_id, document_id, Jsonb(request_data)),
+                (job_id, session_id, document_id, Jsonb(durable_request)),
             )
             job = cursor.fetchone()
+            cursor.execute(
+                """INSERT INTO exams (
+                       id, session_id, user_id, document_id, job_id, status,
+                       stage, metadata, exams, warnings, evaluation
+                   ) SELECT %s, %s, s.user_id, %s, %s, 'queued', 'queued',
+                            %s, '[]'::jsonb, '[]'::jsonb, '{}'::jsonb
+                     FROM sessions s WHERE s.id = %s""",
+                (
+                    exam_id, session_id, document_id, job_id,
+                    Jsonb(dict(request_data.get("metadata") or {})), session_id,
+                ),
+            )
+            cursor.execute(
+                """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
+                   VALUES (%s, 'queued', 'exam_created', %s)""",
+                (
+                    exam_id,
+                    Jsonb({
+                        "job_id": job_id,
+                        "document_id": document_id,
+                        "request": request_data,
+                    }),
+                ),
+            )
             if idempotency_key:
                 expires_at = datetime.now(timezone.utc) + timedelta(
                     seconds=config.IDEMPOTENCY_TTL_SECONDS
@@ -468,6 +495,7 @@ def create_generation_job(
         conn.commit()
     assert job is not None
     result = dict(job)
+    result["exam_id"] = exam_id
     result["_idempotency_reused"] = False
     return result
 
@@ -533,6 +561,20 @@ def cancel_job(job_id: str) -> dict[str, Any]:
                     (job_id,),
                 )
                 job = cursor.fetchone()
+                if job and job["type"] == "exam_generation":
+                    cursor.execute(
+                        """UPDATE exams SET status = 'cancelled', stage = 'cancelled',
+                                  updated_at = CURRENT_TIMESTAMP
+                           WHERE job_id = %s""",
+                        (job_id,),
+                    )
+                    cursor.execute(
+                        """INSERT INTO exam_audit_events (
+                               exam_id, stage, event_type, payload
+                           ) SELECT id, 'cancelled', 'job_cancelled', %s
+                               FROM exams WHERE job_id = %s""",
+                        (Jsonb({"reason": "Cancelled by user"}), job_id),
+                    )
                 if job and job["type"] == "document_ingestion":
                     cursor.execute(
                         """UPDATE documents
@@ -595,6 +637,13 @@ def claim_job(job_id: str, worker_id: str) -> dict[str, Any] | None:
                 (worker_id, job_id),
             )
             row = cursor.fetchone()
+            if row and row["type"] == "exam_generation":
+                cursor.execute(
+                    """UPDATE exams SET status = 'running', stage = 'starting',
+                              updated_at = CURRENT_TIMESTAMP
+                       WHERE job_id = %s""",
+                    (job_id,),
+                )
         conn.commit()
     return dict(row) if row else None
 
@@ -608,6 +657,12 @@ def update_job_progress(job_id: str, stage: str, progress: int) -> None:
                           updated_at = CURRENT_TIMESTAMP
                    WHERE id = %s AND status = 'running'""",
                 (stage, max(0, min(100, progress)), job_id),
+            )
+            cursor.execute(
+                """UPDATE exams SET status = 'running', stage = %s,
+                          updated_at = CURRENT_TIMESTAMP
+                   WHERE job_id = %s AND status IN ('queued', 'running', 'retrying')""",
+                (stage, job_id),
             )
         conn.commit()
 
@@ -647,6 +702,19 @@ def recover_stale_jobs(stale_after_seconds: int) -> list[dict[str, Any]]:
                            WHERE id = %s""",
                         (row["id"],),
                     )
+                    if row["type"] == "exam_generation":
+                        cursor.execute(
+                            """UPDATE exams SET status = 'retrying', stage = 'retrying',
+                                      updated_at = CURRENT_TIMESTAMP WHERE job_id = %s""",
+                            (row["id"],),
+                        )
+                        cursor.execute(
+                            """INSERT INTO exam_audit_events (
+                                   exam_id, stage, event_type, payload
+                               ) SELECT id, 'retrying', 'worker_lost', %s
+                                   FROM exams WHERE job_id = %s""",
+                            (Jsonb({"reason": "Worker heartbeat expired"}), row["id"]),
+                        )
                     requeue.append(dict(row))
                 else:
                     cursor.execute(
@@ -668,6 +736,19 @@ def recover_stale_jobs(stale_after_seconds: int) -> list[dict[str, Any]]:
                                WHERE j.id = %s AND d.id = j.document_id""",
                             (row["id"],),
                         )
+                    elif row["type"] == "exam_generation":
+                        cursor.execute(
+                            """UPDATE exams SET status = 'failed', stage = 'failed',
+                                      updated_at = CURRENT_TIMESTAMP WHERE job_id = %s""",
+                            (row["id"],),
+                        )
+                        cursor.execute(
+                            """INSERT INTO exam_audit_events (
+                                   exam_id, stage, event_type, payload
+                               ) SELECT id, 'failed', 'worker_lost', %s
+                                   FROM exams WHERE job_id = %s""",
+                            (Jsonb({"reason": "Worker heartbeat expired"}), row["id"]),
+                        )
         conn.commit()
     return requeue
 
@@ -683,6 +764,23 @@ def retry_job(job_id: str, error_code: str, error_message: str) -> None:
                    WHERE id = %s AND status = 'running'""",
                 (error_code, str(error_message)[:1000], job_id),
             )
+            cursor.execute(
+                """UPDATE exams SET status = 'retrying', stage = 'retrying',
+                          updated_at = CURRENT_TIMESTAMP WHERE job_id = %s""",
+                (job_id,),
+            )
+            cursor.execute(
+                """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
+                   SELECT id, 'retrying', 'job_retrying', %s
+                     FROM exams WHERE job_id = %s""",
+                (
+                    Jsonb({
+                        "error_code": error_code,
+                        "error_message": str(error_message)[:1000],
+                    }),
+                    job_id,
+                ),
+            )
         conn.commit()
 
 
@@ -694,6 +792,7 @@ def complete_ingestion_job(
             cursor.execute(
                 """UPDATE jobs SET status = 'completed', stage = 'completed',
                           progress = 100, result_data = %s,
+                          error_code = NULL, error_message = NULL,
                           finished_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
                    WHERE id = %s AND status = 'running'
@@ -719,7 +818,7 @@ def complete_ingestion_job(
 
 def complete_generation_job(
     job_id: str, *, exam_id: str, document_id: str, session_id: str,
-    status: str, exams: list[dict[str, Any]], warnings: list[str],
+    status: str, exams: list[dict[str, Any]], warnings: list[Any],
     metadata: dict[str, Any], evaluation: dict[str, Any],
 ) -> bool:
     with db.connection() as conn:
@@ -727,25 +826,40 @@ def complete_generation_job(
             cursor.execute(
                 """UPDATE jobs SET status = 'completed', stage = 'completed',
                           progress = 100, result_data = %s,
+                          error_code = NULL, error_message = NULL,
                           finished_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
                    WHERE id = %s AND status = 'running'
                    RETURNING id""",
-                (Jsonb({"exam_id": exam_id}), job_id),
+                (Jsonb({"exam_id": exam_id, "status": status, "warnings": warnings}), job_id),
             )
             if cursor.fetchone() is None:
                 conn.commit()
                 return False
             cursor.execute(
-                """INSERT INTO exams (
-                       id, session_id, user_id, document_id, job_id, status,
-                       metadata, exams, warnings, evaluation
-                   ) SELECT %s, %s, s.user_id, %s, %s, %s, %s, %s, %s, %s
-                     FROM sessions s WHERE s.id = %s""",
+                """UPDATE exams SET status = %s, stage = 'completed',
+                          metadata = %s, exams = %s, warnings = %s, evaluation = %s,
+                          updated_at = CURRENT_TIMESTAMP
+                   WHERE id = %s AND job_id = %s""",
                 (
-                    exam_id, session_id, document_id, job_id, status,
-                    Jsonb(metadata), Jsonb(exams), Jsonb(warnings), Jsonb(evaluation),
-                    session_id,
+                    status, Jsonb(metadata), Jsonb(exams), Jsonb(warnings),
+                    Jsonb(evaluation), exam_id, job_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ResourceNotFound("Pre-created exam record is missing")
+            cursor.execute(
+                """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
+                   VALUES (%s, 'finalization', 'exam_saved', %s)""",
+                (
+                    exam_id,
+                    Jsonb({
+                        "status": status,
+                        "metadata": metadata,
+                        "warnings": warnings,
+                        "exams": exams,
+                        "evaluation": evaluation,
+                    }),
                 ),
             )
         conn.commit()
@@ -761,7 +875,7 @@ def fail_job(job_id: str, error_code: str, error_message: str) -> None:
                           error_code = %s, error_message = %s,
                           finished_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND status IN ('running', 'retrying')
+                   WHERE id = %s AND status IN ('queued', 'running', 'retrying')
                    RETURNING type, document_id""",
                 (error_code, safe_message, job_id),
             )
@@ -773,6 +887,42 @@ def fail_job(job_id: str, error_code: str, error_message: str) -> None:
                        WHERE id = %s""",
                     (error_code, safe_message, failed[1]),
                 )
+            elif failed and failed[0] == "exam_generation":
+                cursor.execute(
+                    """UPDATE exams SET status = 'failed', stage = 'failed',
+                              updated_at = CURRENT_TIMESTAMP WHERE job_id = %s""",
+                    (job_id,),
+                )
+                cursor.execute(
+                    """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
+                       SELECT id, 'failed', 'job_failed', %s
+                         FROM exams WHERE job_id = %s""",
+                    (
+                        Jsonb({"error_code": error_code, "error_message": safe_message}),
+                        job_id,
+                    ),
+                )
+        conn.commit()
+
+
+def get_exam_id_for_job(job_id: str) -> str | None:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id FROM exams WHERE job_id = %s", (job_id,))
+            row = cursor.fetchone()
+    return str(row[0]) if row else None
+
+
+def append_exam_audit_event(
+    exam_id: str, *, stage: str, event_type: str, payload: dict[str, Any]
+) -> None:
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
+                   VALUES (%s, %s, %s, %s)""",
+                (exam_id, stage, event_type, Jsonb(payload)),
+            )
         conn.commit()
 
 
@@ -783,8 +933,8 @@ def get_exam_for_session(
         with conn.cursor(row_factory=dict_row) as cursor:
             if user_id is None:
                 cursor.execute(
-                    """SELECT id AS exam_id, document_id, created_at, exams,
-                              warnings, metadata, evaluation, status
+                    """SELECT id AS exam_id, document_id, created_at, updated_at,
+                               exams, warnings, metadata, evaluation, status, stage
                        FROM exams WHERE id = %s AND session_id = %s""",
                     (exam_id, session_id),
                 )
@@ -793,8 +943,8 @@ def get_exam_for_session(
                     raise ResourceNotFound("Exam not found")
                 return dict(row)
             cursor.execute(
-                """SELECT id AS exam_id, document_id, created_at, exams,
-                          warnings, metadata, evaluation, status
+                """SELECT id AS exam_id, document_id, created_at, updated_at,
+                           exams, warnings, metadata, evaluation, status, stage
                    FROM exams WHERE id = %s AND (
                        session_id = %s OR user_id = %s
                    )""",
@@ -806,6 +956,21 @@ def get_exam_for_session(
     return dict(row)
 
 
+def list_exam_audit_events(
+    exam_id: str, session_id: str, user_id: str | None = None
+) -> list[dict[str, Any]]:
+    get_exam_for_session(exam_id, session_id, user_id)
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT id, exam_id, stage, event_type, payload, created_at
+                   FROM exam_audit_events WHERE exam_id = %s
+                   ORDER BY created_at, id""",
+                (exam_id,),
+            )
+            return [dict(event) for event in cursor.fetchall()]
+
+
 def list_exams_for_user(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
@@ -813,8 +978,8 @@ def list_exams_for_user(user_id: str, limit: int = 100) -> list[dict[str, Any]]:
                 """SELECT id AS exam_id, document_id, created_at, status,
                           metadata, warnings,
                           jsonb_array_length(exams) AS model_count
-                   FROM exams
-                   WHERE user_id = %s
+                    FROM exams
+                    WHERE user_id = %s AND status IN ('complete', 'partial')
                    ORDER BY created_at DESC
                    LIMIT %s""",
                 (user_id, max(1, min(limit, 200))),

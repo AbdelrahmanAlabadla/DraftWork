@@ -10,6 +10,7 @@ from app.logging_conf import get_logger
 from app.offline.parser_items import (
     ParserSchemaError,
     document_pages,
+    filter_supported_items,
     validate_pages,
 )
 
@@ -84,6 +85,13 @@ class LlamaParser:
                 pages.extend(document_pages(payload))
 
             validate_pages(pages)
+            pages, ignored = filter_supported_items(pages)
+            if ignored:
+                logger.info(
+                    "Ignored non-text parser items | file=%s | counts=%s",
+                    path.name,
+                    ignored,
+                )
         except ParserSchemaError as exc:
             logger.error(
                 "Parser schema validation failed | file=%s | reason=%s",

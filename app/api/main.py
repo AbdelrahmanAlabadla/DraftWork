@@ -43,7 +43,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="ExamGen AI",
     description="Exam Generator V1 — API-first backend. Upload a PDF, then generate exams "
-    "(MCQ / True-False / Short Answer) grounded in the uploaded document.",
+    "(MCQ / True-False / Why) grounded in the uploaded document.",
     version="1.0.0",
     lifespan=lifespan,
 )
