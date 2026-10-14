@@ -848,7 +848,7 @@
       overflow-wrap: anywhere;
     }
 
-    .preview-equation-text .katex-display {
+.preview-equation-text .katex-display {
       margin: 0;
       overflow: auto hidden;
     }
@@ -1469,6 +1469,50 @@ html[dir="rtl"] .count,
 html[dir="rtl"] input[type="date"] {
   direction: ltr;
   unicode-bidi: isolate;
+}
+
+.equation-instruction {
+  margin-bottom: 0.45rem;
+  line-height: 1.55;
+}
+
+.equation-display {
+  direction: ltr;
+  unicode-bidi: isolate;
+  text-align: center;
+  margin: 0.45rem 0;
+  overflow-x: auto;
+}
+
+.math-inline,
+.math-inline .katex {
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: inline-block;
+}
+
+.math-inline {
+  margin-inline: 0.2em;
+}
+
+.math-display {
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: block;
+  text-align: center;
+  margin: 0.45rem 0;
+  overflow-x: auto;
+}
+
+.math-prose {
+  unicode-bidi: isolate;
+}
+
+.math-render-fallback {
+  direction: ltr;
+  unicode-bidi: isolate;
+  white-space: pre-wrap;
+  font-family: "DejaVu Sans", "Cambria Math", monospace;
 }
 
 .export-model-toolbar {
