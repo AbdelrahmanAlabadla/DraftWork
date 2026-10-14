@@ -24,6 +24,7 @@ from app.exports.common import (
     exam_document_language,
     group_exam_sections,
     is_complete_equation_prompt,
+    split_equation_content,
     response_line_count,
 )
 from app.language import detect_language
@@ -426,6 +427,26 @@ def _add_section_heading(doc: Document, label: str, *, page_break_before: bool =
     _paragraph_bottom_border(p, color=RULE, size="5")
 
 
+def _add_mixed_math_runs(
+    paragraph: Any, text: str, *, size: float = 10, bold: bool = False
+) -> None:
+    """Add prose plus inline/display TeX, isolating math as rendered images."""
+    for kind, value in split_equation_content(text, undelimited_as_math=False):
+        if kind == "text":
+            run = paragraph.add_run(value)
+            _set_run_font(run, size=size, bold=bold)
+            continue
+        rendered = render_math(value)
+        if rendered:
+            stream = io.BytesIO(rendered.png)
+            stream.name = "inline-math.png"
+            width = min(CONTENT_WIDTH_IN - 0.5, max(0.18, rendered.width_px / 260))
+            paragraph.add_run().add_picture(stream, width=Inches(width))
+        else:
+            run = paragraph.add_run(value)
+            _set_run_font(run, size=size, bold=bold)
+
+
 def _add_question_stem(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
     p = doc.add_paragraph()
     p.paragraph_format.space_after = Pt(2)
@@ -434,8 +455,7 @@ def _add_question_stem(doc: Document, item: dict[str, Any], rtl: bool = False) -
     content_rtl = _set_content_direction(p, text, rtl)
     run = p.add_run(f"{item['number']}. " if content_rtl else f"Q{item['number']}. ")
     _set_run_font(run, bold=True)
-    run = p.add_run(text)
-    _set_run_font(run, bold=True)
+    _add_mixed_math_runs(p, text, bold=True)
 
 
 def _add_mcq(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
@@ -475,8 +495,7 @@ def _add_mcq(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
             content_rtl = _set_content_direction(p, option_text, rtl)
             if rtl and not content_rtl:
                 p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            run = p.add_run(option_text)
-            _set_run_font(run, size=9.5)
+            _add_mixed_math_runs(p, option_text, size=9.5)
     else:
         for letter, option in options:
             widths = [CONTENT_WIDTH_IN - 0.34, 0.34] if rtl else [0.34, CONTENT_WIDTH_IN - 0.34]
@@ -496,8 +515,7 @@ def _add_mcq(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
             content_rtl = _set_content_direction(p, option_text, rtl)
             if rtl and not content_rtl:
                 p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            run = p.add_run(option_text)
-            _set_run_font(run, size=9.5)
+            _add_mixed_math_runs(p, option_text, size=9.5)
     spacer = doc.add_paragraph()
     spacer.paragraph_format.space_after = Pt(2)
 
@@ -559,8 +577,7 @@ def _add_definition(doc: Document, item: dict[str, Any], rtl: bool = False) -> N
     _set_content_direction(label_p, term, rtl)
     run = label_p.add_run(f"{item['number']}. ")
     _set_run_font(run, bold=True)
-    run = label_p.add_run(term + ":")
-    _set_run_font(run, bold=True)
+    _add_mixed_math_runs(label_p, term + ":", bold=True)
     line_p = table.cell(0, line_col).paragraphs[0]
     line_p.paragraph_format.space_after = Pt(0)
     line_p.add_run("\u00a0")
@@ -580,25 +597,27 @@ def _add_equation(doc: Document, item: dict[str, Any], rtl: bool = False) -> Non
     number.paragraph_format.space_after = Pt(0)
     run = number.add_run(f"{item['number']}.")
     _set_run_font(run, bold=True)
-    equation = equation_cell.paragraphs[0]
-    complete_prompt = is_complete_equation_prompt(item.get("text"))
-    equation.alignment = WD_ALIGN_PARAGRAPH.RIGHT if rtl else (
-        WD_ALIGN_PARAGRAPH.LEFT if complete_prompt else WD_ALIGN_PARAGRAPH.CENTER
-    )
-    equation.paragraph_format.space_after = Pt(0)
-    if rtl:
-        _set_paragraph_rtl(equation)
     equation_text = _clean(item.get("text"), "(missing equation)")
-    rendered = None if complete_prompt else render_math(equation_text)
-    if rendered:
-        natural_width = rendered.width_px / 220
-        picture_width = min(CONTENT_WIDTH_IN - 0.9, max(0.35, natural_width))
-        stream = io.BytesIO(rendered.png)
-        stream.name = "equation.png"
-        equation.add_run().add_picture(stream, width=Inches(picture_width))
-    else:
-        run = equation.add_run(equation_text)
-        _set_run_font(run, bold=True)
+    parts = split_equation_content(equation_text)
+    for part_index, (kind, value) in enumerate(parts):
+        equation = equation_cell.paragraphs[0] if part_index == 0 else equation_cell.add_paragraph()
+        equation.paragraph_format.space_after = Pt(2)
+        if kind == "text":
+            _set_content_direction(equation, value, rtl)
+            run = equation.add_run(value)
+            _set_run_font(run, bold=True)
+            continue
+        equation.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        rendered = render_math(value)
+        if rendered:
+            natural_width = rendered.width_px / 220
+            picture_width = min(CONTENT_WIDTH_IN - 0.9, max(0.35, natural_width))
+            stream = io.BytesIO(rendered.png)
+            stream.name = "equation.png"
+            equation.add_run().add_picture(stream, width=Inches(picture_width))
+        else:
+            run = equation.add_run(value)
+            _set_run_font(run, bold=True)
     _add_answer_lines(doc, response_line_count("equation"), rtl=rtl)
 
 
@@ -610,8 +629,7 @@ def _add_word_problem(doc: Document, item: dict[str, Any], rtl: bool = False) ->
     _set_content_direction(p, text, rtl)
     run = p.add_run(f"{item['number']}. ")
     _set_run_font(run, bold=True)
-    run = p.add_run(text)
-    _set_run_font(run, bold=True)
+    _add_mixed_math_runs(p, text, bold=True)
     _add_answer_lines(doc, response_line_count("word_problem"), rtl=rtl)
 
 
@@ -663,8 +681,7 @@ def _render_student_sections(doc: Document, sections: list[dict[str, Any]], lang
                 marker = f"{item['number']}. " if content_rtl else f"Q{item['number']}. "
                 run = statement_p.add_run(marker)
                 _set_run_font(run, bold=True)
-                run = statement_p.add_run(statement)
-                _set_run_font(run, bold=True)
+                _add_mixed_math_runs(statement_p, statement, bold=True)
 
                 choices_p = doc.add_paragraph()
                 choices_p.paragraph_format.space_after = Pt(4)
@@ -719,8 +736,28 @@ def _render_answer_key(
             content_rtl = _set_content_direction(p, direction_text, rtl)
             run = p.add_run(f"{item['number']}. " if content_rtl else f"Q{item['number']}. ")
             _set_run_font(run, size=9.5, bold=True)
-            run = p.add_run(answer)
-            _set_run_font(run, size=9.5)
+            if item["qtype"] == "equation":
+                labels_for_answer = ANSWER_LABELS_BY_LANG.get(
+                    language, ANSWER_LABELS_BY_LANG["en"]
+                )
+                values = [
+                    *[_clean(step) for step in item.get("solution_steps") or [] if _clean(step)],
+                    _clean(item.get("final_answer"), labels_for_answer["missing_final"]),
+                ]
+                for value in values:
+                    line = doc.add_paragraph()
+                    line.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    rendered = render_math(value)
+                    if rendered:
+                        stream = io.BytesIO(rendered.png)
+                        stream.name = "answer-equation.png"
+                        width = min(CONTENT_WIDTH_IN - 0.9, max(0.35, rendered.width_px / 220))
+                        line.add_run().add_picture(stream, width=Inches(width))
+                    else:
+                        run = line.add_run(value)
+                        _set_run_font(run, size=9.5)
+            else:
+                _add_mixed_math_runs(p, answer, size=9.5)
 
 
 def render_exam_docx(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:

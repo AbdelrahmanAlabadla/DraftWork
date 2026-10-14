@@ -90,6 +90,13 @@ STEM_REVIEW_REASONING_EFFORT: str = (
 ).lower()
 if STEM_REVIEW_REASONING_EFFORT != "medium":
     raise ValueError("STEM_REVIEW_REASONING_EFFORT must be 'medium'")
+STEM_QUANTITATIVE_REASONING_EFFORT: str = (
+    _env("STEM_QUANTITATIVE_REASONING_EFFORT", "medium") or "medium"
+).lower()
+if STEM_QUANTITATIVE_REASONING_EFFORT not in {"medium", "high"}:
+    raise ValueError(
+        "STEM_QUANTITATIVE_REASONING_EFFORT must be 'medium' or 'high'"
+    )
 ACTIVE_LLM_MODEL: str = DEEPSEEK_MODEL if LLM_PROVIDER == "deepseek" else LMS_MODEL
 # Keep validator requests small enough that local models reliably return one
 # verdict per question.  Missing IDs are retried once in an even smaller request.
@@ -98,6 +105,9 @@ VALIDATOR_BATCH_SIZE: int = max(
 )
 MAX_PARALLEL_GENERATION_CALLS: int = max(
     1, min(5, int(_env("MAX_PARALLEL_GENERATION_CALLS", "5") or "5"))
+)
+MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: int = max(
+    1, min(5, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "5") or "5"))
 )
 MAX_PARALLEL_VALIDATOR_CALLS: int = max(
     1, min(5, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "5") or "5"))
@@ -124,7 +134,7 @@ EMBEDDING_BATCH_SIZE: int = max(
 PARSER_PIPELINE_VERSION: str = _env("PARSER_PIPELINE_VERSION", "llamaparse-v1") or "llamaparse-v1"
 CHUNKER_PIPELINE_VERSION: str = _env("CHUNKER_PIPELINE_VERSION", "semantic-v3") or "semantic-v3"
 EMBEDDING_PIPELINE_VERSION: str = _env("EMBEDDING_PIPELINE_VERSION", "dense-sparse-v1") or "dense-sparse-v1"
-ASSESSMENT_CATALOG_VERSION: str = _env("ASSESSMENT_CATALOG_VERSION", "catalog-v5-fitb-bank") or "catalog-v5-fitb-bank"
+ASSESSMENT_CATALOG_VERSION: str = _env("ASSESSMENT_CATALOG_VERSION", "catalog-v8-unified-difficulty") or "catalog-v8-unified-difficulty"
 ASSESSMENT_COMPILER_VERSION: str = (
     _env("ASSESSMENT_COMPILER_VERSION", "compiler-v3-atomic-task-ontology")
     or "compiler-v3-atomic-task-ontology"
@@ -145,10 +155,10 @@ DUPLICATE_TOP_NEIGHBOURS: int = max(
     1, int(_env("DUPLICATE_TOP_NEIGHBOURS", "2") or "2")
 )
 MAX_DUPLICATE_REPAIR_ROUNDS: int = max(
-    1, min(3, int(_env("MAX_DUPLICATE_REPAIR_ROUNDS", "2") or "2"))
+    1, min(3, int(_env("MAX_DUPLICATE_REPAIR_ROUNDS", "3") or "3"))
 )
 MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT: int = max(
-    1, min(2, int(_env("MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT", "2") or "2"))
+    1, min(3, int(_env("MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT", "3") or "3"))
 )
 
 UPLOAD_DIR: str = _env("UPLOAD_DIR", "data/uploads") or "data/uploads"

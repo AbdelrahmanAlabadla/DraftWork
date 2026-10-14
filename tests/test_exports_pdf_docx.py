@@ -458,11 +458,14 @@ def test_browser_preview_matches_export_header_tf_blanks_and_math_layout():
     assert '"preview-student-class"' in preview_js
     assert 'blank + blank[0].repeat(4)' in preview_js
     assert 'stem.appendChild(element("span", "preview-tf-choices"' in preview_js
-    assert "renderEquation(equation, value)" in preview_js
+    assert "renderEquationContent(equation, value, language)" in preview_js
+    assert "renderMixedMath" in preview_js
+    assert "(?<!\\$)\\$" in math_js
     assert "window.katex.render" in math_js
     assert "toMathLatex" in math_js
     assert "katex@0.18.7/dist/katex.min.js" in html
     assert ".preview-equation-text .katex-display" in css
+    assert "unicode-bidi: isolate" in css
 
 
 def test_frontend_markdown_copy_is_questions_first_and_uses_toast():

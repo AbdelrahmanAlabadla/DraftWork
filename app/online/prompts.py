@@ -131,6 +131,23 @@ def _difficulty_block(difficulty: str) -> str:
     return f"## Difficulty Target (follow this strictly)\n{directive}"
 
 
+def _planned_difficulty_block(
+    difficulty: str,
+    planned_items: list[dict[str, Any]] | None,
+) -> str:
+    if not planned_items:
+        return _difficulty_block(difficulty)
+    return (
+        "## Difficulty Target (follow this strictly)\n"
+        f"The teacher requested {difficulty.upper()} difficulty. For every planned slot, the "
+        "slot's current difficulty, actual_difficulty, reasoning_depth, and concrete "
+        "reasoning_requirements are authoritative, including fixed-difficulty exams. Generate "
+        "the cognitive demand recorded on that slot using only its assigned evidence. When a "
+        "fallback slot remains at a different genuine difficulty, do not silently relabel, "
+        "simplify, or intensify it to match the overall request."
+    )
+
+
 _LANGUAGE_NAMES = {
     "en": "English",
     "ar": "Arabic",
@@ -331,7 +348,11 @@ DEFINITION_SCHEMA = (
 DEFINITION_EXAMPLE = DEFINITION_SCHEMA
 
 EQUATION_RULES = (
-    '- The "equation" field is the COMPLETE question prompt, not a bare formula or list of values.\n'
+    '- The "equation" field is a complete equation-centered prompt. Put a short instruction first, '
+    'then put important equations, systems, reactions, and formal relationships on separate display '
+    'lines using valid LaTeX delimiters `\\[ ... \\]`. Use inline `\\( ... \\)` only for short '
+    'expressions that naturally belong in a sentence. Because this is JSON, escape every LaTeX '
+    'backslash correctly.\n'
     "- Follow the entry's assessment guidance and task_operation exactly. The selected material "
     "determines whether Equation means balancing or completing a reaction, solving or factoring an "
     "expression, deriving or proving a relationship, calculation, or another equation-centered task.\n"
@@ -346,6 +367,16 @@ EQUATION_RULES = (
     "operation in another subject.\n"
     "- Keep the student work centered on forming, solving, manipulating, balancing, completing, or "
     "deriving an equation. Use no narrative wrapper unless context is essential to the planned operation.\n"
+    "- Supporting tables are allowed when they directly support evaluating, comparing, or solving "
+    "the displayed relationships. Keep their columns aligned and mathematical entries in LaTeX.\n"
+    "- Use source-appropriate notation: Mathematics equations/systems/expressions; Physics symbolic "
+    "relationships with concise values and units; Chemistry reactions and chemical or quantitative "
+    "relations; and each other STEM discipline's own formal representation. Never force all subjects "
+    "into an algebra template.\n"
+    "- Use valid LaTeX for fractions, exponents, roots, inequalities, systems, units, and reactions: "
+    "for example `\\frac{a}{b}`, `x^{2}`, `\\sqrt{x}`, `\\begin{cases}...\\end{cases}`, "
+    "`\\mathrm{m\\,s^{-1}}`, and `\\mathrm{Fe}+\\mathrm{O_2}\\rightarrow\\mathrm{Fe_2O_3}`. "
+    "Do not use Markdown bracket pseudo-delimiters or raw Unicode layout as a substitute for LaTeX.\n"
     "- Do not turn the task into a Word Problem. If the student must extract relevant quantities from "
     "a meaningful situation and interpret the result in that situation, it belongs in Word Problem.\n"
     '- Provide ordered "solution_steps" appropriate to the planned operation and a separate '
@@ -356,7 +387,7 @@ EQUATION_SCHEMA = (
     '{\n'
     '  "questions": [\n'
     '    {"slot_id": "m1_equation_1", '
-    '"equation": "Solve the system 2x + y = 7 and x - y = 2.", '
+    '"equation": "Solve the system:\\n\\\\[\\\\begin{cases}2x+y=7\\\\\\\\x-y=2\\\\end{cases}\\\\]", '
     '"solution_steps": ["Add the equations to obtain 3x = 9.", '
     '"So x = 3; substitute to obtain y = 1."], "final_answer": "(3, 1)", '
     '"solution_certificate": {"method": "elimination", "important_givens": '
@@ -529,6 +560,12 @@ PLANNER_SYSTEM_PROMPT = (
     "reasoning_mode is the broader cognitive mode. relationship is a stable source-grounded law, "
     "rule, theorem, equation family, or null. target is a concise canonical noun phrase without "
     "scenario-specific values or objects.\n\n"
+    "Difficulty metadata is explicit. requested_difficulty records the teacher request; "
+    "actual_difficulty records the level the task genuinely satisfies and normally equals difficulty. "
+    "For an ordinary task, base_catalog_task_id and base_task_family_id may be null, "
+    "difficulty_adaptation is null, and difficulty_fallback_reason is null. A catalog-backed "
+    "difficulty adaptation preserves those base IDs and uses the supplied adaptation object. Never "
+    "claim actual_difficulty=hard from a label alone.\n\n"
     "canonical_skill is a concise stable skill label independent of names, materials, story wrappers, "
     "knowledge_focus is the exact atomic fact, principle, relationship, or skill being assessed, "
     "written as a stable canonical label independent of question type and wording. "
@@ -714,8 +751,9 @@ def build_prompt(
             f"Generate EXACTLY one question per entry below. Each entry is an isolated evidence "
             f"boundary: use only that entry's assigned_sources and never borrow facts, equations, "
             f"values, conditions, or examples from another entry. Follow its assessment_guidance, "
-            f"task_operation, relationship, target, reasoning_mode, idea, and difficulty. "
-            f"The per-slot difficulty controls each question when the overall request is mix. "
+            f"task_operation, relationship, target, reasoning_mode, reasoning_depth, "
+            f"reasoning_requirements, idea, and difficulty. The per-slot difficulty controls "
+            f"each question for fixed and mixed requests. "
             f"Do not deviate from the planned concepts and "
             f"do not introduce unplanned concepts.\n{plan_lines}\n\n"
         )
@@ -746,7 +784,7 @@ def build_prompt(
 
         f"## Example of a valid output\n{example}\n\n"
 
-        f"{_difficulty_block(difficulty)}\n\n"
+        f"{_planned_difficulty_block(difficulty, planned_items)}\n\n"
 
         f"{_language_block(language)}"
 
@@ -785,7 +823,14 @@ def _format_planned_item(index: int, item: dict[str, Any]) -> str:
         f"required_givens={item.get('required_givens', [])} | "
         f"text_answerable={item.get('text_answerable')} | "
         f"reasoning_mode={item.get('reasoning_mode', '')} | "
+        f"reasoning_depth={item.get('reasoning_depth', '')} | "
+        f"reasoning_requirements={item.get('reasoning_requirements', [])} | "
+        f"prerequisites={item.get('prerequisites', [])} | "
+        f"requested_difficulty={item.get('requested_difficulty', '')} | "
         f"difficulty={item.get('difficulty', '')} | "
+        f"actual_difficulty={item.get('actual_difficulty', item.get('difficulty', ''))} | "
+        f"difficulty_adaptation={json.dumps(item.get('difficulty_adaptation'), ensure_ascii=False)} | "
+        f"difficulty_fallback_reason={item.get('difficulty_fallback_reason')} | "
         f"idea_to_test={item.get('idea_to_test', item.get('concept_to_test', ''))} | "
         f"task_reused={bool(item.get('task_reused'))} | "
         f"fitb_entry_reused={bool(item.get('fitb_entry_reused'))} | "
@@ -873,7 +918,7 @@ def build_fitb_items_prompt(
 
         f"## Example of a valid output\n{FILL_IN_THE_BLANK_ITEMS_EXAMPLE}\n\n"
 
-        f"{_difficulty_block(difficulty)}\n\n"
+        f"{_planned_difficulty_block(difficulty, planned_items)}\n\n"
 
         f"{_language_block(language)}"
 
@@ -962,9 +1007,9 @@ def build_obj_bundled_prompt(
         "## Question Plan\nGenerate EXACTLY the planned counts below in their "
         "respective sections. Treat each entry as an isolated evidence boundary and never use "
         "another entry's assigned_sources. Follow every slot's assessment_guidance, "
-        "task_operation, relationship, target, reasoning_mode, "
-        "idea_to_test, and difficulty. The per-slot difficulty controls each question when "
-        "the overall request is mix. Test ONLY the stated topics and concepts; do not "
+        "task_operation, relationship, target, reasoning_mode, reasoning_depth, "
+        "reasoning_requirements, idea_to_test, and difficulty. The per-slot difficulty "
+        "controls each question for fixed and mixed requests. Test ONLY the stated topics and concepts; do not "
         "introduce unplanned concepts.\n\n"
         + "\n\n".join(plan_lines)
         if plan_lines
@@ -990,7 +1035,7 @@ def build_obj_bundled_prompt(
         f"{mcq_nesting_rule}Omit a question-type section only when its planned "
         "count is zero and the enforced schema omits it.\n\n"
 
-        f"{_difficulty_block(difficulty)}\n\n"
+        f"{_planned_difficulty_block(difficulty, [*mcq_planned, *tf_planned])}\n\n"
 
         f"{_language_block(language)}"
 

@@ -90,6 +90,8 @@ function normalizeClause(source) {
 export function toMathLatex(source) {
   return String(source ?? "")
     .trim()
+    .replace(/^\\\[|\\\]$/g, "")
+    .replace(/^\$\$|\$\$$/g, "")
     .split(/\s*[؛;]\s*/)
     .filter((part) => part.trim())
     .map(normalizeClause)
@@ -97,22 +99,134 @@ export function toMathLatex(source) {
     .join(String.raw`\quad `);
 }
 
-export function renderEquation(target, source) {
+export function splitEquationContent(source) {
+  const text = String(source ?? "").trim();
+  const parts = [];
+  const display = /\$\$([\s\S]*?)\$\$|\\\[([\s\S]*?)\\\]|\\\(([\s\S]*?)\\\)|(?<!\$)\$([^$\n]+?)\$(?!\$)/g;
+  let start = 0;
+  let match;
+  while ((match = display.exec(text)) !== null) {
+    const prose = text.slice(start, match.index).trim();
+    if (prose) parts.push({ type: "text", value: prose });
+    parts.push({
+      type: "math",
+      value: (match[1] ?? match[2] ?? match[3] ?? match[4] ?? "").trim(),
+      display: match[0].startsWith("$$") || match[0].startsWith("\\["),
+    });
+    start = display.lastIndex;
+  }
+  const tail = text.slice(start).trim();
+  if (tail) parts.push({ type: parts.length ? "text" : "math", value: tail });
+  return parts;
+}
+
+export function renderMixedMath(target, source, language = "en") {
+  const text = String(source ?? "");
+  const parts = splitEquationContent(text);
+  const hasDelimitedMath = /\$\$|\\\[|\\\(|(?<!\$)\$[^$\n]+?\$(?!\$)/.test(text);
+  target.replaceChildren();
+  if (!hasDelimitedMath) {
+    target.textContent = text;
+    target.dir = language === "ar" ? "rtl" : "ltr";
+    target.lang = language;
+    return;
+  }
+  parts.forEach((part) => {
+    const node = document.createElement(part.type === "math" && part.display ? "div" : "span");
+    if (part.type === "math") {
+      node.className = part.display ? "math-display" : "math-inline";
+      renderEquation(node, part.value, Boolean(part.display));
+    } else {
+      node.className = "math-prose";
+      node.textContent = part.value;
+      node.dir = language === "ar" ? "rtl" : "ltr";
+      node.lang = language;
+    }
+    target.appendChild(node);
+  });
+}
+
+export function renderEquationContent(target, source, language = "en") {
+  const parts = splitEquationContent(source);
+  target.replaceChildren();
+  parts.forEach((part) => {
+    const node = document.createElement("div");
+    node.className = part.type === "math" ? "equation-display" : "equation-instruction";
+    if (part.type === "math") renderEquation(node, part.value);
+    else {
+      node.textContent = part.value;
+      node.dir = language === "ar" ? "rtl" : "ltr";
+      node.lang = language;
+    }
+    target.appendChild(node);
+  });
+}
+
+export function latexToPlainText(source) {
   const original = String(source ?? "").trim();
+  let value = original
+    .replace(/^\$\$|\$\$$/g, "")
+    .replace(/^\$|\$$/g, "")
+    .replace(/^\\\[|\\\]$/g, "")
+    .replace(/^\\\(|\\\)$/g, "")
+    .trim();
+  const matrix = value.match(
+    /^(.*?)\\begin\{(?:bmatrix|pmatrix|matrix|cases)\}([\s\S]+?)\\end\{(?:bmatrix|pmatrix|matrix|cases)\}$/,
+  );
+  if (matrix) {
+    const rows = matrix[2].split(/\\\\/).map((row) => row.split("&").map((cell) => cell.trim()));
+    if (!rows.length || rows.some((row) => !row.length || row.some((cell) => !cell))) return null;
+    const prefix = matrix[1].trim();
+    value = `${prefix}[${rows.map((row) => row.join(", ")).join("; ")}]`;
+  }
+  let previous;
+  do {
+    previous = value;
+    value = value.replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, "($1/$2)");
+  } while (value !== previous);
+  value = value
+    .replace(/\\sqrt\{([^{}]+)\}/g, "sqrt($1)")
+    .replace(/\\(?:mathrm|text)\{([^{}]+)\}/g, "$1")
+    .replace(/\^\{([^{}]+)\}/g, "^($1)")
+    .replace(/_\{([^{}]+)\}/g, "_($1)")
+    .replace(/\\times\b/g, "×")
+    .replace(/\\div\b/g, "÷")
+    .replace(/\\(?:cdot|,|;|!)/g, " ")
+    .replace(/\\(?:le|leq)\b/g, "≤")
+    .replace(/\\(?:ge|geq)\b/g, "≥")
+    .replace(/\\ne\b/g, "≠")
+    .replace(/\\to\b/g, "→");
+  if (/\\[A-Za-z]+|[{}]/.test(value)) return null;
+  return value.trim() || null;
+}
+
+export function renderEquation(target, source, displayMode = true) {
+  const original = String(source ?? "").trim();
+  const showFallback = (error) => {
+    const converted = latexToPlainText(original);
+    target.textContent = converted ?? original;
+    target.classList?.add("math-render-fallback");
+    target.dataset.mathRenderFallback = converted === null ? "original" : "plain-text";
+    console.error("Math rendering failed", { expression: original, error });
+  };
   target.textContent = original;
   target.dir = "ltr";
   target.lang = "en";
-  if (!original || !window.katex) return false;
+  if (!original) return false;
+  if (!window.katex) {
+    showFallback(new Error("KaTeX is unavailable"));
+    return false;
+  }
   try {
     window.katex.render(toMathLatex(original), target, {
-      displayMode: true,
+      displayMode,
       throwOnError: true,
       strict: "warn",
       trust: false,
     });
     return true;
   } catch (_error) {
-    target.textContent = original;
+    showFallback(_error);
     return false;
   }
 }

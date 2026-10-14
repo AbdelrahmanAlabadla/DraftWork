@@ -48,6 +48,9 @@ def _reviewed_plan_item(qtype: str, slot_id: str, *, chunk: str = "c1", index: i
         "text_answerable": True,
         "reasoning_mode": "conceptual_recall" if qtype == "fill_in_the_blank" else "conceptual_reasoning",
         "difficulty": "easy",
+        "reasoning_depth": "easy",
+        "reasoning_requirements": [f"Provide the requested {qtype} response."],
+        "prerequisites": [],
         "idea_to_test": f"Identify and explain concept {qtype} {index}",
     }
     if qtype == "fill_in_the_blank":
@@ -95,6 +98,74 @@ def test_mcq_answer_positions_are_balanced_and_keep_correct_content():
     snapshot = [dict(item["options"]) for item in questions["mcq"]]
     exam_builder.balance_mcq_answer_positions(questions)
     assert [item["options"] for item in questions["mcq"]] == snapshot
+
+
+def test_mcq_balance_triggers_at_fifty_percent_and_moves_toward_least_used():
+    answers = ["A"] * 5 + ["B"] * 3 + ["C", "D"]
+    questions = {"mcq": [
+        {
+            "question_id": f"q{index}",
+            "options": {
+                "A": f"q{index}-A", "B": f"q{index}-B",
+                "C": f"q{index}-C", "D": f"q{index}-D",
+            },
+            "correct_answer": answer,
+        }
+        for index, answer in enumerate(answers)
+    ]}
+    correct_content = [
+        item["options"][item["correct_answer"]] for item in questions["mcq"]
+    ]
+
+    changed = exam_builder.balance_mcq_answer_positions(questions)
+
+    counts = {
+        label: sum(item["correct_answer"] == label for item in questions["mcq"])
+        for label in "ABCD"
+    }
+    assert counts == {"A": 3, "B": 3, "C": 2, "D": 2}
+    assert len(changed) == 2
+    assert [
+        item["options"][item["correct_answer"]] for item in questions["mcq"]
+    ] == correct_content
+
+
+def test_mcq_balance_leaves_below_threshold_distribution_untouched():
+    answers = ["A"] * 4 + ["B"] * 4 + ["C"] * 2
+    questions = {"mcq": [
+        {
+            "question_id": f"q{index}",
+            "options": {label: f"q{index}-{label}" for label in "ABCD"},
+            "correct_answer": answer,
+        }
+        for index, answer in enumerate(answers)
+    ]}
+    snapshot = [dict(item) | {"options": dict(item["options"])} for item in questions["mcq"]]
+
+    assert exam_builder.balance_mcq_answer_positions(questions) == []
+    assert questions["mcq"] == snapshot
+
+
+def test_mcq_balance_handles_small_sets_without_pointless_changes():
+    one = {"mcq": [{
+        "question_id": "q1", "options": {label: label for label in "ABCD"},
+        "correct_answer": "A",
+    }]}
+    two = {"mcq": [
+        {
+            "question_id": f"q{index}",
+            "options": {label: f"q{index}-{label}" for label in "ABCD"},
+            "correct_answer": "A",
+        }
+        for index in range(2)
+    ]}
+    semantic_answers = [item["options"]["A"] for item in two["mcq"]]
+
+    assert exam_builder.balance_mcq_answer_positions(one) == []
+    assert exam_builder.balance_mcq_answer_positions(two) == ["q0"]
+    assert [item["correct_answer"] for item in two["mcq"]] == ["B", "A"]
+    assert [item["options"][item["correct_answer"]] for item in two["mcq"]] == semantic_answers
+    assert exam_builder.balance_mcq_answer_positions(two) == []
 
 
 _COUNT_RE = re.compile(r"Create exactly (\d+)")

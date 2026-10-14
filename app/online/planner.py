@@ -131,20 +131,6 @@ _ARABIC_DERIVATION_CUE_RE = re.compile(
     r"(?:اشتق|يشتق|اشتقاق|أثبت|اثبت|برهن|برهنة|استنتج|استنتاج)",
     flags=re.IGNORECASE,
 )
-_HARD_DEPTH_CUE_RE = re.compile(
-    r"\b(?:combine|multiple\s+(?:laws|relationships|ideas)|several\s+(?:meaningful\s+)?steps|"
-    r"intermediate\s+result|then\s+(?:interpret|compare|conclude|apply)|compare\s+alternatives|"
-    r"error\s+analysis|derive|derivation|prove|show\s+that|infer)\b|"
-    r"(?:ادمج|دمج|علاقتين|عدة\s+خطوات|نتيجة\s+وسيطة|ثم\s+(?:فسر|قارن|استنتج|طبق)|"
-    r"قارن\s+البدائل|تحليل\s+خطأ|اشتق|يشتق|اشتقاق|أثبت|اثبت|برهن|استنتج|استنتاج|"
-    r"ثم\s+(?:فسر|قارن|استنتج|طبق|وظف|استخدم))",
-    flags=re.IGNORECASE,
-)
-_ARABIC_HARD_DEPTH_CUE_RE = re.compile(
-    r"(?:ادمج|دمج|عدة\s+خطوات|نتيجة\s+وسيطة|قارن|تحليل\s+خطأ|"
-    r"اشتق|يشتق|اشتقاق|أثبت|اثبت|برهن|استنتج|استنتاج)",
-    flags=re.IGNORECASE,
-)
 _VISUAL_DEPENDENCY_RE = re.compile(
     r"\b(?:image|graph|table|diagram|figure|chart|visual)\b|"
     r"(?:صورة|رسم|جدول|مخطط|بياني|تسميات)|"
@@ -583,7 +569,14 @@ def validate_plans(
                         entry[field] = None
                     identity_complete = bool(entry.get("fitb_entry_id"))
                 else:
+                    preserved_family_id = (
+                        entry.get("task_family_id")
+                        if entry.get("difficulty_adaptation") else None
+                    )
                     identity_complete = apply_canonical_task_ids(entry)
+                    if identity_complete and preserved_family_id:
+                        entry["derived_task_id"] = entry.get("task_id")
+                        entry["task_family_id"] = preserved_family_id
                 metadata_complete = all(
                     entry.get(field)
                     for field in (
@@ -661,9 +654,49 @@ def validate_plans(
                     errors.append(f"Slot {sid} has an invalid difficulty.")
                 elif requested_difficulty in {"easy", "medium", "hard"} and (
                     slot_difficulty != requested_difficulty
+                ) and not entry.get("difficulty_fallback_reason") and (
+                    (entry.get("difficulty_adaptation") or {}).get("status") != "pending"
                 ):
                     errors.append(
                         f"Slot {sid} difficulty must be {requested_difficulty}."
+                    )
+                adaptation_status = str(
+                    (entry.get("difficulty_adaptation") or {}).get("status") or ""
+                )
+                reasoning_depth = str(entry.get("reasoning_depth") or "")
+                requirements = entry.get("reasoning_requirements")
+                prerequisites = entry.get("prerequisites")
+                if reasoning_depth not in {"easy", "medium", "hard"}:
+                    errors.append(f"Slot {sid} has an invalid reasoning_depth.")
+                elif adaptation_status != "pending" and reasoning_depth != slot_difficulty:
+                    errors.append(
+                        f"Slot {sid} difficulty {slot_difficulty!r} does not match its "
+                        f"reasoning_depth {reasoning_depth!r}."
+                    )
+                if not isinstance(requirements, list) or not requirements or any(
+                    not isinstance(value, str) or not value.strip() for value in requirements
+                ):
+                    errors.append(
+                        f"Slot {sid} must define concrete, nonempty reasoning_requirements."
+                    )
+                elif len({value.strip().casefold() for value in requirements}) != len(requirements):
+                    errors.append(f"Slot {sid} repeats a reasoning requirement.")
+                if not isinstance(prerequisites, list) or any(
+                    not isinstance(value, str) or not value.strip() for value in prerequisites
+                ):
+                    errors.append(f"Slot {sid} has invalid prerequisites metadata.")
+                adaptation = entry.get("difficulty_adaptation") or {}
+                if adaptation_status == "adapted" and (
+                    not adaptation.get("changed_reasoning_requirements")
+                    or not adaptation.get("evidence_support")
+                    or not set(map(str, adaptation.get("evidence_support") or [])).issubset({
+                        str(entry.get("source_chunk_id") or ""),
+                        *map(str, entry.get("support_chunk_ids") or []),
+                    })
+                ):
+                    errors.append(
+                        f"Slot {sid} has an adapted difficulty without concrete changed reasoning "
+                        "requirements grounded in its assigned evidence."
                     )
                 idea = str(entry.get("idea_to_test") or "")
                 has_derivation_cue = bool(
@@ -679,18 +712,6 @@ def validate_plans(
                     errors.append(
                         f"Slot {sid} uses derivation_relationship but idea_to_test does not "
                         "ask the student to derive, prove, show, or establish a relationship."
-                    )
-                if slot_difficulty == "hard" and mode in {
-                    "calculation", "law_or_theorem_application", "conceptual_recall",
-                    "conceptual_reasoning", "comparison_prediction",
-                } and not (
-                    _HARD_DEPTH_CUE_RE.search(idea)
-                    or _ARABIC_HARD_DEPTH_CUE_RE.search(idea)
-                ):
-                    errors.append(
-                        f"Slot {sid} is labeled hard without a supported deeper-reasoning "
-                        "operation such as combining ideas, meaningful multi-step work, inference, "
-                        "comparison, derivation, proof, error analysis, or an intermediate conclusion."
                     )
 
         # Reject the same relationship/target/operation across question types.
@@ -871,6 +892,16 @@ def finalize_plans(
                 item.setdefault("slot_id", slot_id(model["model_number"], qtype, index))
                 if not item.get("slot_id"):
                     item["slot_id"] = slot_id(model["model_number"], qtype, index)
+                # Backward compatibility for persisted pre-profile plans and
+                # legacy planner test doubles. Current structured outputs and
+                # catalog tasks provide these fields explicitly.
+                item.setdefault("reasoning_depth", item.get("difficulty") or "medium")
+                item.setdefault("reasoning_requirements", [
+                    item.get("student_work_product")
+                    or item.get("task_operation")
+                    or "complete the assigned operation"
+                ])
+                item.setdefault("prerequisites", [])
                 # IDs are derived state. Recompute them after every initial or
                 # targeted planner result so changed semantics cannot retain a
                 # stale catalog identity. FITB has a separate compiler-owned ID.
@@ -878,7 +909,14 @@ def finalize_plans(
                     for field in CANONICAL_TASK_ID_FIELDS:
                         item[field] = None
                 else:
+                    preserved_family_id = (
+                        item.get("task_family_id")
+                        if item.get("difficulty_adaptation") else None
+                    )
                     apply_canonical_task_ids(item)
+                    if preserved_family_id:
+                        item["derived_task_id"] = item.get("task_id")
+                        item["task_family_id"] = preserved_family_id
             items[qtype] = values
         finalized.append({"model_number": model["model_number"], "items": items})
     return finalized

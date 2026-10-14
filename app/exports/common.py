@@ -116,6 +116,32 @@ def is_complete_equation_prompt(value: object) -> bool:
     return bool(_EQUATION_TASK_RE.search(str(value or "")))
 
 
+def split_equation_content(
+    value: object, *, undelimited_as_math: bool = True
+) -> list[tuple[str, str]]:
+    """Split mixed instruction/display-LaTeX content without exposing delimiters."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    result: list[tuple[str, str]] = []
+    cursor = 0
+    pattern = re.compile(
+        r"\$\$([\s\S]*?)\$\$|\\\[([\s\S]*?)\\\]|"
+        r"\\\(([\s\S]*?)\\\)|(?<!\$)\$([^$\n]+?)\$(?!\$)"
+    )
+    for match in pattern.finditer(text):
+        prose = text[cursor:match.start()].strip()
+        if prose:
+            result.append(("text", prose))
+        math = next((group for group in match.groups() if group is not None), "")
+        result.append(("math", math.strip()))
+        cursor = match.end()
+    tail = text[cursor:].strip()
+    if tail:
+        result.append(("text" if result or not undelimited_as_math else "math", tail))
+    return result
+
+
 def expand_fill_blank_text(text: object, extra: int = 4) -> str:
     """Make printed fill-in blanks easier to write in without changing content."""
     value = str(text or "")

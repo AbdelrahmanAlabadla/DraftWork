@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 from pathlib import Path
 
@@ -113,14 +112,74 @@ def test_deterministic_answer_position_balancing_remains_intact():
 
 
 def test_generation_balances_before_graph_validation_and_repairs_rebalance_before_revalidation():
-    generation_source = inspect.getsource(exam_builder.generate_exams_node)
-    assert generation_source.index("balance_mcq_answer_positions") < generation_source.index(
-        'generated_exams.append'
-    )
-    repair_source = inspect.getsource(validator.repair_invalid_questions)
-    assert repair_source.index("balance_mcq_answer_positions") < repair_source.index(
-        'pending_revalidation[mn] = all_repaired'
-    )
+    questions = {"mcq": [
+        {**_mcq(correct=f"correct-{index}"), "question_id": f"q{index}"}
+        for index in range(4)
+    ]}
+    original_correct_content = {
+        item["question_id"]: item["options"][item["correct_answer"]]
+        for item in questions["mcq"]
+    }
+
+    changed = exam_builder.balance_mcq_answer_positions(questions, 1)
+
+    assert changed == ["q0", "q3", "q1"]
+    assert [item["correct_answer"] for item in questions["mcq"]] == ["B", "D", "A", "C"]
+    assert {
+        item["question_id"]: item["options"][item["correct_answer"]]
+        for item in questions["mcq"]
+    } == original_correct_content
+
+
+def test_ordinary_repair_rebalances_changed_mcq_before_final_acceptance(monkeypatch):
+    questions = {"mcq": []}
+    for index, answer in enumerate(("B", "D", "A", "C")):
+        questions["mcq"].append({
+            "question_id": f"q{index}", "slot_id": f"m1_mcq_{index}",
+            "question": f"Which value answers item {index}?",
+            "options": {label: f"q{index}-{label}" for label in "ABCD"},
+            "correct_answer": answer,
+        })
+    exam = {"model_number": 1, "questions": questions}
+    validation_calls = []
+
+    def fake_validate(exam_value, question_ids, *_args):
+        selected = list(question_ids or [item["question_id"] for item in exam_value["questions"]["mcq"]])
+        validation_calls.append(selected)
+        first_call = len(validation_calls) == 1
+        verdicts = [{
+            "question_id": qid,
+            "action": "FIX_ANSWER" if first_call and qid == "q0" else "PASS",
+            "fields_to_fix": ["answer"] if first_call and qid == "q0" else [],
+            "failure_code": "incorrect_answer" if first_call and qid == "q0" else "pass",
+            "reason": "controlled defect" if first_call and qid == "q0" else "",
+            "expected_fix": "Use the content currently under A" if first_call and qid == "q0" else "",
+        } for qid in selected]
+        return {"model_number": 1, "all_pass": all(v["action"] == "PASS" for v in verdicts),
+                "verdicts": verdicts, "warnings": [], "coverage": []}
+
+    def fake_repair(candidate, _verdicts, **_kwargs):
+        candidate["questions"]["mcq"][0]["correct_answer"] = "A"
+        return {"warnings": [], "sent_ids": ["q0"], "repaired_ids": ["q0"], "failed_ids": []}
+
+    monkeypatch.setattr(validator, "_validate_with_context", fake_validate)
+    monkeypatch.setattr(validator, "repair_exam", fake_repair)
+    state = {
+        "generated_exams": [exam], "plans": [], "validation_reports": [],
+        "validated_models": [], "question_repair_attempts": {},
+        "pending_revalidation_ids": {}, "warnings": [],
+    }
+
+    state.update(validator.validate_generated_questions(state))
+    state.update(validator.repair_invalid_questions(state))
+    state.update(validator.validate_generated_questions(state))
+
+    repaired = state["generated_exams"][0]["questions"]["mcq"][0]
+    assert [item["correct_answer"] for item in state["generated_exams"][0]["questions"]["mcq"]] == [
+        "B", "D", "A", "C",
+    ]
+    assert repaired["options"][repaired["correct_answer"]] == "q0-A"
+    assert validation_calls == [["q0", "q1", "q2", "q3"], ["q0"], ["q0"]]
 
 
 def test_mcq_prompt_preserves_catalog_assessment_identity():

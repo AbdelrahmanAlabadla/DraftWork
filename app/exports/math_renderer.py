@@ -125,6 +125,10 @@ def _normalize_clause(clause: str) -> str:
 def to_mathtext(source: object) -> str:
     """Return normalized math syntax without display delimiters."""
     text = str(source or "").strip()
+    if text.startswith(r"\[") and text.endswith(r"\]"):
+        text = text[2:-2].strip()
+    elif text.startswith("$$") and text.endswith("$$"):
+        text = text[2:-2].strip()
     if not text:
         return ""
     clauses = [part for part in re.split(r"\s*[؛;]\s*", text) if part.strip()]
@@ -136,6 +140,94 @@ def render_math(source: object, *, font_size: float = 13.0, dpi: int = 220) -> R
     mathtext = to_mathtext(source)
     if not mathtext:
         return None
+    matrix = re.fullmatch(
+        r"(.*?)\\begin\{(?:bmatrix|pmatrix|matrix)\}([\s\S]+?)"
+        r"\\end\{(?:bmatrix|pmatrix|matrix)\}", mathtext.strip()
+    )
+    if matrix:
+        rows = [row.strip() for row in re.split(r"\\\\", matrix.group(2)) if row.strip()]
+        cells = [[cell.strip() for cell in row.split("&")] for row in rows]
+        if cells and len({len(row) for row in cells}) == 1:
+            rendered_cells = [
+                [render_math(cell, font_size=font_size, dpi=dpi) for cell in row]
+                for row in cells
+            ]
+            if all(all(row) for row in rendered_cells):
+                try:
+                    images = [[Image.open(io.BytesIO(cell.png)).convert("RGBA") for cell in row]
+                              for row in rendered_cells]
+                    col_widths = [max(row[col].width for row in images)
+                                  for col in range(len(images[0]))]
+                    row_heights = [max(cell.height for cell in row) for row in images]
+                    gap = max(8, int(dpi / 24))
+                    bracket = max(8, int(dpi / 28))
+                    prefix = render_math(matrix.group(1), font_size=font_size, dpi=dpi) \
+                        if matrix.group(1).strip() else None
+                    prefix_image = Image.open(io.BytesIO(prefix.png)).convert("RGBA") if prefix else None
+                    grid_w = sum(col_widths) + gap * (len(col_widths) - 1)
+                    grid_h = sum(row_heights) + gap * (len(row_heights) - 1)
+                    prefix_w = (prefix_image.width + gap) if prefix_image else 0
+                    canvas = Image.new("RGBA", (prefix_w + grid_w + 2 * bracket, grid_h),
+                                       (255, 255, 255, 0))
+                    if prefix_image:
+                        canvas.alpha_composite(prefix_image, (0, (grid_h - prefix_image.height) // 2))
+                    x0 = prefix_w + bracket
+                    y = 0
+                    for row_index, row in enumerate(images):
+                        x = x0
+                        for col_index, image in enumerate(row):
+                            canvas.alpha_composite(
+                                image,
+                                (x + (col_widths[col_index] - image.width) // 2,
+                                 y + (row_heights[row_index] - image.height) // 2),
+                            )
+                            x += col_widths[col_index] + gap
+                        y += row_heights[row_index] + gap
+                    from PIL import ImageDraw
+                    draw = ImageDraw.Draw(canvas)
+                    left, right = prefix_w + 1, prefix_w + bracket + grid_w + bracket - 2
+                    line = max(2, int(dpi / 110))
+                    for bx, direction in ((left, 1), (right, -1)):
+                        draw.line((bx, 0, bx, grid_h - 1), fill="#1f2937", width=line)
+                        draw.line((bx, 0, bx + direction * bracket, 0), fill="#1f2937", width=line)
+                        draw.line((bx, grid_h - 1, bx + direction * bracket, grid_h - 1),
+                                  fill="#1f2937", width=line)
+                    output = io.BytesIO()
+                    canvas.save(output, format="PNG")
+                    return RenderedMath(output.getvalue(), canvas.width, canvas.height)
+                except Exception:
+                    return None
+    cases = re.fullmatch(
+        r"\\begin\{cases\}([\s\S]+?)\\end\{cases\}", mathtext.strip()
+    )
+    if cases:
+        rows = [row.strip() for row in re.split(r"\\\\", cases.group(1)) if row.strip()]
+        rendered_rows = [render_math(row, font_size=font_size, dpi=dpi) for row in rows]
+        if rows and all(rendered_rows):
+            try:
+                from matplotlib.font_manager import FontProperties, findfont
+                from PIL import ImageDraw, ImageFont
+
+                images = [Image.open(io.BytesIO(row.png)).convert("RGBA") for row in rendered_rows]
+                gap = max(4, int(dpi / 55))
+                brace_width = max(20, int(font_size * dpi / 72 * 0.8))
+                width = brace_width + max(image.width for image in images)
+                height = sum(image.height for image in images) + gap * (len(images) - 1)
+                canvas = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+                y = 0
+                for image in images:
+                    canvas.alpha_composite(image, (brace_width, y))
+                    y += image.height + gap
+                draw = ImageDraw.Draw(canvas)
+                font_path = findfont(FontProperties(family="DejaVu Sans"))
+                brace_font = ImageFont.truetype(font_path, max(18, int(height * 0.92)))
+                draw.text((0, height / 2), "{", font=brace_font, fill="#1f2937",
+                          anchor="lm")
+                output = io.BytesIO()
+                canvas.save(output, format="PNG")
+                return RenderedMath(png=output.getvalue(), width_px=width, height_px=height)
+            except Exception:
+                return None
     try:
         from matplotlib.font_manager import FontProperties
         from matplotlib.mathtext import math_to_image

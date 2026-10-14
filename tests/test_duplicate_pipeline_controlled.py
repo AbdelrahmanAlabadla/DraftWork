@@ -172,21 +172,39 @@ def test_controlled_12_question_correctness_then_grouped_duplicate_flow(monkeypa
     state.update(duplicate_pipeline.scan_exam_duplicates(state))
     assert len(state["pending_duplicate_groups"]) == 2
     assert state["duplicate_similarity_distributions"][0]["pair_count"] == 66
+    answer_positions_before_repair = {
+        item["question_id"]: item["correct_answer"]
+        for item in state["generated_exams"][0]["questions"]["mcq"]
+    }
     state.update(duplicate_pipeline.repair_duplicate_groups(state))
     reserved = [event["task_id"] for event in state["duplicate_repair_history"]
                 if event.get("status") == "replaced"]
     replaced_ids = {event["question_id"] for event in state["duplicate_repair_history"]
                     if event.get("status") == "replaced"}
     assert len(reserved) == len(set(reserved)) == 2
-    assert state["duplicate_repair_rounds"] == 1
+    assert state["duplicate_repair_rounds"] == 0
+    assert state["duplicate_verification_pending"] is True
+    assert state["duplicate_verification_attempt"] == 1
     assert set(state["duplicate_replacement_attempts"].values()) == {1}
+    answer_positions_after_repair = {
+        item["question_id"]: item["correct_answer"]
+        for item in state["generated_exams"][0]["questions"]["mcq"]
+    }
+    balanced_ids = {
+        qid for qid, answer in answer_positions_after_repair.items()
+        if answer_positions_before_repair.get(qid) != answer
+    }
+    affected_ids = replaced_ids | balanced_ids
+    assert set(state["pending_revalidation_ids"][1]) == affected_ids
 
     state.update(validator.validate_generated_questions(state))
-    assert set(validation_calls[-1]) == replaced_ids
+    assert set(validation_calls[-1]) == affected_ids
     state.update(duplicate_pipeline.scan_exam_duplicates(state))
     assert state["pending_duplicate_groups"] == []
     assert state["invalid_questions"] == []
     assert judge_calls == 2
+    assert state["duplicate_repair_rounds"] == 1
+    assert state["duplicate_verification_pending"] is False
 
 
 def _plan_item_by_slot(plans: list[dict], slot_id: str) -> dict:
@@ -426,6 +444,7 @@ def test_failed_original_regeneration_advances_to_other_used_task(monkeypatch):
 def test_final_scan_exhaustion_marks_and_preserves_missing_slot(monkeypatch):
     from app.online.exam_builder import assemble_exams_node
 
+    monkeypatch.setattr(duplicate_pipeline.config, "MAX_DUPLICATE_REPAIR_ROUNDS", 2)
     exam = {"model_number": 1, "questions": {"why": [
         _sa("q1", "Define A", "A"), _sa("q2", "Define A again", "A"),
     ]}}
@@ -481,15 +500,251 @@ def test_slot_attempt_limit_is_independent_from_optional_third_global_round(monk
         ]}],
         "duplicate_reports": [], "duplicate_similarity_distributions": [],
         "duplicate_repair_rounds": 2,
-        "duplicate_replacement_attempts": {"1:s_q2": 2},
+        "duplicate_replacement_attempts": {"1:s_q2": 3},
         "duplicate_scan_count": 2, "invalid_questions": [], "warnings": [],
     }
 
     state.update(duplicate_pipeline.scan_exam_duplicates(state))
 
     assert state["pending_duplicate_groups"] == []
-    assert [item["question_id"] for item in state["invalid_questions"]] == ["q2"]
-    assert state["invalid_questions"][0]["exhausted_by"] == "slot_attempt_limit"
+    assert state["invalid_questions"] == []
+    assert [item["question_id"] for item in exam["questions"]["why"]] == ["q1", "q2"]
+    assert state["duplicate_repair_history"][-1]["status"] == "duplicate_repair_exhausted_kept"
+    assert state["unresolved_duplicate_conflicts"]
+
+
+def test_third_attempt_uses_numeric_variation_then_skips_duplicate_recheck(monkeypatch):
+    from app.online.graph import _route_after_validation
+
+    original = {
+        "question_id": "q2", "slot_id": "s_q2",
+        "equation": r"Solve: \[2x+5=15\]",
+        "solution_steps": ["2x=10", "x=5"], "final_answer": "x=5",
+    }
+    conflict = {
+        "question_id": "q1", "slot_id": "s_q1",
+        "equation": r"Solve: \[2x+5=15\]",
+        "solution_steps": ["2x=10", "x=5"], "final_answer": "x=5",
+    }
+    exam = {"model_number": 1, "questions": {"equation": [conflict, original]}}
+    captured = {}
+
+    def numeric(_state, _exam, model, qid, conflict_ids, edges):
+        captured.update(model=model, qid=qid, conflict_ids=conflict_ids, edges=edges)
+        return ({
+            **original,
+            "equation": r"Solve: \[4x+7=27\]",
+            "solution_steps": ["4x=20", "x=5"], "final_answer": "x=5",
+        }, [])
+
+    monkeypatch.setattr(duplicate_pipeline, "_numeric_variation_fallback", numeric)
+    monkeypatch.setattr(
+        duplicate_pipeline, "_candidate_pool",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("attempt 3 selected a catalog task")),
+    )
+    edge = {"left": "q1", "right": "q2", "classification": "duplicate"}
+    result = duplicate_pipeline.repair_duplicate_groups({
+        "generated_exams": [exam], "plans": [{"model_number": 1, "items": {"equation": [{
+            "slot_id": "s_q2", "task_id": "t2", "idea_to_test": "solve a linear equation",
+            "reasoning_mode": "symbolic_manipulation", "difficulty": "easy",
+        }]}}],
+        "pending_duplicate_groups": [{
+            "model_number": 1, "question_ids": ["q1", "q2"],
+            "keep_question_ids": ["q1"], "replace_question_ids": ["q2"], "edges": [edge],
+        }],
+        "duplicate_repair_rounds": 2,
+        "duplicate_replacement_attempts": {"1:s_q2": 2},
+        "pending_revalidation_ids": {}, "validated_models": [1],
+        "duplicate_repair_history": [], "warnings": [],
+    })
+
+    repaired = result["generated_exams"][0]["questions"]["equation"][1]
+    assert captured == {"model": 1, "qid": "q2", "conflict_ids": ["q1"], "edges": [edge]}
+    assert repaired["question_id"] == "q2"
+    assert repaired["duplicate_repair_attempt"] == 3
+    assert repaired["duplicate_repair_mode"] == "numeric_variation_fallback"
+    assert repaired["duplicate_conflict_with"] == "q1"
+    assert repaired["numeric_variant"] is True
+    assert repaired["duplicate_recheck_required"] is False
+    assert result["pending_revalidation_ids"] == {1: ["q2"]}
+    assert result["duplicate_repair_rounds"] == 3
+    assert result["duplicate_verification_pending"] is False
+    assert result["duplicate_judge_exempt_ids"] == ["q2"]
+    assert _route_after_validation({
+        "repair_manifest": [],
+        "duplicate_repair_finalization_pending": True,
+    }) == "assemble_exams"
+
+
+def test_third_attempt_keeps_nonnumeric_definition_without_calling_numeric_agent(monkeypatch):
+    from app.online.graph import _route_after_validation
+
+    exam = {"model_number": 1, "questions": {"definition": [
+        {"question_id": "q1", "slot_id": "s1", "term": "osmosis",
+         "reference_answer": "Movement of water through a membrane."},
+        {"question_id": "q2", "slot_id": "s2", "term": "osmosis",
+         "reference_answer": "Movement of water through a membrane."},
+    ]}}
+    monkeypatch.setattr(
+        duplicate_pipeline, "_numeric_variation_fallback",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("numeric agent was called")),
+    )
+    group = {
+        "model_number": 1, "group_id": "definitions", "question_ids": ["q1", "q2"],
+        "keep_question_ids": ["q1"], "replace_question_ids": ["q2"],
+        "edges": [{"left": "q1", "right": "q2", "classification": "duplicate"}],
+    }
+    result = duplicate_pipeline.repair_duplicate_groups({
+        "generated_exams": [exam],
+        "plans": [{"model_number": 1, "items": {"definition": [
+            {"slot_id": "s1", "task_id": "t1"}, {"slot_id": "s2", "task_id": "t2"},
+        ]}}],
+        "pending_duplicate_groups": [group], "duplicate_repair_rounds": 2,
+        "duplicate_replacement_attempts": {"1:s2": 2},
+        "pending_revalidation_ids": {}, "validated_models": [1],
+        "duplicate_repair_history": [], "warnings": [],
+    })
+
+    assert len(result["generated_exams"][0]["questions"]["definition"]) == 2
+    assert result["duplicate_replacement_attempts"]["1:s2"] == 3
+    assert result["duplicate_repair_rounds"] == 3
+    assert result["pending_revalidation_ids"] == {}
+    assert result["duplicate_repair_history"][-1]["status"] == "numeric_variation_not_applicable_kept"
+    assert result["unresolved_duplicate_conflicts"] == [group]
+    assert result["duplicate_repair_finalization_pending"] is True
+    assert _route_after_validation({
+        "repair_manifest": [], "duplicate_repair_finalization_pending": True,
+    }) == "assemble_exams"
+
+
+def test_final_allowed_replacement_verification_clears_stale_conflict(monkeypatch):
+    calls = []
+    monkeypatch.setattr(duplicate_pipeline.config, "MAX_DUPLICATE_REPAIR_ROUNDS", 3)
+    monkeypatch.setattr(
+        duplicate_pipeline,
+        "review_duplicate_candidates",
+        lambda _exam: calls.append(True) or {
+            "candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
+            "similarity_distribution": {"question_count": 2, "pair_count": 1},
+            "usage": {},
+        },
+    )
+    exam = {"model_number": 1, "questions": {"why": [
+        _sa("q1", "Explain energy conservation.", "Energy remains constant."),
+        _sa("q2", "Explain power.", "Power is the rate of energy transfer."),
+    ]}}
+    stale = {"model_number": 1, "group_id": "old", "question_ids": ["q1", "q2"]}
+    passes = [{"question_id": qid, "action": "PASS"} for qid in ("q1", "q2")]
+
+    result = duplicate_pipeline.scan_exam_duplicates({
+        "generated_exams": [exam],
+        "validation_reports": [{"model_number": 1, "all_pass": True, "verdicts": passes}],
+        "duplicate_reports": [{"model_number": 1, "duplicate_groups": [stale]}],
+        "duplicate_similarity_distributions": [], "duplicate_scan_count": 3,
+        "duplicate_repair_rounds": 2,
+        "duplicate_verification_pending": True,
+        "duplicate_verification_attempt": 3,
+        "unresolved_duplicate_conflicts": [stale],
+        "pending_duplicate_groups": [], "invalid_questions": [], "warnings": [],
+    })
+
+    assert calls == [True]
+    assert result["duplicate_repair_rounds"] == 3
+    assert result["duplicate_verification_pending"] is False
+    assert result["pending_duplicate_groups"] == []
+    assert result["unresolved_duplicate_conflicts"] == []
+
+
+def test_final_allowed_replacement_verification_persists_exact_conflict(monkeypatch):
+    calls = []
+    monkeypatch.setattr(duplicate_pipeline.config, "MAX_DUPLICATE_REPAIR_ROUNDS", 3)
+    exact_group = {
+        "group_id": "final", "question_ids": ["q1", "q2"],
+        "keep_question_ids": ["q1"], "replace_question_ids": ["q2"],
+        "edges": [{"left": "q1", "right": "q2", "classification": "duplicate"}],
+    }
+    monkeypatch.setattr(
+        duplicate_pipeline,
+        "review_duplicate_candidates",
+        lambda _exam: calls.append(True) or {
+            "candidate_pairs": [], "pair_verdicts": [],
+            "duplicate_groups": [exact_group],
+            "similarity_distribution": {"question_count": 2, "pair_count": 1},
+            "usage": {},
+        },
+    )
+    exam = {"model_number": 1, "questions": {"why": [
+        _sa("q1", "Explain energy conservation.", "Energy remains constant."),
+        _sa("q2", "Restate energy conservation.", "Energy remains constant."),
+    ]}}
+    passes = [{"question_id": qid, "action": "PASS"} for qid in ("q1", "q2")]
+
+    result = duplicate_pipeline.scan_exam_duplicates({
+        "generated_exams": [exam],
+        "validation_reports": [{"model_number": 1, "all_pass": True, "verdicts": passes}],
+        "duplicate_reports": [], "duplicate_similarity_distributions": [],
+        "duplicate_scan_count": 3, "duplicate_repair_rounds": 2,
+        "duplicate_verification_pending": True,
+        "duplicate_verification_attempt": 3,
+        "pending_duplicate_groups": [], "invalid_questions": [], "warnings": [],
+        "assessment_catalog": {"tasks": [_task("unused", "why")]},
+    })
+
+    assert calls == [True]
+    assert result["duplicate_repair_rounds"] == 3
+    assert result["pending_duplicate_groups"] == []
+    assert result["unresolved_duplicate_conflicts"] == [
+        {"model_number": 1, **exact_group}
+    ]
+    assert len(result["generated_exams"][0]["questions"]["why"]) == 2
+
+
+def test_duplicate_verification_completes_exactly_three_attempts(monkeypatch):
+    calls = []
+    monkeypatch.setattr(duplicate_pipeline.config, "MAX_DUPLICATE_REPAIR_ROUNDS", 3)
+    monkeypatch.setattr(duplicate_pipeline.config, "MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT", 3)
+    conflict = {
+        "group_id": "persistent", "question_ids": ["q1", "q2"],
+        "keep_question_ids": ["q1"], "replace_question_ids": ["q2"],
+        "edges": [{"left": "q1", "right": "q2", "classification": "duplicate"}],
+    }
+    monkeypatch.setattr(
+        duplicate_pipeline,
+        "review_duplicate_candidates",
+        lambda _exam: calls.append(True) or {
+            "candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [conflict],
+            "similarity_distribution": {"question_count": 2, "pair_count": 1},
+            "usage": {},
+        },
+    )
+    exam = {"model_number": 1, "questions": {"why": [
+        _sa("q1", "Explain energy conservation.", "Energy remains constant."),
+        _sa("q2", "Restate energy conservation.", "Energy remains constant."),
+    ]}}
+    passes = [{"question_id": qid, "action": "PASS"} for qid in ("q1", "q2")]
+    state = {
+        "generated_exams": [exam],
+        "validation_reports": [{"model_number": 1, "all_pass": True, "verdicts": passes}],
+        "duplicate_reports": [], "duplicate_similarity_distributions": [],
+        "duplicate_scan_count": 0, "duplicate_repair_rounds": 0,
+        "duplicate_replacement_attempts": {}, "pending_duplicate_groups": [],
+        "invalid_questions": [], "warnings": [],
+    }
+
+    for attempt in (1, 2, 3):
+        state["duplicate_verification_pending"] = True
+        state["duplicate_verification_attempt"] = attempt
+        state.update(duplicate_pipeline.scan_exam_duplicates(state))
+        assert state["duplicate_repair_rounds"] == attempt
+        if attempt < 3:
+            assert state["pending_duplicate_groups"]
+            assert state["unresolved_duplicate_conflicts"] == []
+
+    assert calls == [True, True, True]
+    assert state["pending_duplicate_groups"] == []
+    assert state["unresolved_duplicate_conflicts"] == [
+        {"model_number": 1, **conflict}
+    ]
 
 
 def test_compact_selector_rejects_unused_semantic_collision(monkeypatch):

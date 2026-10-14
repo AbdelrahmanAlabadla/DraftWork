@@ -22,8 +22,10 @@ def test_legacy_generate_endpoint_is_retired():
 
 
 def test_async_exam_job_route_is_the_supported_entry_path():
-    paths = {route.path for route in app.routes}
-    assert "/api/v1/documents/{document_id}/exam-jobs" in paths
+    operation = app.openapi()["paths"][
+        "/api/v1/documents/{document_id}/exam-jobs"
+    ]["post"]
+    assert operation["operationId"].startswith("create_exam_job_")
 
 
 def test_async_payload_uses_canonical_question_types():

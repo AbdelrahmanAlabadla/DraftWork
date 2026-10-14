@@ -39,6 +39,12 @@ class ExamState(TypedDict):
     unrepairable_plan_slots: list[dict[str, Any]]  # omitted slots with repair reasons
     plan_review_history: list[dict[str, Any]]
     plan_review_attempts: int
+    plan_review_retry_required: bool
+    plan_review_rechecks: int
+    plan_duplicate_repair_attempts: dict[str, int]
+    unresolved_plan_duplicate_conflicts: list[dict[str, Any]]
+    difficulty_adjustment_history: list[dict[str, Any]]
+    difficulty_adjustment_attempts: dict[str, int]
     # --- Generation -----------------------------------------------------
     generated_exams: list[dict[str, Any]]  # one result per model, accumulates cross-model memory
     rejection_feedback: Optional[str]
@@ -63,6 +69,11 @@ class ExamState(TypedDict):
     duplicate_similarity_distributions: list[dict[str, Any]]
     pending_duplicate_groups: list[dict[str, Any]]
     duplicate_repair_rounds: int  # complete exam-wide scan/repair cycles already used
+    duplicate_judge_exempt_ids: list[str]  # validated attempt-three numeric variants
+    duplicate_numeric_fallback_pending_validation: bool
+    duplicate_repair_finalization_pending: bool
+    duplicate_verification_pending: bool  # replacement awaits post-validation Duplicate Judge
+    duplicate_verification_attempt: int  # full attempt completed by that verification
     duplicate_replacement_attempts: dict[str, int]  # "model:slot" -> replacements tried
     duplicate_candidate_blacklist: dict[str, list[str]]
     duplicate_replacement_failures: dict[str, list[dict[str, Any]]]
@@ -83,6 +94,7 @@ _AUDIT_NODE_EVENTS = {
     "prepare_assessment_catalog": ("planning", "assessment_catalog_compiled"),
     "plan_exams": ("planning", "plan_completed"),
     "repair_plan": ("planning", "plan_repaired"),
+    "adjust_plan_difficulty": ("difficulty_adjustment", "difficulty_adjustment_completed"),
     "review_plan": ("plan_review", "plan_review_completed"),
     "generate_exams_node": ("generation", "questions_generated"),
     "validate_generated_questions": ("general_validation", "validation_completed"),
@@ -136,6 +148,13 @@ def _audit_node_output(
 def _with_progress(node, stage: str, progress: int, *, after_repair: bool = False):
     """Report the real graph step before running a node."""
     def wrapped(state: ExamState):
+        from app.llm.factory import (
+            reset_online_assessment_domain,
+            set_online_assessment_domain,
+        )
+        domain_token = set_online_assessment_domain(
+            (state.get("assessment_profile") or {}).get("domain")
+        )
         callback = state.get("progress_callback")
         if callback:
             current_stage = stage
@@ -169,6 +188,8 @@ def _with_progress(node, stage: str, progress: int, *, after_repair: bool = Fals
                     diagnostic["stage"], "stage_exception", diagnostic
                 )
             raise
+        finally:
+            reset_online_assessment_domain(domain_token)
         from app.online.lifecycle import reconcile_slot_lifecycle
         merged_state = {**state, **result}
         result["slot_lifecycle"] = reconcile_slot_lifecycle(
@@ -187,6 +208,7 @@ def build_exam_graph() -> StateGraph:
     from app.online.assessment_catalog import prepare_assessment_catalog
     from app.online.planner import plan_exams, repair_plan
     from app.online.plan_review import review_plan
+    from app.online.difficulty_adjustment import adjust_plan_difficulty
     from app.online.exam_builder import generate_exams_node, assemble_exams_node
     from app.online.receive import receive_request
     from app.online.validator import (
@@ -205,6 +227,9 @@ def build_exam_graph() -> StateGraph:
     )
     builder.add_node("plan_exams", _with_progress(plan_exams, "planning_exam", 25))
     builder.add_node("repair_plan", _with_progress(repair_plan, "planning_exam", 25))
+    builder.add_node("adjust_plan_difficulty", _with_progress(
+        adjust_plan_difficulty, "adjusting_difficulty", 30
+    ))
     builder.add_node("review_plan", _with_progress(review_plan, "reviewing_plan", 35))
     builder.add_node("generate_exams", _with_progress(generate_exams_node, "generating_exam", 50))
     builder.add_node(
@@ -237,14 +262,23 @@ def build_exam_graph() -> StateGraph:
     builder.add_conditional_edges(
         "plan_exams",
         _route_after_plan,
-        {"repair_plan": "repair_plan", "review_plan": "review_plan"},
+        {"repair_plan": "repair_plan", "adjust_plan_difficulty": "adjust_plan_difficulty", "review_plan": "review_plan"},
     )
     builder.add_conditional_edges(
         "repair_plan",
         _route_after_plan,
-        {"repair_plan": "repair_plan", "review_plan": "review_plan"},
+        {"repair_plan": "repair_plan", "adjust_plan_difficulty": "adjust_plan_difficulty", "review_plan": "review_plan"},
     )
-    builder.add_edge("review_plan", "generate_exams")
+    builder.add_edge("adjust_plan_difficulty", "review_plan")
+    builder.add_conditional_edges(
+        "review_plan",
+        _route_after_plan_review,
+        {
+            "adjust_plan_difficulty": "adjust_plan_difficulty",
+            "review_plan": "review_plan",
+            "generate_exams": "generate_exams",
+        },
+    )
     builder.add_edge("generate_exams", "validate_generated_questions")
     builder.add_conditional_edges(
         "validate_generated_questions",
@@ -252,6 +286,7 @@ def build_exam_graph() -> StateGraph:
         {
             "repair_invalid_questions": "repair_invalid_questions",
             "scan_exam_duplicates": "scan_exam_duplicates",
+            "assemble_exams": "assemble_exams",
         },
     )
     builder.add_edge("repair_invalid_questions", "validate_generated_questions")
@@ -279,7 +314,28 @@ def _route_after_plan(state: ExamState) -> str:
         and (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
     ):
         return "repair_plan"
+    if any(
+        (item.get("difficulty_adaptation") or {}).get("status") == "pending"
+        for plan in state.get("plans") or []
+        for values in (plan.get("items") or {}).values()
+        for item in values or []
+    ):
+        return "adjust_plan_difficulty"
     return "review_plan"
+
+
+def _route_after_plan_review(state: ExamState) -> str:
+    """Send reviewer-confirmed difficulty mismatches to the dedicated adjuster."""
+    if state.get("plan_review_retry_required"):
+        return "review_plan"
+    if any(
+        (item.get("difficulty_adaptation") or {}).get("status") == "pending"
+        for plan in state.get("plans") or []
+        for values in (plan.get("items") or {}).values()
+        for item in values or []
+    ):
+        return "adjust_plan_difficulty"
+    return "generate_exams"
 
 
 def _route_after_validation(state: ExamState) -> str:
@@ -298,6 +354,8 @@ def _route_after_validation(state: ExamState) -> str:
         for report in state.get("validation_reports") or []:
             if any(v.get("action") in REPAIR_ACTIONS for v in report.get("verdicts") or []):
                 return "repair_invalid_questions"
+    if state.get("duplicate_repair_finalization_pending"):
+        return "assemble_exams"
     return "scan_exam_duplicates"
 
 

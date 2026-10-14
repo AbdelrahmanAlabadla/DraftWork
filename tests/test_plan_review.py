@@ -63,7 +63,21 @@ def _state(catalog_tasks: list[dict], planned_tasks: list[dict]) -> dict:
     }
 
 
-def _response(task_id: str, *, slot_id: str = "m1_mcq_2", selection_type: str = "unused_task") -> dict:
+def _difficulty_verdicts(*slot_ids: str) -> list[dict]:
+    return [{
+        "slot_id": slot_id,
+        "claimed_difficulty": "medium",
+        "achieved_difficulty": "medium",
+        "reasoning_profile_supported": True,
+        "evidence_support_sufficient": True,
+        "reason": "The assigned evidence supports the stated cognitive work.",
+    } for slot_id in slot_ids]
+
+
+def _response(
+    task_id: str, *, slot_id: str = "m1_mcq_2", selection_type: str = "unused_task",
+    reviewed_slot_ids: tuple[str, ...] = ("m1_mcq_1", "m1_mcq_2"),
+) -> dict:
     reused = selection_type == "intentional_reuse"
     return {
         "verdicts": [{
@@ -86,6 +100,7 @@ def _response(task_id: str, *, slot_id: str = "m1_mcq_2", selection_type: str = 
                 "reference_slot_ids": ["m1_mcq_1"],
             }] if reused else []),
         }],
+        "difficulty_verdicts": _difficulty_verdicts(*reviewed_slot_ids),
     }
 
 
@@ -111,7 +126,7 @@ def test_agent_applies_valid_unused_task_and_preserves_canonical_identity(monkey
     before_slots = [
         item["slot_id"] for item in state["plans"][0]["items"]["mcq"]
     ]
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(
         plan_review, "request_structured", lambda *_args, **_kwargs: _response(interpret["task_id"])
     )
@@ -157,7 +172,7 @@ def test_invalid_suggestion_retries_once_with_exact_rejection_reason(monkeypatch
         prompts.append(prompt)
         return next(responses)
 
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(plan_review, "request_structured", fake_request)
 
     result = plan_review.review_plan(state)
@@ -175,7 +190,7 @@ def test_two_invalid_suggestions_use_ranked_deterministic_fallback(monkeypatch):
         _response(interpret["task_id"], selection_type="intentional_reuse"),
         _response("task_missing"),
     ])
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(
         plan_review, "request_structured", lambda *_args, **_kwargs: next(responses)
     )
@@ -192,25 +207,31 @@ def test_two_invalid_suggestions_use_ranked_deterministic_fallback(monkeypatch):
 def test_fallback_does_not_reuse_the_directly_conflicting_task(monkeypatch):
     repeated, _interpret, _compare = _catalog_fixture()
     state = _state([repeated], [repeated, repeated])
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(
         plan_review, "request_structured", lambda *_args, **_kwargs: _response("task_missing")
     )
 
-    with pytest.raises(RuntimeError, match="Plan Review produced an invalid plan"):
-        plan_review.review_plan(deepcopy(state))
+    result = plan_review.review_plan(deepcopy(state))
+    repaired = result["plans"][0]["items"]["mcq"][1]
+    assert repaired["task_id"] == repeated["task_id"]
+    assert repaired["slot_id"] == "m1_mcq_2"
+    assert repaired["plan_duplicate_repair_attempt"] == 1
+    assert repaired["plan_duplicate_repair_mode"] == "targeted_semantic_repair"
+    assert result["plan_review_retry_required"] is True
 
 
 def test_intentional_reuse_uses_nonconflicting_least_used_task_and_reaches_generator(monkeypatch):
     repeated, interpret, _compare = _catalog_fixture()
     state = _state([repeated, interpret], [repeated, repeated, interpret])
     response = _response(
-        interpret["task_id"], slot_id="m1_mcq_2", selection_type="intentional_reuse"
+        interpret["task_id"], slot_id="m1_mcq_2", selection_type="intentional_reuse",
+        reviewed_slot_ids=("m1_mcq_1", "m1_mcq_2", "m1_mcq_3"),
     )
     response["suggestions"][0]["required_instance_distinctions"][0][
         "reference_slot_ids"
     ] = ["m1_mcq_3"]
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(plan_review, "request_structured", lambda *_args, **_kwargs: response)
 
     result = plan_review.review_plan(state)
@@ -238,7 +259,7 @@ def test_plan_review_rejects_conflicting_slots_exact_task_before_apply(monkeypat
     )
     responses = iter([bad, bad])
     prompts_seen = []
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(
         plan_review, "request_structured",
         lambda _client, prompt, **_kwargs: prompts_seen.append(prompt) or next(responses),
@@ -298,10 +319,13 @@ def test_semantically_distinct_plan_is_still_reviewed_as_a_whole(monkeypatch):
     state = _state([repeated, interpret], [repeated, interpret])
 
     calls = []
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(
         plan_review, "request_structured",
-        lambda *_args, **_kwargs: calls.append(True) or {"verdicts": [], "suggestions": []},
+        lambda *_args, **_kwargs: calls.append(True) or {
+            "verdicts": [], "suggestions": [],
+            "difficulty_verdicts": _difficulty_verdicts("m1_mcq_1", "m1_mcq_2"),
+        },
     )
     result = plan_review.review_plan(state)
 
@@ -311,6 +335,60 @@ def test_semantically_distinct_plan_is_still_reviewed_as_a_whole(monkeypatch):
         item["plan_review_status"] == "clear"
         for item in result["plans"][0]["items"]["mcq"]
     )
+
+
+def test_plan_review_passes_stem_domain_and_45000_output_limit(monkeypatch):
+    repeated, interpret, _compare = _catalog_fixture()
+    state = _state([repeated, interpret], [repeated, interpret])
+    state["assessment_profile"] = {"domain": "STEM"}
+    received: dict = {}
+
+    def fake_client(*, domain=None):
+        received["domain"] = domain
+        return object()
+
+    def fake_request(_client, _prompt, **kwargs):
+        received["max_tokens"] = kwargs["max_tokens"]
+        return {
+            "verdicts": [], "suggestions": [],
+            "difficulty_verdicts": _difficulty_verdicts("m1_mcq_1", "m1_mcq_2"),
+        }
+
+    monkeypatch.setattr(plan_review, "create_plan_review_client", fake_client)
+    monkeypatch.setattr(plan_review, "request_structured", fake_request)
+
+    result = plan_review.review_plan(state)
+
+    assert result["plan_errors"] == []
+    assert received == {"domain": "STEM", "max_tokens": 45000}
+
+
+def test_plan_reviewer_routes_false_difficulty_to_adjustment(monkeypatch):
+    repeated, interpret, _compare = _catalog_fixture()
+    state = _state([repeated, interpret], [repeated, interpret])
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
+    monkeypatch.setattr(plan_review, "request_structured", lambda *_args, **_kwargs: {
+        "verdicts": [], "suggestions": [],
+        "difficulty_verdicts": [
+            {
+                "slot_id": "m1_mcq_1", "claimed_difficulty": "medium",
+                "achieved_difficulty": "easy", "reasoning_profile_supported": True,
+                "evidence_support_sufficient": True,
+                "reason": "The task requires only direct recall from the assigned source.",
+            },
+            {
+                "slot_id": "m1_mcq_2", "claimed_difficulty": "medium",
+                "achieved_difficulty": "medium", "reasoning_profile_supported": True,
+                "evidence_support_sufficient": True,
+                "reason": "The task requires source-supported interpretation.",
+            },
+        ],
+    })
+    result = plan_review.review_plan(state)
+    first = result["plans"][0]["items"]["mcq"][0]
+    assert first["actual_difficulty"] == "easy"
+    assert first["difficulty_adaptation"]["status"] == "pending"
+    assert any(event["status"] == "difficulty_mismatch" for event in result["plan_review_history"])
 
 
 def test_fitb_cannot_reuse_the_directly_conflicting_entry(monkeypatch):
@@ -349,9 +427,198 @@ def test_fitb_cannot_reuse_the_directly_conflicting_entry(monkeypatch):
                 "reference_slot_ids": ["m1_fill_in_the_blank_1"],
             }],
         }],
+        "difficulty_verdicts": [
+            {
+                "slot_id": "m1_fill_in_the_blank_1", "claimed_difficulty": "medium",
+                "achieved_difficulty": "medium", "reasoning_profile_supported": True,
+                "evidence_support_sufficient": True, "reason": "Supported recall task.",
+            },
+            {
+                "slot_id": "m1_fill_in_the_blank_2", "claimed_difficulty": "medium",
+                "achieved_difficulty": "medium", "reasoning_profile_supported": True,
+                "evidence_support_sufficient": True, "reason": "Supported recall task.",
+            },
+        ],
     }
-    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda: object())
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(plan_review, "request_structured", lambda *_args, **_kwargs: response)
 
-    with pytest.raises(RuntimeError, match="Plan Review produced an invalid plan"):
-        plan_review.review_plan(state)
+    result = plan_review.review_plan(state)
+    repaired = result["plans"][0]["items"]["fill_in_the_blank"][1]
+    assert result["plan_review_retry_required"] is True
+    assert result["plan_duplicate_repair_attempts"] == {
+        "m1_fill_in_the_blank_2": 1
+    }
+    assert repaired["slot_id"] == "m1_fill_in_the_blank_2"
+    assert repaired["plan_duplicate_repair_mode"] == "targeted_semantic_repair"
+    assert repaired["numeric_diversification_allowed"] is False
+    assert repaired["forced_duplicate_slot_ids"] == ["m1_fill_in_the_blank_1"]
+
+
+def test_duplicate_plan_error_repairs_only_conflicting_word_problem_and_rechecks(monkeypatch):
+    repeated = _task(
+        "travel", concept="speed", operation="calculate_distance",
+        target="total distance", coverage="distance from speed and time",
+        qtype="word_problem",
+    )
+    alternative = _task(
+        "comparison", concept="speed", operation="compare_average_speed",
+        target="faster journey", coverage="compare two supported journeys",
+        qtype="word_problem",
+    )
+    interval = _task(
+        "interval", concept="speed", operation="calculate_time",
+        target="travel time", coverage="time from supported speed and distance",
+        qtype="word_problem",
+    )
+    units = _task(
+        "units", concept="speed", operation="convert_speed",
+        target="speed in alternate units", coverage="supported speed unit conversion",
+        qtype="word_problem",
+    )
+    plans = [{"model_number": 1, "items": {"word_problem": [
+        materialize_plan_item(repeated, "m1_word_problem_1", "medium"),
+        materialize_plan_item(interval, "m1_word_problem_2", "medium"),
+        materialize_plan_item(units, "m1_word_problem_3", "medium"),
+        materialize_plan_item(repeated, "m1_word_problem_4", "medium"),
+    ]}}]
+    duplicate_errors = [
+        "Slot m1_word_problem_4 duplicates the planned reasoning task in "
+        "m1_word_problem_1; change the canonical skill, operation, grounded relationship, target, or givens.",
+        "Slot m1_word_problem_4 repeats the same scenario/setup and conditions as "
+        "m1_word_problem_1; use a meaningfully different scenario or task.",
+    ]
+    state = {
+        "plans": plans, "assessment_catalog": {"tasks": [repeated, alternative, interval, units]},
+        "tasks": [("word_problem", 4)], "num_models": 1, "difficulty": "medium",
+        "retrieved_chunks": [{"child_id": "c1", "content": "speed distance time"}],
+        "assessment_profile": {"question_types": {"word_problem": {
+            "task_operations": [
+                "calculate_distance", "compare_average_speed", "calculate_time", "convert_speed",
+            ],
+        }}},
+        "planning_issues": [], "plan_errors": duplicate_errors,
+    }
+    prompts_seen = []
+    first_response = _response(alternative["task_id"], slot_id="m1_word_problem_4",
+        reviewed_slot_ids=("m1_word_problem_1", "m1_word_problem_2",
+                           "m1_word_problem_3", "m1_word_problem_4"))
+    first_response["verdicts"][0]["pair_id"] = "plan_pair_3"
+    second_response = {
+        "verdicts": [], "suggestions": [],
+        "difficulty_verdicts": _difficulty_verdicts(
+            "m1_word_problem_1", "m1_word_problem_2",
+            "m1_word_problem_3", "m1_word_problem_4"
+        ),
+    }
+    responses = iter([first_response, second_response])
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        plan_review, "request_structured",
+        lambda _client, prompt, **_kwargs: prompts_seen.append(prompt) or next(responses),
+    )
+
+    first = plan_review.review_plan(state)
+    original, _second, _third, repaired = first["plans"][0]["items"]["word_problem"]
+    assert original["task_id"] == repeated["task_id"]
+    assert repaired["slot_id"] == "m1_word_problem_4"
+    assert repaired["task_id"] == alternative["task_id"]
+    assert repaired["requested_difficulty"] == "medium"
+    assert repaired["source_chunk_id"] == "c1"
+    assert repaired["plan_duplicate_conflict_with"] == "m1_word_problem_1"
+    assert repaired["plan_duplicate_repair_attempt"] == 1
+    assert first["plan_review_retry_required"] is True
+    assert all(value in prompts_seen[0] for value in (
+        "m1_word_problem_1", "m1_word_problem_4", duplicate_errors[0],
+        "calculate_distance", "compare_average_speed",
+    ))
+
+    state.update(first)
+    second = plan_review.review_plan(state)
+    assert second["plan_review_retry_required"] is False
+    assert second["plans"][0]["items"]["word_problem"][3][
+        "plan_duplicate_unresolved"
+    ] is False
+
+
+def test_controlled_plan_diversification_allows_numeric_structure_only_for_quantitative_slots():
+    quantitative = _task(
+        "motion", concept="motion", operation="calculate_distance",
+        target="distance", coverage="distance from speed and time", qtype="word_problem",
+    )
+    plan = {"model_number": 1, "items": {"word_problem": [
+        materialize_plan_item(quantitative, "m1_word_problem_1", "medium"),
+        materialize_plan_item(quantitative, "m1_word_problem_2", "medium"),
+    ]}}
+    original = deepcopy(plan["items"]["word_problem"][1])
+
+    repaired = plan_review._controlled_plan_diversification(
+        plan, {"m1_word_problem_1", "m1_word_problem_2"},
+        "Same quantitative setup and reasoning path.",
+        {"m1_word_problem_1": "word_problem", "m1_word_problem_2": "word_problem"},
+    )
+
+    assert repaired["numeric_diversification_allowed"] is True
+    assert repaired["quantitative_structure_requirement"]
+    for immutable in (
+        "slot_id", "task_id", "task_family_id", "question_type", "difficulty",
+        "source_chunk_id", "support_chunk_ids",
+    ):
+        assert repaired.get(immutable) == original.get(immutable)
+    assert plan["items"]["word_problem"][0].get("plan_duplicate_repair_attempt") is None
+
+
+def test_plan_duplicate_recovery_is_bounded_and_unresolved_conflict_can_generate(monkeypatch):
+    repeated = _task(
+        "definition", concept="energy", operation="define",
+        target="energy", coverage="definition of energy", qtype="definition",
+    )
+    state = {
+        "plans": [{"model_number": 1, "items": {"definition": [
+            materialize_plan_item(repeated, "m1_definition_1", "medium"),
+            materialize_plan_item(repeated, "m1_definition_2", "medium"),
+        ]}}],
+        "assessment_catalog": {"tasks": [repeated]},
+        "tasks": [("definition", 2)], "num_models": 1, "difficulty": "medium",
+        "retrieved_chunks": [{"child_id": "c1", "content": "Energy is the ability to do work."}],
+        "assessment_profile": {"question_types": {"definition": {
+            "task_operations": ["define"],
+        }}}, "planning_issues": [],
+    }
+    overlap = _response(
+        repeated["task_id"], slot_id="m1_definition_2",
+        selection_type="intentional_reuse",
+        reviewed_slot_ids=("m1_definition_1", "m1_definition_2"),
+    )
+    overlap["suggestions"][0]["required_instance_distinctions"][0][
+        "reference_slot_ids"
+    ] = ["m1_definition_1"]
+    calls = []
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        plan_review, "request_structured",
+        lambda *_args, **_kwargs: calls.append(True) or deepcopy(overlap),
+    )
+
+    for expected_attempt in (1, 2, 3):
+        result = plan_review.review_plan(state)
+        state.update(result)
+        repaired = state["plans"][0]["items"]["definition"][1]
+        assert repaired["slot_id"] == "m1_definition_2"
+        assert repaired["plan_duplicate_repair_attempt"] == expected_attempt
+        assert repaired["numeric_diversification_allowed"] is False
+        assert state["plan_review_retry_required"] is True
+
+    result = plan_review.review_plan(state)
+    state.update(result)
+    repaired = state["plans"][0]["items"]["definition"][1]
+    assert state["plan_review_retry_required"] is False
+    assert repaired["plan_duplicate_unresolved"] is True
+    assert repaired["plan_duplicate_repair_mode"] == "controlled_diversification"
+    assert state["unresolved_plan_duplicate_conflicts"][0]["status"] == (
+        "plan_duplicate_unresolved_kept"
+    )
+    assert len(calls) == 7  # two rejected responses per repair, then one final audit review
+
+    from app.online.graph import _route_after_plan_review
+    assert _route_after_plan_review(state) == "generate_exams"

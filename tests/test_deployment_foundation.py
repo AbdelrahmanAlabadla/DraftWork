@@ -91,6 +91,7 @@ def test_generation_task_has_800_second_hard_timeout():
 
 def test_online_llm_parallelism_defaults_are_bounded_to_five():
     assert config.MAX_PARALLEL_GENERATION_CALLS == 5
+    assert config.MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS == 5
     assert config.MAX_PARALLEL_VALIDATOR_CALLS == 5
     assert config.DEEPSEEK_CONCURRENCY_LIMIT == 5
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from itertools import combinations
 from typing import Any, Literal
@@ -30,7 +31,68 @@ from app.online.planner import (
 
 
 PLAN_REVIEW_TEMPERATURE = 0.1
-PLAN_REVIEW_MAX_TOKENS = 12000
+PLAN_REVIEW_MAX_TOKENS = 45000
+MAX_PLAN_DUPLICATE_REPAIR_ATTEMPTS = 3
+
+_DUPLICATE_PLAN_ERROR_MARKERS = (
+    "duplicates catalog task",
+    "duplicates the planned reasoning task",
+    "repeats the same scenario/setup and conditions",
+    "repeats the same ",
+)
+_DUPLICATE_SLOT_PATTERNS = (
+    re.compile(r"Slot\s+(\S+)\s+duplicates catalog task .*? already used by\s+(\S+?)(?:;|\.|$)", re.I),
+    re.compile(r"Slot\s+(\S+)\s+duplicates .*? in\s+(\S+?)(?:;|\.|$)", re.I),
+    re.compile(r"Slot\s+(\S+)\s+repeats .*? as\s+(\S+?)(?:;|\.|$)", re.I),
+)
+
+
+def _is_duplicate_plan_error(error: object) -> bool:
+    value = str(error or "").casefold()
+    return any(marker in value for marker in _DUPLICATE_PLAN_ERROR_MARKERS)
+
+
+def _known_duplicate_conflicts(errors: list[str]) -> list[dict[str, Any]]:
+    conflicts: list[dict[str, Any]] = []
+    for error in errors:
+        if not _is_duplicate_plan_error(error):
+            continue
+        for pattern in _DUPLICATE_SLOT_PATTERNS:
+            match = pattern.search(error)
+            if not match:
+                continue
+            repair_slot, conflict_slot = match.groups()
+            record = {
+                "repair_slot_id": repair_slot.rstrip(".;"),
+                "conflict_slot_id": conflict_slot.rstrip(".;"),
+                "reason": error,
+            }
+            if record not in conflicts:
+                conflicts.append(record)
+            break
+    return conflicts
+
+
+def _persisted_duplicate_conflicts(plans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Recover conflict context carried by a slot across bounded review cycles."""
+    conflicts: list[dict[str, Any]] = []
+    for plan in plans:
+        for item in _items_for_model(plan):
+            repair_slot = str(item.get("slot_id") or "")
+            conflict_with = item.get("plan_duplicate_conflict_with")
+            conflict_slots = conflict_with if isinstance(conflict_with, list) else [conflict_with]
+            for conflict_slot in conflict_slots:
+                conflict_slot = str(conflict_slot or "")
+                if not repair_slot or not conflict_slot:
+                    continue
+                record = {
+                    "repair_slot_id": repair_slot,
+                    "conflict_slot_id": conflict_slot,
+                    "reason": str(item.get("plan_duplicate_conflict_reason") or ""),
+                }
+                if record not in conflicts:
+                    conflicts.append(record)
+    return conflicts
 
 
 class PlanReviewPairVerdict(StrictOutputModel):
@@ -64,9 +126,19 @@ class PlanReviewSuggestion(StrictOutputModel):
     required_instance_distinctions: list[PlanReuseDistinction]
 
 
+class PlanDifficultyVerdict(StrictOutputModel):
+    slot_id: NonEmptyString
+    claimed_difficulty: Literal["easy", "medium", "hard"]
+    achieved_difficulty: Literal["easy", "medium", "hard"]
+    reasoning_profile_supported: bool
+    evidence_support_sufficient: bool
+    reason: str = Field(min_length=1, max_length=700)
+
+
 class PlanReviewResponse(StrictOutputModel):
     verdicts: list[PlanReviewPairVerdict]
     suggestions: list[PlanReviewSuggestion]
+    difficulty_verdicts: list[PlanDifficultyVerdict] = Field(default_factory=list)
 
 
 _SYSTEM_PROMPT = """You review the complete planned exam semantically before questions are generated.
@@ -89,6 +161,16 @@ assessment angle, not a finished question. For intentional reuse, explain why re
 and provide concrete instance distinctions from the referenced slots. Different wording, names,
 numbers, or surface scenario alone is not a valid distinction. Reuse metadata is not approval of
 the future question; the final Duplicate Judge remains independent.
+
+Independently inspect any task whose difficulty_adaptation status is adapted. Its actual cognitive
+work and reasoning requirements must match the claimed difficulty and remain supported by its exact
+evidence boundary. Reasoning mode alone, longer wording, or larger numbers do not establish greater
+difficulty. Treat a superficial or unsupported adaptation as invalid semantic planning.
+Return exactly one difficulty_verdict for every planned slot. Determine achieved_difficulty from the
+concrete cognitive work in task_operation, reasoning requirements, prerequisites, target, and work
+product, using only assigned_sources. Do not infer it from the difficulty label, reasoning mode,
+wording length, numerical size, or cue words in idea_to_test. If the claimed level or any required
+operation/prerequisite is unsupported, report the genuine achieved level and mark support false.
 
 Examples:
 - Different task IDs can still overlap: `calculate wavelength from frequency` and `solve c=lambda*f
@@ -308,10 +390,18 @@ def _candidate_pool(
             "task_id": str(task.get("task_id") or ""),
             "selection_type": mode,
             "concept": task.get("concept"),
+            "idea_to_test": task.get("idea_to_test"),
+            "relationship": task.get("relationship"),
             "task_operation": task.get("task_operation"),
             "target": task.get("target"),
             "reasoning_mode": task.get("reasoning_mode"),
+            "reasoning_depth": task.get("reasoning_depth"),
+            "reasoning_requirements": task.get("reasoning_requirements"),
+            "prerequisites": task.get("prerequisites"),
             "student_work_product": task.get("student_work_product"),
+            "required_givens": task.get("required_givens"),
+            "scenario_family": task.get("scenario_family"),
+            "evidence_chunk_ids": task.get("evidence_chunk_ids"),
             "task_family_id": task.get("task_family_id"),
             "coverage_id": task.get("coverage_id"),
             "semantic_conflict_count": int(conflict_count),
@@ -334,7 +424,8 @@ def _candidate_pool(
 
 def _prompt_payload(
     catalog: dict[str, Any], plan: dict[str, Any], pairs: list[dict[str, Any]],
-    difficulty: str, valid_chunk_ids: set[str], *, rejection_reason: str = "",
+    difficulty: str, valid_chunk_ids: set[str], *, evidence_by_id: dict[str, str] | None = None,
+    rejection_reason: str = "", known_conflicts: list[dict[str, Any]] | None = None,
 ) -> tuple[str, dict[str, tuple[str, dict[str, Any]]]]:
     qtypes = _question_type_by_slot(plan)
     candidates: dict[str, list[dict[str, Any]]] = {}
@@ -349,28 +440,48 @@ def _prompt_payload(
         candidates[slot_id] = rows
         for row in rows:
             lookup[f"{slot_id}:{row['candidate_id']}"] = (mode, row)
-    registry = {
-        str(item.get("slot_id") or ""): {
+    sources = evidence_by_id or {}
+    registry = {}
+    for item in _items_for_model(plan):
+        evidence_ids = list(dict.fromkeys(filter(None, [
+            str(item.get("source_chunk_id") or ""),
+            *map(str, item.get("support_chunk_ids") or []),
+        ])))
+        registry[str(item.get("slot_id") or "")] = {
             key: item.get(key) for key in (
                 "task_id", "fitb_entry_id", "task_family_id", "coverage_id", "concept", "knowledge_focus",
-                "relationship", "task_operation", "target", "reasoning_mode",
-                "student_work_product", "given_conditions", "scenario_family", "difficulty",
+                "idea_to_test", "relationship", "task_operation", "operation", "target", "reasoning_mode",
+                "reasoning_depth", "reasoning_requirements", "prerequisites",
+                "student_work_product", "required_givens", "given_conditions", "scenario_family", "difficulty",
+                "requested_difficulty", "actual_difficulty", "difficulty_adaptation",
+                "plan_duplicate_repair_attempt", "plan_duplicate_repair_mode",
+                "plan_duplicate_conflict_with", "plan_duplicate_conflict_reason",
+                "plan_duplicate_unresolved", "required_instance_distinctions",
+                "forced_duplicate_slot_ids", "suggested_assessment_angle",
+                "numeric_diversification_allowed", "quantitative_structure_requirement",
             )
         }
-        for item in _items_for_model(plan)
-    }
+        registry[str(item.get("slot_id") or "")]["assigned_sources"] = {
+            chunk_id: sources.get(chunk_id, "") for chunk_id in evidence_ids
+        }
     retry = (
         "\n\nThe previous suggestion was rejected by code for this exact reason:\n"
         f"{rejection_reason}\nReturn a corrected complete response."
         if rejection_reason else ""
     )
     prompt = (
-        "Review the complete plan registry and every candidate pair. Return verdict rows only for "
+        "Review the complete plan registry and every candidate pair. Return exactly one "
+        "difficulty_verdict per plan-registry slot. Return semantic verdict rows only for "
         "pairs that are genuine semantic overlaps; an empty verdicts array means the whole plan is distinct. "
         "Suggestions are required for every connected group containing a semantic_overlap=true "
         "verdict; one changed slot may resolve several pair verdicts. Choose only from the candidate "
         "list for that slot, preserving its listed selection_type. If all pairs are distinct, return "
-        "an empty suggestions array.\n\n"
+        "an empty suggestions array. For every known deterministic conflict, compare BOTH named "
+        "slots and use its exact explanation when choosing the repair. Deliberately change a "
+        "meaningful conflicting dimension: idea, target, operation, relationship, reasoning path, "
+        "givens, scenario/setup, task family, or quantitative structure. Do not randomly swap IDs "
+        "or treat wording/numbers alone as semantic diversification.\n\n"
+        f"Known deterministic conflicts:\n{json.dumps(known_conflicts or [], ensure_ascii=False)}\n\n"
         f"Plan registry:\n{json.dumps(registry, ensure_ascii=False)}\n\n"
         f"Candidate pairs:\n{json.dumps(pairs, ensure_ascii=False)}\n\n"
         f"Allowed replacement candidates by slot:\n{json.dumps(candidates, ensure_ascii=False)}"
@@ -408,6 +519,13 @@ def _validate_response(
     lookup: dict[str, tuple[str, dict[str, Any]]],
 ) -> list[str]:
     errors: list[str] = []
+    expected_slot_ids = sorted(_question_type_by_slot(plan))
+    difficulty_slot_ids = [verdict.slot_id for verdict in response.difficulty_verdicts]
+    if sorted(difficulty_slot_ids) != expected_slot_ids:
+        errors.append(
+            f"difficulty_verdict slot IDs must be exactly {expected_slot_ids}; "
+            f"received {difficulty_slot_ids}."
+        )
     expected_pair_ids = [pair["pair_id"] for pair in pairs]
     found_pair_ids = [verdict.pair_id for verdict in response.verdicts]
     if (
@@ -541,6 +659,56 @@ def _validate_response(
                     f"the semantic conflict with {sorted(conflicting_slots)}."
                 )
     return errors
+
+
+def _apply_difficulty_verdicts(
+    plan: dict[str, Any], verdicts: list[PlanDifficultyVerdict], requested: str,
+) -> list[dict[str, Any]]:
+    """Record independent semantic review and queue genuine mismatches for adjustment."""
+    by_slot = {str(item.get("slot_id") or ""): item for item in _items_for_model(plan)}
+    events: list[dict[str, Any]] = []
+    for verdict in verdicts:
+        item = by_slot.get(verdict.slot_id)
+        if item is None:
+            continue
+        claimed = str(item.get("difficulty") or verdict.claimed_difficulty)
+        achieved = verdict.achieved_difficulty
+        accepted = (
+            verdict.claimed_difficulty == claimed
+            and achieved == claimed
+            and verdict.reasoning_profile_supported
+            and verdict.evidence_support_sufficient
+        )
+        item["difficulty_review"] = {
+            "status": "verified" if accepted else "mismatch",
+            **verdict.model_dump(),
+        }
+        if not accepted:
+            item["difficulty"] = achieved
+            item["actual_difficulty"] = achieved
+            item["reasoning_depth"] = achieved
+            if (
+                requested in {"easy", "medium", "hard"}
+                and int(item.get("adjustment_attempts") or 0) < 3
+            ):
+                item["difficulty_adaptation"] = {
+                    "status": "pending", "from_difficulty": achieved,
+                    "to_difficulty": requested,
+                    "base_task_id": item.get("base_catalog_task_id") or item.get("task_id"),
+                    "strategy": None, "failed_strategies": [],
+                }
+            else:
+                item["difficulty_adaptation"] = {
+                    **(item.get("difficulty_adaptation") or {}), "status": "failed",
+                }
+                item["difficulty_fallback_reason"] = verdict.reason
+        events.append({
+            "slot_id": verdict.slot_id,
+            "status": "difficulty_verified" if accepted else "difficulty_mismatch",
+            "claimed_difficulty": claimed, "achieved_difficulty": achieved,
+            "reason": verdict.reason,
+        })
+    return events
 
 
 def _apply_suggestion(
@@ -782,6 +950,99 @@ def _fallback_suggestion(
     }
 
 
+def _slot_item(plan: dict[str, Any], slot_id: str) -> dict[str, Any] | None:
+    return next((
+        item for item in _items_for_model(plan)
+        if str(item.get("slot_id") or "") == slot_id
+    ), None)
+
+
+def _conflict_reason_for_slots(
+    conflicts: list[dict[str, Any]], slot_id: str, conflict_slots: set[str],
+    verdict_reasons: list[str] | None = None,
+) -> str:
+    reasons = [
+        str(conflict.get("reason") or "") for conflict in conflicts
+        if slot_id in {
+            str(conflict.get("repair_slot_id") or ""),
+            str(conflict.get("conflict_slot_id") or ""),
+        } and (
+            str(conflict.get("repair_slot_id") or "") in conflict_slots | {slot_id}
+            and str(conflict.get("conflict_slot_id") or "") in conflict_slots | {slot_id}
+        )
+    ]
+    reasons.extend(str(value) for value in verdict_reasons or [] if str(value).strip())
+    return "; ".join(dict.fromkeys(filter(None, reasons))) or (
+        "Plan Review found semantic overlap with " + ", ".join(sorted(conflict_slots))
+    )
+
+
+def _annotate_plan_duplicate_repair(
+    item: dict[str, Any], *, attempt: int, mode: str,
+    conflict_slots: set[str], reason: str, unresolved: bool,
+) -> None:
+    item.update({
+        "plan_duplicate_repair_attempt": attempt,
+        "plan_duplicate_repair_mode": mode,
+        "plan_duplicate_conflict_with": (
+            sorted(conflict_slots)[0] if len(conflict_slots) == 1
+            else sorted(conflict_slots)
+        ),
+        "plan_duplicate_conflict_reason": reason,
+        "plan_duplicate_unresolved": unresolved,
+    })
+
+
+def _controlled_plan_diversification(
+    plan: dict[str, Any], group: set[str], reason: str, qtypes: dict[str, str],
+    *, attempt: int = 3,
+) -> dict[str, Any]:
+    """Add a source-bounded diversification contract without changing slot identity."""
+    slot_id = sorted(group)[-1]
+    item = _slot_item(plan, slot_id)
+    if item is None:
+        raise ValueError(f"Unknown controlled-diversification slot {slot_id}")
+    conflicts = set(group) - {slot_id}
+    qtype = qtypes.get(slot_id, "")
+    mode = str(item.get("reasoning_mode") or "").casefold()
+    operation = str(item.get("task_operation") or item.get("operation") or "").casefold()
+    quantitative = bool(
+        qtype in {"equation", "word_problem"}
+        or mode in {"calculation", "symbolic_manipulation", "optimization", "law_or_theorem_application"}
+        or any(value in operation for value in ("calculate", "solve", "compute", "evaluate", "balance"))
+    )
+    distinction = (
+        "Use a different source-supported quantitative setup, givens, constraints, and calculation "
+        "path while preserving the assigned operation and difficulty."
+        if quantitative else
+        "Use a different source-supported idea, scenario, target, relationship, or reasoning path."
+    )
+    existing = list(item.get("required_instance_distinctions") or [])
+    existing.append({
+        "kind": "different_constraint_structure" if quantitative else "different_assessment_angle",
+        "requirement": distinction,
+        "reference_slot_ids": sorted(conflicts),
+    })
+    item.update({
+        "plan_review_status": "intentional_reuse",
+        "plan_review_reason": "controlled_plan_duplicate_diversification",
+        "plan_review_source": (
+            "controlled_diversification" if attempt >= 3 else "targeted_semantic_repair"
+        ),
+        "suggested_assessment_angle": distinction,
+        "forced_duplicate_slot_ids": sorted(set(item.get("forced_duplicate_slot_ids") or []) | conflicts),
+        "required_instance_distinctions": existing,
+        "numeric_diversification_allowed": quantitative,
+        "quantitative_structure_requirement": distinction if quantitative else None,
+    })
+    _annotate_plan_duplicate_repair(
+        item, attempt=attempt,
+        mode=("controlled_diversification" if attempt >= 3 else "targeted_semantic_repair"),
+        conflict_slots=conflicts, reason=reason, unresolved=False,
+    )
+    return item
+
+
 def review_plan(state: dict[str, Any]) -> dict[str, Any]:
     plans = deepcopy(state.get("plans") or [])
     catalog = state.get("assessment_catalog") or {}
@@ -794,18 +1055,34 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
         str(chunk.get("child_id")) for chunk in state.get("retrieved_chunks") or []
         if chunk.get("child_id")
     }
+    evidence_by_id = {
+        str(chunk.get("child_id")): str(chunk.get("content") or "")
+        for chunk in state.get("retrieved_chunks") or [] if chunk.get("child_id")
+    }
     input_errors = [
         *(state.get("plan_errors") or []),
         *plan_structure_errors(
             plans, state.get("tasks") or [], int(state.get("num_models") or 1)
         ),
     ]
-    if input_errors:
+    duplicate_input_errors = [error for error in input_errors if _is_duplicate_plan_error(error)]
+    structural_input_errors = [error for error in input_errors if not _is_duplicate_plan_error(error)]
+    if structural_input_errors:
         raise RuntimeError(
-            "Plan Review refused an invalid Planner result: " + "; ".join(input_errors)
+            "Plan Review refused an invalid Planner result: "
+            + "; ".join(structural_input_errors)
         )
-    history: list[dict[str, Any]] = []
+    known_conflicts = _known_duplicate_conflicts(duplicate_input_errors)
+    for conflict in _persisted_duplicate_conflicts(plans):
+        if conflict not in known_conflicts:
+            known_conflicts.append(conflict)
+    history: list[dict[str, Any]] = list(state.get("plan_review_history") or [])
+    duplicate_attempts = dict(state.get("plan_duplicate_repair_attempts") or {})
+    unresolved_conflicts = list(state.get("unresolved_plan_duplicate_conflicts") or [])
     total_attempts = 0
+    retry_required = False
+    prior_rechecks = int(state.get("plan_review_rechecks") or 0)
+    rechecks = prior_rechecks
     expected_layout = {
         (int(plan.get("model_number") or 0), qtype): tuple(
             str(item.get("slot_id") or "") for item in values or []
@@ -816,29 +1093,30 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
     }
     for plan_index, plan in enumerate(plans):
         pairs = _potential_pairs(plan)
-        if not pairs:
-            for item in _items_for_model(plan):
-                item.setdefault("plan_review_status", "clear")
-                item.setdefault("plan_review_reason", "no_semantic_overlap")
-            continue
         response: PlanReviewResponse | None = None
         reviewed_trial: dict[str, Any] | None = None
         last_overlap_ids: set[str] = set()
+        last_difficulty_verdicts: list[PlanDifficultyVerdict] = []
         rejection = ""
         failed_task_ids: dict[str, set[str]] = {}
+        exhausted_overlap_groups: list[set[str]] = []
         for attempt in (1, 2):
             total_attempts += 1
             prompt, lookup = _prompt_payload(
                 catalog, plan, pairs, difficulty, valid_chunk_ids,
+                evidence_by_id=evidence_by_id,
                 rejection_reason=rejection,
+                known_conflicts=known_conflicts,
             )
             try:
                 raw = request_structured(
-                    create_plan_review_client(), prompt,
+                    create_plan_review_client(
+                        domain=(state.get("assessment_profile") or {}).get("domain")
+                    ), prompt,
                     response_model=PlanReviewResponse,
                     schema_name="plan_review",
                     agent="plan_reviewer",
-                    item_count=len(pairs),
+                    item_count=max(len(pairs), len(_items_for_model(plan))),
                     operation="plan_review",
                     system_prompt=_SYSTEM_PROMPT,
                     temperature=PLAN_REVIEW_TEMPERATURE,
@@ -858,6 +1136,20 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
             last_overlap_ids = {
                 verdict.pair_id for verdict in parsed.verdicts if verdict.semantic_overlap
             }
+            if sorted(verdict.slot_id for verdict in parsed.difficulty_verdicts) == sorted(
+                _question_type_by_slot(plan)
+            ):
+                last_difficulty_verdicts = list(parsed.difficulty_verdicts)
+            parsed_groups = _conflict_groups(pairs, last_overlap_ids)
+            exhausted_overlap_groups = [
+                group for group in parsed_groups
+                if max((int(duplicate_attempts.get(slot_id) or 0) for slot_id in group), default=0)
+                >= MAX_PLAN_DUPLICATE_REPAIR_ATTEMPTS
+            ]
+            if exhausted_overlap_groups and last_difficulty_verdicts:
+                response = parsed
+                reviewed_trial = deepcopy(plan)
+                break
             errors = _validate_response(
                 parsed, catalog, plan, pairs, difficulty, valid_chunk_ids, lookup
             )
@@ -897,10 +1189,74 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                 overlap_neighbors.setdefault(left, set()).add(right)
                 overlap_neighbors.setdefault(right, set()).add(left)
             plan = reviewed_trial or plan
+            history.extend({
+                "model_number": plan.get("model_number"), **event,
+            } for event in _apply_difficulty_verdicts(
+                plan, response.difficulty_verdicts, difficulty
+            ))
+            if exhausted_overlap_groups:
+                verdict_by_pair = {verdict.pair_id: verdict for verdict in response.verdicts}
+                pair_by_id = {pair["pair_id"]: pair for pair in pairs}
+                for group in exhausted_overlap_groups:
+                    repair_slot = sorted(group)[-1]
+                    item = _slot_item(plan, repair_slot)
+                    if item is None:
+                        continue
+                    conflict_slots = set(group) - {repair_slot}
+                    reasons = [
+                        verdict_by_pair[pair_id].reason
+                        for pair_id in overlap_ids
+                        if pair_id in verdict_by_pair
+                        and {
+                            pair_by_id[pair_id]["left_slot_id"],
+                            pair_by_id[pair_id]["right_slot_id"],
+                        }.issubset(group)
+                    ]
+                    reason = _conflict_reason_for_slots(
+                        known_conflicts, repair_slot, conflict_slots, reasons
+                    )
+                    _annotate_plan_duplicate_repair(
+                        item, attempt=3, mode="controlled_diversification",
+                        conflict_slots=conflict_slots, reason=reason, unresolved=True,
+                    )
+                    record = {
+                        "model_number": plan.get("model_number"),
+                        "slot_id": repair_slot,
+                        "conflict_slot_ids": sorted(conflict_slots),
+                        "reason": reason,
+                        "attempts": 3,
+                        "status": "plan_duplicate_unresolved_kept",
+                    }
+                    unresolved_conflicts.append(record)
+                    history.append(record)
+                for item in _items_for_model(plan):
+                    item.setdefault("plan_review_status", "clear")
+                    item.setdefault("plan_review_reason", "no_semantic_overlap")
+                plans[plan_index] = plan
+                continue
             for suggestion in response.suggestions:
                 applied = next(
                     item for item in _items_for_model(plan)
                     if str(item.get("slot_id") or "") == suggestion.slot_id
+                )
+                conflict_slots = overlap_neighbors.get(suggestion.slot_id, set())
+                repair_attempt = int(duplicate_attempts.get(suggestion.slot_id) or 0) + 1
+                duplicate_attempts[suggestion.slot_id] = repair_attempt
+                verdict_reasons = [
+                    verdict.reason for verdict in response.verdicts
+                    if verdict.semantic_overlap and suggestion.slot_id in {
+                        next((pair["left_slot_id"] for pair in pairs if pair["pair_id"] == verdict.pair_id), ""),
+                        next((pair["right_slot_id"] for pair in pairs if pair["pair_id"] == verdict.pair_id), ""),
+                    }
+                ]
+                conflict_reason = _conflict_reason_for_slots(
+                    known_conflicts, suggestion.slot_id, conflict_slots, verdict_reasons
+                )
+                _annotate_plan_duplicate_repair(
+                    applied, attempt=repair_attempt,
+                    mode=("controlled_diversification" if repair_attempt >= 3
+                          else "targeted_semantic_repair"),
+                    conflict_slots=conflict_slots, reason=conflict_reason, unresolved=False,
                 )
                 history.append({
                     "model_number": plan.get("model_number"), "status": "agent_suggestion_applied",
@@ -910,6 +1266,8 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                     "selection_type": suggestion.selection_type,
                     "suggested_assessment_angle": suggestion.suggested_assessment_angle,
                     "task_inventory": deepcopy(applied.get("task_inventory") or {}),
+                    "plan_duplicate_repair_attempt": repair_attempt,
+                    "plan_duplicate_conflict_reason": conflict_reason,
                 })
             for item in _items_for_model(plan):
                 item.setdefault("plan_review_status", "clear")
@@ -918,27 +1276,87 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                 "model_number": plan.get("model_number"), "status": "agent_review_completed",
                 "overlap_pair_ids": sorted(overlap_ids),
             })
+            if overlap_ids and response.suggestions:
+                retry_required = True
+                rechecks += 1
+            elif not overlap_ids:
+                for item in _items_for_model(plan):
+                    if item.get("plan_duplicate_repair_attempt"):
+                        item["plan_duplicate_unresolved"] = False
             plans[plan_index] = plan
             continue
+        if not last_difficulty_verdicts:
+            raise RuntimeError(
+                "Plan Review did not return a complete independent difficulty assessment."
+            )
         # Both suggestions were invalid. Resolve each potential conflict group using
         # the deterministic selector; if it has no alternative, retain the Planner task.
         groups = _conflict_groups(
             pairs, last_overlap_ids or {pair["pair_id"] for pair in pairs}
         )
+        fallback_changed = False
         for group in groups:
+            next_attempt = max(
+                (int(duplicate_attempts.get(slot_id) or 0) for slot_id in group),
+                default=0,
+            ) + 1
+            repair_slot = sorted(group)[-1]
+            conflict_slots = set(group) - {repair_slot}
+            conflict_reason = _conflict_reason_for_slots(
+                known_conflicts, repair_slot, conflict_slots, [rejection]
+            )
+            if next_attempt >= MAX_PLAN_DUPLICATE_REPAIR_ATTEMPTS:
+                applied = _controlled_plan_diversification(
+                    plan, group, conflict_reason, _question_type_by_slot(plan), attempt=3
+                )
+                duplicate_attempts[repair_slot] = 3
+                fallback_changed = True
+                history.append({
+                    "model_number": plan.get("model_number"),
+                    "status": "controlled_diversification_applied",
+                    "slot_id": repair_slot,
+                    "conflict_slot_ids": sorted(conflict_slots),
+                    "plan_duplicate_repair_attempt": 3,
+                    "plan_duplicate_conflict_reason": conflict_reason,
+                    "numeric_diversification_allowed": bool(
+                        applied.get("numeric_diversification_allowed")
+                    ),
+                })
+                continue
             fallback = _fallback_suggestion(
                 catalog, plan, group, difficulty, valid_chunk_ids, failed_task_ids
             )
             if fallback is None:
+                applied = _controlled_plan_diversification(
+                    plan, group, conflict_reason, _question_type_by_slot(plan),
+                    attempt=next_attempt,
+                )
+                duplicate_attempts[repair_slot] = next_attempt
+                fallback_changed = True
                 history.append({
-                    "model_number": plan.get("model_number"), "status": "original_assignment_retained",
-                    "slot_ids": sorted(group), "reason": "No valid catalog alternative remained.",
+                    "model_number": plan.get("model_number"),
+                    "status": "targeted_contract_diversification_applied",
+                    "slot_id": repair_slot,
+                    "slot_ids": sorted(group),
+                    "reason": conflict_reason,
+                    "plan_duplicate_repair_attempt": next_attempt,
+                    "numeric_diversification_allowed": bool(
+                        applied.get("numeric_diversification_allowed")
+                    ),
                 })
                 continue
             applied = _apply_suggestion(
                 plan, catalog, fallback, difficulty, valid_chunk_ids,
                 source="deterministic_fallback",
             )
+            selected_slot = str(fallback["slot_id"])
+            selected_conflicts = set(group) - {selected_slot}
+            duplicate_attempts[selected_slot] = next_attempt
+            _annotate_plan_duplicate_repair(
+                applied, attempt=next_attempt, mode="targeted_semantic_repair",
+                conflict_slots=selected_conflicts, reason=conflict_reason, unresolved=False,
+            )
+            fallback_changed = True
             history.append({
                 "model_number": plan.get("model_number"), "status": "fallback_applied",
                 "slot_id": fallback["slot_id"],
@@ -946,10 +1364,26 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                 "replacement_fitb_entry_id": fallback["replacement_fitb_entry_id"],
                 "selection_type": fallback["selection_type"],
                 "task_inventory": deepcopy(applied.get("task_inventory") or {}),
+                "plan_duplicate_repair_attempt": next_attempt,
+                "plan_duplicate_conflict_reason": conflict_reason,
             })
         for item in _items_for_model(plan):
             item.setdefault("plan_review_status", "clear")
             item.setdefault("plan_review_reason", "no_semantic_overlap")
+        if fallback_changed:
+            retry_required = True
+            rechecks += 1
+            history.append({
+                "model_number": plan.get("model_number"),
+                "status": "difficulty_recheck_required",
+                "reason": "Deterministic overlap fallback changed a task after the agent review.",
+            })
+        else:
+            history.extend({
+                "model_number": plan.get("model_number"), **event,
+            } for event in _apply_difficulty_verdicts(
+                plan, last_difficulty_verdicts, difficulty
+            ))
 
     plans = finalize_plans(plans, state.get("tasks") or [])
     actual_layout = {
@@ -973,6 +1407,11 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
     errors.extend(plan_structure_errors(
         plans, state.get("tasks") or [], int(state.get("num_models") or 1)
     ))
+    # Duplicate-only findings are allowed while a bounded targeted repair is
+    # awaiting re-review, or after the third attempt has been retained as an
+    # auditable unresolved similarity. All other plan validation remains strict.
+    if retry_required or unresolved_conflicts:
+        errors = [error for error in errors if not _is_duplicate_plan_error(error)]
     if errors:
         raise RuntimeError(
             "Plan Review produced an invalid plan: " + "; ".join(dict.fromkeys(errors))
@@ -982,4 +1421,8 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
         "plan_errors": errors,
         "plan_review_history": history,
         "plan_review_attempts": total_attempts,
+        "plan_review_retry_required": retry_required,
+        "plan_review_rechecks": rechecks,
+        "plan_duplicate_repair_attempts": duplicate_attempts,
+        "unresolved_plan_duplicate_conflicts": unresolved_conflicts,
     }

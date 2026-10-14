@@ -22,6 +22,7 @@ from app.exports.common import (
     exam_document_language,
     group_exam_sections,
     is_complete_equation_prompt,
+    split_equation_content,
     response_line_count,
 )
 from app.language import detect_language
@@ -306,6 +307,38 @@ def _draw_section_heading(pdf: _ExamPDF, label: str, minimum_after: float = 12) 
     pdf.set_text_color(*INK)
 
 
+def _draw_mixed_math(
+    pdf: _ExamPDF, text: str, *, x: float | None = None, width: float | None = None,
+    line_height: float = LINE_HEIGHT, bold: bool = False,
+) -> float:
+    """Render delimited TeX as LTR images and prose with natural direction."""
+    x = pdf.l_margin if x is None else x
+    width = pdf.epw if width is None else width
+    start_y = pdf.get_y()
+    for kind, value in split_equation_content(text, undelimited_as_math=False):
+        if kind == "text":
+            pdf.set_xy(x, pdf.get_y())
+            pdf.set_font(BODY_FONT, "B" if bold else "", BODY_SIZE if bold else 9.6)
+            pdf.multi_cell(width, line_height, value, align=_align(pdf, value),
+                           new_x="LEFT", new_y="NEXT")
+            continue
+        rendered = render_math(value)
+        if rendered:
+            natural_w = rendered.width_px / 220 * 25.4
+            natural_h = rendered.height_px / 220 * 25.4
+            draw_w = min(width, max(4.0, natural_w))
+            draw_h = max(3.0, natural_h * (draw_w / natural_w if natural_w else 1.0))
+            pdf.ensure_space(draw_h + 1)
+            stream = io.BytesIO(rendered.png)
+            stream.name = "inline-math.png"
+            pdf.image(stream, x=x + (width - draw_w) / 2, y=pdf.get_y(), w=draw_w, h=draw_h)
+            pdf.set_y(pdf.get_y() + draw_h + 1)
+        else:
+            pdf.set_xy(x, pdf.get_y())
+            pdf.multi_cell(width, line_height, value, align="C", new_x="LEFT", new_y="NEXT")
+    return pdf.get_y() - start_y
+
+
 def _draw_question_stem(pdf: _ExamPDF, number: int, text: str, minimum_after: float = 0) -> None:
     rtl = _text_is_rtl(text, pdf.rtl)
     marker = f"{number}. " if rtl else f"Q{number}. "
@@ -313,12 +346,14 @@ def _draw_question_stem(pdf: _ExamPDF, number: int, text: str, minimum_after: fl
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     height = _text_height(pdf, stem, pdf.epw)
     pdf.ensure_space(height + minimum_after)
-    pdf.multi_cell(0, LINE_HEIGHT, stem, align=_align(pdf, text), new_x="LEFT", new_y="NEXT")
+    _draw_mixed_math(pdf, stem, bold=True)
 
 
 def _draw_mcq_option(pdf: _ExamPDF, letter: str, option: object, width: float) -> float:
     text = _clean(option)
     pdf.set_font(BODY_FONT, "", 9.6)
+    if any(kind == "math" for kind, _ in split_equation_content(text, undelimited_as_math=False)):
+        return max(8.0, _text_height(pdf, text, width - 11, 5.0))
     return _text_height(pdf, text, width - 11, 5.0)
 
 
@@ -357,16 +392,7 @@ def _draw_mcq_option_at(
             )
     pdf.set_xy(text_x, y)
     pdf.set_font(BODY_FONT, "", 9.6)
-    pdf.multi_cell(
-        text_w,
-        5.0,
-        option_text,
-        # The row starts on the exam's logical side. The shaping engine still
-        # preserves the option text's own bidi order (for example n = c / v).
-        align="R" if row_rtl else "L",
-        new_x="LEFT",
-        new_y="NEXT",
-    )
+    _draw_mixed_math(pdf, option_text, x=text_x, width=text_w, line_height=5.0)
     return height
 
 
@@ -464,14 +490,10 @@ def _draw_true_false(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     else:
         statement_x = pdf.l_margin
     pdf.set_xy(statement_x, row_y)
-    pdf.multi_cell(
-        statement_w,
-        LINE_HEIGHT,
-        statement,
-        align=_align(pdf, raw_statement),
-        new_x="LEFT",
-        new_y="NEXT",
+    actual_height = _draw_mixed_math(
+        pdf, statement, x=statement_x, width=statement_w, bold=True
     )
+    height = max(height, actual_height)
     half = choices_w / 2
     if inline:
         choices_y = row_y
@@ -520,7 +542,7 @@ def _draw_open_ended(
         block_height if block_height <= usable_page_height
         else stem_h + ANSWER_LINE_HEIGHT + 2
     )
-    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_text), new_x="LEFT", new_y="NEXT")
+    _draw_mixed_math(pdf, text, bold=True)
     pdf.ln(1)
     _draw_answer_lines(pdf, line_count, rtl=text_rtl)
     pdf.ln(2.5)
@@ -531,6 +553,18 @@ def _draw_definition(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     marker = f"{item['number']}. "
     raw_term = _clean(item.get("text"), "(missing term)")
     term = marker + raw_term + ": "
+    if any(
+        kind == "math"
+        for kind, _value in split_equation_content(raw_term, undelimited_as_math=False)
+    ):
+        pdf.set_font(BODY_FONT, "B", BODY_SIZE)
+        pdf.ensure_space(LINE_HEIGHT * 2 + 4)
+        _draw_mixed_math(pdf, term, bold=True)
+        y = pdf.get_y() + 1
+        pdf.set_draw_color(71, 85, 105)
+        pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
+        pdf.set_y(y + 4)
+        return
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     term_rtl = _text_is_rtl(raw_term, pdf.rtl)
     term_w = min(pdf.epw * 0.38, max(28.0, pdf.get_string_width(term) + 3.0))
@@ -568,39 +602,42 @@ def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     equation = _clean(item.get("text"), "(missing equation)")
     number_gutter = 12.0
     equation_width = pdf.epw - (2 * number_gutter)
-    complete_prompt = is_complete_equation_prompt(equation)
-    rendered = None if complete_prompt else render_math(equation)
-    if rendered:
-        natural_w = rendered.width_px / 220 * 25.4
-        natural_h = rendered.height_px / 220 * 25.4
-        draw_w = min(equation_width, natural_w)
-        scale = draw_w / natural_w if natural_w else 1.0
-        equation_h = max(LINE_HEIGHT, natural_h * scale)
-    else:
-        pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-        equation_h = _text_height(pdf, equation, equation_width)
+    parts = split_equation_content(equation)
+    equation_h = 0.0
+    layouts = []
+    for kind, value in parts:
+        rendered = render_math(value) if kind == "math" else None
+        if rendered:
+            natural_w = rendered.width_px / 220 * 25.4
+            natural_h = rendered.height_px / 220 * 25.4
+            draw_w = min(equation_width, natural_w)
+            height = max(LINE_HEIGHT, natural_h * (draw_w / natural_w if natural_w else 1.0))
+        else:
+            pdf.set_font(BODY_FONT, "B", BODY_SIZE)
+            draw_w = equation_width
+            height = _text_height(pdf, value, equation_width)
+        layouts.append((kind, value, rendered, draw_w, height))
+        equation_h += height + 1.5
     pdf.ensure_space(equation_h + ANSWER_LINE_HEIGHT + 4)
     y = pdf.get_y()
     number_x = pdf.w - pdf.r_margin - number_gutter if pdf.rtl else pdf.l_margin
     pdf.set_xy(number_x, y)
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     pdf.cell(number_gutter, LINE_HEIGHT, f"{item['number']}.", align="R" if pdf.rtl else "L")
-    if rendered:
-        stream = io.BytesIO(rendered.png)
-        stream.name = "equation.png"
-        image_x = pdf.l_margin + number_gutter + (equation_width - draw_w) / 2
-        pdf.image(stream, x=image_x, y=y, w=draw_w, h=equation_h)
-        pdf.set_y(y + equation_h)
-    else:
-        pdf.set_xy(pdf.l_margin + number_gutter, y)
-        pdf.multi_cell(
-            equation_width,
-            LINE_HEIGHT,
-            equation,
-            align=_align(pdf, equation) if complete_prompt else "C",
-            new_x="LEFT",
-            new_y="NEXT",
-        )
+    cursor_y = y
+    for kind, value, rendered, draw_w, height in layouts:
+        if rendered:
+            stream = io.BytesIO(rendered.png)
+            stream.name = "equation.png"
+            image_x = pdf.l_margin + number_gutter + (equation_width - draw_w) / 2
+            pdf.image(stream, x=image_x, y=cursor_y, w=draw_w, h=height)
+        else:
+            pdf.set_xy(pdf.l_margin + number_gutter, cursor_y)
+            pdf.multi_cell(equation_width, LINE_HEIGHT, value,
+                           align=_align(pdf, value) if kind == "text" else "C",
+                           new_x="LEFT", new_y="NEXT")
+        cursor_y += height + 1.5
+    pdf.set_y(cursor_y)
     pdf.ln(1)
     _draw_answer_lines(pdf, response_line_count("equation"), rtl=pdf.rtl)
     pdf.ln(2.5)
@@ -613,7 +650,7 @@ def _draw_word_problem(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     pdf.set_font(BODY_FONT, "B", BODY_SIZE)
     stem_h = _text_height(pdf, text, pdf.epw)
     pdf.ensure_space(stem_h + ANSWER_LINE_HEIGHT + 2)
-    pdf.multi_cell(0, LINE_HEIGHT, text, align=_align(pdf, raw_text), new_x="LEFT", new_y="NEXT")
+    _draw_mixed_math(pdf, text, bold=True)
     pdf.ln(1)
     _draw_answer_lines(pdf, response_line_count("word_problem"), rtl=_text_is_rtl(raw_text, pdf.rtl))
     pdf.ln(2.5)
@@ -717,6 +754,33 @@ def _draw_answer_key(
     for section in sections:
         _draw_section_heading(pdf, section["label"], minimum_after=11)
         for item in section["items"]:
+            if item["qtype"] == "equation":
+                marker = f"{item['number']}. " if pdf.rtl else f"Q{item['number']}. "
+                pdf.set_font(BODY_FONT, "B", 9.5)
+                pdf.cell(0, 5.0, marker, align="R" if pdf.rtl else "L",
+                         new_x="LEFT", new_y="NEXT")
+                values = [
+                    *[_clean(step) for step in item.get("solution_steps") or [] if _clean(step)],
+                    _clean(item.get("final_answer"), "(missing final answer)"),
+                ]
+                for value in values:
+                    rendered = render_math(value)
+                    if rendered:
+                        natural_w = rendered.width_px / 220 * 25.4
+                        natural_h = rendered.height_px / 220 * 25.4
+                        width = min(pdf.epw - 12, natural_w)
+                        height = natural_h * (width / natural_w if natural_w else 1.0)
+                        pdf.ensure_space(height + 2)
+                        stream = io.BytesIO(rendered.png)
+                        stream.name = "answer-equation.png"
+                        pdf.image(stream, x=pdf.l_margin + (pdf.epw - width) / 2,
+                                  y=pdf.get_y(), w=width, h=height)
+                        pdf.set_y(pdf.get_y() + height + 1.5)
+                    else:
+                        pdf.multi_cell(0, 5.0, value, align="C",
+                                       new_x="LEFT", new_y="NEXT")
+                pdf.ln(1)
+                continue
             answer = _answer_text(item, language=pdf.language)
             answer_rtl = pdf.rtl if item["qtype"] == "mcq" else _text_is_rtl(answer, pdf.rtl)
             marker = f"{item['number']}. " if answer_rtl else f"Q{item['number']}. "
@@ -724,7 +788,7 @@ def _draw_answer_key(
             pdf.set_font(BODY_FONT, "", 9.5)
             height = _text_height(pdf, text, pdf.epw, 5.0)
             pdf.ensure_space(height + 2)
-            pdf.multi_cell(0, 5.0, text, align=_align(pdf, answer), new_x="LEFT", new_y="NEXT")
+            _draw_mixed_math(pdf, text, line_height=5.0)
             pdf.ln(1.5)
 
 

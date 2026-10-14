@@ -294,3 +294,34 @@ console.log(JSON.stringify(warning));
         assert "ملء الفراغ" in rendered
         assert "المفقود" in rendered
         assert "Your exam" not in rendered and "Fill-in" not in rendered
+
+
+@pytest.mark.skipif(NODE is None, reason="node not available")
+def test_partial_exam_warning_never_renders_empty_missing_details(tmp_path):
+    frontend = Path(__file__).parents[1] / "FrontEnd" / "js"
+    module = tmp_path / "exam-lifecycle.mjs"
+    module.write_text(
+        (frontend / "exam-lifecycle.js").read_text(encoding="utf-8")
+        .replace('./i18n.js', './i18n.mjs'), encoding="utf-8",
+    )
+    (tmp_path / "i18n.mjs").write_text(
+        (frontend / "i18n.js").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    script = """
+globalThis.localStorage = {getItem: () => 'en', setItem: () => {}};
+const warning = {hidden: true, textContent: ''};
+globalThis.document = {getElementById: () => warning};
+const lifecycle = await import(process.env.MODULE_URL);
+lifecycle.renderPartialExamWarning({
+  status: 'partial', metadata: {quality_summary: {requested: 19, valid: 17}}, warnings: []
+});
+console.log(warning.textContent);
+"""
+    process = subprocess.run(
+        [NODE, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", timeout=30,
+        env={**os.environ, "MODULE_URL": module.resolve().as_uri()},
+    )
+    assert process.returncode == 0, process.stderr
+    assert "Missing: 2." in process.stdout
+    assert "Missing: ." not in process.stdout

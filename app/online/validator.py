@@ -44,7 +44,7 @@ REPAIR_ACTIONS = frozenset(
     {"FIX_QUESTION", "FIX_ANSWER", "FIX_OPTIONS", "FIX_QUESTION_AND_ANSWER"}
 )
 
-MAX_QUESTION_REPAIR_ATTEMPTS = 2
+MAX_QUESTION_REPAIR_ATTEMPTS = 3
 
 VALIDATOR_TEMPERATURE = 0.1
 # Some served models (e.g. qwen/qwen3-8b) only support reasoning 'off'/'on'.
@@ -1308,13 +1308,14 @@ Rules:
 - Return one root JSON object with a `verdicts` array containing exactly one verdict per question_id.
 - Use assigned_sources for facts, laws, formulas, definitions, terminology, and source-specific values. Neutral numbers explicitly stated as givens in a self-contained exercise are problem data and need not appear verbatim in the source.
 - Check clarity, grammar, grounding, planned question type and operation, difficulty fit, assessment guidance, and non-quantitative answer quality. If difficulty is wrong, repair the student-facing question to match the plan; never request changes to plan.difficulty or any Planner field.
+- Verify difficulty from the cognitive work the student must actually perform against the assigned evidence and expected reasoning_depth/reasoning_requirements. Do not infer difficulty from wording length, large numbers, or reasoning_mode alone. For an adjusted task, independently reject a label-only change or any new operation/prerequisite unsupported by assigned_sources.
 - Compare expected_catalog_task with the actual generated question. The question must preserve the assigned concept/knowledge target, student operation, target/result, reasoning mode, required output, required givens, and evidence boundary. Being on the same broad topic is not enough. If the intended task is to interpret a solution region but the question merely asks whether a point satisfies inequalities, return failure_code=task_drift and describe expected versus actual concept, operation, and target in reason.
 - Check that required representations are included. Leave missing numerical/symbolic givens and calculations to the STEM quantitative validator.
 - For MCQ, verify that the concise stem performs the assigned operation and does not quote a long passage or reveal the answer. Reject difficulty created only by long/confusing wording or irrelevant detail. Verify four parallel options, exactly one defensible best answer, and plausible same-concept distractors based on nearby concepts, misconceptions, reversed relationships, incomplete reasoning, or realistic mistakes. Reject irrelevant/ridiculous distractors, semantic-equivalent options, multiple defensible answers, and a correct option that stands out by length, detail, qualification, grammar, tone, or copied source wording. Reject unsupported facts, numbers, scenarios, and assumptions. Leave numerical/symbolic correctness to the STEM quantitative validator.
 - Distinguish a good catalog task with a bad generated MCQ from a fundamentally unsuitable task. For a repairable generated item, request only the exact student-facing fields that need repair and keep the same task. If the assigned task cannot naturally support one clear best answer, three plausible competitors, and meaningful assessment of its target, use failure_code=mcq_task_unsuitable so allocation can select another task; do not repeatedly repair or weaken that task.
 - Why must ask for causal reasoning, mechanisms, justification, or relationships and preserve a compatible reasoning task. Reject listing, definition, evidence-significance, or simple retrieval prompts labeled Why.
 - Definition stores the bare source term or concept in term; the UI/export supplies the instruction to define it. Reject prompt text embedded in term, another operation, or an answer that does not directly and concisely define that target.
-- Check True/False clarity; one-answer/one-blank FITB; relevant Why/Essay depth; and Equation versus meaningful Word Problem form.
+- Check True/False clarity; one-answer/one-blank FITB; relevant Why/Essay depth; and Equation versus meaningful Word Problem form. Equation must be equation-centered: the student works directly with a displayed mathematical or discipline-specific formal representation. Accept a short instruction, necessary givens/units, multiple equations, and supporting tables that directly serve the symbolic operation. Reject narrative Word Problems, extended prose explanations, or items whose symbolic content appears only in the answer. Do not use word count or symbol count alone. Require valid LaTeX with important expressions visually separate from instructions using display delimiters; require source-appropriate notation for Mathematics, Physics, Chemistry, and other STEM disciplines.
 - For Equation and Word Problem, inspect task_operation, target, student_work_product, relationship, required_givens, and reasoning_mode together. Necessary premises and givens must be present, but the prompt must not perform the operation assigned to the student. A starting relationship is appropriate for rearrange or apply-a-provided-rule tasks. For derive, construct, formulate, combine, prove, balance, or select-the-governing-relationship tasks, reject a stem that supplies the final relationship, completed equation, exact reasoning step, or result being assessed; use failure_code=task_drift and request a question-field repair.
 - Do not impose one universal Equation or Word Problem pattern. Verify that the student work follows the catalog operation rather than defaulting to rearrange-and-isolate or story-then-choose-a-formula. For a Word Problem, providing a rule is valid only when applying a provided rule is the assigned work; omit it when selecting or forming that relationship is assessed.
 - Compare quantitative/application questions with assigned_sources. Unless expected_catalog_task explicitly targets the exact source instance through its target and required_givens, reject copying a worked example's same scenario + values + requested result. Reusing its supported method or constraints with a materially different, fully stated, evidence-consistent instance is allowed. Do not require invented facts or contexts.
@@ -1459,6 +1460,18 @@ def _catalog_task_contract(plan_item: Optional[Dict[str, Any]]) -> Dict[str, Any
         "difficulty": plan.get("difficulty"),
         "assigned_evidence_ids": _plan_source_ids(plan),
     }
+    if any(key in plan for key in (
+        "reasoning_depth", "reasoning_requirements", "prerequisites",
+        "requested_difficulty", "actual_difficulty", "difficulty_adaptation",
+    )):
+        contract.update({
+            "reasoning_depth": plan.get("reasoning_depth"),
+            "reasoning_requirements": list(plan.get("reasoning_requirements") or []),
+            "prerequisites": list(plan.get("prerequisites") or []),
+            "requested_difficulty": plan.get("requested_difficulty"),
+            "actual_difficulty": plan.get("actual_difficulty"),
+            "difficulty_adjustment": plan.get("difficulty_adaptation"),
+        })
     if plan.get("fitb_entry_id"):
         contract.update({
             "fitb_entry_id": plan.get("fitb_entry_id"),
@@ -1512,6 +1525,9 @@ REPAIR_SYSTEM_PROMPT = (
     "operation. Give a starting relation for rearrange/apply-provided-rule work, but do not reveal "
     "the final relationship, completed equation, governing rule, reasoning step, or result when "
     "deriving, constructing, formulating, balancing, proving, or selecting it is the assessed work.\n"
+    "- An Equation repair must remain equation-centered and use valid LaTeX. Keep short instructions "
+    "separate from displayed equations, systems, relationships, reactions, or supporting tables. "
+    "Do not turn it into a narrative Word Problem or reveal a relationship the student must derive.\n"
     "- Return one root JSON object with a `repairs` array containing one repair object per "
     "input item, in any order. Each repair object is:\n"
     '  {"question_id": "...", "repaired_fields": ["..."], '
@@ -1519,7 +1535,7 @@ REPAIR_SYSTEM_PROMPT = (
     "- Return ONLY valid JSON. No fences, no extra text."
 )
 
-STEM_QUANTITATIVE_REPAIR_SYSTEM_PROMPT = """You are a quantitative STEM question repairer using medium reasoning. Repair only listed student-facing quantitative fields: numbers, equations, calculations, units, missing numerical or symbolic givens, solution_steps, final_answer, and numerical or symbolic MCQ options or correct_answer. Also replace the internal solution_certificate so it exactly documents the repaired mathematics. Preserve the catalog task and every field not authorized by fields_to_fix. Add only premises and givens needed by the assigned operation; never add the final relationship, completed equation, governing rule, reasoning step, or result when producing or selecting it is the student work being assessed.
+STEM_QUANTITATIVE_REPAIR_SYSTEM_PROMPT = """You are a quantitative STEM question repairer using medium reasoning. Repair only listed student-facing quantitative fields: numbers, equations, calculations, units, missing numerical or symbolic givens, solution_steps, final_answer, and numerical or symbolic MCQ options or correct_answer. Also replace the internal solution_certificate so it exactly documents the repaired mathematics. Preserve the catalog task and every field not authorized by fields_to_fix. Add only premises and givens needed by the assigned operation; never add the final relationship, completed equation, governing rule, reasoning step, or result when producing or selecting it is the student work being assessed. Keep Equation items equation-centered and in valid LaTeX, with concise instructions separated from display equations and no narrative Word Problem conversion.
 Independently solve the repaired problem from scratch. Treat expected_results and expected_fix as diagnostic hypotheses, not authority. Verify by a second method when practical, such as substitution, reverse calculation, constraint testing, conservation, dimensional analysis, or independent recomputation. For optimization, use only feasible candidates. For MCQ, verify exactly one option is correct and put its label in solution_certificate.matching_correct_option. Keep solution_steps, final_answer, options, stored answer, and solution_certificate consistent. Never edit Planner metadata or address wording, difficulty, duplication, or coverage.
 Return one root JSON object with a `repairs` array containing one full repair object per input question with unchanged question_id. Return only valid JSON."""
 
@@ -2894,6 +2910,7 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     retry_seeds = deepcopy(state.get("repair_retry_seeds") or {})
     validation_repair_history = list(state.get("validation_repair_history") or [])
     candidate_updates_by_model: Dict[int, Dict[str, Any]] = {}
+    balanced_candidate_ids_by_model: Dict[int, list[str]] = {}
 
     # Repair writes are transactional: validate each staged candidate first and
     # mutate the active exam/plan only after every required validator passes.
@@ -2995,6 +3012,18 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             retry_seeds[slot_id] = deepcopy(candidate)
         validation_repair_history.append(event)
     # Candidates are consumed exactly once, whether accepted or rejected.
+    if candidate_updates_by_model:
+        from app.online.exam_builder import balance_mcq_answer_positions
+        for exam in generated:
+            mn = int(exam.get("model_number") or 1)
+            if mn not in candidate_updates_by_model:
+                continue
+            changed_ids = balance_mcq_answer_positions(
+                exam.get("questions") or {}, mn
+            )
+            if changed_ids:
+                balanced_candidate_ids_by_model[mn] = changed_ids
+
     for exam in generated:
         mn = exam.get("model_number")
         if mn in validated:
@@ -3030,6 +3059,16 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         if int(mn or 0) in candidate_updates_by_model:
             update = candidate_updates_by_model[int(mn or 0)]
             report = _merge_validation_report(previous, update) if previous is not None else update
+            balanced_ids = balanced_candidate_ids_by_model.get(int(mn or 0), [])
+            if balanced_ids:
+                logger.info(
+                    "Revalidating MCQs changed by post-repair balancing | "
+                    "model=%d | question_count=%d | question_ids=%s",
+                    mn,
+                    len(balanced_ids),
+                    balanced_ids,
+                )
+                report = _merge_validation_report(report, run_reviews(balanced_ids))
         elif mn in pending_revalidation:
             repaired_ids = list(pending_revalidation.pop(mn) or [])
             if repaired_ids:

@@ -80,6 +80,25 @@ def strict_json_schema(model: type[BaseModel]) -> dict:
     return schema
 
 
+class DifficultyAdaptation(StrictOutputModel):
+    status: Literal["pending", "adapted", "failed"]
+    from_difficulty: Literal["easy", "medium", "hard"]
+    to_difficulty: Literal["easy", "medium", "hard"]
+    base_task_id: str = Field(min_length=1)
+    strategy: str | None = None
+    failed_strategies: list[str] = Field(default_factory=list)
+    changed_reasoning_requirements: list[NonEmptyString] = Field(default_factory=list)
+    evidence_support: list[NonEmptyString] = Field(default_factory=list)
+    evidence_justification: str | None = None
+
+
+class ReasoningProfile(StrictOutputModel):
+    depth: Literal["easy", "medium", "hard"]
+    requirements: list[NonEmptyString] = Field(min_length=1, max_length=8)
+    prerequisites: list[NonEmptyString] = Field(default_factory=list, max_length=8)
+    evidence_chunk_ids: list[NonEmptyString] = Field(min_length=1, max_length=4)
+
+
 class PlanItem(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     source_chunk_id: str = Field(min_length=1)
@@ -99,6 +118,20 @@ class PlanItem(StrictOutputModel):
     reasoning_mode: ReasoningMode
     difficulty: Literal["easy", "medium", "hard"]
     idea_to_test: str = Field(min_length=1)
+    requested_difficulty: Literal["easy", "medium", "hard", "mix"] | None = None
+    actual_difficulty: Literal["easy", "medium", "hard"] | None = None
+    base_catalog_task_id: str | None = None
+    base_task_family_id: str | None = None
+    difficulty_adaptation: DifficultyAdaptation | None = None
+    difficulty_fallback_reason: str | None = None
+    reasoning_depth: Literal["easy", "medium", "hard"] | None = None
+    reasoning_requirements: list[str] = Field(default_factory=list)
+    prerequisites: list[str] = Field(default_factory=list)
+    derived_task_id: str | None = None
+    selected_replacement_task_id: str | None = None
+    task_was_previously_used: bool = False
+    adjustment_attempts: int = 0
+    adjustment_failure_reason: str | None = None
 
 
 class QuestionTypeAssessment(StrictOutputModel):

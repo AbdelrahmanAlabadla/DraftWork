@@ -1,6 +1,6 @@
 import { state } from "./state.js";
 import { applyContentDirection, t } from "./i18n.js";
-import { renderEquation } from "./math-renderer.js";
+import { renderEquationContent, renderMixedMath } from "./math-renderer.js";
 
 // Mirrors app.exports.common so screen, PDF, and DOCX use one visual contract.
 const RESPONSE_LINE = "_".repeat(92);
@@ -64,7 +64,9 @@ function format(template, params = {}) {
 }
 
 function contentElement(tag, className, text, fallbackLanguage = "en") {
-  return applyContentDirection(element(tag, className, text), text, fallbackLanguage);
+  const node = applyContentDirection(element(tag, className), text, fallbackLanguage);
+  renderMixedMath(node, text, fallbackLanguage);
+  return node;
 }
 
 function element(tag, className = "", text = "") {
@@ -144,7 +146,9 @@ function addQuestionStem(parent, number, text, language, fallback) {
   const value = clean(text, fallback);
   applyContentDirection(stem, value, language);
   stem.appendChild(element("strong", "", language === "ar" ? `${number}. ` : `Q${number}. `));
-  stem.appendChild(document.createTextNode(value));
+  const content = element("span", "preview-question-content");
+  renderMixedMath(content, value, language);
+  stem.appendChild(content);
   parent.appendChild(stem);
 }
 
@@ -153,7 +157,9 @@ function addPlainNumberedStem(parent, number, text, language, fallback) {
   const value = clean(text, fallback);
   applyContentDirection(stem, value, language);
   stem.appendChild(element("strong", "", `${number}. `));
-  stem.appendChild(document.createTextNode(value));
+  const content = element("span", "preview-question-content");
+  renderMixedMath(content, value, language);
+  stem.appendChild(content);
   parent.appendChild(stem);
 }
 
@@ -192,7 +198,10 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
       const row = element("div", "preview-definition-row");
       const value = clean(text, examLabels.missingTerm);
       applyContentDirection(row, value, language);
-      row.appendChild(element("strong", "", `${index + 1}. ${value}:`));
+      row.appendChild(element("strong", "", `${index + 1}. `));
+      const term = element("strong", "preview-question-content");
+      renderMixedMath(term, `${value}:`, language);
+      row.appendChild(term);
       row.appendChild(element("span", "preview-definition-line"));
       question.appendChild(row);
     } else if (qtype === "equation") {
@@ -200,12 +209,7 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
       row.appendChild(element("strong", "preview-equation-number", `${index + 1}.`));
       const value = clean(text, examLabels.missingQuestion);
       const equation = element("div", "preview-equation-text");
-      if (EQUATION_TASK_RE.test(value)) {
-        equation.textContent = value;
-        applyContentDirection(equation, value, language);
-      } else {
-        renderEquation(equation, value);
-      }
+      renderEquationContent(equation, value, language);
       row.appendChild(equation);
       question.appendChild(row);
     } else if (qtype === "true_false") {
@@ -213,7 +217,9 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
       const value = clean(text, examLabels.missingQuestion);
       applyContentDirection(stem, value, language);
       stem.appendChild(element("strong", "", language === "ar" ? `${index + 1}. ` : `Q${index + 1}. `));
-      stem.appendChild(document.createTextNode(value));
+      const content = element("span", "preview-question-content");
+      renderMixedMath(content, value, language);
+      stem.appendChild(content);
       stem.appendChild(element("span", "preview-tf-choices", examLabels.trueFalse));
       question.appendChild(stem);
     } else if (qtype === "word_problem") {
@@ -278,7 +284,23 @@ function buildAnswerKey(exam, labels, language, examLabels) {
         applyContentDirection(row, answer, language);
       }
       row.appendChild(element("strong", "", language === "ar" ? `${index + 1}. ` : `Q${index + 1}. `));
-      row.appendChild(document.createTextNode(answer));
+      if (qtype === "equation") {
+        const worked = element("div", "preview-equation-answer");
+        (item.solution_steps || []).forEach((step) => {
+          renderEquationContent(worked.appendChild(element("div")), `\\[${clean(step)}\\]`, language);
+        });
+        const final = element("div", "preview-equation-final");
+        final.appendChild(contentElement("strong", "", `${examLabels.finalAnswer}: `, language));
+        const finalMath = element("span");
+        renderEquationContent(finalMath, `\\[${clean(item.final_answer, examLabels.noFinalAnswer)}\\]`, language);
+        final.appendChild(finalMath);
+        worked.appendChild(final);
+        row.appendChild(worked);
+      } else {
+        const content = element("span", "preview-answer-content");
+        renderMixedMath(content, answer, language);
+        row.appendChild(content);
+      }
       paper.appendChild(row);
     });
   });

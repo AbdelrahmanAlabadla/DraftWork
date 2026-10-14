@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import json
+import pytest
+from pydantic import ValidationError
+
 from app.online import assessment_catalog as catalog
 
 
@@ -192,6 +196,62 @@ def test_catalog_prompt_defines_semantic_suitability_for_active_types():
     assert "concept + narrow target + student operation + expected work product" in prompt
     assert "identify a term from its description versus state its definition" in prompt
     assert "Do not target a fixed task count" in prompt
+
+
+def test_catalog_prompt_defines_one_cognitive_difficulty_classification():
+    prompt = catalog._catalog_prompt(
+        "source", "English", ["c1"], domain_type="stem", subject="mathematics"
+    )
+    for phrase in (
+        "native_difficulty and reasoning_depth are two names for that same grounded classification",
+        "direct recall, recognition, straightforward substitution",
+        "selecting or organizing a method, connecting dependent operations",
+        "integrating relationships or constraints, evaluating alternatives",
+        "wording length, numerical size, visible step count",
+    ):
+        assert phrase in prompt
+
+
+def test_catalog_schema_rejects_contradictory_native_difficulty_and_depth():
+    payload = {
+        "knowledge_anchor": "linear equations", "topic": "algebra",
+        "concept": "linear equality", "relationship": "equal operations preserve equality",
+        "task_operation": "solve_equation", "student_work_product": "solve for x",
+        "target": "value of x", "reasoning_mode": "symbolic_manipulation",
+        "allowed_question_types": ["equation"], "evidence_chunk_ids": ["c1"],
+        "required_givens": [], "scenario_family": None, "text_answerable": True,
+        "native_difficulty": "easy", "reasoning_depth": "medium",
+        "reasoning_requirements": ["Apply inverse operations."],
+        "prerequisites": ["Understand equality."],
+    }
+    with pytest.raises(ValidationError, match="must be the same grounded"):
+        catalog.CatalogTaskDraft.model_validate(payload)
+    finalized = catalog._finalize_catalog(
+        {"assessment_profile": _profile("c1"), "tasks": [payload]},
+        key="catalog", processed_document_key="processed",
+        selected_chunk_ids=["c1"], usage=None,
+    )
+    assert finalized["tasks"] == []
+
+
+def test_current_version_cache_rejects_inconsistent_difficulty_metadata(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(catalog.config, "ASSESSMENT_CATALOG_CACHE_DIR", str(tmp_path))
+    key = "b" * 64
+    path = catalog._path_for(key)
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({
+        "cache_key": key,
+        "catalog_version": catalog.config.ASSESSMENT_CATALOG_VERSION,
+        "tasks": [{
+            "native_difficulty": "easy", "reasoning_depth": "medium",
+            "supported_difficulties": ["easy"],
+            "reasoning_requirements": ["Recall a fact."], "prerequisites": [],
+        }],
+        "fitb_bank": [],
+    }), encoding="utf-8")
+    assert catalog._read_cache(key) is None
 
 
 def test_finalizer_does_not_invent_mcq_or_semantic_types():

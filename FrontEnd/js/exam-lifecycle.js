@@ -48,12 +48,21 @@ export function renderPartialExamWarning(record = {}) {
     const qtype = translatedType === typeKey ? rawType.replaceAll("_", " ") : translatedType;
     return t("warning.partial.item", { missing, qtype });
   });
+  const fallbackMessages = (record.warnings || [])
+    .filter((item) => item && typeof item === "object" && item.type === "difficulty_fallback")
+    .map((item) => String(item.message || "").trim())
+    .filter(Boolean);
+  const missingCount = Math.max(0, summary.requested - summary.generated);
+  const missingMessage = details.length
+    ? t("warning.partial.missing", { details: details.join(", ") })
+    : (missingCount ? t("warning.partial.missing", { details: String(missingCount) }) : "");
   warning.textContent = [
     t("warning.partial.summary", {
       generated: summary.generated,
       requested: summary.requested,
     }),
-    t("warning.partial.missing", { details: details.join(", ") }),
-  ].join(" ");
+    missingMessage,
+    ...fallbackMessages,
+  ].filter(Boolean).join(" ");
   warning.hidden = false;
 }

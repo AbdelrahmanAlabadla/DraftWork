@@ -34,6 +34,9 @@ def _item(
         "text_answerable": True,
         "reasoning_mode": reasoning_mode,
         "difficulty": difficulty,
+        "reasoning_depth": difficulty,
+        "reasoning_requirements": [f"{task_operation}: {resolved_target}"],
+        "prerequisites": [],
         "idea_to_test": idea,
         "concept_to_test": idea,
     }
@@ -781,10 +784,11 @@ def test_direct_single_relationship_calculation_cannot_be_labeled_hard():
         reasoning_mode="calculation",
         difficulty="hard",
     )]}}]
+    plans[0]["items"]["mcq"][0]["reasoning_depth"] = "easy"
     errors = planner.validate_plans(
         plans, [("mcq", 1)], 1, {"chunk-a"}, "mix"
     )
-    assert any("labeled hard without" in error for error in errors)
+    assert any("does not match its reasoning_depth" in error for error in errors)
 
 
 def test_scenario_suffix_does_not_hide_duplicate_quantitative_target():
@@ -903,12 +907,13 @@ def test_hard_conceptual_reasoning_requires_real_depth_cue():
     item.update({
         "reasoning_mode": "conceptual_reasoning",
         "difficulty": "hard",
+        "reasoning_depth": "easy",
     })
     plan = {"model_number": 1, "items": {"true_false": [item]}}
 
     errors = planner.validate_plans([plan], [("true_false", 1)], 1)
 
-    assert any("labeled hard without" in error for error in errors)
+    assert any("does not match its reasoning_depth" in error for error in errors)
 
 
 def test_why_rejects_numerical_calculation_mode():
@@ -941,10 +946,11 @@ def test_direct_comparison_cannot_be_labeled_hard():
         relationship="wavelength-index relationship", target="wavelength in medium",
         reasoning_mode="comparison_prediction", difficulty="hard",
     )]}}]
+    plans[0]["items"]["mcq"][0]["reasoning_depth"] = "medium"
     errors = planner.validate_plans(
         plans, [("mcq", 1)], 1, {"chunk-a"}, "mix"
     )
-    assert any("labeled hard without" in error for error in errors)
+    assert any("does not match its reasoning_depth" in error for error in errors)
 
 
 def test_missing_output_slots_are_reported_by_id():
