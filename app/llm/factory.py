@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextvars import ContextVar, Token
 from typing import TYPE_CHECKING
 
 from app.config import LLM_PROVIDER
@@ -9,14 +10,55 @@ if TYPE_CHECKING:
     from app.llm.deepseek import DeepSeekClient
 
 
+_ONLINE_ASSESSMENT_DOMAIN: ContextVar[str] = ContextVar(
+    "online_assessment_domain", default=""
+)
+
+
+def set_online_assessment_domain(domain: str | None) -> Token:
+    """Bind the persisted assessment domain for all LLM calls in one graph node."""
+    return _ONLINE_ASSESSMENT_DOMAIN.set(str(domain or "").strip().upper())
+
+
+def reset_online_assessment_domain(token: Token) -> None:
+    _ONLINE_ASSESSMENT_DOMAIN.reset(token)
+
+
+def _domain(domain: str | None = None) -> str:
+    return str(domain or _ONLINE_ASSESSMENT_DOMAIN.get() or "").strip().upper()
+
+
+def _stem_reasoning_effort(stage: str) -> str:
+    from app import config
+
+    if stage in {"stem_quantitative_validator", "stem_quantitative_repairer"}:
+        return config.STEM_QUANTITATIVE_REASONING_EFFORT
+    return config.STEM_REVIEW_REASONING_EFFORT
+
+
 def create_llm_client(
     *,
     local_url: str | None = None,
     local_model: str | None = None,
     local_reasoning: str | None = None,
     deepseek_model: str | None = None,
+    domain: str | None = None,
+    stage: str = "online_default",
 ) -> LMStudioClient | DeepSeekClient:
-    """Create the selected LLM client while keeping LM Studio as the default."""
+    """Create an online client, routing every STEM stage through OpenAI."""
+    normalized_domain = _domain(domain)
+    if normalized_domain == "STEM":
+        from app import config
+        from app.llm.openai_client import OpenAIClient
+
+        return OpenAIClient(
+            model=config.STEM_REVIEW_MODEL,
+            reasoning_effort=_stem_reasoning_effort(stage),
+        )
+    if normalized_domain == "NON_STEM":
+        from app.llm.deepseek import DeepSeekClient
+
+        return DeepSeekClient(model=deepseek_model)
     if LLM_PROVIDER == "deepseek":
         from app.llm.deepseek import DeepSeekClient
 
@@ -28,18 +70,19 @@ def create_llm_client(
     )
 
 
-def create_plan_review_client():
-    """Plan comparison always uses the small, bounded DeepSeek reviewer."""
-    from app.llm.deepseek import DeepSeekClient
-
-    return DeepSeekClient(model="deepseek-flash")
+def create_plan_review_client(*, domain: str | None = None):
+    """Create the domain-routed plan reviewer."""
+    return create_llm_client(domain=domain, stage="plan_reviewer")
 
 
-def create_duplicate_replacement_client():
-    """Use the bounded comparison model for compact duplicate replacement selection."""
-    from app.llm.deepseek import DeepSeekClient
+def create_duplicate_replacement_client(*, domain: str | None = None):
+    """Create the domain-routed duplicate replacement selector."""
+    return create_llm_client(domain=domain, stage="duplicate_replacement")
 
-    return DeepSeekClient(model="deepseek-flash")
+
+def create_difficulty_adjustment_client(*, domain: str | None = None):
+    """Create the on-demand, domain-routed difficulty adjustment agent."""
+    return create_llm_client(domain=domain, stage="difficulty_adjuster")
 
 
 def create_review_client(*, domain: str, stage: str):
@@ -50,25 +93,9 @@ def create_review_client(*, domain: str, stage: str):
         "stem_quantitative_repairer", "duplicate_judge",
     }:
         raise ValueError(f"Unsupported review stage: {stage}")
-    if stage == "general_validator":
-        from app.llm.deepseek import DeepSeekClient
-        return DeepSeekClient()
-    if normalized_domain == "STEM" and stage in {
-        "correctness_validator", "stem_quantitative_validator",
-        "stem_quantitative_repairer", "duplicate_judge",
-    }:
-        from app import config
-        from app.llm.openai_client import OpenAIClient
-
-        return OpenAIClient(
-            model=config.STEM_REVIEW_MODEL,
-            reasoning_effort=config.STEM_REVIEW_REASONING_EFFORT,
-        )
-    if normalized_domain == "NON_STEM":
-        from app.llm.deepseek import DeepSeekClient
-
-        return DeepSeekClient()
-    raise ValueError("Assessment profile must contain domain STEM or NON_STEM")
+    if normalized_domain not in {"STEM", "NON_STEM"}:
+        raise ValueError("Assessment profile must contain domain STEM or NON_STEM")
+    return create_llm_client(domain=normalized_domain, stage=stage)
 
 
 def assessment_compiler_identity(*, domain_type: str) -> dict[str, str]:
@@ -94,14 +121,5 @@ def assessment_compiler_identity(*, domain_type: str) -> dict[str, str]:
 def create_assessment_compiler_client(*, domain_type: str):
     """Route the compiler solely from the persisted title-generation domain."""
     identity = assessment_compiler_identity(domain_type=domain_type)
-    if identity["provider"] == "openai":
-        from app import config
-        from app.llm.openai_client import OpenAIClient
-
-        return OpenAIClient(
-            model=identity["model"],
-            reasoning_effort=config.STEM_REVIEW_REASONING_EFFORT,
-        )
-    from app.llm.deepseek import DeepSeekClient
-
-    return DeepSeekClient()
+    domain = "STEM" if identity["provider"] == "openai" else "NON_STEM"
+    return create_llm_client(domain=domain, stage="assessment_compiler")

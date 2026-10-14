@@ -118,6 +118,41 @@ def test_generator_plan_text_preserves_catalog_and_replacement_identity():
         assert expected in rendered
 
 
+def test_fixed_difficulty_generator_honors_fallback_slots_actual_difficulty():
+    item = {
+        **_task("task-medium"),
+        "slot_id": "m1_why_1",
+        "source_chunk_id": "c1",
+        "support_chunk_ids": [],
+        "requested_difficulty": "easy",
+        "difficulty": "medium",
+        "actual_difficulty": "medium",
+        "reasoning_depth": "medium",
+        "reasoning_requirements": ["connect cause and effect"],
+        "prerequisites": ["identify the relevant relationship"],
+        "difficulty_adaptation": {
+            "status": "failed",
+            "from_difficulty": "medium",
+            "to_difficulty": "easy",
+        },
+        "difficulty_fallback_reason": "source_does_not_support_safe_simplification",
+        "assigned_sources": {"primary": {"chunk_id": "c1", "text": "source"}},
+    }
+
+    _system, user = prompts.build_prompt(
+        "why", 1, "unused global context", difficulty="easy", planned_items=[item]
+    )
+
+    assert "requested_difficulty=easy" in user
+    assert "difficulty=medium" in user
+    assert "actual_difficulty=medium" in user
+    assert "reasoning_depth=medium" in user
+    assert "reasoning_requirements=['connect cause and effect']" in user
+    assert "including fixed-difficulty exams" in user
+    assert "do not silently relabel" in user
+    assert prompts._DIFFICULTY_EASY not in user
+
+
 def test_definition_term_is_bare_concept_across_normalization_and_validation():
     item = {"term": "linear equation", "reference_answer": "An equation of degree one."}
     assert _normalize_definition(item) == item
@@ -135,7 +170,14 @@ def test_mcq_balance_recomputes_certificate_mapping_before_validation():
             "matching_correct_option": "A", "verification_method": "substitution",
         },
     }
-    questions = {"mcq": [question]}
+    questions = {"mcq": [question, *[
+        {
+            "question": f"Which value is correct for item {index}?",
+            "options": {"A": "4", "B": "3", "C": "2", "D": "1"},
+            "correct_answer": "A",
+        }
+        for index in range(2, 5)
+    ]]}
     balance_mcq_answer_positions(questions)
     assert question["correct_answer"] == "B"
     assert question["options"]["B"] == "4"

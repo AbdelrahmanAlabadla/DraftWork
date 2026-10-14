@@ -285,31 +285,54 @@ _MCQ_POSITION_SEQUENCE = ("B", "D", "A", "C", "C", "A", "D", "B")
 def balance_mcq_answer_positions(
     questions: dict[str, Any], model_number: int = 1
 ) -> list[str]:
-    """Place correct MCQ options in a deterministic, balanced sequence.
+    """Rebalance concentrated MCQ answer positions deterministically.
 
     Only option positions and the stored answer letter change; option content is
     preserved exactly. Any certificate option mapping is recomputed at the same
-    time so validation never receives content paired with stale metadata.
+    time so validation never receives content paired with stale metadata. A
+    section is left untouched while every answer position is below 50%.
     """
     mcqs = questions.get("mcq") or []
-    changed_ids: list[str] = []
-    offset = max(0, int(model_number) - 1) % len(_MCQ_POSITION_SEQUENCE)
+    labels = ("A", "B", "C", "D")
+    eligible: list[tuple[int, dict[str, Any]]] = []
+    counts = {label: 0 for label in labels}
     for index, item in enumerate(mcqs):
         options = item.get("options")
         current = str(item.get("correct_answer") or "")
-        target = _MCQ_POSITION_SEQUENCE[(index + offset) % len(_MCQ_POSITION_SEQUENCE)]
-        if not isinstance(options, dict) or current not in options or target not in options:
+        if not isinstance(options, dict) or current not in labels or any(
+            label not in options for label in labels
+        ):
             continue
-        changed = current != target
-        if current != target:
-            options[current], options[target] = options[target], options[current]
+        eligible.append((index, item))
+        counts[current] += 1
+
+    total = len(eligible)
+    if total <= 1 or not any(count * 2 >= total for count in counts.values()):
+        return []
+
+    changed_ids: list[str] = []
+    offset = max(0, int(model_number) - 1) % len(_MCQ_POSITION_SEQUENCE)
+    while max(counts.values()) - min(counts.values()) > 1:
+        source = next(label for label in labels if counts[label] == max(counts.values()))
+        target = next(label for label in labels if counts[label] == min(counts.values()))
+        matching = [
+            (index, item) for index, item in eligible
+            if item.get("correct_answer") == source
+            and _MCQ_POSITION_SEQUENCE[(index + offset) % len(_MCQ_POSITION_SEQUENCE)] == target
+        ]
+        index, item = (matching or [
+            pair for pair in eligible if pair[1].get("correct_answer") == source
+        ])[0]
+        options = item["options"]
+        options[source], options[target] = options[target], options[source]
         item["correct_answer"] = target
         certificate = item.get("solution_certificate")
         if isinstance(certificate, dict):
-            changed = changed or certificate.get("matching_correct_option") != target
             certificate["matching_correct_option"] = target
-        if changed and item.get("question_id"):
+        if item.get("question_id"):
             changed_ids.append(str(item["question_id"]))
+        counts[source] -= 1
+        counts[target] += 1
     return changed_ids
 
 
@@ -1672,6 +1695,16 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             difficulty, assessment_profile, planning_issues,
         ),
     ]
+    if state.get("unresolved_plan_duplicate_conflicts"):
+        from app.online.plan_review import _is_duplicate_plan_error
+        planning_gate_errors = [
+            error for error in planning_gate_errors
+            if not _is_duplicate_plan_error(error)
+        ]
+        warnings.append(
+            "Plan duplicate diversification was exhausted; generation continued with "
+            "auditable unresolved plan similarity for the final Duplicate Judge."
+        )
     if planning_gate_errors:
         raise RuntimeError(
             "Generator refused an invalid reviewed plan: "
@@ -2230,6 +2263,12 @@ def generate_exams(
         "plan_attempts": 0,
         "unrepairable_plan_slots": [],
         "plan_review_history": [],
+        "plan_review_retry_required": False,
+        "plan_review_rechecks": 0,
+        "plan_duplicate_repair_attempts": {},
+        "unresolved_plan_duplicate_conflicts": [],
+        "difficulty_adjustment_history": [],
+        "difficulty_adjustment_attempts": {},
         "plan_review_attempts": 0,
         "generated_exams": [],
         "rejection_feedback": None,
@@ -2252,6 +2291,11 @@ def generate_exams(
         "duplicate_similarity_distributions": [],
         "pending_duplicate_groups": [],
         "duplicate_repair_rounds": 0,
+        "duplicate_judge_exempt_ids": [],
+        "duplicate_numeric_fallback_pending_validation": False,
+        "duplicate_repair_finalization_pending": False,
+        "duplicate_verification_pending": False,
+        "duplicate_verification_attempt": 0,
         "duplicate_replacement_attempts": {},
         "duplicate_candidate_blacklist": {},
         "duplicate_replacement_failures": {},
@@ -2361,6 +2405,20 @@ def generate_exams(
             "target": item.get("target"),
             "reasoning_mode": item.get("reasoning_mode"),
             "difficulty": item.get("difficulty"),
+            "requested_difficulty": item.get("requested_difficulty"),
+            "actual_difficulty": item.get("actual_difficulty") or item.get("difficulty"),
+            "base_catalog_task_id": item.get("base_catalog_task_id"),
+            "base_task_family_id": item.get("base_task_family_id"),
+            "difficulty_adaptation": item.get("difficulty_adaptation"),
+            "difficulty_fallback_reason": item.get("difficulty_fallback_reason"),
+            "reasoning_depth": item.get("reasoning_depth"),
+            "reasoning_requirements": list(item.get("reasoning_requirements") or []),
+            "prerequisites": list(item.get("prerequisites") or []),
+            "derived_task_id": item.get("derived_task_id") or item.get("task_id"),
+            "selected_replacement_task_id": item.get("selected_replacement_task_id"),
+            "task_was_previously_used": bool(item.get("task_was_previously_used")),
+            "adjustment_attempts": int(item.get("adjustment_attempts") or 0),
+            "adjustment_failure_reason": item.get("adjustment_failure_reason"),
             "source_chunk_id": item.get("source_chunk_id"),
             "support_chunk_ids": list(item.get("support_chunk_ids") or []),
             "given_conditions": list(item.get("given_conditions") or []),
@@ -2418,7 +2476,15 @@ def generate_exams(
         "semantic_identities": semantic_identities,
         "duplicate_repair_history": list(result.get("duplicate_repair_history") or []),
         "plan_review_history": list(result.get("plan_review_history") or []),
+        "difficulty_adjustment_history": list(result.get("difficulty_adjustment_history") or []),
+        "difficulty_adjustment_attempts": dict(result.get("difficulty_adjustment_attempts") or {}),
         "plan_review_attempts": int(result.get("plan_review_attempts") or 0),
+        "plan_duplicate_repair_attempts": dict(
+            result.get("plan_duplicate_repair_attempts") or {}
+        ),
+        "unresolved_plan_duplicate_conflicts": list(
+            result.get("unresolved_plan_duplicate_conflicts") or []
+        ),
         "duplicate_repair_rounds": int(result.get("duplicate_repair_rounds") or 0),
         "duplicate_replacement_attempts": dict(
             result.get("duplicate_replacement_attempts") or {}

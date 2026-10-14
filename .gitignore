@@ -5,6 +5,7 @@ __pycache__/
 data/
 output/
 tmp/
+.tmp_*
 .pytest_cache/
 *.log
 .idea/

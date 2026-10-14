@@ -10,7 +10,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from app import config
 from app.llm.client import request_structured
@@ -243,6 +243,19 @@ class CatalogTaskDraft(StrictOutputModel):
     required_givens: list[NonEmptyString] = Field(max_length=12)
     scenario_family: str | None = Field(max_length=160)
     text_answerable: bool
+    native_difficulty: Literal["easy", "medium", "hard"]
+    reasoning_depth: Literal["easy", "medium", "hard"]
+    reasoning_requirements: list[NonEmptyString] = Field(min_length=1, max_length=8)
+    prerequisites: list[NonEmptyString] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def difficulty_is_one_grounded_classification(self):
+        if self.native_difficulty != self.reasoning_depth:
+            raise ValueError(
+                "native_difficulty and reasoning_depth must be the same grounded "
+                "cognitive classification"
+            )
+        return self
 
 
 class FITBEntryDraft(StrictOutputModel):
@@ -519,9 +532,30 @@ def _read_cache(key: str) -> dict[str, Any] | None:
         or payload.get("catalog_version") != config.ASSESSMENT_CATALOG_VERSION
         or not isinstance(payload.get("tasks"), list)
         or not isinstance(payload.get("fitb_bank"), list)
+        or not all(_cached_task_contract_valid(task) for task in payload.get("tasks") or [])
     ):
         return None
     return payload
+
+
+def _cached_task_contract_valid(task: Any) -> bool:
+    """Reject cached catalogs that predate or violate the unified difficulty contract."""
+    if not isinstance(task, dict):
+        return False
+    native = str(task.get("native_difficulty") or "")
+    depth = str(task.get("reasoning_depth") or "")
+    requirements = task.get("reasoning_requirements")
+    prerequisites = task.get("prerequisites")
+    return bool(
+        native in {"easy", "medium", "hard"}
+        and depth == native
+        and task.get("supported_difficulties") == [native]
+        and isinstance(requirements, list)
+        and requirements
+        and all(isinstance(value, str) and value.strip() for value in requirements)
+        and isinstance(prerequisites, list)
+        and all(isinstance(value, str) and value.strip() for value in prerequisites)
+    )
 
 
 def _write_cache(key: str, payload: dict[str, Any]) -> None:
@@ -582,6 +616,7 @@ def _compatible_compiler_seed(
             and payload["assessment_profile"].get("domain") in {"STEM", "NON_STEM"}
             and len(payload.get("tasks") or []) >= 28
             and isinstance(payload.get("fitb_bank"), list)
+            and all(_cached_task_contract_valid(task) for task in payload.get("tasks") or [])
         ):
             return {
                 "assessment_profile": payload["assessment_profile"],
@@ -630,6 +665,26 @@ assessable output rather than a bundled topic. One evidence chunk may support mu
 when it explicitly supports their distinct operations and targets.
 Every task_operation used by a task must also appear under every corresponding question type in
 assessment_profile.question_types.task_operations.
+For every task, determine difficulty in this exact order:
+1. Identify the assessed concept, narrow target, student operation, and expected work product.
+2. Identify the concrete reasoning requirements and prerequisites supported by the assigned evidence.
+3. Determine the cognitive demand of that work.
+4. Assign one native cognitive-difficulty classification.
+
+Use these unified classifications:
+- easy: direct recall, recognition, straightforward substitution, or a simple operation with an
+  immediately identifiable method;
+- medium: selecting or organizing a method, connecting dependent operations, interpreting an
+  intermediate result, or applying relationships through multiple cognitive decisions;
+- hard: integrating relationships or constraints, evaluating alternatives, deriving a non-obvious
+  result, analyzing errors or representations, or justifying a complex solution.
+
+native_difficulty and reasoning_depth are two names for that same grounded classification. They must
+always contain the same value. reasoning_mode describes the kind of reasoning and does not determine
+its level. reasoning_requirements must name the actual operations and decisions the student performs;
+prerequisites must contain only knowledge supported by the assigned evidence. Never infer difficulty
+from wording length, numerical size, visible step count, reasoning_mode, or keyword cues such as
+derive, compare, analyze, or justify.
 
 Choose allowed_question_types semantically for each atomic task; this field is authoritative for
 downstream allocation. Do not decide suitability from the operation label or reasoning_mode alone.
@@ -639,7 +694,13 @@ only when the task naturally supports its student-facing work:
 - true_false: one clear, source-grounded, unambiguous claim;
 - definition: the meaning of a term or concept;
 - why: cause, reason, justification, mechanism, or relationship reasoning;
-- equation: symbolic manipulation, derivation, balancing, solving, or other equation-centred work;
+- equation: symbolic manipulation, derivation, balancing, solving, or other equation-centred work
+  in which the student works directly with a mathematical or
+  discipline-specific formal representation: an equation, system, expression, inequality,
+  scientific relationship, chemical reaction, or equivalent notation. A short instruction,
+  necessary givens/units, multiple expressions, and a supporting table are allowed when they
+  directly serve that symbolic operation. Do not assign equation to a prose-centred scenario,
+  extended explanation, or task whose symbolic content appears only in the answer;
 - word_problem: a grounded verbal quantitative scenario with supported givens and a numerical result;
 - essay: bounded multi-point synthesis, explanation, comparison, or argument.
 FITB is supplied only by the separate fitb_bank below. Never put fill_in_the_blank in an atomic
@@ -728,19 +789,36 @@ def _finalize_catalog(
             # A task without a compiler-declared compatible representation is structurally
             # unusable; do not invent a semantic compatibility decision here.
             continue
-        supported_difficulties = ["easy", "medium"]
-        if reasoning_mode in {
-            "conceptual_reasoning", "calculation", "symbolic_manipulation",
-            "law_or_theorem_application", "derivation_relationship",
-            "logical_proof_reasoning", "comparison_prediction", "error_analysis",
-        }:
-            supported_difficulties.append("hard")
+        raw_native = str(raw_task.get("native_difficulty") or "")
+        raw_depth = str(raw_task.get("reasoning_depth") or "")
+        if raw_native and raw_depth and raw_native != raw_depth:
+            logger.warning(
+                "Assessment catalog task rejected for contradictory difficulty | "
+                "native=%s | reasoning_depth=%s | operation=%s | target=%s",
+                raw_native, raw_depth, raw_task.get("task_operation"), raw_task.get("target"),
+            )
+            continue
+        native_difficulty = raw_native or raw_depth or "medium"
+        if native_difficulty not in {"easy", "medium", "hard"}:
+            native_difficulty = "medium"
+        reasoning_depth = raw_depth or native_difficulty
+        if reasoning_depth not in {"easy", "medium", "hard"}:
+            reasoning_depth = native_difficulty
+        if native_difficulty != reasoning_depth:
+            continue
+        supported_difficulties = [native_difficulty]
         finalized.append({
             **raw_task,
             **identity,
             "evidence_chunk_ids": list(dict.fromkeys(evidence)),
             "allowed_question_types": allowed,
             "supported_difficulties": supported_difficulties,
+            "native_difficulty": native_difficulty,
+            "reasoning_depth": reasoning_depth,
+            "reasoning_requirements": list(raw_task.get("reasoning_requirements") or [
+                str(raw_task.get("student_work_product") or raw_task.get("task_operation"))
+            ]),
+            "prerequisites": list(raw_task.get("prerequisites") or []),
         })
         if len(finalized) >= config.CATALOG_MAX_TASKS:
             break
@@ -924,12 +1002,27 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
 def _difficulty_for(task: dict[str, Any], requested: str) -> str | None:
     supported = list(task.get("supported_difficulties") or [])
     if requested != "mix":
-        # Difficulty is a writing constraint for direct questions. Any
-        # grounded task can be simplified to easy; harder requests still need
-        # explicit catalog support for deeper evidence.
-        if requested == "easy" and supported:
-            return "easy"
-        return requested if requested in supported else None
+        native = _native_difficulty(task)
+        return native if native == requested else None
+    for level in ("medium", "easy", "hard"):
+        if level in supported:
+            return level
+    return None
+
+
+def _native_difficulty(task: dict[str, Any]) -> str | None:
+    """Return one honest task level, including a deterministic legacy fallback."""
+    for value in (task.get("native_difficulty"), task.get("reasoning_depth")):
+        level = str(value or "")
+        if level in {"easy", "medium", "hard"}:
+            return level
+    supported = {
+        str(value) for value in (task.get("supported_difficulties") or [])
+        if str(value) in {"easy", "medium", "hard"}
+    }
+    # Old catalogs used supported_difficulties as a broad capability list and did not
+    # persist a native level. Preserve the old Mixed-mode preference as the migration
+    # rule, while never deriving the level from the teacher's current request.
     for level in ("medium", "easy", "hard"):
         if level in supported:
             return level
@@ -965,6 +1058,22 @@ def materialize_plan_item(task: dict[str, Any], slot_id: str, difficulty: str) -
         "text_answerable": True,
         "reasoning_mode": task.get("reasoning_mode"),
         "difficulty": difficulty,
+        "requested_difficulty": difficulty,
+        "actual_difficulty": difficulty,
+        "base_catalog_task_id": task["task_id"],
+        "base_task_family_id": task.get("task_family_id") or task["task_id"],
+        "difficulty_adaptation": None,
+        "difficulty_fallback_reason": None,
+        "reasoning_depth": task.get("reasoning_depth") or difficulty,
+        "reasoning_requirements": list(task.get("reasoning_requirements") or [
+            task.get("student_work_product") or task.get("task_operation") or "complete the assigned operation"
+        ]),
+        "prerequisites": list(task.get("prerequisites") or []),
+        "derived_task_id": None,
+        "selected_replacement_task_id": None,
+        "task_was_previously_used": False,
+        "adjustment_attempts": 0,
+        "adjustment_failure_reason": None,
         "idea_to_test": idea,
         "concept_to_test": idea,
     }
@@ -998,6 +1107,13 @@ def materialize_fitb_plan_item(
         "text_answerable": True,
         "reasoning_mode": "conceptual_recall",
         "difficulty": difficulty,
+        "requested_difficulty": difficulty,
+        "actual_difficulty": difficulty,
+        "reasoning_depth": difficulty,
+        "reasoning_requirements": ["identify the supported term from one textual clue"],
+        "prerequisites": [],
+        "difficulty_adaptation": None,
+        "difficulty_fallback_reason": None,
         "idea_to_test": entry["clue_basis"],
         "concept_to_test": entry["clue_basis"],
         "fitb_answer": entry["answer"],
@@ -1029,12 +1145,24 @@ def allocate_catalog_plan(
         compatible: dict[tuple[str, int], list[tuple[int, dict[str, Any], str]]] = {}
         for slot in slots:
             qtype, _index = slot
-            compatible[slot] = [
+            direct = [
                 (position, candidate, level)
                 for position, candidate in enumerate(source_tasks)
                 for level in [_difficulty_for(candidate, difficulty)]
                 if level is not None and qtype in (candidate.get("allowed_question_types") or [])
             ]
+            if difficulty in {"easy", "medium", "hard"}:
+                fallback = [
+                    (position, candidate, native_level)
+                    for position, candidate in enumerate(source_tasks)
+                    for native_level in [_native_difficulty(candidate)]
+                    if qtype in (candidate.get("allowed_question_types") or [])
+                    and native_level is not None
+                    and native_level != difficulty
+                ]
+                compatible[slot] = direct + fallback
+            else:
+                compatible[slot] = direct
         ordered_slots = sorted(slots, key=lambda slot: (len(compatible[slot]), slot[0], slot[1]))
         assignment: dict[tuple[str, int], tuple[dict[str, Any], str]] = {}
         resource_owner: dict[str, tuple[str, int]] = {}
@@ -1059,6 +1187,7 @@ def allocate_catalog_plan(
             ranked = sorted(
                 compatible[slot],
                 key=lambda entry: (
+                    difficulty in {"easy", "medium", "hard"} and entry[2] != difficulty,
                     coverage_usage_count.get(str(entry[1].get("coverage_id") or ""), 0) > 0,
                     task_usage_count.get(str(entry[1].get("task_id") or ""), 0) > 0,
                     len(entry[1].get("allowed_question_types") or []),
@@ -1113,6 +1242,7 @@ def allocate_catalog_plan(
             _position, chosen, level = min(
                 pool,
                 key=lambda entry: (
+                    difficulty in {"easy", "medium", "hard"} and entry[2] != difficulty,
                     coverage_usage_count.get(str(entry[1].get("coverage_id") or ""), 0),
                     task_usage_count.get(str(entry[1].get("task_id") or ""), 0),
                     str(entry[1].get("task_id") or ""),
@@ -1206,6 +1336,17 @@ def allocate_catalog_plan(
                 item = materialize_plan_item(
                     chosen, f"m{model_number}_{qtype}_{index}", level
                 )
+                item["requested_difficulty"] = difficulty
+                item["actual_difficulty"] = level
+                if difficulty in {"easy", "medium", "hard"} and level != difficulty:
+                    item["difficulty_adaptation"] = {
+                        "status": "pending",
+                        "from_difficulty": level,
+                        "to_difficulty": difficulty,
+                        "base_task_id": task_id,
+                        "strategy": None,
+                        "failed_strategies": [],
+                    }
                 task_usage_count[task_id] = task_usage_count.get(task_id, 0) + 1
                 coverage_id = str(chosen.get("coverage_id") or "")
                 if coverage_id:
@@ -1215,7 +1356,7 @@ def allocate_catalog_plan(
                     for candidate in source_tasks
                     if candidate.get("task_id")
                     and qtype in (candidate.get("allowed_question_types") or [])
-                    and _difficulty_for(candidate, difficulty) is not None
+                    and _native_difficulty(candidate) is not None
                 }
                 used_compatible_ids = {
                     candidate_id for candidate_id in compatible_ids
