@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from copy import deepcopy
 import json
+import re
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
@@ -120,6 +121,128 @@ def _question_slot(exam: dict[str, Any], question_id: str) -> str:
     return ""
 
 
+_NUMERIC_VARIATION_FIELDS: dict[str, list[str]] = {
+    "mcq": ["question", "options", "correct_answer", "solution_certificate"],
+    "true_false": ["statement", "answer", "solution_certificate"],
+    "equation": ["equation", "solution_steps", "final_answer", "solution_certificate"],
+    "word_problem": ["question", "solution_steps", "final_answer", "solution_certificate"],
+    "fill_in_the_blank": ["question", "distractors"],
+    "definition": ["term", "reference_answer"],
+    "why": ["question", "reference_answer"],
+    "essay": ["question", "reference_answer", "key_points"],
+}
+
+
+_NUMERIC_CHARACTER_RE = re.compile(r"[0-9\u0660-\u0669\u06f0-\u06f9]")
+
+
+def _numeric_variation_applicable(
+    state: dict[str, Any], exam: dict[str, Any], model_number: int,
+    question_id: str, qtype: str, item: dict[str, Any],
+) -> bool:
+    """Require both quantitative classification and mutable numeric content."""
+    if qtype not in {"mcq", "true_false", "fill_in_the_blank", "equation", "word_problem"}:
+        return False
+    from app.online.validator import _plan_context_for_model, _quantitative_question_ids
+
+    plan_by_slot, _source_by_chunk = _plan_context_for_model(state, model_number)
+    if question_id not in set(_quantitative_question_ids(exam, plan_by_slot)):
+        return False
+    relevant = {
+        key: item.get(key) for key in (
+            "question", "statement", "equation", "options", "correct_answer",
+            "answer", "answers", "solution_steps", "final_answer", "distractors",
+        ) if key in item
+    }
+    return bool(_NUMERIC_CHARACTER_RE.search(json.dumps(relevant, ensure_ascii=False)))
+
+
+def _numeric_variation_fallback(
+    state: dict[str, Any], exam: dict[str, Any], model_number: int,
+    question_id: str, conflict_question_ids: list[str],
+    conflict_edges: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Produce attempt three by changing dependent quantitative content only.
+
+    The normal repair contract owns schema normalization, immutable question IDs,
+    source evidence, and answer/certificate consistency.  This wrapper supplies
+    both sides of the duplicate conflict and authorizes only question content.
+    """
+    from app.llm.factory import create_llm_client, create_review_client
+    from app.online.validator import (
+        _build_by_id, _plan_context_for_model, _quantitative_question_ids, repair_exam,
+    )
+
+    isolated = deepcopy(exam)
+    by_id = _build_by_id(isolated.get("questions") or {})
+    entry = by_id.get(question_id)
+    if entry is None:
+        return None, [f"numeric fallback: question {question_id} was not found"]
+    qtype, _container, item = entry
+    conflicts = [
+        deepcopy(by_id[qid][2]) for qid in conflict_question_ids if qid in by_id
+    ]
+    plan_by_slot, source_by_chunk = _plan_context_for_model(state, model_number)
+    plan = plan_by_slot.get(str(item.get("slot_id") or "")) or {}
+    fields = _NUMERIC_VARIATION_FIELDS.get(qtype, [])
+    if not fields or not conflicts:
+        return None, ["numeric fallback: no supported fields or conflict question"]
+    details = {
+        "mode": "numeric_variation_fallback",
+        "duplicate_question": deepcopy(item),
+        "conflicting_questions": conflicts,
+        "duplicate_judge_conflict_details": deepcopy(conflict_edges),
+        "preserve": {
+            "question_id": question_id,
+            "question_type": qtype,
+            "difficulty": plan.get("actual_difficulty") or plan.get("difficulty"),
+            "idea_to_test": plan.get("idea_to_test"),
+            "reasoning_mode": plan.get("reasoning_mode"),
+            "concept": plan.get("concept"),
+            "task_operation": plan.get("task_operation"),
+            "target": plan.get("target"),
+            "expected_answer_type": plan.get("expected_work_product")
+            or plan.get("student_work_product"),
+            "evidence_chunk_ids": plan.get("support_chunk_ids")
+            or plan.get("evidence_chunk_ids") or [plan.get("source_chunk_id")],
+        },
+    }
+    verdict = {
+        "question_id": question_id,
+        "action": "FIX_QUESTION_AND_ANSWER",
+        "failure_code": "duplicate_numeric_variation_required",
+        "fields_to_fix": fields,
+        "reason": json.dumps(details, ensure_ascii=False),
+        "expected_fix": (
+            "Compare both questions and change the values, coefficients, quantities, "
+            "constants, or answer values that cause overlap. Recalculate every dependent "
+            "answer, option, distractor, unit, explanation, solution step, and intermediate "
+            "result. Preserve the listed semantic metadata and difficulty. Avoid blind "
+            "number substitution, invalid or unrealistic values, unintended fractions, "
+            "no/infinite-solution cases, and multiple-correct-answer MCQs."
+        ),
+    }
+    quantitative = question_id in set(_quantitative_question_ids(isolated, plan_by_slot))
+    domain = str(
+        (state.get("assessment_profile") or {}).get("domain")
+        or state.get("domain_type") or "STEM"
+    )
+    client = (
+        create_review_client(domain=domain, stage="stem_quantitative_repairer")
+        if quantitative else create_llm_client(domain=domain, stage="general_repairer")
+    )
+    result = repair_exam(
+        isolated, [verdict], client=client, plan_by_slot=plan_by_slot,
+        source_by_chunk=source_by_chunk,
+        repair_role="stem_quantitative" if quantitative else "general",
+    )
+    warnings = list(result.get("warnings") or [])
+    if question_id not in set(result.get("repaired_ids") or []):
+        return None, warnings or ["numeric fallback: repair was rejected"]
+    repaired = (_build_by_id(isolated.get("questions") or {}).get(question_id) or (None, None, None))[2]
+    return deepcopy(repaired) if isinstance(repaired, dict) else None, warnings
+
+
 def _active_slot_ids(exam: dict[str, Any]) -> set[str]:
     return {
         str(item.get("slot_id"))
@@ -201,6 +324,19 @@ def _candidate_pool(
             break
         candidates.append(candidate)
         seen.add(_identity(candidate))
+    if not candidates and difficulty in {"easy", "medium", "hard"}:
+        for _ in range(limit):
+            candidate = catalog_exhaustion_replacement(
+                catalog, plans, slot_id, qtype, "mix",
+                excluded_task_ids=seen, active_slot_ids=active_slots,
+            )
+            if not candidate or not _identity(candidate) or _identity(candidate) in seen:
+                break
+            candidate["requested_difficulty"] = difficulty
+            candidate["actual_difficulty"] = candidate.get("difficulty")
+            candidate["selected_replacement_task_id"] = candidate.get("task_id")
+            candidates.append(candidate)
+            seen.add(_identity(candidate))
     return candidates
 
 
@@ -340,9 +476,14 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
                   (state.get("duplicate_candidate_blacklist") or {}).items()}
     failure_memory = {key: list(value) for key, value in
                       (state.get("duplicate_replacement_failures") or {}).items()}
+    history = list(state.get("duplicate_repair_history") or [])
     scan_index = int(state.get("duplicate_scan_count") or 0) + 1
     fact_cache = dict(state.get("duplicate_fact_cache") or {})
-    if repair_rounds >= config.MAX_DUPLICATE_REPAIR_ROUNDS:
+    verification_pending = bool(state.get("duplicate_verification_pending"))
+    verification_attempt = int(
+        state.get("duplicate_verification_attempt") or repair_rounds + 1
+    )
+    if repair_rounds >= config.MAX_DUPLICATE_REPAIR_ROUNDS and not verification_pending:
         unresolved = list(state.get("unresolved_duplicate_conflicts") or [])
         unresolved.extend(deepcopy(state.get("pending_duplicate_groups") or []))
         if not unresolved and reports:
@@ -359,6 +500,8 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
             "generated_exams": list(_exam_by_model(state).values()),
             "duplicate_fact_cache": fact_cache,
             "unresolved_duplicate_conflicts": unresolved,
+            "duplicate_verification_pending": False,
+            "duplicate_verification_attempt": 0,
         }
     stored_domain = str((state.get("assessment_profile") or {}).get("domain") or "")
     review_client = None
@@ -384,8 +527,25 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
                 raise
             return review_duplicate_candidates(filtered_exam)
 
+    unresolved: list[dict[str, Any]] = []
+    final_verification = (
+        verification_pending
+        and verification_attempt >= config.MAX_DUPLICATE_REPAIR_ROUNDS
+    )
     for model_number, exam in _exam_by_model(state).items():
         filtered_exam = _correctness_pass_exam(state, exam)
+        # Attempt-three numeric variants have already passed the ordinary /
+        # quantitative validator and are accepted without another duplicate
+        # judge call by contract. Exclude only those IDs from this judge input.
+        exempt_ids = set(state.get("duplicate_judge_exempt_ids") or [])
+        if exempt_ids:
+            for section in (filtered_exam.get("questions") or {}).values():
+                values = section.get("items") if isinstance(section, dict) else section
+                if isinstance(values, list):
+                    values[:] = [
+                        value for value in values
+                        if str(value.get("question_id") or "") not in exempt_ids
+                    ]
         forced_pairs = _forced_catalog_reuse_pairs(
             filtered_exam, state.get("plans") or [], model_number
         )
@@ -400,7 +560,6 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
         groups = list(report.get("duplicate_groups") or [])
         if not groups:
             continue
-        history = list(state.get("duplicate_repair_history") or [])
         for group in groups:
             for qid in group.get("question_ids") or []:
                 slot_id = _question_slot(exam, qid)
@@ -418,6 +577,9 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
                             "reason": "duplicate_after_replacement",
                             "conflict_edges": deepcopy(group.get("edges") or []),
                         })
+        if final_verification:
+            unresolved.extend({"model_number": model_number, **deepcopy(group)} for group in groups)
+            continue
         replace_ids = list(dict.fromkeys(
             qid for group in groups for qid in group.get("replace_question_ids") or []
         ))
@@ -470,16 +632,14 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
                 })
 
         for qid, exhausted_by in exhausted.items():
-            removed = _remove_question(exam, qid)
-            invalid.append({
+            slot_id = _question_slot(exam, qid)
+            unresolved.extend(
+                {"model_number": model_number, **deepcopy(group)}
+                for group in groups if qid in (group.get("question_ids") or [])
+            )
+            history.append({
                 "model_number": model_number, "question_id": qid,
-                "slot_id": (removed or {}).get("slot_id"),
-                "failure_code": "duplicate_repair_exhausted",
-                "reason": (
-                    "The final duplicate scan still found a conflict after the global repair-round limit."
-                    if exhausted_by == "global_round_limit"
-                    else "The slot still conflicted after its replacement-attempt limit."
-                ),
+                "slot_id": slot_id, "status": "duplicate_repair_exhausted_kept",
                 "exhausted_by": exhausted_by,
             })
         fitb = exam.get("questions", {}).get("fill_in_the_blank")
@@ -489,7 +649,8 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
                 _rebuild_fitb_word_bank(fitb)
         if exhausted:
             warnings.append(
-                f"Model {model_number}: removed {len(exhausted)} duplicate slot(s) after final scan."
+                f"Model {model_number}: retained {len(exhausted)} valid slot(s) with unresolved "
+                "similarity after all three duplicate-repair attempts."
             )
     return {
         "duplicate_reports": reports,
@@ -504,6 +665,13 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
             key: list(dict.fromkeys(values)) for key, values in blacklists.items()
         },
         "duplicate_replacement_failures": failure_memory,
+        "duplicate_repair_history": history,
+        "duplicate_repair_rounds": (
+            verification_attempt if verification_pending else repair_rounds
+        ),
+        "duplicate_verification_pending": False,
+        "duplicate_verification_attempt": 0,
+        "unresolved_duplicate_conflicts": unresolved,
     }
 
 
@@ -618,7 +786,8 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
 
     plans = deepcopy(state.get("plans") or [])
     exams = _exam_by_model(state)
-    repair_round = int(state.get("duplicate_repair_rounds") or 0) + 1
+    completed_rounds = int(state.get("duplicate_repair_rounds") or 0)
+    repair_round = completed_rounds + 1
     slot_attempts = dict(state.get("duplicate_replacement_attempts") or {})
     pending_revalidation = dict(state.get("pending_revalidation_ids") or {})
     validated = list(state.get("validated_models") or [])
@@ -631,6 +800,12 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                   (state.get("duplicate_candidate_blacklist") or {}).items()}
     failure_memory = {key: list(value) for key, value in
                       (state.get("duplicate_replacement_failures") or {}).items()}
+    verification_required = False
+    numeric_repaired_ids: list[str] = []
+    judge_exempt_ids = list(state.get("duplicate_judge_exempt_ids") or [])
+    numeric_fallback_attempted = False
+    finalization_pending = False
+    unresolved_conflicts = list(state.get("unresolved_duplicate_conflicts") or [])
     for report in state.get("validation_reports") or []:
         report_model = int(report.get("model_number") or 0)
         for verdict in report.get("verdicts") or []:
@@ -704,6 +879,66 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                 for edge in group.get("edges") or []
                 if qid in {edge.get("left"), edge.get("right")}
             ]
+            if slot_attempt == 3:
+                if not _numeric_variation_applicable(
+                    state, exam, model_number, qid, qtype, item
+                ):
+                    finalization_pending = True
+                    unresolved_conflicts.extend(
+                        {"model_number": model_number, **deepcopy(group)}
+                        for group in groups if qid in (group.get("question_ids") or [])
+                    )
+                    history.append({
+                        "model_number": model_number, "question_id": qid,
+                        "slot_id": slot_id, "repair_round": repair_round,
+                        "slot_attempt": slot_attempt,
+                        "duplicate_repair_mode": "numeric_variation_fallback",
+                        "status": "numeric_variation_not_applicable_kept",
+                        "conflict_question_ids": related_question_ids,
+                    })
+                    warnings.append(
+                        f"Model {model_number}: retained {qid}; numeric duplicate variation "
+                        "was not applicable after two semantic replacement attempts."
+                    )
+                    continue
+                numeric_fallback_attempted = True
+                repaired, numeric_warnings = _numeric_variation_fallback(
+                    state, exam, model_number, qid, related_question_ids, conflict_edges
+                )
+                warnings.extend(numeric_warnings)
+                if repaired is None:
+                    history.append({
+                        "model_number": model_number, "question_id": qid,
+                        "slot_id": slot_id, "repair_round": repair_round,
+                        "slot_attempt": slot_attempt,
+                        "duplicate_repair_mode": "numeric_variation_fallback",
+                        "status": "numeric_variation_failed",
+                        "failure_reason": "; ".join(numeric_warnings),
+                    })
+                    continue
+                item.clear()
+                item.update(repaired)
+                item.update({
+                    "duplicate_repair_attempt": 3,
+                    "duplicate_repair_mode": "numeric_variation_fallback",
+                    "duplicate_conflict_with": (
+                        related_question_ids[0] if len(related_question_ids) == 1
+                        else related_question_ids
+                    ),
+                    "numeric_variant": True,
+                    "duplicate_recheck_required": False,
+                })
+                numeric_repaired_ids.append(qid)
+                judge_exempt_ids.append(qid)
+                history.append({
+                    "model_number": model_number, "question_id": qid,
+                    "slot_id": slot_id, "repair_round": repair_round,
+                    "slot_attempt": slot_attempt,
+                    "duplicate_repair_mode": "numeric_variation_fallback",
+                    "conflict_question_ids": related_question_ids,
+                    "status": "numeric_variation_generated",
+                })
+                continue
             candidates = _candidate_pool(
                 catalog, plans, slot_id, qtype, str(state.get("difficulty") or "mix"),
                 _active_slot_ids(exam), blacklist,
@@ -715,6 +950,10 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                 previous_failures=failure_memory.get(attempt_key) or [],
             )
             if replacement:
+                replacement["selected_replacement_task_id"] = replacement.get("task_id")
+                replacement["task_was_previously_used"] = bool(
+                    replacement.get("task_reused") or replacement.get("fitb_entry_reused")
+                )
                 replacement["forced_duplicate_slot_ids"] = related_slot_ids
                 replacement["forced_duplicate_question_ids"] = related_question_ids
                 replacement["duplicate_conflict_context"] = conflict_edges
@@ -874,6 +1113,55 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                                 "candidate_id": failed_id, "reason": "generation_failed",
                             })
                         continue
+                    from app.online.difficulty_adjustment import adjust_generated_question
+                    active_plan = _plan_by_slot(plans, model_number).get(
+                        reservation["slot_id"]
+                    ) or {}
+                    generated, adjustment = adjust_generated_question(
+                        state=state, qtype=qtype or reservation["qtype"],
+                        question=generated, plan=active_plan,
+                        previous_questions=reservation.get("previous_task_questions") or [],
+                    )
+                    active_plan["adjustment_attempts"] = int(
+                        active_plan.get("adjustment_attempts") or 0
+                    ) + (0 if adjustment.get("status") == "not_needed" else 1)
+                    if adjustment.get("status") == "succeeded":
+                        target = str(active_plan.get("requested_difficulty") or "")
+                        active_plan["difficulty"] = target
+                        active_plan["actual_difficulty"] = target
+                        active_plan["reasoning_depth"] = target
+                        active_plan["reasoning_requirements"] = list(
+                            adjustment.get("changed_reasoning_requirements") or []
+                        )
+                        active_plan["difficulty_fallback_reason"] = None
+                        active_plan["adjustment_failure_reason"] = None
+                        active_plan["difficulty_adaptation"] = {
+                            "status": "adapted",
+                            "from_difficulty": adjustment.get("from_difficulty")
+                            or adjustment.get("direction", "").split("_to_")[0],
+                            "to_difficulty": target,
+                            "base_task_id": active_plan.get("base_catalog_task_id")
+                            or active_plan.get("task_id"),
+                            "strategy": "generated_question_adjustment",
+                            "failed_strategies": [],
+                            "changed_reasoning_requirements": list(
+                                adjustment.get("changed_reasoning_requirements") or []
+                            ),
+                            "evidence_support": list(
+                                adjustment.get("evidence_support") or []
+                            ),
+                            "evidence_justification": adjustment.get(
+                                "evidence_justification"
+                            ),
+                        }
+                    elif adjustment.get("status") == "failed":
+                        active_plan["adjustment_failure_reason"] = adjustment.get("reason")
+                        active_plan["difficulty_fallback_reason"] = adjustment.get("reason")
+                    history.append({
+                        **history_reservation, "model_number": model_number,
+                        "status": "difficulty_adjustment_" + adjustment.get("status", "unknown"),
+                        "difficulty_adjustment": adjustment,
+                    })
                     current = _build_by_id(exam.get("questions") or {}).get(qid)
                     if current is None:
                         continue
@@ -885,7 +1173,11 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
             if isinstance(fitb, dict):
                 if not _fitb_word_bank_valid(fitb):
                     _rebuild_fitb_word_bank(fitb)
+        normal_repaired_ids = list(repaired_ids)
+        repaired_ids.extend(numeric_repaired_ids)
+        numeric_repaired_ids = []
         if repaired_ids:
+            verification_required = verification_required or bool(normal_repaired_ids)
             from app.online.exam_builder import balance_mcq_answer_positions
             repaired_ids = list(dict.fromkeys([
                 *repaired_ids,
@@ -899,7 +1191,12 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "plans": plans, "generated_exams": list(exams.values()),
-        "duplicate_repair_rounds": repair_round,
+        "duplicate_repair_rounds": (
+            max(completed_rounds, 3)
+            if numeric_fallback_attempted or finalization_pending else completed_rounds
+        ),
+        "duplicate_verification_pending": verification_required,
+        "duplicate_verification_attempt": repair_round if verification_required else 0,
         "duplicate_replacement_attempts": slot_attempts,
         "pending_revalidation_ids": pending_revalidation,
         "pending_duplicate_groups": [], "validated_models": validated,
@@ -909,6 +1206,12 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
             key: list(dict.fromkeys(values)) for key, values in blacklists.items()
         },
         "duplicate_replacement_failures": failure_memory,
+        "duplicate_judge_exempt_ids": list(dict.fromkeys(judge_exempt_ids)),
+        "duplicate_numeric_fallback_pending_validation": bool(judge_exempt_ids),
+        "duplicate_repair_finalization_pending": (
+            finalization_pending or bool(judge_exempt_ids)
+        ),
+        "unresolved_duplicate_conflicts": unresolved_conflicts,
         "developer_diagnostics": diagnostics,
     }
 

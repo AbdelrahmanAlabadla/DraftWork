@@ -2230,7 +2230,11 @@ def test_repair_failure_keeps_original_for_revalidation():
 def test_selective_revalidation_merges_untouched_passes(monkeypatch):
     all_ids = [f"model1_mcq_{index}" for index in range(1, 11)]
     invalid_ids = all_ids[-3:]
-    exam = _exam({"mcq": [_mcq(qid) for qid in all_ids]})
+    balanced_answers = ("B", "D", "A", "C", "C", "A", "D", "B", "B", "D")
+    exam = _exam({"mcq": [
+        _mcq(qid, answer=answer)
+        for qid, answer in zip(all_ids, balanced_answers)
+    ]})
     validation_scopes = []
 
     def fake_validate(_exam_value, client=None, question_ids=None):

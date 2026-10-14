@@ -81,6 +81,52 @@ def _question_shortage_warnings(
     return warnings
 
 
+def _difficulty_fallback_warnings(result: dict[str, Any]) -> list[dict[str, Any]]:
+    identities = result.get("semantic_identities") or []
+    lifecycle = result.get("slot_lifecycle") or {}
+    finalized_slots = {
+        str(slot_id) for slot_id, record in lifecycle.items()
+        if record.get("terminal_status") == "finalized"
+    }
+    finalized = [
+        row for row in identities
+        if not finalized_slots or str(row.get("slot_id") or "") in finalized_slots
+    ]
+    fallbacks = [row for row in finalized if row.get("difficulty_fallback_reason")]
+    if not fallbacks:
+        return []
+    requested_levels = {
+        str(row.get("requested_difficulty") or "") for row in fallbacks
+        if row.get("requested_difficulty") in {"easy", "medium", "hard"}
+    }
+    if len(requested_levels) != 1:
+        return []
+    requested_level = next(iter(requested_levels))
+    counts: dict[str, int] = {}
+    for row in finalized:
+        level = str(row.get("actual_difficulty") or row.get("difficulty") or "unknown")
+        counts[level] = counts.get(level, 0) + 1
+    produced = sum(counts.values())
+    matched = counts.get(requested_level, 0)
+    substitutions = {level: count for level, count in counts.items()
+                     if level != requested_level and count}
+    return [{
+        "type": "difficulty_fallback",
+        "requested_difficulty": requested_level,
+        "requested_count": produced,
+        f"{requested_level}_count": matched,
+        "actual_difficulty_counts": counts,
+        "fallback_counts": substitutions,
+        "message": (
+            f"Your exam was generated with {produced} of {produced} requested questions. "
+            f"It contains {matched} {requested_level.title()} and "
+            + ", ".join(f"{count} {level.title()}" for level, count in sorted(substitutions.items()))
+            + f" questions because the selected material did not support enough distinct "
+              f"{requested_level.title()} questions."
+        ),
+    }]
+
+
 class TrackedJobTask(Task):
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         if args:
@@ -334,9 +380,11 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         shortage_warnings = _question_shortage_warnings(
             result, tasks, int(request_data["num_models"])
         )
+        difficulty_warnings = _difficulty_fallback_warnings(result)
         persisted_warnings: list[Any] = [
             *list(result.get("warnings") or []),
             *shortage_warnings,
+            *difficulty_warnings,
         ]
         if shortage_warnings:
             repositories.append_exam_audit_event(
@@ -349,6 +397,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         metadata["document_language"] = result.get("document_language") or "en"
         metadata["quality_summary"] = dict(result.get("quality_summary") or {})
         metadata["question_shortages"] = shortage_warnings
+        metadata["difficulty_fallbacks"] = difficulty_warnings
         metadata["generation_audit"] = {
             "invalid_questions": list(result.get("invalid_questions") or []),
             "unrepairable_plan_slots": list(result.get("unrepairable_plan_slots") or []),
@@ -356,6 +405,14 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "duplicate_repair_history": list(result.get("duplicate_repair_history") or []),
             "plan_review_history": list(result.get("plan_review_history") or []),
             "plan_review_attempts": int(result.get("plan_review_attempts") or 0),
+            "plan_duplicate_repair_attempts": dict(
+                result.get("plan_duplicate_repair_attempts") or {}
+            ),
+            "unresolved_plan_duplicate_conflicts": list(
+                result.get("unresolved_plan_duplicate_conflicts") or []
+            ),
+            "difficulty_adjustment_history": list(result.get("difficulty_adjustment_history") or []),
+            "difficulty_adjustment_attempts": dict(result.get("difficulty_adjustment_attempts") or {}),
             "duplicate_repair_rounds": int(result.get("duplicate_repair_rounds") or 0),
             "duplicate_replacement_attempts": dict(
                 result.get("duplicate_replacement_attempts") or {}

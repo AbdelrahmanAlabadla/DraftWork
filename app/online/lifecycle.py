@@ -95,6 +95,15 @@ def reconcile_slot_lifecycle(
                     "plan_review_selection_rank": deepcopy(
                         item.get("selection_rank") or {}
                     ),
+                    "requested_difficulty": item.get("requested_difficulty"),
+                    "actual_difficulty": item.get("actual_difficulty") or item.get("difficulty"),
+                    "difficulty_adjustment": deepcopy(item.get("difficulty_adaptation")),
+                    "difficulty_fallback_reason": item.get("difficulty_fallback_reason"),
+                    "base_catalog_task_id": item.get("base_catalog_task_id"),
+                    "base_task_family_id": item.get("base_task_family_id"),
+                    "derived_task_id": item.get("derived_task_id") or item.get("task_id"),
+                    "adjustment_attempts": int(item.get("adjustment_attempts") or 0),
+                    "adjustment_failure_reason": item.get("adjustment_failure_reason"),
                 })
 
     for exam in state.get("generated_exams") or []:
