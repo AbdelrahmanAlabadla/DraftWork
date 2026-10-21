@@ -42,15 +42,23 @@ class ExamState(TypedDict):
     plan_review_retry_required: bool
     plan_review_rechecks: int
     plan_duplicate_repair_attempts: dict[str, int]
+    plan_review_candidate_blacklist: dict[str, list[str]]
     unresolved_plan_duplicate_conflicts: list[dict[str, Any]]
+    plan_review_pair_verdicts: dict[str, dict[str, Any]]
+    plan_review_difficulty_verdicts: dict[str, dict[str, Any]]
+    plan_review_slot_fingerprints: dict[str, dict[str, str]]
+    plan_review_issues: list[dict[str, Any]]
+    plan_review_telemetry: list[dict[str, Any]]
     difficulty_adjustment_history: list[dict[str, Any]]
     difficulty_adjustment_attempts: dict[str, int]
+    difficulty_verification_slot_ids: list[str]
     # --- Generation -----------------------------------------------------
     generated_exams: list[dict[str, Any]]  # one result per model, accumulates cross-model memory
     rejection_feedback: Optional[str]
     mcq_task_reassignments: list[dict[str, Any]]
     # --- Post-generation validation / repair ----------------------------
     validation_reports: list[dict[str, Any]]  # one report per validated model
+    validation_ledger: dict[str, dict[str, Any]]
     validated_models: list[int]  # models that fully passed (skip re-validation)
     question_repair_attempts: dict[str, int]  # per-slot repair budget already used
     repair_manifest: list[dict[str, Any]]
@@ -88,6 +96,7 @@ class ExamState(TypedDict):
     error: Optional[str]
     progress_callback: Optional[Callable[[str, int], None]]
     audit_callback: Optional[Callable[[str, str, dict[str, Any]], None]]
+    is_cancelled: Optional[Callable[[], bool]]
 
 
 _AUDIT_NODE_EVENTS = {
@@ -256,8 +265,12 @@ def build_exam_graph() -> StateGraph:
     )
 
     builder.set_entry_point("receive_request")
-    builder.add_edge("receive_request", "retrieve_context")
-    builder.add_edge("retrieve_context", "prepare_assessment_catalog")
+    builder.add_node(
+        "retrieve_context_progress",
+        _with_progress(retrieve_context, "retrieving_context", 10),
+    )
+    builder.add_edge("receive_request", "retrieve_context_progress")
+    builder.add_edge("retrieve_context_progress", "prepare_assessment_catalog")
     builder.add_edge("prepare_assessment_catalog", "plan_exams")
     builder.add_conditional_edges(
         "plan_exams",
@@ -269,7 +282,14 @@ def build_exam_graph() -> StateGraph:
         _route_after_plan,
         {"repair_plan": "repair_plan", "adjust_plan_difficulty": "adjust_plan_difficulty", "review_plan": "review_plan"},
     )
-    builder.add_edge("adjust_plan_difficulty", "review_plan")
+    builder.add_conditional_edges(
+        "adjust_plan_difficulty",
+        _route_after_difficulty_adjustment,
+        {
+            "adjust_plan_difficulty": "adjust_plan_difficulty",
+            "review_plan": "review_plan",
+        },
+    )
     builder.add_conditional_edges(
         "review_plan",
         _route_after_plan_review,
@@ -314,13 +334,8 @@ def _route_after_plan(state: ExamState) -> str:
         and (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
     ):
         return "repair_plan"
-    if any(
-        (item.get("difficulty_adaptation") or {}).get("status") == "pending"
-        for plan in state.get("plans") or []
-        for values in (plan.get("items") or {}).values()
-        for item in values or []
-    ):
-        return "adjust_plan_difficulty"
+    # Difficulty mismatches are first verified and collected by Plan Review.
+    # The reviewer then routes only confirmed pending slots to the adjuster.
     return "review_plan"
 
 
@@ -336,6 +351,16 @@ def _route_after_plan_review(state: ExamState) -> str:
     ):
         return "adjust_plan_difficulty"
     return "generate_exams"
+
+
+def _route_after_difficulty_adjustment(state: ExamState) -> str:
+    """Finish bounded adjustment attempts before one targeted Plan Review."""
+    return "adjust_plan_difficulty" if any(
+        (item.get("difficulty_adaptation") or {}).get("status") == "pending"
+        for plan in state.get("plans") or []
+        for values in (plan.get("items") or {}).values()
+        for item in values or []
+    ) else "review_plan"
 
 
 def _route_after_validation(state: ExamState) -> str:

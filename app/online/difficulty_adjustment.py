@@ -18,8 +18,10 @@ from app.llm.schemas import (
     generation_response_model,
 )
 from app.online.planner import finalize_plans, validate_plans
+from app.online.assessment_catalog import build_task_usage_index, materialize_plan_item
 
 MAX_DIFFICULTY_ADJUSTMENT_ATTEMPTS = 3
+DIFFICULTY_ADJUSTMENT_BATCH_SIZE = 3
 
 
 class PlannedTaskAdjustmentPatch(StrictOutputModel):
@@ -56,6 +58,12 @@ class PlanDifficultyAdjustmentDecision(StrictOutputModel):
         elif self.adjusted_fields is not None:
             raise ValueError("adjusted_fields must be null when adjustment_succeeded is false")
         return self
+
+
+class PlanDifficultyAdjustmentBatch(StrictOutputModel):
+    """Independent decisions for one bounded adjustment request."""
+
+    results: list[PlanDifficultyAdjustmentDecision] = Field(min_length=1, max_length=3)
 
 
 class GeneratedQuestionDifficultyDecision(StrictOutputModel):
@@ -235,6 +243,10 @@ def _focused_task_input(
         "current_givens_and_constraints": {
             "given_conditions": list(task.get("given_conditions") or []),
             "required_givens": list(task.get("required_givens") or []),
+            "variable_givens": list(task.get("variable_givens") or []),
+            "allowed_variations": list(task.get("allowed_variations") or []),
+            "complexity_boundaries": list(task.get("complexity_boundaries") or []),
+            "exact_source_instance": bool(task.get("exact_source_instance", False)),
             "idea_to_test": task.get("idea_to_test"),
         },
         "reasoning_profile": {
@@ -300,6 +312,78 @@ def _execute_adjustment(work: dict[str, Any]) -> dict[str, Any]:
         "checks": checks,
         "rejection_reasons": _rejection_reasons(checks),
     }
+
+
+def _execute_adjustment_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Adjust up to three isolated tasks in one call and validate each independently."""
+    if not batch or len(batch) > DIFFICULTY_ADJUSTMENT_BATCH_SIZE:
+        raise ValueError("difficulty adjustment batches must contain one to three tasks")
+    requested = str(batch[0]["requested"])
+    payload = {
+        "mode": "planned_task_batch",
+        "instructions": (
+            "Return one independent result for every supplied slot. A failure for one slot must "
+            "not change or omit another slot's result. Use only that slot's assigned evidence IDs."
+        ),
+        "tasks": [{
+            "task": _focused_task_input(
+                work["original"], str(work["qtype"]), str(work["actual"]), requested,
+            ),
+            "assigned_evidence": deepcopy(work["evidence"]),
+            "occupied_task_summaries": deepcopy(work["occupied_tasks"]),
+        } for work in batch],
+    }
+    # Keep the legacy singular key for one-item batches and saved test harnesses.
+    if len(batch) == 1:
+        payload["task"] = payload["tasks"][0]["task"]
+        payload["assigned_evidence"] = payload["tasks"][0]["assigned_evidence"]
+        payload["occupied_task_summaries"] = payload["tasks"][0]["occupied_task_summaries"]
+    prompt = json.dumps(payload, ensure_ascii=False)
+    raw = request_structured(
+        create_difficulty_adjustment_client(domain=str(batch[0]["domain"])), prompt,
+        response_model=PlanDifficultyAdjustmentBatch,
+        schema_name="difficulty_adjustment_plan_batch", agent="difficulty_adjuster",
+        operation="adjust_planned_task_batch", item_count=len(batch),
+        system_prompt=SYSTEM_PROMPT, temperature=0.1, max_tokens=3500 * len(batch),
+    )
+    if isinstance(raw, dict) and "results" not in raw and len(batch) == 1:
+        raw = {"results": [raw]}
+    parsed = PlanDifficultyAdjustmentBatch.model_validate(raw)
+    by_slot: dict[str, PlanDifficultyAdjustmentDecision] = {}
+    for decision in parsed.results:
+        if decision.slot_id in by_slot:
+            raise ValueError(f"duplicate adjustment result for slot {decision.slot_id}")
+        by_slot[decision.slot_id] = decision
+    expected = {str(work["slot_id"]) for work in batch}
+    if set(by_slot) != expected:
+        raise ValueError(
+            f"adjustment result slot IDs must exactly match {sorted(expected)}; "
+            f"received {sorted(by_slot)}"
+        )
+    results: list[dict[str, Any]] = []
+    for work in batch:
+        decision = by_slot[str(work["slot_id"])]
+        original = deepcopy(work["original"])
+        proposed = None
+        if decision.adjustment_succeeded and decision.adjusted_fields:
+            proposed = deepcopy(original)
+            patch = decision.adjusted_fields.model_dump(exclude_none=True)
+            patch.pop("strategy", None)
+            proposed.update(patch)
+            proposed.update({
+                "difficulty": requested,
+                "actual_difficulty": requested,
+                "reasoning_depth": requested,
+            })
+        checks = _acceptance_diagnostics(
+            decision, original, proposed, qtype=str(work["qtype"]),
+            requested=requested, evidence_ids=list(work["evidence_ids"]),
+        )
+        results.append({
+            **work, "decision": decision, "failure": "", "proposed": proposed,
+            "checks": checks, "rejection_reasons": _rejection_reasons(checks),
+        })
+    return results
 
 
 def _apply_adjustment_result(
@@ -370,7 +454,13 @@ def _apply_adjustment_result(
             exact_failure = f"model_declined: {decision.reason}"
         item["adjustment_failure_reason"] = exact_failure
         item["difficulty_fallback_reason"] = exact_failure
-        item["difficulty_adaptation"] = {**adaptation, "status": "failed"}
+        item["difficulty_adaptation"] = {
+            **adaptation,
+            "status": "pending" if attempt < MAX_DIFFICULTY_ADJUSTMENT_ATTEMPTS else "failed",
+            "failed_strategies": [
+                *list(adaptation.get("failed_strategies") or []), exact_failure,
+            ],
+        }
     history.append({
         "slot_id": result["slot_id"],
         "attempt": attempt,
@@ -384,6 +474,73 @@ def _apply_adjustment_result(
         "acceptance_checks": checks,
         "rejection_reasons": rejection_reasons,
     })
+
+
+def _apply_catalog_fallbacks(
+    plans: list[dict[str, Any]], catalog: dict[str, Any], requested: str,
+) -> None:
+    """Replace exhausted adjustments deterministically, otherwise retain the genuine task."""
+    if requested not in {"easy", "medium", "hard"}:
+        return
+    usage = build_task_usage_index(plans)
+    order = {
+        "easy": ("easy", "medium", "hard"),
+        "hard": ("hard", "medium", "easy"),
+        "medium": ("medium", "easy", "hard"),
+    }[requested]
+    tasks = list((catalog or {}).get("tasks") or [])
+    for plan in plans:
+        for qtype, values in (plan.get("items") or {}).items():
+            for index, item in enumerate(values or []):
+                adaptation = dict(item.get("difficulty_adaptation") or {})
+                if adaptation.get("status") != "failed" or int(item.get("adjustment_attempts") or 0) < 3:
+                    continue
+                current_id = str(item.get("task_id") or "")
+                compatible = [task for task in tasks if (
+                    qtype in (task.get("allowed_question_types") or [])
+                    and task.get("evidence_chunk_ids")
+                    and str(task.get("task_id") or "") != current_id
+                )]
+                chosen = None
+                chosen_level = None
+                for level in order:
+                    level_tasks = [task for task in compatible if str(
+                        task.get("native_difficulty") or task.get("reasoning_depth") or ""
+                    ) == level]
+                    if level_tasks:
+                        chosen = min(level_tasks, key=lambda task: (
+                            int((usage.get(str(task.get("task_id") or "")) or {}).get("count") or 0),
+                            -len(task.get("evidence_chunk_ids") or []),
+                            str(task.get("task_id") or ""),
+                        ))
+                        chosen_level = level
+                        break
+                if chosen is None:
+                    item["difficulty_adaptation"] = {**adaptation, "status": "retained"}
+                    item["difficulty_fallback_reason"] = (
+                        item.get("difficulty_fallback_reason")
+                        or "No compatible catalog alternative remained after three adjustment attempts."
+                    )
+                    continue
+                replacement = materialize_plan_item(chosen, str(item.get("slot_id") or ""), chosen_level)
+                replacement.update({
+                    "requested_difficulty": requested,
+                    "selected_replacement_task_id": chosen.get("task_id"),
+                    "difficulty_fallback_reason": (
+                        None if chosen_level == requested else
+                        f"Adjustment exhausted; retained the closest supported {chosen_level} task."
+                    ),
+                    "adjustment_attempts": int(item.get("adjustment_attempts") or 0),
+                    "adjustment_failure_reason": item.get("adjustment_failure_reason"),
+                    "difficulty_adaptation": {
+                        "status": "fallback", "from_difficulty": item.get("actual_difficulty"),
+                        "to_difficulty": requested, "base_task_id": chosen.get("task_id"),
+                        "strategy": "catalog_fallback", "failed_strategies": list(
+                            adaptation.get("failed_strategies") or []
+                        ),
+                    },
+                })
+                values[index] = replacement
 
 
 def adjust_plan_difficulty(state: dict[str, Any]) -> dict[str, Any]:
@@ -452,25 +609,30 @@ def adjust_plan_difficulty(state: dict[str, Any]) -> dict[str, Any]:
 
     completed: list[dict[str, Any] | None] = [None] * len(work_items)
     if work_items:
-        worker_count = min(MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS, len(work_items))
+        batches = [
+            work_items[index:index + DIFFICULTY_ADJUSTMENT_BATCH_SIZE]
+            for index in range(0, len(work_items), DIFFICULTY_ADJUSTMENT_BATCH_SIZE)
+        ]
+        worker_count = min(MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS, len(batches), 10)
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
-                executor.submit(copy_context().run, _execute_adjustment, work): index
-                for index, work in enumerate(work_items)
+                executor.submit(copy_context().run, _execute_adjustment_batch, batch): batch_index
+                for batch_index, batch in enumerate(batches)
             }
             for future in as_completed(futures):
-                index = futures[future]
+                batch_index = futures[future]
+                start = batch_index * DIFFICULTY_ADJUSTMENT_BATCH_SIZE
                 try:
-                    completed[index] = future.result()
+                    for offset, result in enumerate(future.result()):
+                        completed[start + offset] = result
                 except Exception as exc:
-                    completed[index] = {
-                        **work_items[index],
-                        "decision": None,
-                        "failure": f"{type(exc).__name__}: {exc}",
-                        "proposed": None,
-                        "checks": {"structured_response_valid": False},
-                        "rejection_reasons": ["structured_response_valid=false"],
-                    }
+                    for offset, work in enumerate(batches[batch_index]):
+                        completed[start + offset] = {
+                            **work, "decision": None,
+                            "failure": f"{type(exc).__name__}: {exc}", "proposed": None,
+                            "checks": {"structured_response_valid": False},
+                            "rejection_reasons": ["structured_response_valid=false"],
+                        }
     # Merge only on the graph thread and always in the original slot traversal order.
     for index, work in enumerate(work_items):
         result = completed[index]
@@ -484,13 +646,28 @@ def adjust_plan_difficulty(state: dict[str, Any]) -> dict[str, Any]:
                 "rejection_reasons": ["structured_response_valid=false"],
             }
         _apply_adjustment_result(work["target_item"], result, history)
+    if any(
+        (item.get("difficulty_adaptation") or {}).get("status") == "pending"
+        for plan in plans
+        for values in (plan.get("items") or {}).values()
+        for item in values or []
+    ):
+        return adjust_plan_difficulty({
+            **state,
+            "plans": plans,
+            "difficulty_adjustment_history": history,
+            "difficulty_adjustment_attempts": attempts,
+        })
+    _apply_catalog_fallbacks(plans, state.get("assessment_catalog") or {}, requested)
     plans = finalize_plans(plans, state.get("tasks") or [])
     errors = validate_plans(plans, state.get("tasks") or [], int(state.get("num_models") or 1),
                             set(chunks), requested, state.get("assessment_profile") or {},
                             state.get("planning_issues") or [])
+    verification_ids = [str(work["slot_id"]) for work in work_items]
     return {"plans": plans, "plan_errors": errors,
             "difficulty_adjustment_history": history,
-            "difficulty_adjustment_attempts": attempts}
+            "difficulty_adjustment_attempts": attempts,
+            "difficulty_verification_slot_ids": verification_ids}
 
 
 def adjust_generated_question(*, state: dict[str, Any], qtype: str, question: dict[str, Any],

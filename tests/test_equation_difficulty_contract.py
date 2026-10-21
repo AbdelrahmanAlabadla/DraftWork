@@ -221,7 +221,8 @@ def test_exhausted_hard_adaptation_records_honest_medium_fallback(monkeypatch):
     assert result["plan_errors"] == []
     assert item["requested_difficulty"] == "hard"
     assert item["actual_difficulty"] == item["difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "failed"
+    assert item["difficulty_adaptation"]["status"] == "retained"
+    assert item["adjustment_attempts"] == 3
     assert item["difficulty_fallback_reason"]
 
 
@@ -312,7 +313,7 @@ def test_failed_math_equation_slots_pass_without_hard_keyword_cues():
     assert not any("m1_equation_1" in error or "m1_equation_2" in error for error in errors)
 
 
-def test_keyword_stuffing_cannot_override_reasoning_depth():
+def test_removed_catalog_reasoning_metadata_cannot_override_plan_difficulty():
     task = _task("stuffed", ["hard"])
     task.update({
         "reasoning_depth": "easy",
@@ -330,7 +331,11 @@ def test_keyword_stuffing_cannot_override_reasoning_depth():
     errors = planner.validate_plans(
         plans, [("equation", 1)], 1, {"c1"}, "hard", _profile(), []
     )
-    assert any("does not match its reasoning_depth" in error for error in errors)
+    assert item["reasoning_depth"] == "hard"
+    assert item["reasoning_requirements"] == [
+        f"{task['task_operation']}: {task['target']}"
+    ]
+    assert not any("does not match its reasoning_depth" in error for error in errors)
 
 
 def test_adjusted_task_rejects_unsupported_reasoning_evidence():

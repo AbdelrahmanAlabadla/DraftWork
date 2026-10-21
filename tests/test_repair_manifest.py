@@ -83,6 +83,9 @@ def test_unsupported_given_routes_to_assignment_replacement():
     assert val._repair_classification("invalid_structure") == (
         "structure_invalid", "repair_question"
     )
+    assert val._repair_classification(
+        "incomplete_solution", validation_role="stem_quantitative"
+    ) == ("quantitative_solution_invalid", "repair_question")
 
 
 def test_repair_budget_is_per_slot(monkeypatch):

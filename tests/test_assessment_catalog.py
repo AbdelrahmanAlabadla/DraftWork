@@ -48,15 +48,18 @@ def test_catalog_compiles_once_then_reuses_exact_selection(monkeypatch, tmp_path
             "assessment_profile": _profile("c1"),
             "tasks": [{
                 "knowledge_anchor": "work equals force times displacement along force",
-                "topic": "work", "concept": "mechanical work",
+                "concept": "mechanical work",
                 "relationship": "W = F d cos theta", "task_operation": "explain",
                 "student_work_product": "explain the relationship", "target": "meaning of work",
                 "reasoning_mode": "conceptual_reasoning",
-                "supported_difficulties": ["medium"],
                 "allowed_question_types": ["why"],
                 "evidence_chunk_ids": ["c1"], "required_givens": [],
+                "allowed_variations": [], "variable_givens": [],
+                "complexity_boundaries": [], "exact_source_instance": False,
                 "scenario_family": None, "text_answerable": True,
+                "native_difficulty": "medium", "prerequisites": [],
             }],
+            "fitb_bank": [], "batch_complete": True,
         }
 
     monkeypatch.setattr(catalog, "request_structured", fake_request)
@@ -80,6 +83,25 @@ def test_catalog_compiles_once_then_reuses_exact_selection(monkeypatch, tmp_path
     assert "assessment_profile.subject: mathematics" in calls[0]
     assert "do not reclassify or override" in calls[0]
     assert first["assessment_catalog_key"] == second["assessment_catalog_key"]
+
+
+def test_completed_empty_selection_returns_clear_insufficient_content(monkeypatch, tmp_path):
+    monkeypatch.setattr(catalog.config, "ASSESSMENT_CATALOG_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        catalog, "create_assessment_compiler_client", lambda **_kwargs: SimpleNamespace(last_usage={})
+    )
+    monkeypatch.setattr(catalog, "request_structured", lambda *_args, **_kwargs: {
+        "assessment_profile": _profile("c1"), "tasks": [], "fitb_bank": [],
+        "batch_complete": True,
+    })
+    result = catalog.prepare_assessment_catalog({
+        "processed_document_key": "empty-doc", "document_id": "doc-empty",
+        "retrieved_chunks": [{"child_id": "c1", "content": "Decorative divider."}],
+        "document_language": "en", "domain_type": "non_stem", "subject": "general",
+    })
+    assert result["assessment_catalog"] == {}
+    assert result["assessment_catalog_insufficient_content"] is True
+    assert result["assessment_catalog_failure_reason"] == "no_source_supported_assessment_tasks"
 
 
 def test_catalog_key_changes_with_selection_processed_version_and_logic(monkeypatch):
@@ -193,8 +215,9 @@ def test_catalog_prompt_defines_semantic_suitability_for_active_types():
         "bounded multi-point synthesis",
     ):
         assert phrase in prompt
-    assert "concept + narrow target + student operation + expected work product" in prompt
-    assert "identify a term from its description versus state its definition" in prompt
+    assert "A task represents one\ncoherent educational objective or task family" in prompt
+    assert "Identify all meaningful assessment opportunities before constructing task objects" in prompt
+    assert "Keep independently taught methods, skills, and objectives\nseparate" in prompt
     assert "Do not target a fixed task count" in prompt
 
 
@@ -203,7 +226,7 @@ def test_catalog_prompt_defines_one_cognitive_difficulty_classification():
         "source", "English", ["c1"], domain_type="stem", subject="mathematics"
     )
     for phrase in (
-        "native_difficulty and reasoning_depth are two names for that same grounded classification",
+        "Record that single grounded cognitive-difficulty classification in difficulty",
         "direct recall, recognition, straightforward substitution",
         "selecting or organizing a method, connecting dependent operations",
         "integrating relationships or constraints, evaluating alternatives",
@@ -212,7 +235,7 @@ def test_catalog_prompt_defines_one_cognitive_difficulty_classification():
         assert phrase in prompt
 
 
-def test_catalog_schema_rejects_contradictory_native_difficulty_and_depth():
+def test_catalog_schema_rejects_removed_metadata_fields():
     payload = {
         "knowledge_anchor": "linear equations", "topic": "algebra",
         "concept": "linear equality", "relationship": "equal operations preserve equality",
@@ -224,14 +247,15 @@ def test_catalog_schema_rejects_contradictory_native_difficulty_and_depth():
         "reasoning_requirements": ["Apply inverse operations."],
         "prerequisites": ["Understand equality."],
     }
-    with pytest.raises(ValidationError, match="must be the same grounded"):
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         catalog.CatalogTaskDraft.model_validate(payload)
     finalized = catalog._finalize_catalog(
         {"assessment_profile": _profile("c1"), "tasks": [payload]},
         key="catalog", processed_document_key="processed",
         selected_chunk_ids=["c1"], usage=None,
     )
-    assert finalized["tasks"] == []
+    assert len(finalized["tasks"]) == 1
+    assert not {"topic", "reasoning_depth", "reasoning_requirements"} & finalized["tasks"][0].keys()
 
 
 def test_current_version_cache_rejects_inconsistent_difficulty_metadata(
@@ -271,7 +295,7 @@ def test_finalizer_does_not_invent_mcq_or_semantic_types():
     assert finalized["tasks"][0]["allowed_question_types"] == ["why"]
 
 
-def test_atomic_task_identity_changes_with_work_product_target_or_reasoning():
+def test_task_family_identity_groups_targets_and_retains_them_as_variations():
     base = {
         "knowledge_anchor": "wavelength", "topic": "waves", "concept": "wavelength",
         "relationship": None, "task_operation": "assess_wavelength",
@@ -291,8 +315,12 @@ def test_atomic_task_identity_changes_with_work_product_target_or_reasoning():
         raw, key="catalog", processed_document_key="processed", selected_chunk_ids=["c1"],
         usage=None,
     )
-    assert len({task["task_id"] for task in finalized["tasks"]}) == 3
-    assert len({task["task_family_id"] for task in finalized["tasks"]}) == 3
+    assert len(finalized["tasks"]) == 1
+    task = finalized["tasks"][0]
+    assert {variation["target"] for variation in task["allowed_variations"]} == {
+        "state wavelength meaning", "explain wavelength relation",
+    }
+    assert set(task["allowed_question_types"]) == {"mcq", "definition", "why"}
     assert len({task["coverage_id"] for task in finalized["tasks"]}) == 1
 
 
@@ -372,15 +400,19 @@ def test_stored_non_stem_metadata_routes_compiler_to_deepseek_path(monkeypatch, 
     monkeypatch.setattr(catalog, "request_structured", lambda *_args, **_kwargs: {
         "assessment_profile": profile,
         "tasks": [{
-            "knowledge_anchor": "causes of industrialization", "topic": "history",
+                "knowledge_anchor": "causes of industrialization",
             "concept": "industrial revolution", "relationship": None,
             "task_operation": "explain_causes",
             "student_work_product": "explain historical causes", "target": "industrialization",
             "reasoning_mode": "conceptual_reasoning",
-            "allowed_question_types": ["why"], "evidence_chunk_ids": ["c1"],
-            "required_givens": [], "scenario_family": None, "text_answerable": True,
-        }],
-    })
+                "allowed_question_types": ["why"], "evidence_chunk_ids": ["c1"],
+                "required_givens": [], "scenario_family": None, "text_answerable": True,
+                "allowed_variations": [], "variable_givens": [],
+                "complexity_boundaries": [], "exact_source_instance": False,
+                "native_difficulty": "medium", "prerequisites": [],
+            }],
+            "fitb_bank": [], "batch_complete": True,
+        })
     result = catalog.prepare_assessment_catalog({
         "processed_document_key": "processed-history",
         "retrieved_chunks": [{"child_id": "c1", "content": "Industrialization history."}],
@@ -393,7 +425,7 @@ def test_stored_non_stem_metadata_routes_compiler_to_deepseek_path(monkeypatch, 
     assert stored["subject"] == "history"
 
 
-def test_catalog_shares_relationship_identity_but_keeps_distinct_atomic_targets():
+def test_catalog_groups_semantically_equivalent_relationship_targets_as_variations():
     task = {
         "knowledge_anchor": "energy formula", "topic": "quantum", "concept": "energy",
         "task_operation": "apply_equation", "student_work_product": "write equation",
@@ -413,11 +445,11 @@ def test_catalog_shares_relationship_identity_but_keeps_distinct_atomic_targets(
         usage=None,
     )
 
-    relationships = [entry["relationship_id"] for entry in finalized["tasks"]]
-    families = [entry["task_family_id"] for entry in finalized["tasks"]]
-    assert len(relationships) == 2
-    assert len(set(relationships)) == 1
-    assert len(set(families)) == 2
+    assert len(finalized["tasks"]) == 1
+    assert finalized["tasks"][0]["relationship_id"]
+    assert [v["target"] for v in finalized["tasks"][0]["allowed_variations"]] == [
+        "quantum energy"
+    ]
 
 
 def test_allocator_never_reuses_one_catalog_task_with_metadata_renaming():
@@ -440,6 +472,35 @@ def test_allocator_never_reuses_one_catalog_task_with_metadata_renaming():
     chosen = [item["task_id"] for values in plans[0]["items"].values() for item in values]
     assert issues == []
     assert len(chosen) == len(set(chosen)) == 2
+
+
+def test_reusable_task_contract_separates_invariants_from_exercise_parameters():
+    task = {
+        "task_id": "task_systems", "task_family_id": "family_systems",
+        "coverage_id": "knowledge_systems", "concept_id": "concept_systems",
+        "relationship_id": "relationship_systems", "knowledge_anchor": "linear count systems",
+        "topic": "systems", "concept": "two-variable linear systems",
+        "relationship": "two totals determine two unknown counts",
+        "task_operation": "apply_supported_system_method",
+        "student_work_product": "a supported system result", "target": "one system result",
+        "reasoning_mode": "calculation", "supported_difficulties": ["easy"],
+        "allowed_question_types": ["equation", "word_problem"],
+        "evidence_chunk_ids": ["c1"],
+        "required_givens": ["counts must be nonnegative integers"],
+        "variable_givens": ["the two totals", "which quantity is unknown"],
+        "allowed_variations": ["solve", "construct", "verify", "new numerical instance"],
+        "complexity_boundaries": ["do not introduce nonlinear systems"],
+        "exact_source_instance": False, "scenario_family": "count contexts",
+        "text_answerable": True,
+    }
+
+    item = catalog.materialize_plan_item(task, "m1_word_problem_1", "easy")
+
+    assert item["required_givens"] == ["counts must be nonnegative integers"]
+    assert item["variable_givens"] == ["the two totals", "which quantity is unknown"]
+    assert item["allowed_variations"] == ["solve", "construct", "verify", "new numerical instance"]
+    assert item["complexity_boundaries"] == ["do not introduce nonlinear systems"]
+    assert item["exact_source_instance"] is False
 
 
 def test_replacement_cannot_select_the_current_task_again():
@@ -631,11 +692,34 @@ def test_duplicate_replacement_uses_other_used_task_before_original_task():
     assert replacement["reuse_reason"] == "no_unused_compatible_task"
     assert replacement["forced_duplicate_slot_ids"] == ["s_existing", "s_conflict"]
     assert replacement["forced_duplicate_question_ids"] == ["q_conflict"]
-    assert "numbers alone do not qualify" in replacement["reuse_rule"]
+    assert "different numerical instance is allowed" in replacement["reuse_rule"]
+    assert "Wording alone never qualifies" in replacement["reuse_rule"]
     inventory = replacement["task_inventory"]
     assert inventory["all_unused_compatible_count"] == 1
     assert inventory["eligible_unused_after_exclusions_count"] == 1
     assert inventory["remaining_unused_compatible_count"] == 1
+
+
+def test_catalog_task_remains_reusable_after_three_prior_uses():
+    current = _equation_task("current", "family_current", "coverage_current")
+    reusable = _equation_task("reusable", "family_reusable", "coverage_reusable")
+    plans = [{"model_number": 1, "items": {"equation": [
+        catalog.materialize_plan_item(current, "s_replace", "medium"),
+        *[
+            catalog.materialize_plan_item(reusable, f"s_used_{index}", "medium")
+            for index in range(3)
+        ],
+    ]}}]
+
+    replacement = catalog.catalog_exhaustion_replacement(
+        {"tasks": [current, reusable]}, plans, "s_replace", "equation", "medium",
+    )
+
+    assert replacement["task_id"] == "reusable"
+    assert replacement["task_reused"] is True
+    assert replacement["task_usage_count"] == 3
+    assert replacement["reuse_mode"] == "intentional_practice_variation"
+    assert replacement["source_evidence_ids"]
 
 
 def test_duplicate_replacement_ranks_used_tasks_by_active_exam_coverage():
@@ -802,3 +886,126 @@ def test_fitb_replacement_reuses_least_used_entry_after_bank_exhaustion():
     assert replacement["fitb_entry_id"] == alternate["fitb_entry_id"]
     assert replacement["fitb_entry_reused"] is True
     assert replacement["catalog_replacement_stage"] == "reused_fitb_entry_after_bank_exhaustion"
+
+
+def _family_task_with_variations() -> dict:
+    return {
+        "knowledge_anchor": "Linear account balance",
+        "concept": "Model and analyze a linear balance",
+        "relationship": "B(n) = B0 - 25n",
+        "task_operation": "model_linear_balance",
+        "student_work_product": "balance equation",
+        "target": "balance equation",
+        "reasoning_mode": "symbolic_manipulation",
+        "allowed_question_types": ["equation"],
+        "evidence_chunk_ids": ["chunk_12", "chunk_13"],
+        "required_givens": ["deduction per meeting"],
+        "allowed_variations": [
+            {
+                "target": "initial balance", "operation": "calculate",
+                "givens": ["deduction", "meeting count", "remaining balance"],
+                "question_types": ["word_problem", "mcq"],
+                "evidence_chunk_ids": ["chunk_12"],
+                "reasoning_mode": "calculation", "student_work_product": "initial balance",
+            },
+            {
+                "target": "meeting count until zero balance", "operation": "calculate",
+                "givens": ["initial balance", "deduction per meeting"],
+                "question_types": ["word_problem"],
+                "reasoning_mode": "calculation", "student_work_product": "meeting count",
+            },
+        ],
+        "variable_givens": ["deduction", "meeting count", "remaining balance"],
+        "complexity_boundaries": ["linear balances only"],
+        "exact_source_instance": False,
+        "scenario_family": "account balance",
+        "text_answerable": True,
+        "native_difficulty": "medium",
+        "prerequisites": ["linear equations"],
+    }
+
+
+def test_variation_ids_evidence_inheritance_and_question_type_union():
+    finalized = catalog._finalize_catalog(
+        {"assessment_profile": _profile("chunk_12"), "tasks": [_family_task_with_variations()]},
+        key="catalog", processed_document_key="processed",
+        selected_chunk_ids=["chunk_12", "chunk_13"], usage=None,
+    )
+    task = finalized["tasks"][0]
+    assert set(task["allowed_question_types"]) == {"equation", "word_problem", "mcq"}
+    assert len({v["variation_id"] for v in task["allowed_variations"]}) == 2
+    assert task["allowed_variations"][0]["evidence_chunk_ids"] == ["chunk_12"]
+    assert task["allowed_variations"][1]["evidence_chunk_ids"] is None
+    inherited = catalog.permitted_task_variations(task, "word_problem")[1]
+    assert inherited["target"] == "meeting count until zero balance"
+
+
+def test_invalid_variation_evidence_is_dropped_without_rejecting_task():
+    task = _family_task_with_variations()
+    task["allowed_variations"][0]["evidence_chunk_ids"] = ["chunk_outside"]
+    finalized = catalog._finalize_catalog(
+        {"assessment_profile": _profile("chunk_12"), "tasks": [task]},
+        key="catalog", processed_document_key="processed",
+        selected_chunk_ids=["chunk_12", "chunk_13"], usage=None,
+    )
+    assert len(finalized["tasks"]) == 1
+    assert [v["target"] for v in finalized["tasks"][0]["allowed_variations"]] == [
+        "meeting count until zero balance"
+    ]
+
+
+def test_method_specific_objectives_do_not_collapse_and_ids_ignore_primary_angle():
+    task = _family_task_with_variations()
+    same_objective = {**task, "target": "starting balance", "student_work_product": "value"}
+    elimination = {**task, "task_operation": "solve_by_elimination", "scenario_family": "linear systems"}
+    substitution = {**task, "task_operation": "solve_by_substitution", "scenario_family": "linear systems"}
+    assert catalog.canonical_task_ids(task)["task_id"] == catalog.canonical_task_ids(same_objective)["task_id"]
+    assert catalog.canonical_task_ids(elimination)["task_id"] != catalog.canonical_task_ids(substitution)["task_id"]
+
+
+def test_generator_binds_compatible_variation_and_effective_evidence():
+    from app.online.exam_builder import _bind_selected_variation
+
+    finalized = catalog._finalize_catalog(
+        {"assessment_profile": _profile("chunk_12"), "tasks": [_family_task_with_variations()]},
+        key="catalog", processed_document_key="processed",
+        selected_chunk_ids=["chunk_12", "chunk_13"], usage=None,
+    )["tasks"][0]
+    plan = catalog.materialize_plan_item(finalized, "m1_word_problem_1", "medium")
+    chosen = next(v for v in plan["permitted_variations"] if v["target"] == "initial balance")
+    question = {"selected_variation_id": chosen["variation_id"]}
+    assert _bind_selected_variation(question, plan, "word_problem") is True
+    assert question["effective_evidence_chunk_ids"] == ["chunk_12"]
+    assert _bind_selected_variation(
+        {"selected_variation_id": chosen["variation_id"]}, plan, "equation"
+    ) is False
+
+
+def test_arabic_variation_metadata_and_evidence_are_preserved():
+    values = catalog._normalize_variations([{
+        "target": "الزوج المرتب", "operation": "solve_by_elimination",
+        "givens": ["نظام معادلتين"], "question_types": ["equation"],
+        "evidence_chunk_ids": ["مقطع_١"], "reasoning_mode": "calculation",
+    }])
+    assert values[0]["target"] == "الزوج المرتب"
+    assert values[0]["evidence_chunk_ids"] == ["مقطع_١"]
+    assert values[0]["variation_id"].startswith("variation_")
+
+
+def test_identity_is_stable_when_unordered_restriction_lists_are_reordered():
+    task = _family_task_with_variations()
+    task["required_givens"] = ["nonnegative balance", "fixed deduction"]
+    task["complexity_boundaries"] = ["whole meetings", "linear balances only"]
+    reordered = {
+        **task,
+        "required_givens": list(reversed(task["required_givens"])),
+        "complexity_boundaries": list(reversed(task["complexity_boundaries"])),
+    }
+    assert catalog.canonical_task_ids(task)["task_id"] == catalog.canonical_task_ids(reordered)["task_id"]
+
+    variation = task["allowed_variations"][0]
+    reversed_givens = {**variation, "givens": list(reversed(variation["givens"]))}
+    assert (
+        catalog._normalize_variations([variation])[0]["variation_id"]
+        == catalog._normalize_variations([reversed_givens])[0]["variation_id"]
+    )

@@ -229,6 +229,16 @@ def parse_plans(raw: object, num_models: int) -> list[dict[str, Any]]:
                         str(value).strip() for value in (q.get("required_givens") or [])
                         if str(value).strip()
                     ],
+                    "variable_givens": [
+                        str(value).strip() for value in (q.get("variable_givens") or [])
+                        if str(value).strip()
+                    ],
+                    "allowed_variations": deepcopy(q.get("allowed_variations") or []),
+                    "complexity_boundaries": [
+                        str(value).strip() for value in (q.get("complexity_boundaries") or [])
+                        if str(value).strip()
+                    ],
+                    "exact_source_instance": bool(q.get("exact_source_instance", False)),
                     "text_answerable": q.get("text_answerable", True),
                     "reasoning_mode": str(q.get("reasoning_mode") or "").strip(),
                     "difficulty": str(q.get("difficulty") or "").strip().lower(),
@@ -1127,6 +1137,17 @@ def plan_exams(state: ExamState) -> dict[str, Any]:
     catalog = state.get("assessment_catalog") or {}
 
     if catalog:
+        if (
+            catalog.get("catalog_compilation_complete") is not True
+            and (
+                "catalog_compilation_complete" in catalog
+                or "catalog_version" in catalog
+                or "cache_key" in catalog
+            )
+        ):
+            raise RuntimeError(
+                "Assessment Catalog is incomplete and cannot be used for planning"
+            )
         plans, planning_issues = allocate_catalog_plan(
             catalog, tasks, num_models, difficulty
         )
@@ -1432,6 +1453,16 @@ def _merge_plan_replacements(
                 str(value).strip() for value in (replacement.get("required_givens") or [])
                 if str(value).strip()
             ],
+            "variable_givens": [
+                str(value).strip() for value in (replacement.get("variable_givens") or [])
+                if str(value).strip()
+            ],
+            "allowed_variations": deepcopy(replacement.get("allowed_variations") or []),
+            "complexity_boundaries": [
+                str(value).strip() for value in (replacement.get("complexity_boundaries") or [])
+                if str(value).strip()
+            ],
+            "exact_source_instance": bool(replacement.get("exact_source_instance", False)),
             "text_answerable": replacement.get("text_answerable", True),
             "reasoning_mode": str(replacement.get("reasoning_mode") or "").strip(),
             "difficulty": str(replacement.get("difficulty") or "").strip().lower(),

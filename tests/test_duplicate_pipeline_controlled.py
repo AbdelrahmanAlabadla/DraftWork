@@ -51,6 +51,9 @@ def _plan_item(task: dict, qid: str) -> dict:
 
 
 def test_controlled_12_question_correctness_then_grouped_duplicate_flow(monkeypatch):
+    # This lifecycle test expects one Judge call per scan. Parallel Judge
+    # batching has dedicated coverage in test_performance_optimizations.py.
+    monkeypatch.setattr(duplicate_judge, "DUPLICATE_JUDGE_BATCH_SIZE", 1000)
     questions = {
         "why": [
             _sa("q1", "What does mechanical work mean?", "Energy transfer by force through displacement."),
@@ -141,6 +144,13 @@ def test_controlled_12_question_correctness_then_grouped_duplicate_flow(monkeypa
             )))
         return {"verdicts": verdicts}
     monkeypatch.setattr(duplicate_judge, "request_structured", fake_judge)
+    monkeypatch.setattr(
+        duplicate_pipeline, "_select_replacement_candidate",
+        lambda **kwargs: (
+            (kwargs.get("candidates") or [None])[0],
+            {"selection_source": "controlled_test"},
+        ),
+    )
 
     def fake_generate(_state, plans, _model_number, qid, _exam):
         task_id = _plan_item_by_slot(plans, f"s_{qid}")["task_id"]
@@ -392,9 +402,15 @@ def test_exact_task_reuse_is_transactional_and_rolls_back_failed_precommit(monke
 
     assert exam["questions"]["why"][1]["question"] == "Original task B"
     assert _plan_item_by_slot(result["plans"], "s_q2")["task_id"] == "task_q2"
-    assert result["duplicate_repair_history"][-1]["status"] == "no_compatible_catalog_replacement"
+    assert result["duplicate_repair_history"][-1]["status"] == "precommit_rejected"
     assert result["pending_revalidation_ids"] == {}
-    assert captured == {}
+    assert captured["previous_task_questions"]
+    roles = {
+        value.get("context_role")
+        for value in captured["previous_task_questions"]
+    }
+    assert "rejected_duplicate_question" in roles
+    assert "duplicate_conflict" in roles
 
 
 def test_failed_original_regeneration_advances_to_other_used_task(monkeypatch):
@@ -437,8 +453,47 @@ def test_failed_original_regeneration_advances_to_other_used_task(monkeypatch):
 
     result = duplicate_pipeline.repair_duplicate_groups(state)
 
-    assert captured == {}
-    assert result["duplicate_repair_history"][-1]["status"] == "no_compatible_catalog_replacement"
+    assert captured["task_id"] == "task_q1"
+    assert captured["reuse_mode"] == "intentional_practice_variation"
+    assert captured["task_usage_count"] == 1
+    assert result["duplicate_repair_history"][-1]["status"] == "replaced"
+    assert result["pending_revalidation_ids"][1] == ["q2"]
+
+
+def test_selector_keeps_authorized_same_skill_reuse_and_supplies_all_previous_questions(monkeypatch):
+    reused = _plan_item(_task("reuse", "equation"), "candidate")
+    reused.update({
+        "task_reused": True,
+        "reuse_mode": "intentional_practice_variation",
+        "task_usage_count": 3,
+    })
+    active = []
+    previous = []
+    for index in range(3):
+        active.append(dict(reused, slot_id=f"old_{index}"))
+        previous.append({
+            "question_id": f"q{index}", "slot_id": f"old_{index}",
+            "task_id": reused["task_id"], "question": f"x + {index} = {index + 2}",
+            "correct_answer": "x = 2", "solution_steps": ["subtract the constant"],
+        })
+
+    monkeypatch.setattr(
+        "app.llm.client.request_structured",
+        lambda *_args, **_kwargs: {
+            "slot_to_replace": "target", "conflicts_with": [], "conflict_reason": "",
+            "replacement_task_id": reused["task_id"], "replacement_fitb_entry_id": None,
+            "why_this_candidate_resolves_the_conflict": "new numerical instance",
+            "checked_against_active_slots": True, "rejected_candidates": [],
+        },
+    )
+    chosen, context = duplicate_pipeline._select_replacement_candidate(
+        slot_id="target", qtype="equation", conflict_slots=[], conflict_edges=[],
+        candidates=[reused], active_items=active, blacklist=set(), previous_failures=[],
+        existing_questions=previous, allow_semantic_overlap_candidates=True,
+    )
+
+    assert chosen["task_id"] == reused["task_id"]
+    assert len(context["candidates"][0]["previous_uses"]) == 3
 
 
 def test_final_scan_exhaustion_marks_and_preserves_missing_slot(monkeypatch):
@@ -513,7 +568,7 @@ def test_slot_attempt_limit_is_independent_from_optional_third_global_round(monk
     assert state["unresolved_duplicate_conflicts"]
 
 
-def test_third_attempt_uses_numeric_variation_then_skips_duplicate_recheck(monkeypatch):
+def test_third_attempt_uses_numeric_variation_then_requires_duplicate_recheck(monkeypatch):
     from app.online.graph import _route_after_validation
 
     original = {
@@ -547,6 +602,12 @@ def test_third_attempt_uses_numeric_variation_then_skips_duplicate_recheck(monke
         "generated_exams": [exam], "plans": [{"model_number": 1, "items": {"equation": [{
             "slot_id": "s_q2", "task_id": "t2", "idea_to_test": "solve a linear equation",
             "reasoning_mode": "symbolic_manipulation", "difficulty": "easy",
+            "variable_givens": ["coefficients and constants"],
+                "allowed_variations": [{
+                    "target": "solution", "operation": "solve_equation",
+                    "givens": ["coefficients and constants"], "representation": None,
+                    "application": None, "numeric_values_may_change": True,
+                }],
         }]}}],
         "pending_duplicate_groups": [{
             "model_number": 1, "question_ids": ["q1", "q2"],
@@ -565,15 +626,51 @@ def test_third_attempt_uses_numeric_variation_then_skips_duplicate_recheck(monke
     assert repaired["duplicate_repair_mode"] == "numeric_variation_fallback"
     assert repaired["duplicate_conflict_with"] == "q1"
     assert repaired["numeric_variant"] is True
-    assert repaired["duplicate_recheck_required"] is False
+    assert repaired["duplicate_recheck_required"] is True
     assert result["pending_revalidation_ids"] == {1: ["q2"]}
     assert result["duplicate_repair_rounds"] == 3
-    assert result["duplicate_verification_pending"] is False
-    assert result["duplicate_judge_exempt_ids"] == ["q2"]
+    # The final numeric variation is no longer exempt: it must receive an
+    # independent Duplicate Judge scan rather than skipping straight to assembly.
+    assert result["duplicate_verification_pending"] is True
+    assert result["duplicate_judge_exempt_ids"] == []
     assert _route_after_validation({
         "repair_manifest": [],
         "duplicate_repair_finalization_pending": True,
     }) == "assemble_exams"
+
+
+def test_numeric_variation_requires_task_authorization_and_respects_exact_source_instance():
+    item = {
+        "question_id": "q1", "slot_id": "s1",
+        "equation": r"Solve: \[2x+5=15\]", "solution_steps": ["x=5"],
+        "final_answer": "x=5",
+    }
+    exam = {"model_number": 1, "questions": {"equation": [item]}}
+    plan = {
+        "slot_id": "s1", "task_id": "t1", "question_type": "equation",
+        "task_operation": "solve_equation", "reasoning_mode": "symbolic_manipulation",
+        "difficulty": "easy",
+    }
+    state = {"plans": [{"model_number": 1, "items": {"equation": [plan]}}]}
+
+    assert duplicate_pipeline._numeric_variation_applicable(
+        state, exam, 1, "q1", "equation", item,
+    ) is False
+
+    plan["variable_givens"] = ["coefficients and constants"]
+    plan["allowed_variations"] = [{
+        "target": "solution", "operation": "solve_equation",
+        "givens": ["coefficients and constants"], "representation": None,
+        "application": None, "numeric_values_may_change": True,
+    }]
+    assert duplicate_pipeline._numeric_variation_applicable(
+        state, exam, 1, "q1", "equation", item,
+    ) is True
+
+    plan["exact_source_instance"] = True
+    assert duplicate_pipeline._numeric_variation_applicable(
+        state, exam, 1, "q1", "equation", item,
+    ) is False
 
 
 def test_third_attempt_keeps_nonnumeric_definition_without_calling_numeric_agent(monkeypatch):

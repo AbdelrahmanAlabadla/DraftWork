@@ -61,13 +61,15 @@ def _question_shortage_warnings(
             for qtype, section in (exam.get("questions") or {}).items():
                 generated[qtype] = generated.get(qtype, 0) + _section_question_count(section)
     warnings: list[dict[str, Any]] = []
+    missing_ids = [str(value) for value in result.get("missing_slot_ids") or []]
+    invalid_ids = [str(value) for value in result.get("invalid_slot_ids") or []]
     for qtype, count_per_model in tasks:
         requested = int(count_per_model) * int(num_models)
         produced = int(generated.get(qtype, 0))
         if produced >= requested:
             continue
         missing = requested - produced
-        warnings.append({
+        warning = {
             "type": "question_shortage",
             "question_type": qtype,
             "requested_count": requested,
@@ -77,7 +79,14 @@ def _question_shortage_warnings(
             "generated": produced,
             "missing": missing,
             "reason": "missing_questions",
-        })
+        }
+        slot_ids = [
+            slot_id for slot_id in [*missing_ids, *invalid_ids]
+            if f"_{qtype}_" in slot_id
+        ]
+        if slot_ids:
+            warning["missing_slot_ids"] = slot_ids
+        warnings.append(warning)
     return warnings
 
 
@@ -106,24 +115,16 @@ def _difficulty_fallback_warnings(result: dict[str, Any]) -> list[dict[str, Any]
     for row in finalized:
         level = str(row.get("actual_difficulty") or row.get("difficulty") or "unknown")
         counts[level] = counts.get(level, 0) + 1
-    produced = sum(counts.values())
     matched = counts.get(requested_level, 0)
     substitutions = {level: count for level, count in counts.items()
                      if level != requested_level and count}
     return [{
         "type": "difficulty_fallback",
         "requested_difficulty": requested_level,
-        "requested_count": produced,
         f"{requested_level}_count": matched,
         "actual_difficulty_counts": counts,
         "fallback_counts": substitutions,
-        "message": (
-            f"Your exam was generated with {produced} of {produced} requested questions. "
-            f"It contains {matched} {requested_level.title()} and "
-            + ", ".join(f"{count} {level.title()}" for level, count in sorted(substitutions.items()))
-            + f" questions because the selected material did not support enough distinct "
-              f"{requested_level.title()} questions."
-        ),
+        "reason": "difficulty_substitution",
     }]
 
 
@@ -396,6 +397,14 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         metadata = dict(request_data.get("metadata") or {})
         metadata["document_language"] = result.get("document_language") or "en"
         metadata["quality_summary"] = dict(result.get("quality_summary") or {})
+        metadata["original_request"] = {
+            "total": sum(int(count) for _qtype, count in tasks) * int(request_data["num_models"]),
+            "question_counts": {
+                qtype: int(count) * int(request_data["num_models"])
+                for qtype, count in tasks
+            },
+            "num_models": int(request_data["num_models"]),
+        }
         metadata["question_shortages"] = shortage_warnings
         metadata["difficulty_fallbacks"] = difficulty_warnings
         metadata["generation_audit"] = {
@@ -405,8 +414,13 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "duplicate_repair_history": list(result.get("duplicate_repair_history") or []),
             "plan_review_history": list(result.get("plan_review_history") or []),
             "plan_review_attempts": int(result.get("plan_review_attempts") or 0),
+            "plan_review_issues": list(result.get("plan_review_issues") or []),
+            "plan_review_telemetry": list(result.get("plan_review_telemetry") or []),
             "plan_duplicate_repair_attempts": dict(
                 result.get("plan_duplicate_repair_attempts") or {}
+            ),
+            "plan_review_candidate_blacklist": dict(
+                result.get("plan_review_candidate_blacklist") or {}
             ),
             "unresolved_plan_duplicate_conflicts": list(
                 result.get("unresolved_plan_duplicate_conflicts") or []
@@ -416,6 +430,12 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "duplicate_repair_rounds": int(result.get("duplicate_repair_rounds") or 0),
             "duplicate_replacement_attempts": dict(
                 result.get("duplicate_replacement_attempts") or {}
+            ),
+            "duplicate_candidate_blacklist": dict(
+                result.get("duplicate_candidate_blacklist") or {}
+            ),
+            "duplicate_replacement_failures": dict(
+                result.get("duplicate_replacement_failures") or {}
             ),
             "validation_repair_history": list(result.get("validation_repair_history") or []),
             "repair_manifest": list(result.get("repair_manifest") or []),

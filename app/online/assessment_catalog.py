@@ -6,11 +6,15 @@ import json
 import os
 import re
 import tempfile
+import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import Field, model_validator
+from pydantic import ConfigDict, Field, StrictBool, ValidationError
 
 from app import config
 from app.llm.client import request_structured
@@ -25,11 +29,29 @@ from app.llm.schemas import (
     QuestionType,
     ReasoningMode,
     StrictOutputModel,
+    TaskVariation,
 )
 from app.logging_conf import get_logger
 from app.online.semantic_keys import formula_semantic_key
 
 logger = get_logger("ASSESSMENT_CATALOG")
+
+
+class CatalogBatchIncompleteError(RuntimeError):
+    """A compiler batch never produced an explicit complete, valid response."""
+
+    def __init__(self, batch_index: int, attempts: int, reason: str):
+        self.batch_index = batch_index
+        self.attempts = attempts
+        self.reason = reason
+        super().__init__(
+            f"Assessment Catalog batch {batch_index + 1} remained incomplete "
+            f"after {attempts} attempts: {reason}"
+        )
+
+
+class CatalogCompilationCancelled(RuntimeError):
+    """Catalog compilation stopped because its owning job was cancelled."""
 
 
 _FITB_ANSWER_NOISE = {
@@ -87,6 +109,33 @@ def is_authorized_catalog_exhaustion_reuse(item: dict[str, Any]) -> bool:
             "semantic_plan_repair_intentional_reuse",
         }
         and str(item.get("reused_task_id") or "") == task_id
+        and item.get("required_instance_distinctions")
+        and item.get("forced_duplicate_slot_ids")
+    )
+
+
+def is_authorized_intentional_practice_reuse(item: dict[str, Any]) -> bool:
+    """Return whether exact-task reuse has the complete practice-variation contract.
+
+    This includes both least-used catalog reuse and regeneration of the original
+    valid task after a generated duplicate.  The explicit metadata prevents a
+    bare ``reuse_mode`` label from bypassing generator duplicate safeguards.
+    """
+    if is_authorized_catalog_exhaustion_reuse(item):
+        return True
+    task_id = str(item.get("task_id") or "")
+    return bool(
+        task_id
+        and item.get("task_reused") is True
+        and item.get("reuse_mode") == "intentional_practice_variation"
+        and item.get("reuse_reason") == "regenerate_original_task_after_duplicate"
+        and item.get("catalog_replacement_stage")
+        == "regenerated_original_task_after_duplicate"
+        and str(item.get("reused_task_id") or "") == task_id
+        and int(item.get("task_usage_count") or 0) > 0
+        and item.get("variation_reason")
+        and item.get("intended_variation")
+        and item.get("source_evidence_ids")
         and item.get("required_instance_distinctions")
         and item.get("forced_duplicate_slot_ids")
     )
@@ -156,11 +205,15 @@ def compatible_task_inventory(
             "reuse_mode": not unused_ids and bool(compatible_ids),
             "reuse_reason": "no_unused_compatible_fitb_entry" if not unused_ids and compatible_ids else None,
         }
+    indexed_ids = set((catalog.get("tasks_by_question_type") or {}).get(qtype) or [])
     compatible_ids = {
         str(task.get("task_id"))
         for task in catalog.get("tasks") or []
         if task.get("task_id")
-        and qtype in (task.get("allowed_question_types") or [])
+        and (
+            str(task.get("task_id")) in indexed_ids
+            if indexed_ids else qtype in (task.get("allowed_question_types") or [])
+        )
         and _difficulty_for(task, requested_difficulty) is not None
     }
     used_ids = {
@@ -231,7 +284,6 @@ def _inventory_after_reservation(
 
 class CatalogTaskDraft(StrictOutputModel):
     knowledge_anchor: str = Field(min_length=1, max_length=240)
-    topic: str = Field(min_length=1, max_length=160)
     concept: str = Field(min_length=1, max_length=200)
     relationship: str | None = Field(max_length=240)
     task_operation: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
@@ -241,21 +293,14 @@ class CatalogTaskDraft(StrictOutputModel):
     allowed_question_types: list[QuestionType] = Field(min_length=1)
     evidence_chunk_ids: list[NonEmptyString] = Field(min_length=1, max_length=4)
     required_givens: list[NonEmptyString] = Field(max_length=12)
+    allowed_variations: list[TaskVariation] = Field(default_factory=list)
+    variable_givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
+    complexity_boundaries: list[NonEmptyString] = Field(default_factory=list, max_length=8)
+    exact_source_instance: bool = False
     scenario_family: str | None = Field(max_length=160)
-    text_answerable: bool
+    text_answerable: StrictBool
     native_difficulty: Literal["easy", "medium", "hard"]
-    reasoning_depth: Literal["easy", "medium", "hard"]
-    reasoning_requirements: list[NonEmptyString] = Field(min_length=1, max_length=8)
     prerequisites: list[NonEmptyString] = Field(default_factory=list, max_length=8)
-
-    @model_validator(mode="after")
-    def difficulty_is_one_grounded_classification(self):
-        if self.native_difficulty != self.reasoning_depth:
-            raise ValueError(
-                "native_difficulty and reasoning_depth must be the same grounded "
-                "cognitive classification"
-            )
-        return self
 
 
 class FITBEntryDraft(StrictOutputModel):
@@ -268,8 +313,59 @@ class FITBEntryDraft(StrictOutputModel):
 
 class AssessmentCatalogResponse(StrictOutputModel):
     assessment_profile: AssessmentProfile
-    tasks: list[CatalogTaskDraft] = Field(min_length=1)
+    tasks: list[CatalogTaskDraft]
     fitb_bank: list[FITBEntryDraft] = Field(default_factory=list, max_length=128)
+
+
+class CompactCatalogTask(StrictOutputModel):
+    """LLM-facing task contract for one compiler batch.
+
+    Readable wire aliases reduce schema/output size. ``model_dump`` normalizes
+    them to the full internal field names before any downstream consumer sees
+    the task.
+    """
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    knowledge_anchor: str = Field(alias="anchor", min_length=1, max_length=240)
+    concept: str = Field(min_length=1, max_length=200)
+    relationship: str | None = Field(alias="relation", max_length=240)
+    task_operation: str = Field(alias="operation", min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
+    student_work_product: str = Field(alias="work_product", min_length=1, max_length=200)
+    target: str = Field(min_length=1, max_length=200)
+    reasoning_mode: ReasoningMode = Field(alias="mode")
+    allowed_question_types: list[QuestionType] = Field(alias="question_types", min_length=1)
+    evidence_chunk_ids: list[NonEmptyString] = Field(alias="evidence_ids", min_length=1, max_length=4)
+    required_givens: list[NonEmptyString] = Field(max_length=12)
+    allowed_variations: list[TaskVariation] = Field(alias="variations", default_factory=list)
+    variable_givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
+    complexity_boundaries: list[NonEmptyString] = Field(alias="boundaries", default_factory=list, max_length=8)
+    exact_source_instance: bool = False
+    scenario_family: str | None = Field(max_length=160)
+    text_answerable: StrictBool = Field(alias="answerable")
+    native_difficulty: Literal["easy", "medium", "hard"] = Field(alias="difficulty")
+    prerequisites: list[NonEmptyString] = Field(alias="prereqs", default_factory=list, max_length=8)
+
+
+class CompactCatalogBatchResponse(StrictOutputModel):
+    """Compact per-batch response for every batch except the first."""
+
+    tasks: list[CompactCatalogTask]
+    fitb_bank: list[FITBEntryDraft] = Field(default_factory=list, max_length=128)
+    batch_complete: Literal[True]
+
+
+class CompactCatalogBatchWithProfileResponse(StrictOutputModel):
+    """First-batch response: carries the single catalog-level profile."""
+
+    assessment_profile: AssessmentProfile
+    tasks: list[CompactCatalogTask]
+    fitb_bank: list[FITBEntryDraft] = Field(default_factory=list, max_length=128)
+    batch_complete: Literal[True]
+
+
+CATALOG_CONTRACT_VERSION = "catalog-v11-task-family-variations"
+CATALOG_BATCHING_VERSION = "parent-pairs-v1"
 
 
 def _completed_json_objects(text: str) -> list[dict[str, Any]]:
@@ -301,7 +397,9 @@ def _completed_json_objects(text: str) -> list[dict[str, Any]]:
     return completed
 
 
-def _recover_catalog_checkpoint(text: str) -> dict[str, Any] | None:
+def _recover_catalog_checkpoint(
+    text: str, *, require_profile: bool = True,
+) -> dict[str, Any] | None:
     objects = _completed_json_objects(text)
     profile = next((
         value for value in objects
@@ -310,23 +408,69 @@ def _recover_catalog_checkpoint(text: str) -> dict[str, Any] | None:
         and value.get("subject")
         and value.get("domain") in {"STEM", "NON_STEM"}
     ), None)
-    tasks = [
-        value for value in objects
-        if value.get("knowledge_anchor") and value.get("task_operation")
-        and isinstance(value.get("evidence_chunk_ids"), list)
-    ]
-    fitb_bank = [
-        value for value in objects
-        if value.get("answer") and value.get("evidence_chunk_id")
-        and value.get("clue_basis") and not value.get("task_operation")
-    ]
-    if profile is None or len(tasks) < 28:
+    if profile is not None:
+        try:
+            profile = AssessmentProfile.model_validate(profile).model_dump()
+        except ValidationError:
+            profile = None
+    tasks: list[dict[str, Any]] = []
+    for value in objects:
+        if not (
+            (value.get("anchor") or value.get("knowledge_anchor"))
+            and (value.get("operation") or value.get("task_operation"))
+            and isinstance(value.get("evidence_ids") or value.get("evidence_chunk_ids"), list)
+        ):
+            continue
+        try:
+            tasks.append(CompactCatalogTask.model_validate(value).model_dump())
+        except ValidationError:
+            continue
+    fitb_bank: list[dict[str, Any]] = []
+    for value in objects:
+        if not (
+            value.get("answer") and value.get("evidence_chunk_id")
+            and value.get("clue_basis") and not value.get("task_operation")
+        ):
+            continue
+        try:
+            fitb_bank.append(FITBEntryDraft.model_validate(value).model_dump())
+        except ValidationError:
+            continue
+    if require_profile and profile is None:
+        return None
+    if not tasks and not fitb_bank:
         return None
     logger.warning(
         "Recovered assessment catalog checkpoint | complete_tasks=%d | discarded_tail=true",
         len(tasks),
     )
-    return {"assessment_profile": profile, "tasks": tasks, "fitb_bank": fitb_bank}
+    recovered: dict[str, Any] = {
+        "tasks": tasks,
+        "fitb_bank": fitb_bank,
+        "batch_complete": False,
+        "recovered_truncated_checkpoint": True,
+    }
+    if profile is not None:
+        recovered["assessment_profile"] = profile
+    return recovered
+
+
+def _validate_completed_batch(
+    value: Any, *, response_model: type[StrictOutputModel], valid_chunk_ids: set[str],
+) -> dict[str, Any]:
+    """Fail closed unless one batch is explicit, schema-valid, and source-bound."""
+    parsed = response_model.model_validate(value)
+    normalized = parsed.model_dump()
+    if normalized.get("batch_complete") is not True:
+        raise ValueError("batch_complete must be explicitly true")
+    for task in normalized.get("tasks") or []:
+        evidence = set(map(str, task.get("evidence_chunk_ids") or []))
+        if not evidence or not evidence.issubset(valid_chunk_ids):
+            raise ValueError("task evidence IDs are outside this compiler batch")
+    for entry in normalized.get("fitb_bank") or []:
+        if str(entry.get("evidence_chunk_id") or "") not in valid_chunk_ids:
+            raise ValueError("FITB evidence ID is outside this compiler batch")
+    return normalized
 
 
 def _normalized(value: object) -> str:
@@ -431,9 +575,6 @@ def canonical_task_ids(item: dict[str, Any]) -> dict[str, str | None] | None:
         "knowledge_anchor": knowledge_anchor,
         "concept": item.get("concept"),
         "task_operation": item.get("task_operation"),
-        "student_work_product": item.get("student_work_product"),
-        "target": item.get("target"),
-        "reasoning_mode": item.get("reasoning_mode"),
     }
     if any(not str(value or "").strip() for value in required.values()):
         return None
@@ -447,15 +588,15 @@ def canonical_task_ids(item: dict[str, Any]) -> dict[str, str | None] | None:
     )
     return {
         "task_id": _stable_id(
-            "task", coverage_id, item.get("task_operation"),
-            item.get("student_work_product"), item.get("target"),
-            item.get("reasoning_mode"), relationship_basis or "",
-            item.get("required_givens") or [], item.get("scenario_family") or "",
+            "task", coverage_id, item.get("concept"), item.get("task_operation"),
+            relationship_basis or "",
+            sorted(_normalized(value) for value in item.get("required_givens") or []),
+            item.get("scenario_family") or "",
+            sorted(_normalized(value) for value in item.get("complexity_boundaries") or []),
         ),
         "task_family_id": _stable_id(
-            "family", coverage_id, item.get("task_operation"),
-            item.get("student_work_product"), item.get("target"),
-            relationship_basis or item.get("concept"), item.get("reasoning_mode"),
+            "family", coverage_id, item.get("concept"),
+            relationship_basis or "", item.get("scenario_family") or "",
         ),
         "coverage_id": coverage_id,
         "concept_id": concept_id,
@@ -474,16 +615,149 @@ def apply_canonical_task_ids(item: dict[str, Any]) -> bool:
     return True
 
 
+def _normalize_variations(values: Any) -> list[dict[str, Any]]:
+    """Normalize, identify, and merge semantically identical assessment angles."""
+    normalized: dict[str, dict[str, Any]] = {}
+    for value in values or []:
+        if hasattr(value, "model_dump"):
+            value = value.model_dump()
+        if not isinstance(value, dict):
+            continue
+        try:
+            variation = TaskVariation.model_validate(value).model_dump()
+        except ValidationError:
+            continue
+        variation_id = _stable_id(
+            "variation", variation.get("target"), variation.get("operation"),
+            sorted(_normalized(value) for value in variation.get("givens") or []),
+            variation.get("reasoning_mode") or "",
+            variation.get("student_work_product") or "",
+            variation.get("representation") or "", variation.get("application") or "",
+            variation.get("numeric_values_may_change", False),
+        )
+        variation["variation_id"] = variation_id
+        existing = normalized.get(variation_id)
+        if existing is None:
+            normalized[variation_id] = variation
+            continue
+        existing["question_types"] = list(dict.fromkeys([
+            *(existing.get("question_types") or []),
+            *(variation.get("question_types") or []),
+        ]))
+        evidence = list(dict.fromkeys([
+            *(existing.get("evidence_chunk_ids") or []),
+            *(variation.get("evidence_chunk_ids") or []),
+        ]))
+        existing["evidence_chunk_ids"] = evidence or None
+    return list(normalized.values())
+
+
+def _primary_variation(task: dict[str, Any]) -> dict[str, Any]:
+    """Expose the compatible primary angle as a selectable, stable variation."""
+    primary = {
+        "target": task.get("target"),
+        "operation": task.get("task_operation"),
+        "givens": list(task.get("required_givens") or []),
+        "question_types": list(task.get("primary_question_types") or task.get("allowed_question_types") or []),
+        "evidence_chunk_ids": list(task.get("evidence_chunk_ids") or []),
+        "reasoning_mode": task.get("reasoning_mode"),
+        "student_work_product": task.get("student_work_product"),
+        "representation": None,
+        "application": task.get("scenario_family"),
+        "numeric_values_may_change": bool(task.get("variable_givens")),
+    }
+    normalized = _normalize_variations([primary])
+    if normalized:
+        return normalized[0]
+    # Legacy/test plans may carry a free-form reasoning label from the pre-contract era.
+    primary["reasoning_mode"] = None
+    normalized = _normalize_variations([primary])
+    if normalized:
+        return normalized[0]
+    primary["student_work_product"] = None
+    return _normalize_variations([primary])[0]
+
+
+def permitted_task_variations(task: dict[str, Any], question_type: str | None = None) -> list[dict[str, Any]]:
+    variations = [_primary_variation(task), *_normalize_variations(task.get("allowed_variations"))]
+    if question_type:
+        variations = [
+            variation for variation in variations
+            if question_type in (variation.get("question_types") or [])
+        ]
+    return variations
+
+
+def selected_variation(task: dict[str, Any], variation_id: str, question_type: str) -> dict[str, Any] | None:
+    return next((
+        variation for variation in permitted_task_variations(task, question_type)
+        if variation.get("variation_id") == variation_id
+    ), None)
+
+
+_METHOD_RESTRICTION_RE = re.compile(
+    r"\b(?:must|required|only|without|rather\s+than|do\s+not|not)\b|"
+    r"(?:يجب|فقط|دون|بدون|لا\s+تستخدم)", re.IGNORECASE,
+)
+
+
+def _migrate_legacy_method_restrictions(task: dict[str, Any]) -> list[str]:
+    """Preserve only genuine method constraints from the removed legacy field."""
+    boundaries = [
+        str(value).strip() for value in task.get("complexity_boundaries") or []
+        if str(value).strip()
+    ]
+    for value in task.get("reasoning_requirements") or []:
+        text = str(value).strip()
+        if text and _METHOD_RESTRICTION_RE.search(text) and text not in boundaries:
+            boundaries.append(text)
+    return boundaries
+
+
+def _expand_compact_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Expand a compact compiler task into the full downstream catalog contract.
+
+    Deterministic and idempotent: a full task from an earlier catalog, or one
+    already expanded from a vocabulary code, passes through unchanged.
+    """
+    if not isinstance(task, dict):
+        return task
+    expanded = dict(task)
+    expanded["complexity_boundaries"] = _migrate_legacy_method_restrictions(expanded)
+    expanded["allowed_variations"] = _normalize_variations(
+        expanded.get("allowed_variations") or expanded.get("variations")
+    )
+    # Removed Catalog fields must never survive as compatibility placeholders.
+    for field in ("topic", "reasoning_depth", "reasoning_requirements"):
+        expanded.pop(field, None)
+    return expanded
+
+
 def catalog_cache_key(
     processed_document_key: str,
     selected_chunk_ids: list[str],
     compiler_identity: dict[str, str] | None = None,
 ) -> str:
+    finalizer_contract = "\n".join((
+        inspect.getsource(canonical_task_ids),
+        inspect.getsource(canonical_fitb_entry),
+        CATALOG_CONTRACT_VERSION,
+        inspect.getsource(_normalize_variations),
+        inspect.getsource(_migrate_legacy_method_restrictions),
+        inspect.getsource(_expand_compact_task),
+        inspect.getsource(_finalize_catalog),
+        inspect.getsource(_catalog_prompt),
+        json.dumps(AssessmentCatalogResponse.model_json_schema(), sort_keys=True),
+    ))
     payload = {
         "processed_document_key": processed_document_key,
         "selected_chunk_ids": sorted(set(map(str, selected_chunk_ids))),
         "catalog_version": config.ASSESSMENT_CATALOG_VERSION,
-        "catalog_logic_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        # Deliberately exclude unrelated module text (logging, comments, imports).
+        # Only behavior that can change a finalized catalog invalidates this cache.
+        "catalog_contract_sha256": hashlib.sha256(
+            finalizer_contract.encode("utf-8")
+        ).hexdigest(),
         "compiler": compiler_identity or {},
     }
     return hashlib.sha256(
@@ -497,8 +771,12 @@ def compiler_cache_key(
     compiler_identity: dict[str, str] | None = None,
 ) -> str:
     compiler_contract = "\n".join((
+        CATALOG_CONTRACT_VERSION,
         inspect.getsource(_catalog_prompt),
-        json.dumps(AssessmentCatalogResponse.model_json_schema(), sort_keys=True),
+        json.dumps(CompactCatalogBatchResponse.model_json_schema(), sort_keys=True),
+        json.dumps(
+            CompactCatalogBatchWithProfileResponse.model_json_schema(), sort_keys=True
+        ),
     ))
     payload = {
         "processed_document_key": processed_document_key,
@@ -535,24 +813,40 @@ def _read_cache(key: str) -> dict[str, Any] | None:
         or not all(_cached_task_contract_valid(task) for task in payload.get("tasks") or [])
     ):
         return None
+    if not isinstance(payload.get("tasks_by_question_type"), dict):
+        payload["tasks_by_question_type"] = {
+            qtype: [
+                str(task["task_id"]) for task in payload.get("tasks") or []
+                if qtype in (task.get("allowed_question_types") or [])
+            ]
+            for qtype in (
+                "mcq", "true_false", "definition", "why", "equation",
+                "word_problem", "essay",
+            )
+        }
+        payload["tasks_by_question_type"]["fill_in_the_blank"] = [
+            str(entry["fitb_entry_id"]) for entry in payload.get("fitb_bank") or []
+            if entry.get("fitb_entry_id") and not entry.get("alias_of_fitb_entry_id")
+        ]
     return payload
 
 
 def _cached_task_contract_valid(task: Any) -> bool:
-    """Reject cached catalogs that predate or violate the unified difficulty contract."""
+    """Reject caches outside the precise 18-field task contract."""
     if not isinstance(task, dict):
         return False
     native = str(task.get("native_difficulty") or "")
-    depth = str(task.get("reasoning_depth") or "")
-    requirements = task.get("reasoning_requirements")
     prerequisites = task.get("prerequisites")
     return bool(
         native in {"easy", "medium", "hard"}
-        and depth == native
         and task.get("supported_difficulties") == [native]
-        and isinstance(requirements, list)
-        and requirements
-        and all(isinstance(value, str) and value.strip() for value in requirements)
+        and "topic" not in task
+        and "reasoning_depth" not in task
+        and "reasoning_requirements" not in task
+        and isinstance(task.get("text_answerable"), bool)
+        and task.get("text_answerable") is True
+        and _normalize_variations(task.get("allowed_variations"))
+        == task.get("allowed_variations")
         and isinstance(prerequisites, list)
         and all(isinstance(value, str) and value.strip() for value in prerequisites)
     )
@@ -614,7 +908,7 @@ def _compatible_compiler_seed(
             and payload.get("assessment_profile")
             and payload["assessment_profile"].get("subject")
             and payload["assessment_profile"].get("domain") in {"STEM", "NON_STEM"}
-            and len(payload.get("tasks") or []) >= 28
+            and bool(payload.get("tasks"))
             and isinstance(payload.get("fitb_bank"), list)
             and all(_cached_task_contract_valid(task) for task in payload.get("tasks") or [])
         ):
@@ -633,7 +927,26 @@ def _catalog_prompt(
     *,
     domain_type: str,
     subject: str,
+    include_profile: bool = True,
 ) -> str:
+    if include_profile:
+        output_contract = (
+            "Return one root JSON object with exactly these top-level fields:\n"
+            "- assessment_profile: the complete profile required by the schema;\n"
+            "- tasks: the array of educational-objective task-family objects.\n"
+            "- fitb_bank: the compact array of answer/evidence/clue objects.\n"
+            "- batch_complete: true, written only after both arrays are complete.\n"
+            "Never return either field outside that root object and never return a bare task array."
+        )
+    else:
+        output_contract = (
+            "Return one root JSON object with exactly these top-level fields:\n"
+            "- tasks: the array of educational-objective task-family objects.\n"
+            "- fitb_bank: the compact array of answer/evidence/clue objects.\n"
+            "- batch_complete: true, written only after both arrays are complete.\n"
+            "Do not return an assessment_profile; it is compiled once from the first batch.\n"
+            "Never return either field outside that root object and never return a bare task array."
+        )
     return f"""You are the one-time assessment compiler for selected textbook content.
 Read the complete selection once and create a reusable semantic assessment catalog.
 
@@ -642,34 +955,44 @@ assessment profile; do not reclassify or override them:
 - assessment_profile.subject: {subject}
 - assessment_profile.domain: {"STEM" if domain_type == "stem" else "NON_STEM"}
 
-The catalog is an ontology, not an exam. Extract distinct atomic assessment tasks supported by the
-text. One task is exactly: concept + narrow target + student operation + expected work product.
-knowledge_anchor identifies the underlying fact, concept, relationship, or skill and may be shared
-by several tasks. Sharing a knowledge anchor, concept, or evidence chunk does not make two tasks
-duplicates when the student operation, target, or expected work product is genuinely different.
+The catalog is an ontology, not an exam. Follow this opportunity-first workflow internally; return
+only the strict Catalog JSON and never output an opportunity inventory or analysis transcript.
 
-Create separate tasks when the source supports materially different student work, including:
-- identify a term from its description versus state its definition;
-- identify a named phenomenon versus explain its cause or mechanism;
-- identify a relationship versus explain that relationship;
-- conceptual explanation versus symbolic manipulation or derivation;
-- symbolic manipulation versus a numerical calculation with grounded givens.
-For example, wavelength may support identify_term_from_definition -> term, state_definition ->
-definition, explain_relationship -> explanation, and symbolic_rearrangement -> equation. These
-tasks share a knowledge area but assess different work.
+PHASE 1 — DISCOVER EDUCATIONAL OPPORTUNITIES
+Step 1 — Read every source subsection. Systematically examine both parent sections and every selected
+child chunk. Explicitly examine every selected child chunk. Inspect concepts, definitions, terminology, formulas, relationships, methods,
+explanations, reasoning, worked examples, exercises and numbered subquestions, applications, tables,
+graphs, diagrams, interpretations, comparisons, and classifications. One child may contain several
+unrelated objectives. Do not stop after its first valid objective, and do not consider a chunk fully
+covered merely because one task cites it.
 
-Merge only paraphrases or aliases of the same concept + target + operation + work product. Do not
-create question-type copies of the same task, and do not create repeated identify/define/calculate
-tasks with superficial wording, scenario, or numerical changes. Each target must be one narrow
-assessable output rather than a bundled topic. One evidence chunk may support multiple atomic tasks
-when it explicitly supports their distinct operations and targets.
+Step 2 — Identify all meaningful assessment opportunities before constructing task objects. For each
+source-supported opportunity, determine the objective or skill, student operation, target or expected
+result, required reasoning, supporting chunk, and whether it is independent or another angle of an
+existing objective. Treat each independent exercise, subquestion, application, or explanation as a
+candidate during discovery. Do not immediately make one task per exercise, discard a similar-looking
+opportunity, or treat different numerical instances as automatically distinct tasks or variations.
+
+PHASE 2 — CONSTRUCT THE ASSESSMENT CATALOG
+Step 3 — Group the discovered opportunities into coherent task families. A task represents one
+coherent educational objective or task family, not one narrow question target. Group targets, operations, reasoning directions,
+representations, and applications only when they genuinely assess that same objective, using
+variations for meaningful alternative angles. Keep independently taught methods, skills, and objectives
+separate. A shared chapter, section, chunk, formula, wording pattern, or final answer does not justify
+merging. The goal is meaningful organization, not minimizing task IDs.
+
+Step 4 — Generate complete Catalog metadata. Use the task's top-level target, operation, work_product,
+and mode for one primary assessment angle and put every other meaningful, nonredundant angle under
+variations. Preserve compatible question types, evidence, optional variation evidence and inheritance,
+difficulty, boundaries, prerequisites, source restrictions, and explicit answerability. Do not create
+question-type copies, superficial paraphrases, number-only copies, invented opportunities, filler, or
+variations that repeat the primary angle. One evidence chunk may support multiple task families or
+several variations.
 Every task_operation used by a task must also appear under every corresponding question type in
 assessment_profile.question_types.task_operations.
-For every task, determine difficulty in this exact order:
-1. Identify the assessed concept, narrow target, student operation, and expected work product.
-2. Identify the concrete reasoning requirements and prerequisites supported by the assigned evidence.
-3. Determine the cognitive demand of that work.
-4. Assign one native cognitive-difficulty classification.
+For every task, determine difficulty from the assessed concept, narrow target, student operation,
+work product, prerequisites, and cognitive demand supported by the assigned evidence,
+and the cognitive demand of that work. Assign one native cognitive-difficulty classification.
 
 Use these unified classifications:
 - easy: direct recall, recognition, straightforward substitution, or a simple operation with an
@@ -679,15 +1002,16 @@ Use these unified classifications:
 - hard: integrating relationships or constraints, evaluating alternatives, deriving a non-obvious
   result, analyzing errors or representations, or justifying a complex solution.
 
-native_difficulty and reasoning_depth are two names for that same grounded classification. They must
-always contain the same value. reasoning_mode describes the kind of reasoning and does not determine
-its level. reasoning_requirements must name the actual operations and decisions the student performs;
-prerequisites must contain only knowledge supported by the assigned evidence. Never infer difficulty
+Record that single grounded cognitive-difficulty classification in difficulty. mode describes the
+kind of reasoning and does not determine its level. Prereqs contain only knowledge supported by the
+assigned evidence. A mandatory source-specific solution method belongs in operation or boundaries;
+do not emit generic solution steps such as substitute values or apply the formula. Never infer difficulty
 from wording length, numerical size, visible step count, reasoning_mode, or keyword cues such as
 derive, compare, analyze, or justify.
 
-Choose allowed_question_types semantically for each atomic task; this field is authoritative for
-downstream allocation. Do not decide suitability from the operation label or reasoning_mode alone.
+Choose allowed_question_types as the union of types genuinely supported by the primary angle and
+all variations; this field is authoritative for downstream allocation. Also give each variation its
+own question_types. Do not decide suitability from the operation label or reasoning_mode alone.
 Use the concept, target, relationship, evidence, and required givens together. A type is suitable
 only when the task naturally supports its student-facing work:
 - mcq: one defensible best answer plus three plausible same-concept distractors;
@@ -719,34 +1043,61 @@ calculated value, unit-bearing answer, mathematical notation, chemical symbolic 
 calculation. `clue_basis` is concise pure text describing what the future cloze may test without
 giving away the answer.
 
-Cover the selection broadly before adding depth to any concept. Do not target a fixed task count.
-Return every meaningful atomic task needed for broad assessment coverage, up to the schema limit,
-but never pad the catalog with paraphrases. Before returning, audit every important term, concept,
-relationship, explanation, symbolic skill, and grounded calculation in the selection for a distinct
-concept + target + operation + work-product combination. When supported, include at least
-four definitional tasks, three symbolic equation tasks, and four contextual calculation tasks.
+Cover the selection broadly before adding depth to any concept. Do not target a fixed task count or
+variation count, minimum, quota, or maximum. Return every source-supported educational objective and
+all of its meaningful assessment opportunities; never remove an opportunity to save tokens and never
+pad with filler. A task may validly have zero, one, or many alternative variations.
 Do not satisfy symbolic coverage by forcing every Equation task into rearranging a supplied final
 relationship. Preserve the evidence-supported operation: constructing, deriving, combining,
 balancing, solving, proving, and rearranging are distinct only when the source supports that work.
 Do not create several superficial rearrangements merely to meet coverage.
 
-Treat worked examples as evidence for a method, relationship, constraints, and supported kinds of
-givens. Unless reproducing that exact source instance is itself the narrow assessment target, do not
-encode the worked example's complete scenario + exact values + requested result as the catalog task.
+Worked examples demonstrate methods, relationships, constraints, and supported kinds of givens, and
+may also contain independently assessable applications, targets, explanations, or subquestions.
+Preserve those opportunities when supported; do not automatically reduce every worked example to
+evidence for a broader method. Unless the exact instance is itself the assessment target, express its
+transferable operation and target instead of encoding the complete scenario + exact values + requested result.
 For a general application task, express the transferable operation and target, and include only
 source-required constants or constraints in required_givens. Never invent an unsupported scientific
 fact or context.
-Include only tasks answerable from
-text. Evidence IDs must come from the supplied list and every required numerical/symbolic given must
-be present in those chunks. Equation tasks must ask for symbolic manipulation/derivation; word
-problems must ask for a contextual numerical solution. Keep task metadata concise and language
-independent enough for reuse. Return no more than {config.CATALOG_MAX_TASKS} tasks.
+For every task, use the variation fields as follows:
+- required_givens contains only invariant laws, scientific constants, factual truths, necessary
+  constraints, or source-specific values that every valid instance must preserve;
+- variable_givens describes illustrative quantities or parameters that a future question may choose
+  and change while remaining valid (for example total matches, distance, speed, or elapsed time);
+- variations is an array of bounded objects. Each object names one exact source-supported target,
+  operation, givens, and question_types; optionally use reasoning_mode, student_work_product, form for
+  representation, context for application, and evidence_chunk_ids for a narrower evidence subset.
+  Omit evidence_chunk_ids to inherit the task evidence. Never repeat the primary angle merely to fill
+  the array. Set vary_numbers true only when the named givens are illustrative parameters and changing
+  them preserves the relationship and constraints. Never emit broad labels such as different_target,
+  different_operation, or different_application. Set variation_id to null; deterministic code assigns
+  it after validation. Do not invent an angle absent from the source;
+- complexity_boundaries lists concepts, methods, or difficulty increases that the selected evidence
+  does not authorize. Use short source-specific restrictions, not generic permission codes;
+- exact_source_instance is true only when assessing the exact worked example is itself the task.
 
-Return one root JSON object with exactly these top-level fields:
-- assessment_profile: the complete profile required by the schema;
-- tasks: the array of atomic assessment task objects.
-- fitb_bank: the compact array of answer/evidence/clue objects.
-Never return either field outside that root object and never return a bare task array.
+PHASE 3 — FINAL COVERAGE REVIEW
+Step 5 — Recheck coverage and grounding in both directions before returning. Source → Catalog: revisit
+every selected child, including exercises, subquestions, worked examples, explanations, and
+applications. Ensure every meaningful discovered opportunity appears as a primary angle or variation;
+add an overlooked valid angle to the appropriate family or create a separate task when justified.
+A cited chunk may still contain unrelated uncovered opportunities. Catalog → Source: ensure every task
+and variation is supported by its cited evidence and that no operation, target, numerical freedom, or
+reasoning requirement exceeds the source. Return only the existing strict v11 Catalog JSON.
+Ordinary textbook exercise numbers belong in variable_givens, not required_givens. A formula's
+structure, a physical constant, an integrality/non-negativity constraint, or a factual source value
+may remain required. Do not authorize a variation merely because it is generally true in the subject;
+it must be supported by the selected evidence and educational scope.
+Set answerable explicitly for every task. False tasks are filtered and must never be presented as
+usable merely because related evidence exists. Evidence IDs must come from the supplied list and every required numerical/symbolic given must
+be present in those chunks. Equation tasks must ask for symbolic manipulation/derivation; word
+problems must ask for a contextual numerical solution. Use information-dense values: short noun
+phrases, compact formulas, canonical operation/mode identifiers, atomic givens/prereqs, and precise
+boundaries. Omit filler such as "students should be able to". Preserve Arabic source-specific terms
+when they carry meaning. A batch may legitimately return empty tasks and fitb_bank arrays.
+
+{output_contract}
 
 Document language: {language}
 Valid source chunk IDs: {json.dumps(valid_chunk_ids, ensure_ascii=False)}
@@ -761,25 +1112,72 @@ def _finalize_catalog(
 ) -> dict[str, Any]:
     valid_ids = set(map(str, selected_chunk_ids))
     finalized: list[dict[str, Any]] = []
-    seen_task_ids: set[str] = set()
+    finalized_by_id: dict[str, dict[str, Any]] = {}
     for raw_task in raw.get("tasks") or []:
         if not isinstance(raw_task, dict):
             continue
+        raw_task = _expand_compact_task(raw_task)
         evidence = [
             str(value) for value in raw_task.get("evidence_chunk_ids") or []
             if str(value) in valid_ids
         ]
-        if not evidence or not raw_task.get("text_answerable", True):
+        if not evidence or raw_task.get("text_answerable") is not True:
             continue
+        parent_evidence = set(evidence)
+        valid_variations: list[dict[str, Any]] = []
+        for variation in _normalize_variations(raw_task.get("allowed_variations")):
+            explicit = variation.get("evidence_chunk_ids")
+            if explicit is not None:
+                explicit_ids = {str(value) for value in explicit}
+                # One bad optional angle must not discard an otherwise complete task.
+                if not explicit_ids or not explicit_ids.issubset(parent_evidence & valid_ids):
+                    continue
+                variation["evidence_chunk_ids"] = list(dict.fromkeys(map(str, explicit)))
+            valid_variations.append(variation)
+        raw_task["allowed_variations"] = valid_variations
         identity = canonical_task_ids(raw_task)
         if identity is None:
             continue
         task_id = str(identity["task_id"])
-        if task_id in seen_task_ids:
+        if task_id in finalized_by_id:
+            existing = finalized_by_id[task_id]
+            existing["evidence_chunk_ids"] = list(dict.fromkeys([
+                *(existing.get("evidence_chunk_ids") or []), *evidence,
+            ]))
+            existing["allowed_question_types"] = list(dict.fromkeys([
+                *(existing.get("allowed_question_types") or []),
+                *(raw_task.get("allowed_question_types") or []),
+                *(qtype for variation in valid_variations
+                  for qtype in variation.get("question_types") or []),
+            ]))
+            for field in ("variable_givens", "complexity_boundaries"):
+                existing[field] = list(dict.fromkeys([
+                    *(existing.get(field) or []), *(raw_task.get(field) or []),
+                ]))
+            incoming_primary = _primary_variation({
+                **raw_task,
+                "evidence_chunk_ids": evidence,
+                "primary_question_types": list(raw_task.get("allowed_question_types") or []),
+            })
+            existing_primary_id = _primary_variation(existing).get("variation_id")
+            existing["allowed_variations"] = _normalize_variations([
+                *(existing.get("allowed_variations") or []),
+                *([incoming_primary] if incoming_primary.get("variation_id") != existing_primary_id else []),
+                *(raw_task.get("allowed_variations") or []),
+            ])
+            existing["exact_source_instance"] = bool(
+                existing.get("exact_source_instance")
+                and raw_task.get("exact_source_instance")
+            )
             continue
-        seen_task_ids.add(task_id)
         reasoning_mode = str(raw_task.get("reasoning_mode") or "")
         allowed = list(dict.fromkeys(raw_task.get("allowed_question_types") or []))
+        primary_allowed = list(allowed)
+        allowed = list(dict.fromkeys([
+            *allowed,
+            *(qtype for variation in valid_variations
+              for qtype in variation.get("question_types") or []),
+        ]))
         allowed = [
             qtype for qtype in allowed
             if qtype in {"mcq", "true_false", "definition",
@@ -789,39 +1187,31 @@ def _finalize_catalog(
             # A task without a compiler-declared compatible representation is structurally
             # unusable; do not invent a semantic compatibility decision here.
             continue
-        raw_native = str(raw_task.get("native_difficulty") or "")
-        raw_depth = str(raw_task.get("reasoning_depth") or "")
-        if raw_native and raw_depth and raw_native != raw_depth:
-            logger.warning(
-                "Assessment catalog task rejected for contradictory difficulty | "
-                "native=%s | reasoning_depth=%s | operation=%s | target=%s",
-                raw_native, raw_depth, raw_task.get("task_operation"), raw_task.get("target"),
-            )
-            continue
-        native_difficulty = raw_native or raw_depth or "medium"
+        native_difficulty = str(raw_task.get("native_difficulty") or "medium")
         if native_difficulty not in {"easy", "medium", "hard"}:
             native_difficulty = "medium"
-        reasoning_depth = raw_depth or native_difficulty
-        if reasoning_depth not in {"easy", "medium", "hard"}:
-            reasoning_depth = native_difficulty
-        if native_difficulty != reasoning_depth:
-            continue
         supported_difficulties = [native_difficulty]
-        finalized.append({
+        exact_source_instance = bool(raw_task.get("exact_source_instance", False))
+        finalized_task = {
             **raw_task,
             **identity,
             "evidence_chunk_ids": list(dict.fromkeys(evidence)),
             "allowed_question_types": allowed,
+            "primary_question_types": primary_allowed,
             "supported_difficulties": supported_difficulties,
             "native_difficulty": native_difficulty,
-            "reasoning_depth": reasoning_depth,
-            "reasoning_requirements": list(raw_task.get("reasoning_requirements") or [
-                str(raw_task.get("student_work_product") or raw_task.get("task_operation"))
-            ]),
             "prerequisites": list(raw_task.get("prerequisites") or []),
-        })
-        if len(finalized) >= config.CATALOG_MAX_TASKS:
-            break
+            "allowed_variations": (
+                [] if exact_source_instance
+                else valid_variations
+            ),
+            "variable_givens": list(raw_task.get("variable_givens") or []),
+            "complexity_boundaries": list(raw_task.get("complexity_boundaries") or []),
+            "exact_source_instance": exact_source_instance,
+            "text_answerable": True,
+        }
+        finalized.append(finalized_task)
+        finalized_by_id[task_id] = finalized_task
     fitb_bank: list[dict[str, Any]] = []
     canonical_by_answer: dict[str, str] = {}
     seen_fitb_ids: set[str] = set()
@@ -868,6 +1258,29 @@ def _finalize_catalog(
                 type_profile["support"] = "unsupported"
                 type_profile["task_operations"] = []
                 type_profile["evidence_chunk_ids"] = []
+    family_counts: dict[str, int] = {}
+    for task in finalized:
+        family_id = str(task.get("task_family_id") or "")
+        if family_id:
+            family_counts[family_id] = family_counts.get(family_id, 0) + 1
+    for task in finalized:
+        family_id = str(task.get("task_family_id") or "")
+        if family_id and family_counts.get(family_id, 0) > 1:
+            task["semantic_overlap_group_id"] = family_id
+    tasks_by_question_type = {
+        qtype: [
+            str(task["task_id"]) for task in finalized
+            if qtype in (task.get("allowed_question_types") or [])
+        ]
+        for qtype in (
+            "mcq", "true_false", "definition", "why", "equation",
+            "word_problem", "essay",
+        )
+    }
+    tasks_by_question_type["fill_in_the_blank"] = [
+        str(entry["fitb_entry_id"]) for entry in fitb_bank
+        if not entry.get("alias_of_fitb_entry_id")
+    ]
     return {
         "cache_key": key,
         "catalog_version": config.ASSESSMENT_CATALOG_VERSION,
@@ -876,7 +1289,115 @@ def _finalize_catalog(
         "assessment_profile": profile,
         "tasks": finalized,
         "fitb_bank": fitb_bank,
+        "tasks_by_question_type": tasks_by_question_type,
         "compiler_usage": usage or {},
+        "catalog_compilation_complete": raw.get("catalog_compilation_complete", True),
+        "recovered_batch_count": int(raw.get("recovered_batch_count") or 0),
+    }
+
+
+def build_task_usage_index(
+    plans: list[dict[str, Any]], generated_exams: list[dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build a current usage view from authoritative plan and question state."""
+    usage: dict[str, dict[str, Any]] = {}
+    slot_task: dict[str, str] = {}
+    for plan in plans or []:
+        for values in (plan.get("items") or {}).values():
+            for item in values or []:
+                task_id = str(item.get("fitb_entry_id") or item.get("task_id") or "")
+                slot_id = str(item.get("slot_id") or "")
+                if not task_id:
+                    continue
+                row = usage.setdefault(
+                    task_id, {"count": 0, "slot_ids": [], "question_ids": []}
+                )
+                row["count"] += 1
+                if slot_id and slot_id not in row["slot_ids"]:
+                    row["slot_ids"].append(slot_id)
+                    slot_task[slot_id] = task_id
+    for exam in generated_exams or []:
+        for section in (exam.get("questions") or {}).values():
+            items = section.get("items") if isinstance(section, dict) else section
+            for item in items or []:
+                slot_id = str(item.get("slot_id") or "")
+                task_id = slot_task.get(slot_id)
+                question_id = str(item.get("question_id") or "")
+                if task_id and question_id and question_id not in usage[task_id]["question_ids"]:
+                    usage[task_id]["question_ids"].append(question_id)
+    for row in usage.values():
+        row["slot_ids"].sort()
+        row["question_ids"].sort()
+    return usage
+
+
+def _balanced_catalog_batches(
+    chunks: list[dict[str, Any]], limit: int | None = None,
+) -> list[list[dict[str, Any]]]:
+    """Return ordered batches containing two complete selected parent groups.
+
+    ``limit`` remains accepted for callers from the previous batching contract;
+    parent pairs are intentionally independent of child count or text size.
+    Chunks without stored parent metadata are conservatively treated as their
+    own parent so unrelated source records are never merged into one section.
+    """
+    parent_groups: dict[str, list[dict[str, Any]]] = {}
+    parent_order: list[str] = []
+    for index, chunk in enumerate(chunks):
+        parent_id = str(chunk.get("parent_id") or "").strip()
+        parent_key = parent_id or f"__child_parent__:{chunk.get('child_id') or index}"
+        if parent_key not in parent_groups:
+            parent_groups[parent_key] = []
+            parent_order.append(parent_key)
+        parent_groups[parent_key].append(chunk)
+    return [
+        [
+            chunk
+            for parent_key in parent_order[offset:offset + 2]
+            for chunk in parent_groups[parent_key]
+        ]
+        for offset in range(0, len(parent_order), 2)
+    ]
+
+
+def _catalog_source_membership(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Describe ordered selected parent/child membership for cache identity."""
+    batches = _balanced_catalog_batches(chunks)
+    groups: list[dict[str, Any]] = []
+    for batch in batches:
+        for chunk in batch:
+            parent_id = str(chunk.get("parent_id") or "").strip()
+            fallback = str(chunk.get("child_id") or "")
+            key = parent_id or f"__child_parent__:{fallback}"
+            if not groups or groups[-1]["parent_key"] != key:
+                groups.append({"parent_key": key, "child_ids": []})
+            groups[-1]["child_ids"].append(fallback)
+    return groups
+
+
+def _merge_catalog_batches(results: list[dict[str, Any]]) -> dict[str, Any]:
+    if not results:
+        return {}
+    task_lists = [list(result.get("tasks") or []) for result in results]
+    fitb_lists = [list(result.get("fitb_bank") or []) for result in results]
+    tasks: list[dict[str, Any]] = []
+    fitb_bank: list[dict[str, Any]] = []
+    for index in range(max((len(values) for values in task_lists), default=0)):
+        tasks.extend(deepcopy(values[index]) for values in task_lists if index < len(values))
+    for index in range(max((len(values) for values in fitb_lists), default=0)):
+        fitb_bank.extend(deepcopy(values[index]) for values in fitb_lists if index < len(values))
+    return {
+        "assessment_profile": deepcopy(results[0].get("assessment_profile") or {}),
+        "tasks": tasks,
+        "fitb_bank": fitb_bank,
+        "catalog_compilation_complete": all(
+            result.get("batch_complete") is True
+            and not result.get("recovered_truncated_checkpoint")
+            for result in results
+        ),
+        "recovered_batch_count": sum(
+            int(bool(result.get("recovered_truncated_checkpoint"))) for result in results
+        ),
     }
 
 
@@ -917,6 +1438,14 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     selected = [str(chunk.get("child_id")) for chunk in chunks if chunk.get("child_id")]
+    membership = _catalog_source_membership(chunks)
+    compiler_identity = {
+        **compiler_identity,
+        "batching": CATALOG_BATCHING_VERSION,
+        "source_membership_sha256": hashlib.sha256(
+            json.dumps(membership, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
     processed_key = str(state.get("processed_document_key") or state.get("document_id") or "")
     key = catalog_cache_key(processed_key, selected, compiler_identity)
     cached = _read_cache(key)
@@ -938,46 +1467,167 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
         }
     compiler_key = compiler_cache_key(processed_key, selected, compiler_identity)
     raw = _read_compiler_cache(compiler_key)
+    if raw is not None and raw.get("catalog_compilation_complete") is not True:
+        # Leave the file untouched for diagnostics. It is not a reusable result.
+        raw = None
     compiler_cache_hit = raw is not None
     client = None
+    compiler_usage: dict[str, Any] = {}
     if raw is None:
-        client = create_assessment_compiler_client(domain_type=domain_type)
-        try:
-            raw = request_structured(
-            client,
-            _catalog_prompt(
-                state.get("planner_context") or state.get("context") or "",
-                state.get("document_language") or "en",
-                selected,
-                domain_type=domain_type,
-                subject=subject,
-            ),
-            response_model=AssessmentCatalogResponse,
-            schema_name="assessment_catalog",
-            agent="assessment_compiler",
-            operation="assessment_catalog",
-            item_count=min(config.CATALOG_MAX_TASKS, max(32, len(chunks) * 2)),
-            system_prompt="Compile a complete, non-redundant assessment ontology grounded only in the source.",
-            temperature=0.1,
-            max_tokens=18000,
+        from app.online.retrieval import build_planner_context
+
+        batches = _balanced_catalog_batches(chunks)
+
+        def compile_batch(batch_index: int, batch: list[dict[str, Any]]):
+            batch_started = time.perf_counter()
+            # The catalog profile is catalog-level, but only the first batch
+            # compiles it; every later batch omits it to avoid regenerating the
+            # same ~3.4 kB profile across all twelve calls.
+            include_profile = batch_index == 0
+            response_model = (
+                CompactCatalogBatchWithProfileResponse if include_profile
+                else CompactCatalogBatchResponse
             )
-        except (DeepSeekIncompleteError, DeepSeekValidationError) as exc:
-            recovered = _recover_catalog_checkpoint(exc.partial_output)
-            if recovered is None:
-                raise
-            raw = recovered
-        _write_compiler_cache(compiler_key, raw if isinstance(raw, dict) else {})
+            batch_ids = [
+                str(chunk.get("child_id")) for chunk in batch if chunk.get("child_id")
+            ]
+            batch_key = compiler_cache_key(processed_key, batch_ids, {
+                **compiler_identity, "batch_index": batch_index,
+                "batch_count": len(batches), "partition": CATALOG_BATCHING_VERSION,
+            })
+            cached_batch = _read_compiler_cache(batch_key)
+            if cached_batch is not None:
+                try:
+                    validated_cache = _validate_completed_batch(
+                        cached_batch, response_model=response_model,
+                        valid_chunk_ids=set(batch_ids),
+                    )
+                except (ValidationError, ValueError, TypeError):
+                    validated_cache = None
+                if validated_cache is not None:
+                    return batch_index, validated_cache, {
+                        "compiler_duration_ms": round(
+                            (time.perf_counter() - batch_started) * 1000, 3
+                        )
+                    }, True
+            batch_client = create_assessment_compiler_client(domain_type=domain_type)
+            # This is the provider-neutral outer recovery budget for an
+            # incomplete Catalog batch.  Provider clients retain their own
+            # transport/structured-output retry policies.
+            max_attempts = max(1, int(config.CATALOG_BATCH_MAX_ATTEMPTS))
+            last_reason = "no response"
+            for attempt in range(1, max_attempts + 1):
+                is_cancelled = state.get("is_cancelled")
+                if callable(is_cancelled) and is_cancelled():
+                    raise CatalogCompilationCancelled(
+                        f"Assessment Catalog compilation cancelled before retrying batch "
+                        f"{batch_index + 1}"
+                    )
+                try:
+                    result = request_structured(
+                        batch_client,
+                        _catalog_prompt(
+                            build_planner_context(batch),
+                            state.get("document_language") or "en", batch_ids,
+                            domain_type=domain_type, subject=subject,
+                            include_profile=include_profile,
+                        ),
+                        response_model=response_model,
+                        schema_name="assessment_catalog_batch",
+                        agent="assessment_compiler",
+                        operation="assessment_catalog_batch",
+                        item_count=max(1, len(batch)),
+                        system_prompt=(
+                            "Compile a complete, non-redundant assessment ontology "
+                            "grounded only in this evidence batch."
+                        ),
+                        temperature=0.1, max_tokens=18000,
+                    )
+                    value = _validate_completed_batch(
+                        result, response_model=response_model,
+                        valid_chunk_ids=set(batch_ids),
+                    )
+                except (DeepSeekIncompleteError, DeepSeekValidationError) as exc:
+                    checkpoint = _recover_catalog_checkpoint(
+                        exc.partial_output, require_profile=include_profile
+                    )
+                    recovered_count = len((checkpoint or {}).get("tasks") or [])
+                    last_reason = (
+                        f"{type(exc).__name__}; recovered {recovered_count} complete tasks "
+                        "from a truncated checkpoint"
+                    )
+                except (ValidationError, ValueError, TypeError) as exc:
+                    last_reason = f"invalid completion contract: {exc}"
+                else:
+                    _write_compiler_cache(batch_key, value)
+                    usage = dict(getattr(batch_client, "last_usage", None) or {})
+                    usage["catalog_batch_attempts"] = attempt
+                    usage["compiler_duration_ms"] = round(
+                        (time.perf_counter() - batch_started) * 1000, 3
+                    )
+                    return batch_index, value, usage, False
+                if callable(is_cancelled) and is_cancelled():
+                    raise CatalogCompilationCancelled(
+                        f"Assessment Catalog compilation cancelled after incomplete batch "
+                        f"{batch_index + 1}"
+                    )
+                logger.warning(
+                    "Retrying incomplete assessment catalog batch | batch=%d | attempt=%d/%d | reason=%s",
+                    batch_index + 1, attempt, max_attempts, last_reason,
+                )
+            raise CatalogBatchIncompleteError(batch_index, max_attempts, last_reason)
+
+        completed: dict[int, tuple[dict[str, Any], dict[str, Any], bool]] = {}
+        workers = min(config.MAX_PARALLEL_CATALOG_CALLS, len(batches))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(copy_context().run, compile_batch, index, batch): index
+                for index, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                index, value, usage, cache_hit = future.result()
+                completed[index] = (value, usage, cache_hit)
+
+        raw = _merge_catalog_batches([
+            completed[index][0] for index in range(len(batches))
+        ])
+        if raw.get("catalog_compilation_complete") is not True:
+            incomplete = [
+                str(index + 1) for index in range(len(batches))
+                if completed[index][0].get("batch_complete") is not True
+            ]
+            raise CatalogBatchIncompleteError(
+                int(incomplete[0]) - 1 if incomplete else 0,
+                int(config.CATALOG_BATCH_MAX_ATTEMPTS),
+                f"merged catalog contains incomplete batches: {', '.join(incomplete) or 'unknown'}",
+            )
+        compiler_usage = {
+            "batch_count": len(batches),
+            "batch_cache_hits": sum(
+                int(completed[index][2]) for index in range(len(batches))
+            ),
+            "batches": [completed[index][1] for index in range(len(batches))],
+        }
+        if isinstance(raw, dict) and raw.get("catalog_compilation_complete") is True:
+            _write_compiler_cache(compiler_key, raw)
     if isinstance(raw, dict):
         profile = raw.setdefault("assessment_profile", {})
         if isinstance(profile, dict):
             profile["subject"] = subject
             profile["domain"] = "STEM" if domain_type == "stem" else "NON_STEM"
+    if not isinstance(raw, dict) or raw.get("catalog_compilation_complete") is not True:
+        raise CatalogBatchIncompleteError(
+            0, int(config.CATALOG_BATCH_MAX_ATTEMPTS),
+            "catalog compilation did not produce a complete merged result",
+        )
     payload = _finalize_catalog(
         raw if isinstance(raw, dict) else {}, key=key,
         processed_document_key=processed_key, selected_chunk_ids=selected,
-        usage=getattr(client, "last_usage", None) if client is not None else {},
+        usage=compiler_usage or (
+            getattr(client, "last_usage", None) if client is not None else {}
+        ),
     )
-    if not payload["tasks"]:
+    if not payload["tasks"] and not payload["fitb_bank"]:
         # Compatibility for legacy/local test doubles that still return the
         # former planner contract. Production structured output cannot omit
         # tasks because AssessmentCatalogResponse requires them.
@@ -987,6 +1637,8 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "assessment_catalog_key": key,
             "assessment_catalog_cache_hit": False,
             "assessment_compiler_cache_hit": compiler_cache_hit,
+            "assessment_catalog_insufficient_content": True,
+            "assessment_catalog_failure_reason": "no_source_supported_assessment_tasks",
         }
     _write_cache(key, payload)
     logger.info("Assessment catalog compiled | key=%s | tasks=%d", key, len(payload["tasks"]))
@@ -1012,7 +1664,7 @@ def _difficulty_for(task: dict[str, Any], requested: str) -> str | None:
 
 def _native_difficulty(task: dict[str, Any]) -> str | None:
     """Return one honest task level, including a deterministic legacy fallback."""
-    for value in (task.get("native_difficulty"), task.get("reasoning_depth")):
+    for value in (task.get("native_difficulty"),):
         level = str(value or "")
         if level in {"easy", "medium", "hard"}:
             return level
@@ -1044,7 +1696,9 @@ def materialize_plan_item(task: dict[str, Any], slot_id: str, difficulty: str) -
         "relationship_id": task.get("relationship_id"),
         "source_chunk_id": evidence[0],
         "support_chunk_ids": evidence[1:],
-        "topic": task.get("topic") or task.get("concept"),
+        # PlanItem retains a presentation topic for existing UI/prompt contracts;
+        # Catalog tasks no longer duplicate source section titles.
+        "topic": task.get("concept") or task.get("knowledge_anchor"),
         "concept": task.get("concept") or task.get("knowledge_anchor"),
         "canonical_skill": task.get("task_operation"),
         "knowledge_focus": task.get("knowledge_anchor"),
@@ -1055,7 +1709,15 @@ def materialize_plan_item(task: dict[str, Any], slot_id: str, difficulty: str) -
         "given_conditions": list(task.get("required_givens") or []),
         "scenario_family": task.get("scenario_family"),
         "required_givens": list(task.get("required_givens") or []),
-        "text_answerable": True,
+        "allowed_variations": list(task.get("allowed_variations") or []),
+        "permitted_variations": permitted_task_variations(task),
+        "primary_question_types": list(
+            task.get("primary_question_types") or task.get("allowed_question_types") or []
+        ),
+        "variable_givens": list(task.get("variable_givens") or []),
+        "complexity_boundaries": list(task.get("complexity_boundaries") or []),
+        "exact_source_instance": bool(task.get("exact_source_instance", False)),
+        "text_answerable": task.get("text_answerable") is True,
         "reasoning_mode": task.get("reasoning_mode"),
         "difficulty": difficulty,
         "requested_difficulty": difficulty,
@@ -1064,10 +1726,10 @@ def materialize_plan_item(task: dict[str, Any], slot_id: str, difficulty: str) -
         "base_task_family_id": task.get("task_family_id") or task["task_id"],
         "difficulty_adaptation": None,
         "difficulty_fallback_reason": None,
-        "reasoning_depth": task.get("reasoning_depth") or difficulty,
-        "reasoning_requirements": list(task.get("reasoning_requirements") or [
-            task.get("student_work_product") or task.get("task_operation") or "complete the assigned operation"
-        ]),
+        "reasoning_depth": difficulty,
+        "reasoning_requirements": [
+            f"{task.get('task_operation')}: {task.get('target')}"
+        ],
         "prerequisites": list(task.get("prerequisites") or []),
         "derived_task_id": None,
         "selected_replacement_task_id": None,
@@ -1128,6 +1790,15 @@ def allocate_catalog_plan(
     catalog: dict[str, Any], tasks: list[tuple[str, int]], num_models: int,
     difficulty: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if (
+        catalog.get("catalog_compilation_complete") is not True
+        and (
+            "catalog_compilation_complete" in catalog
+            or "catalog_version" in catalog
+            or "cache_key" in catalog
+        )
+    ):
+        raise RuntimeError("Assessment Catalog is incomplete and cannot be planned")
     source_tasks = list(catalog.get("tasks") or [])
     plans: list[dict[str, Any]] = []
     issues: list[dict[str, Any]] = []
@@ -1832,6 +2503,18 @@ def catalog_exhaustion_replacement(
             "reused_due_to_catalog_exhaustion": True,
             "task_reused": True,
             "reuse_reason": "no_unused_compatible_task",
+            "reuse_mode": "intentional_practice_variation",
+            "task_usage_count": _count,
+            "previous_question_ids": [],
+            "variation_reason": "catalog_exhausted_use_least_used_compatible_task",
+            "intended_variation": (
+                "Prefer a source-supported different representation or procedure; otherwise use a "
+                "genuinely different quantitative instance with recalculated answers and solutions."
+            ),
+            "source_evidence_ids": list(dict.fromkeys([
+                *([replacement.get("source_chunk_id")] if replacement.get("source_chunk_id") else []),
+                *(replacement.get("support_chunk_ids") or []),
+            ])),
             "reused_task_id": reused_task_id,
             "required_instance_distinctions": [
                 "different_target_or_unknown",
@@ -1840,10 +2523,12 @@ def catalog_exhaustion_replacement(
                 "different_constraint_structure",
                 "different_direction_of_reasoning",
                 "different_application_requiring_new_reasoning",
+                "different_numerical_instance_when_other_variations_are_unsupported",
             ],
             "reuse_rule": (
-                "Use at least one meaningful distinction supported by this task. Different wording, "
-                "names, scenarios, or numbers alone do not qualify."
+                "Prefer a source-supported different representation or procedure. If the source "
+                "supports only the same method, a genuinely different numerical instance is allowed "
+                "when all dependent answers and solution steps are recalculated. Wording alone never qualifies."
             ),
             "forced_duplicate_slot_ids": list(dict.fromkeys([
                 *same_task_slots,
@@ -1874,6 +2559,18 @@ def catalog_exhaustion_replacement(
         "reused_due_to_catalog_exhaustion": False,
         "task_reused": True,
         "reuse_reason": "regenerate_original_task_after_duplicate",
+        "reuse_mode": "intentional_practice_variation",
+        "task_usage_count": usage_count.get(current_task_id, 0),
+        "previous_question_ids": [],
+        "variation_reason": "regenerate_valid_catalog_task_after_duplicate",
+        "intended_variation": (
+            "Produce a source-supported different representation or procedure; if unavailable, a "
+            "genuinely different numerical instance with independently recalculated results."
+        ),
+        "source_evidence_ids": list(dict.fromkeys([
+            *([replacement.get("source_chunk_id")] if replacement.get("source_chunk_id") else []),
+            *(replacement.get("support_chunk_ids") or []),
+        ])),
         "reused_task_id": current_task_id,
         "forced_duplicate_slot_ids": list(dict.fromkeys(
             str(value) for value in (forced_duplicate_slot_ids or []) if str(value)
@@ -1886,6 +2583,7 @@ def catalog_exhaustion_replacement(
             "different_target_or_unknown_when_supported",
             "different_required_method_when_supported",
             "different_direction_of_reasoning_when_supported",
+            "different_numerical_instance_when_other_variations_are_unsupported",
         ],
         "reuse_rule": (
             "Regenerate this valid catalog task after a duplicate item. Use the rejected "

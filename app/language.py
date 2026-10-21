@@ -24,6 +24,14 @@ _ALEF_VARIANTS = "\u0623\u0625\u0622"
 
 _PUNCT_RE = re.compile(r"[\W_]+", re.UNICODE)
 
+# Notation detection for STEM content. Arabic natural language does NOT imply
+# Arabic-Indic digits or Arabic variable letters: the source's own convention is
+# authoritative. These are deterministic, offline heuristics used only to build
+# a generation/rendering policy — they never rewrite stored content.
+_WESTERN_DIGIT_RE = re.compile(r"[0-9]")
+_ARABIC_INDIC_DIGIT_RE = re.compile(r"[\u0660-\u0669\u06F0-\u06F9]")
+_LATIN_LETTER_RE = re.compile(r"[A-Za-z]")
+
 
 def detect_language(text: str) -> str:
     """Return ``"ar"`` or ``"en"`` based on the dominant script in *text*.
@@ -41,6 +49,32 @@ def detect_language(text: str) -> str:
 
 def is_rtl(language: str) -> bool:
     return language == "ar"
+
+
+def source_notation(text: str) -> dict[str, str]:
+    """Classify the notation conventions present in source text.
+
+    Returns a small deterministic policy describing the digit style and whether
+    Latin variables appear. Callers use it to keep generated Arabic STEM content
+    faithful to the source's own mathematical conventions instead of
+    transliterating variables or converting digit scripts. Ambiguous or empty
+    input yields ``unspecified`` so callers preserve the source as-is.
+    """
+    value = str(text or "")
+    has_western = bool(_WESTERN_DIGIT_RE.search(value))
+    has_arabic_indic = bool(_ARABIC_INDIC_DIGIT_RE.search(value))
+    if has_western and not has_arabic_indic:
+        digits = "western"
+    elif has_arabic_indic and not has_western:
+        digits = "arabic_indic"
+    elif has_western and has_arabic_indic:
+        digits = "mixed"
+    else:
+        digits = "unspecified"
+    return {
+        "digits": digits,
+        "latin_variables": "present" if _LATIN_LETTER_RE.search(value) else "absent",
+    }
 
 
 def _strip_arabic_diacritics(text: str) -> str:

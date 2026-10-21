@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
@@ -58,10 +59,6 @@ STEM_QUANTITATIVE_VALIDATOR_MAX_TOKENS = 12_000
 # Backwards-compatible name for callers/tests that import the historical
 # constant. It now describes the general validator ceiling.
 VALIDATOR_MAX_TOKENS = GENERAL_VALIDATOR_MAX_TOKENS
-
-GLOBAL_VALIDATOR_TEMPERATURE = 0.1
-GLOBAL_VALIDATOR_REASONING = "on"
-GLOBAL_VALIDATOR_MAX_TOKENS = 12000
 
 REPAIR_TEMPERATURE = 0.1
 # Repairer reasoning is deliberately disabled for both DeepSeek and local
@@ -775,19 +772,10 @@ _WHY_PROMPT_RE = re.compile(
     r"\bما\s+هو\s+سبب\b|\bفس[ّ]?ر\s+سبب\b)",
     re.IGNORECASE,
 )
-_DEFINITION_PROMPT_RE = re.compile(
-    r"(?:^\s*define\b|^\s*what\s+is\s+meant\s+by\b|^\s*what\s+does\b.+\bmean\b|"
-    r"^\s*عر[ّ]?ف\b|^\s*ما\s+(?:المقصود\s+ب|معنى))",
-    re.IGNORECASE,
-)
 
 
 def _is_why_prompt(value: object) -> bool:
     return bool(_WHY_PROMPT_RE.search(str(value or "").strip()))
-
-
-def _is_definition_prompt(value: object) -> bool:
-    return bool(_DEFINITION_PROMPT_RE.search(str(value or "").strip()))
 
 
 def _local_verdict(qtype: str, item: Dict[str, Any], section: Any) -> Optional[Dict[str, Any]]:
@@ -1309,7 +1297,8 @@ Rules:
 - Use assigned_sources for facts, laws, formulas, definitions, terminology, and source-specific values. Neutral numbers explicitly stated as givens in a self-contained exercise are problem data and need not appear verbatim in the source.
 - Check clarity, grammar, grounding, planned question type and operation, difficulty fit, assessment guidance, and non-quantitative answer quality. If difficulty is wrong, repair the student-facing question to match the plan; never request changes to plan.difficulty or any Planner field.
 - Verify difficulty from the cognitive work the student must actually perform against the assigned evidence and expected reasoning_depth/reasoning_requirements. Do not infer difficulty from wording length, large numbers, or reasoning_mode alone. For an adjusted task, independently reject a label-only change or any new operation/prerequisite unsupported by assigned_sources.
-- Compare expected_catalog_task with the actual generated question. The question must preserve the assigned concept/knowledge target, student operation, target/result, reasoning mode, required output, required givens, and evidence boundary. Being on the same broad topic is not enough. If the intended task is to interpret a solution region but the question merely asks whether a point satisfies inequalities, return failure_code=task_drift and describe expected versus actual concept, operation, and target in reason.
+- Compare expected_catalog_task with the actual generated question. It must preserve the source-grounded concept/knowledge, invariant required_givens, complexity_boundaries, question type, difficulty, and evidence boundary. The base operation, target/result, representation, or application may change only when one allowed_variations object explicitly names that target and operation and its stated givens/conditions are satisfied. numeric_values_may_change authorizes new valid values only for that bounded angle; it never authorizes a new concept or method. variable_givens name exercise parameters but do not independently authorize an unlisted target or operation. When exact_source_instance is true, preserve the exact target and values. Being on the same broad topic is not enough. If the question changes to an unauthorized operation/target or crosses a complexity boundary, return failure_code=task_drift and describe the mismatch.
+- Treat expected_catalog_task.selected_variation as the exact chosen assessment angle. Check the actual question, answer, and solution against its target, operation, givens, reasoning, representation, application, and compatible question type. Use only effective_evidence_chunk_ids and the corresponding assigned_sources. Semantic consistency is required; exact wording matches are not.
 - Check that required representations are included. Leave missing numerical/symbolic givens and calculations to the STEM quantitative validator.
 - For MCQ, verify that the concise stem performs the assigned operation and does not quote a long passage or reveal the answer. Reject difficulty created only by long/confusing wording or irrelevant detail. Verify four parallel options, exactly one defensible best answer, and plausible same-concept distractors based on nearby concepts, misconceptions, reversed relationships, incomplete reasoning, or realistic mistakes. Reject irrelevant/ridiculous distractors, semantic-equivalent options, multiple defensible answers, and a correct option that stands out by length, detail, qualification, grammar, tone, or copied source wording. Reject unsupported facts, numbers, scenarios, and assumptions. Leave numerical/symbolic correctness to the STEM quantitative validator.
 - Distinguish a good catalog task with a bad generated MCQ from a fundamentally unsuitable task. For a repairable generated item, request only the exact student-facing fields that need repair and keep the same task. If the assigned task cannot naturally support one clear best answer, three plausible competitors, and meaningful assessment of its target, use failure_code=mcq_task_unsuitable so allocation can select another task; do not repeatedly repair or weaken that task.
@@ -1318,7 +1307,7 @@ Rules:
 - Check True/False clarity; one-answer/one-blank FITB; relevant Why/Essay depth; and Equation versus meaningful Word Problem form. Equation must be equation-centered: the student works directly with a displayed mathematical or discipline-specific formal representation. Accept a short instruction, necessary givens/units, multiple equations, and supporting tables that directly serve the symbolic operation. Reject narrative Word Problems, extended prose explanations, or items whose symbolic content appears only in the answer. Do not use word count or symbol count alone. Require valid LaTeX with important expressions visually separate from instructions using display delimiters; require source-appropriate notation for Mathematics, Physics, Chemistry, and other STEM disciplines.
 - For Equation and Word Problem, inspect task_operation, target, student_work_product, relationship, required_givens, and reasoning_mode together. Necessary premises and givens must be present, but the prompt must not perform the operation assigned to the student. A starting relationship is appropriate for rearrange or apply-a-provided-rule tasks. For derive, construct, formulate, combine, prove, balance, or select-the-governing-relationship tasks, reject a stem that supplies the final relationship, completed equation, exact reasoning step, or result being assessed; use failure_code=task_drift and request a question-field repair.
 - Do not impose one universal Equation or Word Problem pattern. Verify that the student work follows the catalog operation rather than defaulting to rearrange-and-isolate or story-then-choose-a-formula. For a Word Problem, providing a rule is valid only when applying a provided rule is the assigned work; omit it when selecting or forming that relationship is assessed.
-- Compare quantitative/application questions with assigned_sources. Unless expected_catalog_task explicitly targets the exact source instance through its target and required_givens, reject copying a worked example's same scenario + values + requested result. Reusing its supported method or constraints with a materially different, fully stated, evidence-consistent instance is allowed. Do not require invented facts or contexts.
+- Compare quantitative/application questions with assigned_sources. Reject copying a worked example's same scenario + values + requested result unless exact_source_instance is true. Reusing its supported method or constraints with a materially different, fully stated instance is allowed when variable_givens or allowed_variations authorize it. Do not treat changed variable exercise parameters as task drift. Do not require invented facts or contexts.
 - Choose the smallest repair: PASS, FIX_ANSWER, FIX_OPTIONS, FIX_QUESTION, or FIX_QUESTION_AND_ANSWER.
 - fields_to_fix may name only exact canonical fields: question, statement, term, equation, options, correct_answer, reference_answer, solution_steps, final_answer, key_points, distractors, or solution_certificate. For Fill-in-the-Blank, request only question and/or distractors; its catalog answer and Word Bank are code-owned. Never use a generic answer alias and never name Planner metadata.
 - Return only valid JSON using the required verdict schema."""
@@ -1428,17 +1417,20 @@ def _plan_source_ids(plan_item: Optional[Dict[str, Any]]) -> List[str]:
 
 
 def _assigned_source_chunks(
-    plan_item: Optional[Dict[str, Any]], source_by_chunk: Optional[Dict[str, str]]
+    plan_item: Optional[Dict[str, Any]], source_by_chunk: Optional[Dict[str, str]],
+    evidence_ids: Optional[List[str]] = None,
 ) -> Dict[str, str]:
     sources = source_by_chunk or {}
     return {
         chunk_id: sources[chunk_id]
-        for chunk_id in _plan_source_ids(plan_item)
+        for chunk_id in (evidence_ids if evidence_ids is not None else _plan_source_ids(plan_item))
         if sources.get(chunk_id)
     }
 
 
-def _catalog_task_contract(plan_item: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _catalog_task_contract(
+    plan_item: Optional[Dict[str, Any]], question: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Expose the intended assessment task without relying on broad topic fit."""
     plan = plan_item or {}
     contract = {
@@ -1456,9 +1448,18 @@ def _catalog_task_contract(plan_item: Optional[Dict[str, Any]]) -> Dict[str, Any
         "reasoning_mode": plan.get("reasoning_mode"),
         "required_output": plan.get("student_work_product"),
         "required_givens": list(plan.get("required_givens") or []),
+        "variable_givens": list(plan.get("variable_givens") or []),
+        "allowed_variations": list(plan.get("allowed_variations") or []),
+        "complexity_boundaries": list(plan.get("complexity_boundaries") or []),
+        "exact_source_instance": bool(plan.get("exact_source_instance", False)),
         "scenario_family": plan.get("scenario_family"),
         "difficulty": plan.get("difficulty"),
         "assigned_evidence_ids": _plan_source_ids(plan),
+        "selected_variation_id": (question or {}).get("selected_variation_id"),
+        "selected_variation": (question or {}).get("selected_variation"),
+        "effective_evidence_chunk_ids": list(
+            (question or {}).get("effective_evidence_chunk_ids") or _plan_source_ids(plan)
+        ),
     }
     if any(key in plan for key in (
         "reasoning_depth", "reasoning_requirements", "prerequisites",
@@ -1528,30 +1529,16 @@ REPAIR_SYSTEM_PROMPT = (
     "- An Equation repair must remain equation-centered and use valid LaTeX. Keep short instructions "
     "separate from displayed equations, systems, relationships, reactions, or supporting tables. "
     "Do not turn it into a narrative Word Problem or reveal a relationship the student must derive.\n"
-    "- Return one root JSON object with a `repairs` array containing one repair object per "
-    "input item, in any order. Each repair object is:\n"
-    '  {"question_id": "...", "repaired_fields": ["..."], '
-    '"question": {the full repaired question object with the same fields}]}\n'
+    "- Return one root JSON object with a `repairs` array containing one repair patch per "
+    "input item, in any order. Each object is "
+    '{"question_id":"...","patch":{only the exact fields_to_fix}}. '
+    "Never return the complete question and never add another field.\n"
     "- Return ONLY valid JSON. No fences, no extra text."
 )
 
-STEM_QUANTITATIVE_REPAIR_SYSTEM_PROMPT = """You are a quantitative STEM question repairer using medium reasoning. Repair only listed student-facing quantitative fields: numbers, equations, calculations, units, missing numerical or symbolic givens, solution_steps, final_answer, and numerical or symbolic MCQ options or correct_answer. Also replace the internal solution_certificate so it exactly documents the repaired mathematics. Preserve the catalog task and every field not authorized by fields_to_fix. Add only premises and givens needed by the assigned operation; never add the final relationship, completed equation, governing rule, reasoning step, or result when producing or selecting it is the student work being assessed. Keep Equation items equation-centered and in valid LaTeX, with concise instructions separated from display equations and no narrative Word Problem conversion.
+STEM_QUANTITATIVE_REPAIR_SYSTEM_PROMPT = """You are a quantitative STEM question repairer using medium reasoning. Repair every authorized field listed in fields_to_fix. Quantitative fields include numbers, equations, calculations, units, missing numerical or symbolic givens, solution_steps, final_answer, and numerical or symbolic MCQ options or correct_answer. When required_fixes also contains a General Validator finding, address its authorized wording, option, or structure field in the same coherent patch; do not discard either validator's finding. Also replace the internal solution_certificate so it exactly documents the repaired mathematics. Preserve the catalog task and every field not authorized by fields_to_fix. Add only premises and givens needed by the assigned operation; never add the final relationship, completed equation, governing rule, reasoning step, or result when producing or selecting it is the student work being assessed. Keep Equation items equation-centered and in valid LaTeX, with concise instructions separated from display equations and no narrative Word Problem conversion.
 Independently solve the repaired problem from scratch. Treat expected_results and expected_fix as diagnostic hypotheses, not authority. Verify by a second method when practical, such as substitution, reverse calculation, constraint testing, conservation, dimensional analysis, or independent recomputation. For optimization, use only feasible candidates. For MCQ, verify exactly one option is correct and put its label in solution_certificate.matching_correct_option. Keep solution_steps, final_answer, options, stored answer, and solution_certificate consistent. Never edit Planner metadata or address wording, difficulty, duplication, or coverage.
-Return one root JSON object with a `repairs` array containing one full repair object per input question with unchanged question_id. Return only valid JSON."""
-
-REPAIR_OUTPUT_SCHEMA = (
-    '{\n'
-    '  "repairs": [\n'
-    '  {\n'
-    '    "question_id": "...",\n'
-    '    "repaired_fields": ["..."],\n'
-    '    "question": {"question": "...", "options": {"A": "...", "B": "...", '
-    '"C": "...", "D": "..."}, "correct_answer": "..."}\n'
-    '  }\n'
-    '  ]\n'
-    '}'
-)
-
+Return one root JSON object with a `repairs` array. Each item must be {"question_id":"...","patch":{only the exact fields_to_fix}}. Never return the complete question or an unrequested field. Return only valid JSON."""
 
 def build_repair_prompt(payload: List[Dict[str, Any]]) -> str:
     block = json.dumps(payload, ensure_ascii=False, indent=None)
@@ -1561,8 +1548,9 @@ def build_repair_prompt(payload: List[Dict[str, Any]]) -> str:
         "question_id unchanged.\n\n"
         "## Items to repair\n"
         f"{block}\n\n"
-        "## Repair object format (use exactly these field names)\n"
-        f"{REPAIR_OUTPUT_SCHEMA}\n\n"
+        "## Repair object format\n"
+        '{"repairs":[{"question_id":"the unchanged ID","patch":'
+        "{exactly every field in fields_to_fix and no other fields}}]}\n\n"
         "Return ONLY one JSON object with a `repairs` array. No text before or after, "
         "no fences, and never return a bare root array."
     )
@@ -1721,8 +1709,11 @@ def validate_exam(
             "question_type": qtype,
             "question": payload,
             "plan": plan_item or {},
-            "expected_catalog_task": _catalog_task_contract(plan_item),
-            "_source_chunks": _assigned_source_chunks(plan_item, source_by_chunk),
+            "expected_catalog_task": _catalog_task_contract(plan_item, item),
+            "_source_chunks": _assigned_source_chunks(
+                plan_item, source_by_chunk,
+                list(item.get("effective_evidence_chunk_ids") or []) or None,
+            ),
         })
 
     scope_ids = [*local_verdicts, *(entry["question_id"] for entry in entries)]
@@ -1922,6 +1913,10 @@ def validate_exam(
             initial_rejection_reason = ""
             initial_rows_already_recorded = False
             try:
+                logger.info(
+                    "Validator request | role=%s | batch_size=%d | question_ids=%s | reason=initial",
+                    validation_role, len(sent_ids), sent_ids,
+                )
                 raw = request_structured(
                     batch_llm,
                     build_validator_prompt(batch, quantitative=quantitative),
@@ -1929,7 +1924,8 @@ def validate_exam(
                         sent_ids, quantitative=quantitative
                     ),
                     schema_name="validator_verdicts",
-                    agent="validator",
+                    agent=f"{validation_role}_validator",
+                    operation=f"{validation_role}_validation",
                     item_count=len(batch),
                     expected_ids=sent_ids,
                     expected_id_field="question_id",
@@ -1992,6 +1988,10 @@ def validate_exam(
                 for missing_entry in missing:
                     missing_id = missing_entry["question_id"]
                     try:
+                        logger.info(
+                            "Validator request | role=%s | batch_size=1 | question_ids=%s | reason=revalidation:%s",
+                            validation_role, [missing_id], rejection_reason,
+                        )
                         raw2 = request_structured(
                             batch_llm,
                             build_validator_prompt(
@@ -2002,7 +2002,8 @@ def validate_exam(
                                 [missing_id], quantitative=quantitative
                             ),
                             schema_name="validator_missing_verdict",
-                            agent="validator",
+                            agent=f"{validation_role}_validator",
+                            operation=f"{validation_role}_revalidation",
                             item_count=1,
                             expected_ids=[missing_id],
                             expected_id_field="question_id",
@@ -2177,6 +2178,52 @@ def _fields_changed_disallowed(
     return violations
 
 
+def _repair_fields_with_dependencies(
+    qtype: str, fields: Set[str], repair_role: str,
+) -> Set[str]:
+    """Declare derived quantitative fields that must be rebuilt in one patch."""
+    expanded = set(fields)
+    if repair_role != "stem_quantitative" or expanded == {"solution_certificate"}:
+        return expanded
+    if qtype == "mcq":
+        if expanded & {"question", "options", "correct_answer"}:
+            expanded.add("solution_certificate")
+            if "options" in expanded:
+                expanded.add("correct_answer")
+    elif qtype == "true_false" and expanded & {"statement", "answer"}:
+        expanded.add("solution_certificate")
+    elif qtype in {"equation", "word_problem"} and expanded & {
+        "equation", "question", "solution_steps", "final_answer",
+    }:
+        expanded.update({"solution_steps", "final_answer", "solution_certificate"})
+    return expanded
+
+
+def _repair_role_for(
+    qtype: str, verdict: Dict[str, Any], *, domain: str = "STEM",
+) -> str:
+    """Route mathematical defects even when validation_role was lost upstream."""
+    if str(domain or "").upper() != "STEM":
+        return "general"
+    if str(verdict.get("validation_role") or "") == "stem_quantitative":
+        return "stem_quantitative"
+    code = str(verdict.get("failure_code") or "")
+    fields = set(_allowed_canonical(
+        qtype, verdict.get("fields_to_fix") or [], str(verdict.get("action") or "")
+    ))
+    if code in {
+        "incomplete_solution", "incorrect_calculation", "incorrect_result",
+        "invalid_solution_certificate", "invalid_or_extraneous_solution",
+        "missing_units",
+    }:
+        return "stem_quantitative"
+    if qtype in {"equation", "word_problem"} and fields & {
+        "equation", "solution_steps", "final_answer", "solution_certificate",
+    }:
+        return "stem_quantitative"
+    return "general"
+
+
 def repair_exam(
         exam: Dict[str, Any], verdicts: List[Dict[str, Any]], client: Optional[Any] = None,
         plan_by_slot: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -2235,6 +2282,18 @@ def repair_exam(
                     if str(label).strip().upper() != correct_label and str(text).strip()
                 ]
                 required_repair = "replace_all_rejected_distractors"
+        allowed = _allowed_canonical(
+            qtype, v.get("fields_to_fix") or [], v.get("action") or "FIX_ANSWER"
+        )
+        allowed = _repair_fields_with_dependencies(qtype, allowed, repair_role)
+        if not allowed:
+            warnings.append(
+                f"repair: {qid} has no authorized canonical patch fields; rejected"
+            )
+            continue
+        # The manifest is the source of patch authority. Record deterministic
+        # dependency expansion explicitly before constructing the JSON schema.
+        v["fields_to_fix"] = sorted(allowed)
         payload.append(
             {
                 "question_id": qid,
@@ -2242,12 +2301,15 @@ def repair_exam(
                 "fields_to_fix": v.get("fields_to_fix") or [],
                 "reason": v.get("reason") or "",
                 "expected_fix": v.get("expected_fix") or "",
+                "required_fixes": deepcopy(v.get("required_fixes") or []),
                 "expected_results": list(v.get("expected_results") or []),
                 "independent_solution": v.get("independent_solution"),
                 "first_incorrect_step": v.get("first_incorrect_step"),
                 "replacement_mode": _requires_plan_replacement(v),
                 "rejected_distractors": rejected_distractors,
                 "required_repair": required_repair,
+                "previous_repair_rejection": v.get("previous_repair_rejection") or "",
+                "authorized_patch_fields": sorted(allowed),
                 "question": p,
                 "plan": plan_item or {},
                 "source_chunks": source_chunks,
@@ -2271,7 +2333,10 @@ def repair_exam(
     user_prompt = build_repair_prompt(payload)
     try:
         repair_model_items = [
-            (item["question_id"], by_id[item["question_id"]][0])
+            (
+                item["question_id"], by_id[item["question_id"]][0],
+                list(item["authorized_patch_fields"]),
+            )
             for item in payload
         ]
         raw = request_structured(
@@ -2330,36 +2395,41 @@ def repair_exam(
             warnings.append(f"repair: unknown question_id {qid}; rejected")
             continue
         qtype, container, item = entry
-        new_item = r.get("question")
-        if not isinstance(new_item, dict):
-            warnings.append(f"repair: {qid} returned no question payload; rejected")
+        patch = r.get("patch")
+        if not isinstance(patch, dict):
+            warnings.append(f"repair: {qid} returned no patch payload; rejected")
             continue
+
+        verdict = verdict_by_id.get(qid) or {}
+        request_item = next(
+            (value for value in payload if value.get("question_id") == qid), {}
+        )
+        allowed = set(request_item.get("authorized_patch_fields") or [])
+        patch_keys = set(map(str, patch))
+        unauthorized = sorted(patch_keys - allowed)
+        missing = sorted(allowed - patch_keys)
+        if unauthorized:
+            warnings.append(
+                f"repair: {qid} patch contained unauthorized field(s) {unauthorized}; rejected"
+            )
+            continue
+        if missing:
+            warnings.append(
+                f"repair: {qid} patch omitted required field(s) {missing}; rejected"
+            )
+            continue
+
+        new_item = deepcopy(item)
+        new_item.update(deepcopy(patch))
         proposed_fitb_bank = None
 
         stashed_id = item.get("question_id")
         stashed_slot_id = item.get("slot_id")
         stashed_fitb_entry_id = item.get("fitb_entry_id")
-        if qtype == "fill_in_the_blank":
-            new_item = {
-                "slot_id": stashed_slot_id,
-                "fitb_entry_id": stashed_fitb_entry_id,
-                "question": new_item.get("stem"),
-                "answers": list(item.get("answers") or []),
-                "distractors": [
-                    new_item.get("distractor_1"), new_item.get("distractor_2")
-                ],
-            }
         normalized = _normalize(qtype, new_item)
         if normalized is None:
             warnings.append(f"repair: {qid} output failed normalization; rejected")
             continue
-        # Never copy a certificate from the pre-repair question. It is derived
-        # from the old content and becomes stale as soon as an answer-bearing
-        # field changes. Quantitative repairs must return a fresh certificate;
-        # general repairs retain an explicit null invalidation marker so the
-        # quantitative validator must request a fresh certificate.
-        if repair_role != "stem_quantitative":
-            normalized["solution_certificate"] = None
         if repair_role == "stem_quantitative" and not normalized.get("solution_certificate"):
             warnings.append(
                 f"repair: {qid} quantitative repair omitted a valid solution_certificate; rejected"
@@ -2371,10 +2441,6 @@ def repair_exam(
         if stashed_fitb_entry_id:
             normalized["fitb_entry_id"] = stashed_fitb_entry_id
 
-        verdict = verdict_by_id.get(qid) or {}
-        request_item = next(
-            (value for value in payload if value.get("question_id") == qid), {}
-        )
         rejected_distractors = {
             _simple_option_signature(value)
             for value in request_item.get("rejected_distractors") or []
@@ -2393,19 +2459,6 @@ def repair_exam(
                     f"repair: {qid} retained rejected distractor content; rejected"
                 )
                 continue
-        if _requires_plan_replacement(verdict):
-            allowed = set(_ALL_CANONICAL.get(qtype, set()))
-        else:
-            allowed = _allowed_canonical(
-                qtype, verdict.get("fields_to_fix") or [], verdict.get("action") or "FIX_ANSWER"
-            )
-        if repair_role == "stem_quantitative":
-            allowed.add("solution_certificate")
-        else:
-            # General repairs deliberately remove derived certificates before
-            # revalidation. That invalidation is mandatory bookkeeping, not an
-            # unauthorized student-facing edit.
-            allowed.add("solution_certificate")
         fitb_bank_changed = bool(
             qtype == "fill_in_the_blank"
             and isinstance(container, dict)
@@ -2571,6 +2624,18 @@ def _merge_role_reports(general: Dict[str, Any], quantitative: Dict[str, Any]) -
     merged = []
     for verdict in general.get("verdicts") or []:
         quant = quant_by_id.get(str(verdict.get("question_id") or ""))
+        findings = []
+        for role, finding in (("general", verdict), ("stem_quantitative", quant)):
+            if finding is not None and finding.get("action") != "PASS":
+                findings.append({
+                    "validator": role,
+                    "type": finding.get("action"),
+                    "failure_code": finding.get("failure_code"),
+                    "reason": finding.get("reason") or "",
+                    "expected_fix": finding.get("expected_fix") or "",
+                    "fields_to_fix": list(finding.get("fields_to_fix") or []),
+                    "verdict": deepcopy(finding),
+                })
         if quant is None or quant.get("action") == "PASS":
             chosen = dict(verdict)
         elif verdict.get("action") == "PASS":
@@ -2579,6 +2644,12 @@ def _merge_role_reports(general: Dict[str, Any], quantitative: Dict[str, Any]) -
             chosen = dict(quant)
             chosen["additional_general_issue"] = {key: verdict.get(key) for key in
                 ("action", "failure_code", "fields_to_fix", "reason", "expected_fix")}
+        chosen["required_fixes"] = findings
+        if len(findings) > 1:
+            chosen["validation_role"] = "combined"
+            chosen["fields_to_fix"] = sorted({
+                field for finding in findings for field in finding["fields_to_fix"]
+            })
         merged.append(chosen)
     return {**general, "verdicts": merged,
             "all_pass": all(v.get("action") == "PASS" for v in merged),
@@ -2586,24 +2657,6 @@ def _merge_role_reports(general: Dict[str, Any], quantitative: Dict[str, Any]) -
             "warnings": [*(general.get("warnings") or []), *(quantitative.get("warnings") or [])],
             "general_review": general,
             "quantitative_review": quantitative}
-
-
-def _semantic_identity(
-    plan: Dict[str, Any], question_type: Optional[str] = None
-) -> Dict[str, Any]:
-    """Return the compact diagnostic identity persisted for a plan slot."""
-    return {
-        "slot_id": plan.get("slot_id"),
-        "question_type": question_type or plan.get("question_type"),
-        "knowledge_focus": plan.get("knowledge_focus"),
-        "student_work_product": plan.get("student_work_product"),
-        "task_operation": plan.get("task_operation"),
-        "relationship": plan.get("relationship") or plan.get("concept"),
-        "target": plan.get("target"),
-        "reasoning_mode": plan.get("reasoning_mode"),
-        "given_conditions": list(plan.get("given_conditions") or []),
-        "scenario_family": plan.get("scenario_family"),
-    }
 
 
 def _regenerate_plan_slot(
@@ -2750,6 +2803,7 @@ def _manifest_from_report(
             str(verdict.get("failure_code") or ""),
             validation_role=str(verdict.get("validation_role") or "general"),
         )
+        required_fixes = deepcopy(verdict.get("required_fixes") or [])
         if str(verdict.get("failure_code") or "") in {
             "missing_required_given", "missing_required_givens", "invalid_required_givens",
         }:
@@ -2780,6 +2834,8 @@ def _manifest_from_report(
             "what_must_change": verdict.get("expected_fix") or "",
             "preferred_recovery": repair_type,
             "validation_role": verdict.get("validation_role") or "general",
+            "fields_to_fix": list(verdict.get("fields_to_fix") or []),
+            "required_fixes": required_fixes,
             "verdict": deepcopy(verdict),
         })
     for missing in report.get("missing_slots") or []:
@@ -2909,40 +2965,77 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     replacement_memory = deepcopy(state.get("repair_replacement_memory") or {})
     retry_seeds = deepcopy(state.get("repair_retry_seeds") or {})
     validation_repair_history = list(state.get("validation_repair_history") or [])
+    validation_ledger = deepcopy(state.get("validation_ledger") or {})
     candidate_updates_by_model: Dict[int, Dict[str, Any]] = {}
     balanced_candidate_ids_by_model: Dict[int, list[str]] = {}
 
-    # Repair writes are transactional: validate each staged candidate first and
-    # mutate the active exam/plan only after every required validator passes.
-    for candidate in state.get("repair_candidates") or []:
+    # Validation of isolated staged candidates is independent. Workers only
+    # produce reports; commits below remain deterministic and transactional.
+    repair_candidates = list(state.get("repair_candidates") or [])
+
+    def validate_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
         mn = int(candidate.get("model_number") or 1)
-        slot_id = str(candidate.get("slot_id") or "")
         qid = str(candidate.get("question_id") or "")
         staged_exam = candidate.get("exam") or {}
         candidate_state = {**state, "plans": candidate.get("plans") or plans}
         candidate_plan, candidate_sources = _plan_context_for_model(candidate_state, mn)
         args = (staged_exam, [qid], candidate_plan, candidate_sources)
-        general = (_validate_with_context(*args, general_client, "general")
-                   if general_client is not None else _validate_with_context(*args))
-        candidate_report = general
         quantitative_ids = set(_quantitative_question_ids(staged_exam, candidate_plan))
         if quantitative_client is not None and qid in quantitative_ids:
             from app.llm.factory import create_review_client
             fresh_quantitative_client = create_review_client(
                 domain="STEM", stage="stem_quantitative_validator"
             )
-            quantitative = _validate_with_context(
-                staged_exam, [qid], candidate_plan, candidate_sources,
-                fresh_quantitative_client, "stem_quantitative",
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                general_future = executor.submit(
+                    copy_context().run, _validate_with_context, *args,
+                    general_client, "general",
+                )
+                quantitative_future = executor.submit(
+                    copy_context().run, _validate_with_context,
+                    staged_exam, [qid], candidate_plan, candidate_sources,
+                    fresh_quantitative_client, "stem_quantitative",
+                )
+                general = general_future.result()
+                quantitative = quantitative_future.result()
+            return _merge_role_reports(general, quantitative)
+        return (
+                _validate_with_context(*args, general_client, "general")
+                if general_client is not None else _validate_with_context(*args)
             )
-            candidate_report = _merge_role_reports(general, quantitative)
+
+    candidate_reports: dict[int, Dict[str, Any]] = {}
+    parallel = [
+        (index, candidate) for index, candidate in enumerate(repair_candidates)
+        if str(candidate.get("question_type") or "") != "fill_in_the_blank"
+    ]
+    serial = [
+        (index, candidate) for index, candidate in enumerate(repair_candidates)
+        if str(candidate.get("question_type") or "") == "fill_in_the_blank"
+    ]
+    if parallel:
+        workers = min(MAX_PARALLEL_VALIDATOR_CALLS, len(parallel), 10)
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(copy_context().run, validate_candidate, candidate): index
+                for index, candidate in parallel
+            }
+            for future in as_completed(futures):
+                candidate_reports[futures[future]] = future.result()
+    for index, candidate in serial:
+        candidate_reports[index] = validate_candidate(candidate)
+
+    # Repair writes are transactional: mutate the active exam/plan only after
+    # every required validator for that candidate passes.
+    for index, candidate in enumerate(repair_candidates):
+        mn = int(candidate.get("model_number") or 1)
+        slot_id = str(candidate.get("slot_id") or "")
+        qid = str(candidate.get("question_id") or "")
+        staged_exam = candidate.get("exam") or {}
+        candidate_state = {**state, "plans": candidate.get("plans") or plans}
+        candidate_plan, _candidate_sources = _plan_context_for_model(candidate_state, mn)
+        candidate_report = candidate_reports[index]
         verdicts = list(candidate_report.get("verdicts") or [])
-        if mn in candidate_updates_by_model:
-            candidate_updates_by_model[mn] = _merge_validation_report(
-                candidate_updates_by_model[mn], candidate_report
-            )
-        else:
-            candidate_updates_by_model[mn] = candidate_report
         passed = bool(verdicts) and all(v.get("action") == "PASS" for v in verdicts)
         target = next((
             item for item in repair_manifest
@@ -2964,6 +3057,12 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             staged_entry = _build_by_id(staged_exam.get("questions") or {}).get(qid)
             if active_exam is not None and staged_entry is not None:
                 _put_question(active_exam, staged_entry[0], staged_entry[2])
+                if mn in candidate_updates_by_model:
+                    candidate_updates_by_model[mn] = _merge_validation_report(
+                        candidate_updates_by_model[mn], candidate_report
+                    )
+                else:
+                    candidate_updates_by_model[mn] = candidate_report
                 staged_plan = candidate_plan.get(slot_id)
                 if staged_plan:
                     from app.online.duplicate_pipeline import _replace_plan_item
@@ -3032,16 +3131,40 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         plan_by_slot, source_by_chunk = _plan_context_for_model(
             {**state, "plans": plans}, int(mn or 1)
         )
+        def question_fingerprints() -> dict[str, str]:
+            result: dict[str, str] = {}
+            for qtype, container, item in _iter_questions(exam.get("questions") or {}):
+                qid = str(item.get("question_id") or "")
+                slot_id = str(item.get("slot_id") or "")
+                if not qid:
+                    continue
+                payload = {
+                    "question": item,
+                    "plan": plan_by_slot.get(slot_id) or {},
+                    "section_dependency": (
+                        list(container.get("word_bank") or [])
+                        if qtype == "fill_in_the_blank" and isinstance(container, dict)
+                        else None
+                    ),
+                }
+                result[qid] = hashlib.sha256(
+                    json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+            return result
+
+        current_fingerprints = question_fingerprints()
+        model_ledger = validation_ledger.setdefault(str(mn), {})
+
         def run_reviews(ids: Optional[Iterable[str]]) -> Dict[str, Any]:
             args = (exam, ids, plan_by_slot, source_by_chunk)
-            general = (_validate_with_context(*args, general_client, "general")
-                       if general_client is not None else _validate_with_context(*args))
             if quantitative_client is None:
-                return general
+                return (_validate_with_context(*args, general_client, "general")
+                        if general_client is not None else _validate_with_context(*args))
             quantitative_ids = set(_quantitative_question_ids(exam, plan_by_slot))
             selected = [qid for qid in (ids or quantitative_ids) if qid in quantitative_ids]
             if not selected:
-                return general
+                return (_validate_with_context(*args, general_client, "general")
+                        if general_client is not None else _validate_with_context(*args))
             active_quantitative_client = quantitative_client
             if ids is not None:
                 # A repaired answer is checked in a fresh stateless Luna request.
@@ -3052,9 +3175,18 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 active_quantitative_client = create_review_client(
                     domain="STEM", stage="stem_quantitative_validator"
                 )
-            quantitative = _validate_with_context(
-                exam, selected, plan_by_slot, source_by_chunk,
-                active_quantitative_client, "stem_quantitative")
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                general_future = executor.submit(
+                    copy_context().run, _validate_with_context, *args,
+                    general_client, "general"
+                )
+                quantitative_future = executor.submit(
+                    copy_context().run, _validate_with_context,
+                    exam, selected, plan_by_slot, source_by_chunk,
+                    active_quantitative_client, "stem_quantitative",
+                )
+                general = general_future.result()
+                quantitative = quantitative_future.result()
             return _merge_role_reports(general, quantitative)
         if int(mn or 0) in candidate_updates_by_model:
             update = candidate_updates_by_model[int(mn or 0)]
@@ -3085,7 +3217,55 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             else:
                 report = run_reviews(None)
         else:
-            report = run_reviews(None)
+            quantitative_required_ids = set(
+                _quantitative_question_ids(exam, plan_by_slot)
+                if quantitative_client is not None else []
+            )
+            stale_ids = [
+                qid for qid, fingerprint in current_fingerprints.items()
+                if (
+                    (model_ledger.get(qid) or {}).get("fingerprint") != fingerprint
+                    or "general" not in ((model_ledger.get(qid) or {}).get("roles") or {})
+                    or (
+                        qid in quantitative_required_ids
+                        and "stem_quantitative" not in (
+                            (model_ledger.get(qid) or {}).get("roles") or {}
+                        )
+                    )
+                )
+            ]
+            if previous is not None and not stale_ids:
+                logger.info("Validation ledger reuse | model=%d | unchanged=%d", mn, len(current_fingerprints))
+                report = previous
+            elif previous is not None:
+                logger.info(
+                    "Validation fingerprint recheck | model=%d | question_count=%d | question_ids=%s",
+                    mn, len(stale_ids), stale_ids,
+                )
+                report = _merge_validation_report(previous, run_reviews(stale_ids))
+            else:
+                report = run_reviews(None)
+        verdict_by_id_for_ledger = {
+            str(verdict.get("question_id") or ""): verdict
+            for verdict in (
+                (report.get("general_review") or {}).get("verdicts")
+                or report.get("verdicts") or []
+            )
+            if verdict.get("question_id")
+        }
+        quantitative_by_id = {
+            str(verdict.get("question_id") or ""): verdict
+            for verdict in ((report.get("quantitative_review") or {}).get("verdicts") or [])
+            if verdict.get("question_id")
+        }
+        for qid, fingerprint in current_fingerprints.items():
+            verdict = verdict_by_id_for_ledger.get(qid)
+            if verdict is None:
+                continue
+            roles = {"general": deepcopy(verdict)}
+            if qid in quantitative_by_id:
+                roles["stem_quantitative"] = deepcopy(quantitative_by_id[qid])
+            model_ledger[qid] = {"fingerprint": fingerprint, "roles": roles}
         present_slots = {
             str(item.get("slot_id") or "")
             for _qtype, _container, item in _iter_questions(exam.get("questions") or {})
@@ -3183,10 +3363,11 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         "final_global_reviews": list(state.get("final_global_reviews") or []),
         "exam_quality_findings": list(state.get("exam_quality_findings") or []),
         "validation_repair_history": validation_repair_history,
+        "validation_ledger": validation_ledger,
     }
 
 
-def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
+def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
     """Stage bounded, reason-aware candidates without mutating the active exam."""
     generated = state.get("generated_exams") or []
     plans = deepcopy(state.get("plans") or [])
@@ -3236,7 +3417,9 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         )
         selected_id = ""
         if use_replacement:
-            from app.online.assessment_catalog import catalog_exhaustion_replacement
+            from app.online.duplicate_pipeline import (
+                _candidate_pool, _complete_question_context, _select_replacement_candidate,
+            )
             excluded = {str(v) for v in [
                 target.get("task_id"), target.get("fitb_entry_id"),
                 *(memory.get("blacklisted_candidate_ids") or []),
@@ -3247,12 +3430,44 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 for _kind, _container, item in _iter_questions(staged_exam.get("questions") or {})
                 for answer in (item.get("answers") or []) if answer
             }
-            replacement = catalog_exhaustion_replacement(
+            active_slot_ids = {str(item.get("slot_id")) for _k, _c, item in
+                               _iter_questions(staged_exam.get("questions") or {}) if item.get("slot_id")}
+            candidate_pool = _candidate_pool(
                 state.get("assessment_catalog") or {}, staged_plans, slot_id, qtype,
-                str(state.get("difficulty") or "mix"), excluded_task_ids=excluded,
-                used_fitb_answer_keys=used_answers,
-                active_slot_ids={str(item.get("slot_id")) for _k, _c, item in
-                                 _iter_questions(staged_exam.get("questions") or {}) if item.get("slot_id")},
+                str(state.get("difficulty") or "mix"), active_slot_ids, excluded,
+            )
+            active_plan_items = list(plan_by_slot.values())
+            existing_question_context = []
+            for existing_qtype, _container, existing_item in _iter_questions(
+                staged_exam.get("questions") or {}
+            ):
+                existing_slot = str(existing_item.get("slot_id") or "")
+                existing_plan = plan_by_slot.get(existing_slot) or {
+                    "slot_id": existing_slot, "question_type": existing_qtype,
+                }
+                existing_question_context.append(_complete_question_context(
+                    str(existing_item.get("question_id") or ""), existing_item,
+                    existing_plan, role="active_exam_question",
+                ))
+            failed_entry = _build_by_id(staged_exam.get("questions") or {}).get(qid)
+            failed_item = (failed_entry or (None, None, {}))[2]
+            replacement, selector_context = _select_replacement_candidate(
+                slot_id=slot_id, qtype=qtype, conflict_slots=[], conflict_edges=[],
+                candidates=candidate_pool, active_items=active_plan_items,
+                blacklist=excluded, previous_failures=list(memory.get("candidate_failures") or []),
+                failed_slot_context={
+                    "slot_id": slot_id, "question_id": qid, "question_type": qtype,
+                    "original_task_id": target.get("task_id"),
+                    "failure_code": target.get("failure_code"),
+                    "failure_reason": target.get("failure_reason"),
+                    "required_difficulty": state.get("difficulty"),
+                    "plan": deepcopy(plan_by_slot.get(slot_id) or {}),
+                    "existing_question": _complete_question_context(
+                        qid, failed_item, plan_by_slot.get(slot_id) or {}, role="failed_question",
+                    ) if failed_item else None,
+                },
+                existing_questions=existing_question_context,
+                allow_semantic_overlap_candidates=True,
             )
             if replacement is None:
                 reason = "No unused or reusable grounded replacement remained for this slot."
@@ -3261,6 +3476,34 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                                 "attempt": attempt, "repair_action": repair_action,
                                 "status": "candidate_generation_failed", "new_failure_reason": reason})
                 continue
+            replacement["replacement_selector_context"] = selector_context
+            for rejected in (selector_context.get("agent_choice") or {}).get(
+                "rejected_candidates", []
+            ):
+                rejected_id = str(rejected.get("candidate_id") or "")
+                if not rejected_id or rejected_id == str(
+                    replacement.get("fitb_entry_id") or replacement.get("task_id") or ""
+                ):
+                    continue
+                memory["blacklisted_candidate_ids"].append(rejected_id)
+                memory["candidate_failures"].append({
+                    "candidate_id": rejected_id,
+                    "reason": str(rejected.get("reason") or "replacement_selector_rejected"),
+                    "attempt": attempt,
+                    "stage": "replacement_selector",
+                })
+            reused_identity = str(replacement.get("fitb_entry_id") or replacement.get("task_id") or "")
+            previous_uses = [
+                value for value in existing_question_context
+                if str(value.get("fitb_entry_id") or value.get("task_id") or "") == reused_identity
+            ]
+            if previous_uses:
+                replacement["previous_task_questions"] = previous_uses
+                replacement["previous_question_ids"] = [
+                    str(value.get("question_id")) for value in previous_uses if value.get("question_id")
+                ]
+                replacement["task_usage_count"] = len(previous_uses)
+                replacement["reuse_mode"] = "intentional_practice_variation"
             from app.online.duplicate_pipeline import _replace_plan_item
             selected_id = str(replacement.get("fitb_entry_id") or replacement.get("task_id") or "")
             memory["replacement_attempt_count"] = int(memory.get("replacement_attempt_count") or 0) + 1
@@ -3282,6 +3525,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             _put_question(staged_exam, qtype, _placeholder_question(qtype, slot_id, qid))
         generated_ok = False
         outcome_warnings: list[str] = []
+        selected_repair_role: str | None = None
         if repair_action in {"regenerate_missing_slot", "replace_fitb_entry", "replace_task"}:
             generated_ok, outcome_warnings = _regenerate_plan_slot(
                 staged_state, staged_exam, mn, qid, plan_by_slot, source_by_chunk)
@@ -3289,7 +3533,23 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             verdict = deepcopy(target.get("verdict") or {})
             verdict.setdefault("question_id", qid)
             verdict.setdefault("action", "FIX_QUESTION")
-            if str(target.get("validation_role") or "general") == "stem_quantitative":
+            verdict["fields_to_fix"] = list(
+                target.get("fields_to_fix") or verdict.get("fields_to_fix") or []
+            )
+            prior_rejection = next((
+                str(item.get("new_failure_reason") or item.get("failure_reason") or "")
+                for item in reversed(target.get("history") or [])
+                if item.get("new_failure_reason") or item.get("failure_reason")
+            ), "")
+            if prior_rejection:
+                verdict["previous_repair_rejection"] = prior_rejection
+            repair_role = _repair_role_for(
+                qtype, verdict,
+                domain=str((state.get("assessment_profile") or {}).get("domain") or "STEM"),
+            )
+            selected_repair_role = repair_role
+            target["repair_role"] = repair_role
+            if repair_role == "stem_quantitative":
                 from app.llm.factory import create_review_client
                 client = create_review_client(domain="STEM", stage="stem_quantitative_repairer")
                 outcome = repair_exam(staged_exam, [verdict], client=client,
@@ -3313,7 +3573,9 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                                                       "reason": reason, "attempt": attempt})
             target.update(failure_code="candidate_generation_failed", failure_reason=reason)
             target.setdefault("history", []).append({"attempt": attempt,
-                "repair_action": repair_action, "status": "candidate_generation_failed",
+                "repair_action": repair_action, "repair_role": target.get("repair_role"),
+                "requested_fields": list(target.get("fields_to_fix") or []),
+                "status": "candidate_generation_failed",
                 "new_failure_reason": reason})
             history.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
                             "attempt": attempt, "repair_action": repair_action,
@@ -3322,6 +3584,8 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         candidate_plan = plan_by_slot.get(slot_id) or {}
         candidates.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
             "question_type": qtype, "attempt": attempt, "repair_action": repair_action,
+            "repair_role": selected_repair_role,
+            "requested_fields": list((target.get("verdict") or {}).get("fields_to_fix") or []),
             "had_original": had_original, "previous_failure_code": target.get("failure_code"),
             "previous_failure_reason": target.get("failure_reason"),
             "candidate_task_id": candidate_plan.get("task_id"),
@@ -3331,6 +3595,8 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             validated_models.remove(mn)
         target["status"] = "candidate_generated"
         target.setdefault("history", []).append({"attempt": attempt, "repair_action": repair_action,
+            "repair_role": selected_repair_role,
+            "requested_fields": list((target.get("verdict") or {}).get("fields_to_fix") or []),
             "candidate_id": selected_id or candidate_plan.get("fitb_entry_id") or candidate_plan.get("task_id"),
             "status": "candidate_generated", "failure_reason_received": target.get("failure_reason")})
 
@@ -3341,3 +3607,100 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             "validation_repair_history": history, "pending_revalidation_ids": {},
             "validated_models": validated_models, "warnings": warnings,
             "eval_stats": state.get("eval_stats")}
+
+
+def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Build independent repair candidates concurrently, then merge by slot.
+
+    FITB repairs stay in one ordered group because their shared word bank is a
+    section-level dependency. Every other target receives an isolated snapshot.
+    """
+    manifest = deepcopy(state.get("repair_manifest") or [])
+    active = [item for item in manifest if item.get("status") != "resolved"]
+    if len(active) < 2:
+        return _repair_invalid_questions_serial(state)
+
+    jobs: list[list[Dict[str, Any]]] = [
+        [item] for item in active
+        if str(item.get("question_type") or "") != "fill_in_the_blank"
+    ]
+    fitb = [item for item in active
+            if str(item.get("question_type") or "") == "fill_in_the_blank"]
+    if fitb:
+        jobs.append(fitb)
+
+    def run_job(targets: list[Dict[str, Any]]) -> Dict[str, Any]:
+        slot_ids = {str(item.get("slot_id") or "") for item in targets}
+        isolated = {
+            **state,
+            "repair_manifest": deepcopy(targets),
+            "warnings": [],
+            "validation_repair_history": [],
+            "repair_replacement_memory": {
+                key: deepcopy(value)
+                for key, value in (state.get("repair_replacement_memory") or {}).items()
+                if key in slot_ids
+            },
+            "repair_retry_seeds": {
+                key: deepcopy(value)
+                for key, value in (state.get("repair_retry_seeds") or {}).items()
+                if key in slot_ids
+            },
+        }
+        return _repair_invalid_questions_serial(isolated)
+
+    completed: dict[int, Dict[str, Any]] = {}
+    workers = min(MAX_PARALLEL_VALIDATOR_CALLS, len(jobs), 10)
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(copy_context().run, run_job, targets): index
+            for index, targets in enumerate(jobs)
+        }
+        for future in as_completed(futures):
+            completed[futures[future]] = future.result()
+
+    manifest_by_key = {
+        (int(item.get("model_number") or 0), str(item.get("slot_id") or "")): item
+        for item in manifest
+    }
+    attempts = dict(state.get("question_repair_attempts") or {})
+    memory = deepcopy(state.get("repair_replacement_memory") or {})
+    retry_seeds = deepcopy(state.get("repair_retry_seeds") or {})
+    candidates: list[Dict[str, Any]] = []
+    warnings = list(state.get("warnings") or [])
+    history = list(state.get("validation_repair_history") or [])
+    validated = set(state.get("validated_models") or [])
+    for index in range(len(jobs)):
+        result = completed[index]
+        for item in result.get("repair_manifest") or []:
+            manifest_by_key[(int(item.get("model_number") or 0),
+                             str(item.get("slot_id") or ""))] = item
+        for target in jobs[index]:
+            slot_id = str(target.get("slot_id") or "")
+            if slot_id in (result.get("question_repair_attempts") or {}):
+                attempts[slot_id] = result["question_repair_attempts"][slot_id]
+            if slot_id in (result.get("repair_replacement_memory") or {}):
+                memory[slot_id] = result["repair_replacement_memory"][slot_id]
+            if slot_id in (result.get("repair_retry_seeds") or {}):
+                retry_seeds[slot_id] = result["repair_retry_seeds"][slot_id]
+        candidates.extend(result.get("repair_candidates") or [])
+        warnings.extend(result.get("warnings") or [])
+        history.extend(result.get("validation_repair_history") or [])
+        validated.intersection_update(result.get("validated_models") or [])
+
+    ordered_manifest = [
+        manifest_by_key[(int(item.get("model_number") or 0), str(item.get("slot_id") or ""))]
+        for item in manifest
+    ]
+    return {
+        "repair_manifest": ordered_manifest,
+        "repair_candidates": candidates,
+        "question_repair_attempts": attempts,
+        "repair_replacement_memory": memory,
+        "repair_retry_seeds": retry_seeds,
+        "validation_repair_history": history,
+        "pending_revalidation_ids": {},
+        "validated_models": sorted(validated),
+        "warnings": warnings,
+        "eval_stats": state.get("eval_stats"),
+    }

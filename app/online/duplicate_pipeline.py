@@ -7,7 +7,7 @@ import json
 import re
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app import config
 from app.logging_conf import get_logger
@@ -22,6 +22,12 @@ from app.online.duplicate_judge import review_duplicate_candidates
 logger = get_logger("DUPLICATE_PIPELINE")
 
 
+class ReplacementCandidateRejection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    candidate_id: str
+    reason: str
+
+
 class DuplicateReplacementChoice(BaseModel):
     model_config = ConfigDict(extra="forbid")
     slot_to_replace: str
@@ -31,6 +37,7 @@ class DuplicateReplacementChoice(BaseModel):
     replacement_fitb_entry_id: str | None = None
     why_this_candidate_resolves_the_conflict: str
     checked_against_active_slots: bool
+    rejected_candidates: list[ReplacementCandidateRejection] = Field(default_factory=list)
 
 
 def _exam_by_model(state: dict[str, Any]) -> dict[int, dict[str, Any]]:
@@ -56,15 +63,35 @@ def _correctness_pass_exam(state: dict[str, Any], exam: dict[str, Any]) -> dict[
                     item for item in values
                     if str(item.get("question_id") or "") in passed
                 ]
-    plan_by_slot = _plan_by_slot(state.get("plans") or [], model_number)
-    for section in (filtered.get("questions") or {}).values():
+    _attach_reuse_context(filtered, state.get("plans") or [], model_number)
+    return filtered
+
+
+def _attach_reuse_context(
+    exam: dict[str, Any], plans: list[dict[str, Any]], model_number: int,
+) -> None:
+    plan_by_slot = _plan_by_slot(plans, model_number)
+    for section in (exam.get("questions") or {}).values():
         values = section.get("items") if isinstance(section, dict) else section
         for item in values or []:
             plan = plan_by_slot.get(str(item.get("slot_id") or "")) or {}
-            if plan.get("plan_review_status") != "intentional_reuse":
+            authorized = bool(
+                plan.get("plan_review_status") == "intentional_reuse"
+                or plan.get("reuse_mode") == "intentional_practice_variation"
+                or is_authorized_catalog_exhaustion_reuse(plan)
+            )
+            if not authorized:
                 continue
             item["plan_review_reuse_context"] = {
-                "status": "intentional_reuse",
+                "status": "intentional_practice_variation",
+                "authorized": True,
+                "task_id": plan.get("task_id"),
+                "task_family_id": plan.get("task_family_id"),
+                "task_usage_count": plan.get("task_usage_count"),
+                "reuse_mode": plan.get("reuse_mode"),
+                "variation_reason": plan.get("variation_reason"),
+                "intended_variation": plan.get("intended_variation"),
+                "source_evidence_ids": list(plan.get("source_evidence_ids") or []),
                 "suggested_assessment_angle": plan.get("suggested_assessment_angle"),
                 "reuse_justification": plan.get("reuse_justification"),
                 "required_instance_distinctions": deepcopy(
@@ -72,7 +99,6 @@ def _correctness_pass_exam(state: dict[str, Any], exam: dict[str, Any]) -> dict[
                 ),
                 "reference_slot_ids": list(plan.get("forced_duplicate_slot_ids") or []),
             }
-    return filtered
 
 
 def _plan_by_slot(plans: list[dict[str, Any]], model_number: int) -> dict[str, dict[str, Any]]:
@@ -146,6 +172,15 @@ def _numeric_variation_applicable(
     from app.online.validator import _plan_context_for_model, _quantitative_question_ids
 
     plan_by_slot, _source_by_chunk = _plan_context_for_model(state, model_number)
+    plan = plan_by_slot.get(str(item.get("slot_id") or "")) or {}
+    if plan.get("exact_source_instance") is True:
+        return False
+    numeric_variation = any(
+        isinstance(value, dict) and value.get("numeric_values_may_change") is True
+        for value in plan.get("allowed_variations") or []
+    )
+    if not plan.get("variable_givens") or not numeric_variation:
+        return False
     if question_id not in set(_quantitative_question_ids(exam, plan_by_slot)):
         return False
     relevant = {
@@ -201,6 +236,10 @@ def _numeric_variation_fallback(
             "concept": plan.get("concept"),
             "task_operation": plan.get("task_operation"),
             "target": plan.get("target"),
+            "required_givens": list(plan.get("required_givens") or []),
+            "variable_givens": list(plan.get("variable_givens") or []),
+            "allowed_variations": list(plan.get("allowed_variations") or []),
+            "complexity_boundaries": list(plan.get("complexity_boundaries") or []),
             "expected_answer_type": plan.get("expected_work_product")
             or plan.get("student_work_product"),
             "evidence_chunk_ids": plan.get("support_chunk_ids")
@@ -282,12 +321,52 @@ def _compact_metadata(item: dict[str, Any]) -> dict[str, Any]:
         "slot_id", "task_id", "fitb_entry_id", "task_family_id", "coverage_id",
         "concept", "concept_id", "task_operation", "operation", "target",
         "reasoning_mode", "expected_work_product", "relationship_id",
-        "normalized_answer", "clue_basis", "evidence_chunk_id",
+        "normalized_answer", "clue_basis", "evidence_chunk_id", "source_chunk_id",
+        "reasoning_requirements", "prerequisites", "student_work_product",
+        "required_givens", "variable_givens", "allowed_variations",
+        "complexity_boundaries", "exact_source_instance",
+        "difficulty", "actual_difficulty", "requested_difficulty", "reuse_mode",
+        "variation_reason", "intended_variation", "source_evidence_ids",
     ) if item.get(key) not in (None, "", [])}
     work_product = item.get("expected_work_product") or item.get("student_work_product")
     if work_product:
         compact["expected_work_product"] = work_product
     return compact
+
+
+def _complete_question_context(
+    question_id: str, item: dict[str, Any], plan: dict[str, Any], *, role: str,
+) -> dict[str, Any]:
+    return {
+        "context_role": role,
+        "question_id": question_id,
+        "slot_id": item.get("slot_id") or plan.get("slot_id"),
+        "task_id": plan.get("task_id"),
+        "fitb_entry_id": plan.get("fitb_entry_id"),
+        "task_family_id": plan.get("task_family_id"),
+        "question_type": plan.get("question_type"),
+        "question": item.get("question") or item.get("statement") or item.get("term")
+        or item.get("equation") or item.get("prompt"),
+        "options": deepcopy(item.get("options")),
+        "correct_answer": item.get("correct_answer") or item.get("answer")
+        or item.get("answers") or item.get("reference_answer") or item.get("final_answer"),
+        "solution_steps": deepcopy(item.get("solution_steps") or []),
+        "solution_certificate": deepcopy(item.get("solution_certificate")),
+        "idea_to_test": plan.get("idea_to_test"),
+        "task_operation": plan.get("task_operation"),
+        "target": plan.get("target"),
+        "reasoning_requirements": deepcopy(plan.get("reasoning_requirements") or []),
+        "student_work_product": plan.get("student_work_product"),
+        "required_givens": deepcopy(plan.get("required_givens") or []),
+        "variable_givens": deepcopy(plan.get("variable_givens") or []),
+        "allowed_variations": deepcopy(plan.get("allowed_variations") or []),
+        "complexity_boundaries": deepcopy(plan.get("complexity_boundaries") or []),
+        "exact_source_instance": bool(plan.get("exact_source_instance", False)),
+        "source_evidence_ids": list(plan.get("source_evidence_ids") or [
+            value for value in [plan.get("source_chunk_id"), *(plan.get("support_chunk_ids") or [])]
+            if value
+        ]),
+    }
 
 
 def _norm(value: Any) -> str:
@@ -307,6 +386,42 @@ def _obvious_semantic_collision(candidate: dict[str, Any], active: dict[str, Any
         (_norm(candidate.get("target")), _norm(active.get("target"))),
     ]
     return all(left and left == right for left, right in values)
+
+
+def _conflict_resolution_score(
+    candidate: dict[str, Any], conflicting: list[dict[str, Any]],
+) -> tuple[bool, int]:
+    """Return whether metadata proves a conflict is resolved and its strength.
+
+    Missing semantic metadata is ambiguous and deliberately falls back to the
+    existing LLM selector. A deterministic choice is made only when every
+    conflicting slot has an explicit difference in assessed work.
+    """
+    if not conflicting:
+        return False, 0
+    fields = (
+        ("concept", "concept_id"),
+        ("target",),
+        ("task_operation", "operation"),
+        ("reasoning_mode",),
+        ("expected_work_product", "student_work_product"),
+    )
+    total = 0
+    for active in conflicting:
+        differences = 0
+        comparable = 0
+        for aliases in fields:
+            left = next((_norm(candidate.get(name)) for name in aliases
+                         if _norm(candidate.get(name))), "")
+            right = next((_norm(active.get(name)) for name in aliases
+                          if _norm(active.get(name))), "")
+            if left and right:
+                comparable += 1
+                differences += int(left != right)
+        if comparable == 0 or differences == 0:
+            return False, total
+        total += differences
+    return True, total
 
 
 def _candidate_pool(
@@ -344,6 +459,9 @@ def _select_replacement_candidate(
     *, slot_id: str, qtype: str, conflict_slots: list[str], conflict_edges: list[dict[str, Any]],
     candidates: list[dict[str, Any]], active_items: list[dict[str, Any]],
     blacklist: set[str], previous_failures: list[dict[str, Any]],
+    failed_slot_context: dict[str, Any] | None = None,
+    existing_questions: list[dict[str, Any]] | None = None,
+    allow_semantic_overlap_candidates: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     active_without_slot = [item for item in active_items if str(item.get("slot_id")) != slot_id]
     usage: dict[str, int] = {}
@@ -353,9 +471,36 @@ def _select_replacement_candidate(
         _identity(item) for item in active_without_slot
         if str(item.get("slot_id") or "") in conflict_slots
     }
+    failed_candidate_ids = {
+        str(failure.get("candidate_id") or failure.get("task_id") or
+            failure.get("fitb_entry_id") or "")
+        for failure in previous_failures
+        if str(failure.get("candidate_id") or failure.get("task_id") or
+               failure.get("fitb_entry_id") or "")
+    }
+
+    def question_type_compatible(candidate: dict[str, Any]) -> bool:
+        if qtype == "fill_in_the_blank":
+            return bool(candidate.get("fitb_entry_id"))
+        declared = candidate.get("allowed_question_types")
+        # Legacy persisted plans may predate this compiler field. Keep their
+        # existing candidate behavior, but never accept an explicit mismatch.
+        return not declared or qtype in declared
+
+    def authorized_reuse(candidate: dict[str, Any]) -> bool:
+        return bool(
+            candidate.get("task_reused") or candidate.get("fitb_entry_reused")
+            or candidate.get("reuse_mode") == "intentional_practice_variation"
+        )
+
     safe = [candidate for candidate in candidates
-            if _identity(candidate) not in blacklist | conflicting_ids
-            and not any(_obvious_semantic_collision(candidate, item) for item in active_without_slot)]
+            if _identity(candidate) not in blacklist
+            and _identity(candidate) not in failed_candidate_ids
+            and question_type_compatible(candidate)
+            and (_identity(candidate) not in conflicting_ids or authorized_reuse(candidate))
+            and (allow_semantic_overlap_candidates or authorized_reuse(candidate) or not any(
+                _obvious_semantic_collision(candidate, item) for item in active_without_slot
+            ))]
     def rank(candidate: dict[str, Any]) -> tuple[Any, ...]:
         collision_count = sum(_obvious_semantic_collision(candidate, item) for item in active_without_slot)
         represented = lambda key: sum(_norm(candidate.get(key)) == _norm(item.get(key))
@@ -365,23 +510,61 @@ def _select_replacement_candidate(
                 represented("concept_id"), represented("task_operation"), represented("target"),
                 represented("task_family_id"), represented("reasoning_mode"), _identity(candidate))
     safe.sort(key=rank)
+    conflicting_items = [
+        item for item in active_without_slot
+        if str(item.get("slot_id") or "") in conflict_slots
+    ]
+    deterministic: list[tuple[dict[str, Any], int]] = []
+    for candidate in safe:
+        resolved, strength = _conflict_resolution_score(candidate, conflicting_items)
+        # Without a Judge explanation there is no reliable semantic basis for
+        # bypassing the selector, even if catalog labels happen to differ.
+        if resolved and conflict_edges:
+            deterministic.append((candidate, strength))
+    deterministic.sort(key=lambda value: (
+        int(usage.get(_identity(value[0]), 0) > 0),
+        usage.get(_identity(value[0]), 0),
+        -value[1],
+        rank(value[0]),
+    ))
     context = {
         "slot_to_replace": slot_id, "conflicts_with": conflict_slots,
         "conflict": conflict_edges, "active_slots": [_compact_metadata(item) for item in active_without_slot],
-        "candidates": [{**_compact_metadata(item), "used_count": usage.get(_identity(item), 0)}
-                       for item in safe],
+        "failed_slot": deepcopy(failed_slot_context or {}),
+        "existing_questions": deepcopy(existing_questions or []),
+        "candidates": [{
+            **_compact_metadata(item),
+            "used_count": usage.get(_identity(item), 0),
+            "ranking": index + 1,
+            "previous_uses": [
+                deepcopy(question) for question in (existing_questions or [])
+                if str(question.get("task_id") or question.get("fitb_entry_id") or "")
+                == _identity(item)
+            ],
+        } for index, item in enumerate(safe)],
         "blacklisted_candidate_ids": sorted(blacklist),
+        "previously_failed_candidate_ids": sorted(failed_candidate_ids),
         "previous_failures": previous_failures,
     }
     if not safe:
         return None, context
+    if deterministic:
+        chosen, strength = deterministic[0]
+        return chosen, {
+            **context,
+            "selection_source": "deterministic_conflict_ranking",
+            "conflict_resolution_strength": strength,
+        }
     try:
         from app.llm.factory import create_duplicate_replacement_client
         from app.llm.client import request_structured
         raw = request_structured(
             create_duplicate_replacement_client(),
-            "Choose the candidate that resolves the stated conflict and is least likely to conflict "
-            "with compact active-slot metadata. Prefer unused and less-used only after semantic safety. "
+            "Choose the first semantically suitable candidate from this Python-ranked batch. Prefer "
+            "unused candidates, then least-used candidates. A previously used task is allowed only "
+            "when its actual previous questions support a distinct source-grounded representation, "
+            "procedure, or numerical instance. Wording-only variation is unsuitable. Compare the "
+            "failed slot, failure reason, all previous uses, same-family context, and active slots. "
             "Return JSON matching the schema.\n" + json.dumps(context, ensure_ascii=False),
             response_model=DuplicateReplacementChoice, schema_name="duplicate_replacement_choice",
             agent="duplicate_replacement", operation="select_replacement", item_count=len(safe),
@@ -534,9 +717,10 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
     )
     for model_number, exam in _exam_by_model(state).items():
         filtered_exam = _correctness_pass_exam(state, exam)
-        # Attempt-three numeric variants have already passed the ordinary /
-        # quantitative validator and are accepted without another duplicate
-        # judge call by contract. Exclude only those IDs from this judge input.
+        # Legacy compatibility: persisted jobs may still carry exempt IDs from the
+        # older contract where attempt-three numeric variants skipped this judge.
+        # New numeric variants are no longer exempt, so the final variation always
+        # receives an independent duplicate verification here.
         exempt_ids = set(state.get("duplicate_judge_exempt_ids") or [])
         if exempt_ids:
             for section in (filtered_exam.get("questions") or {}).values():
@@ -749,6 +933,7 @@ def _precommit_fallback_candidate(
         ]
         return False, [f"fallback precommit correctness rejected: {'; '.join(reasons)}"], fact_cache
 
+    _attach_reuse_context(candidate_exam, plans, model_number)
     forced = _forced_catalog_reuse_pairs(candidate_exam, plans, model_number)
     try:
         duplicate_client = create_review_client(domain=domain, stage="duplicate_judge")
@@ -872,7 +1057,6 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                 history, model_number, slot_id
             )
             blacklist = set(blacklists.get(attempt_key) or []) | failed_replacement_task_ids
-            blacklist.add(_identity(old_plan_item))
             active_plan_items = list(_plan_by_slot(plans, model_number).values())
             conflict_edges = [
                 edge for group in groups if qid in (group.get("replace_question_ids") or [])
@@ -926,10 +1110,9 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                         else related_question_ids
                     ),
                     "numeric_variant": True,
-                    "duplicate_recheck_required": False,
+                    "duplicate_recheck_required": True,
                 })
                 numeric_repaired_ids.append(qid)
-                judge_exempt_ids.append(qid)
                 history.append({
                     "model_number": model_number, "question_id": qid,
                     "slot_id": slot_id, "repair_round": repair_round,
@@ -948,7 +1131,40 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                 conflict_edges=conflict_edges, candidates=candidates,
                 active_items=active_plan_items, blacklist=blacklist,
                 previous_failures=failure_memory.get(attempt_key) or [],
+                failed_slot_context={
+                    **_compact_metadata(old_plan_item),
+                    "question_id": qid,
+                    "question": _complete_question_context(
+                        qid, item, old_plan_item, role="failed_duplicate_question"
+                    ),
+                    "failure_code": "semantic_duplicate",
+                    "failure_reason": conflict_edges,
+                },
+                existing_questions=[
+                    _complete_question_context(
+                        candidate_id, entry[2],
+                        next((
+                            active for active in active_plan_items
+                            if str(active.get("slot_id") or "")
+                            == str(entry[2].get("slot_id") or "")
+                        ), {}),
+                        role="active_exam_question",
+                    )
+                    for candidate_id, entry in by_id.items()
+                ],
             )
+            for rejected in (selector_context.get("agent_choice") or {}).get(
+                "rejected_candidates", []
+            ):
+                rejected_id = str(rejected.get("candidate_id") or "")
+                if not rejected_id:
+                    continue
+                blacklists.setdefault(attempt_key, []).append(rejected_id)
+                failure_memory.setdefault(attempt_key, []).append({
+                    "candidate_id": rejected_id,
+                    "reason": str(rejected.get("reason") or "replacement_selector_rejected"),
+                    "stage": "replacement_selector",
+                })
             if replacement:
                 replacement["selected_replacement_task_id"] = replacement.get("task_id")
                 replacement["task_was_previously_used"] = bool(
@@ -987,25 +1203,9 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                         for existing in previous_task_questions
                     ):
                         return
-                    previous_task_questions.append({
-                        "context_role": role,
-                        "question_id": context_qid,
-                        "slot_id": context_slot,
-                        "task_id": context_plan.get("task_id"),
-                        "fitb_entry_id": context_plan.get("fitb_entry_id"),
-                        "question_text": context_item.get("question")
-                        or context_item.get("statement") or context_item.get("term")
-                        or context_item.get("equation"),
-                        "idea_to_test": context_plan.get("idea_to_test"),
-                        "task_operation": context_plan.get("task_operation"),
-                        "target": context_plan.get("target"),
-                        "reasoning_mode": context_plan.get("reasoning_mode"),
-                        "scenario_family": context_plan.get("scenario_family"),
-                        "answer_pattern": context_item.get("correct_answer")
-                        or context_item.get("answers")
-                        or context_item.get("reference_answer")
-                        or context_item.get("final_answer"),
-                    })
+                    previous_task_questions.append(_complete_question_context(
+                        context_qid, context_item, context_plan, role=role,
+                    ))
 
                 for previous_slot, previous_plan in plan_items.items():
                     if previous_slot == slot_id or str(
@@ -1039,6 +1239,14 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                             "duplicate_conflict",
                         )
                 replacement["previous_task_questions"] = previous_task_questions
+                replacement["previous_question_ids"] = [
+                    str(value.get("question_id")) for value in previous_task_questions
+                    if value.get("question_id")
+                ]
+                replacement["task_usage_count"] = len([
+                    value for value in previous_task_questions
+                    if value.get("context_role") == "previous_question_from_reused_task"
+                ])
             if replacement is None or not _replace_plan_item(plans, model_number, slot_id, replacement):
                 history.append({"model_number": model_number, "question_id": qid,
                                 "slot_id": slot_id, "repair_round": repair_round,
@@ -1162,6 +1370,39 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                         "status": "difficulty_adjustment_" + adjustment.get("status", "unknown"),
                         "difficulty_adjustment": adjustment,
                     })
+                    if reservation.get("catalog_replacement_stage") == (
+                        "regenerated_original_task_after_duplicate"
+                    ):
+                        accepted, precommit_warnings, fact_cache = _precommit_fallback_candidate(
+                            state, plans, model_number, qid, exam, generated, fact_cache,
+                        )
+                        warnings.extend(precommit_warnings)
+                        if not accepted:
+                            _replace_plan_item(
+                                plans, model_number, reservation["slot_id"],
+                                reservation.get("old_plan_item") or {},
+                            )
+                            failed_id = str(
+                                reservation.get("fitb_entry_id")
+                                or reservation.get("task_id") or ""
+                            )
+                            if failed_id:
+                                blacklists.setdefault(
+                                    _slot_attempt_key(model_number, reservation["slot_id"]), []
+                                ).append(failed_id)
+                                failure_memory.setdefault(
+                                    _slot_attempt_key(model_number, reservation["slot_id"]), []
+                                ).append({
+                                    "candidate_id": failed_id,
+                                    "reason": "; ".join(precommit_warnings),
+                                    "stage": "fallback_precommit",
+                                })
+                            history.append({
+                                **history_reservation, "model_number": model_number,
+                                "status": "precommit_rejected",
+                                "failure_reason": "; ".join(precommit_warnings),
+                            })
+                            continue
                     current = _build_by_id(exam.get("questions") or {}).get(qid)
                     if current is None:
                         continue
@@ -1195,8 +1436,13 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
             max(completed_rounds, 3)
             if numeric_fallback_attempted or finalization_pending else completed_rounds
         ),
-        "duplicate_verification_pending": verification_required,
-        "duplicate_verification_attempt": repair_round if verification_required else 0,
+        "duplicate_verification_pending": (
+            verification_required or numeric_fallback_attempted
+        ),
+        "duplicate_verification_attempt": (
+            repair_round
+            if (verification_required or numeric_fallback_attempted) else 0
+        ),
         "duplicate_replacement_attempts": slot_attempts,
         "pending_revalidation_ids": pending_revalidation,
         "pending_duplicate_groups": [], "validated_models": validated,

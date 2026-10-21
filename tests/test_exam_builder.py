@@ -643,7 +643,7 @@ def test_authorized_catalog_exhaustion_reuse_passes_generator_task_guard():
     assert exam_builder._is_semantic_plan_duplicate("s2", plan_by_slot, [existing]) is False
 
 
-def test_unauthorized_catalog_task_reuse_stays_blocked_by_generator_guard():
+def test_task_id_reuse_alone_never_blocks_a_question_instance():
     existing = {"slot_id": "s1", "question": "Existing question"}
     plan_by_slot = {
         "s1": {"slot_id": "s1", "task_id": "task_equation"},
@@ -653,7 +653,128 @@ def test_unauthorized_catalog_task_reuse_stays_blocked_by_generator_guard():
             # Missing the allocator's full authorization contract.
         },
     }
-    assert exam_builder._is_semantic_plan_duplicate("s2", plan_by_slot, [existing]) is True
+    assert exam_builder._is_semantic_plan_duplicate("s2", plan_by_slot, [existing]) is False
+    assert exam_builder._is_duplicate(
+        "mcq", {"question": "Existing question"},
+        {("mcq", " ".join(exam_builder.normalize_text("Existing question")))},
+    ) is True
+
+
+def test_four_distinct_questions_can_share_one_task_id_in_one_batch(monkeypatch):
+    task_id = "task_contextual_system"
+    planned = [
+        {
+            "slot_id": f"m1_equation_{index}", "task_id": task_id,
+            "topic": "linear systems", "concept": "contextual two-variable systems",
+            "task_operation": "apply_supported_linear_system_method",
+            "target": "a supported system result", "student_work_product": "worked result",
+            "reasoning_mode": "calculation", "difficulty": "easy",
+            "allowed_variations": [
+                "solve for either unknown", "construct the equations",
+                "verify a proposed solution", "use a new valid numerical instance",
+            ],
+            "variable_givens": ["context totals and unknown counts"],
+            "required_givens": ["two linear constraints"],
+            "complexity_boundaries": ["no nonlinear systems"],
+        }
+        for index in range(1, 5)
+    ]
+    batch = [
+        {"slot_id": "m1_equation_1", "equation": "Solve x+y=13 and 2x+4y=38.",
+         "solution_steps": ["Eliminate x.", "y=6 and x=7."], "final_answer": "(7,6)"},
+        {"slot_id": "m1_equation_2", "equation": "Verify whether (9,8) solves x+y=17 and 2x+4y=50.",
+         "solution_steps": ["9+8=17.", "18+32=50."], "final_answer": "Yes"},
+        {"slot_id": "m1_equation_3", "equation": "Construct a system for 12 events and 36 participants, using 2 or 4 participants per event.",
+         "solution_steps": ["Let x and y be the counts.", "x+y=12; 2x+4y=36."],
+         "final_answer": "x+y=12; 2x+4y=36"},
+        {"slot_id": "m1_equation_4", "equation": "Solve a+b=15 and 2a+4b=42.",
+         "solution_steps": ["Eliminate a.", "b=6 and a=9."], "final_answer": "(9,6)"},
+    ]
+    client = SequencedClient([batch])
+    _patch_client(monkeypatch, client)
+
+    questions, warnings = exam_builder._generate_type_from_plan(
+        "equation", planned, "ctx", "easy", 1, set(), [], [],
+        global_plan_by_slot={item["slot_id"]: item for item in planned},
+    )
+
+    assert len(questions) == 4
+    assert {question["slot_id"] for question in questions} == {
+        f"m1_equation_{index}" for index in range(1, 5)
+    }
+    assert not any("semantic plan duplicate" in warning for warning in warnings)
+
+
+def test_authorized_original_task_third_use_passes_generator_task_guard():
+    existing = {"slot_id": "s1", "question": "Solve 2x + 5 = 15."}
+    plan_by_slot = {
+        "s1": {"slot_id": "s1", "task_id": "task_linear"},
+        "s2": {"slot_id": "s2", "task_id": "task_linear"},
+        "s3": {
+            "slot_id": "s3",
+            "task_id": "task_linear",
+            "task_reused": True,
+            "reuse_mode": "intentional_practice_variation",
+            "reuse_reason": "regenerate_original_task_after_duplicate",
+            "catalog_replacement_stage": "regenerated_original_task_after_duplicate",
+            "reused_task_id": "task_linear",
+            "task_usage_count": 2,
+            "variation_reason": "regenerate_valid_catalog_task_after_duplicate",
+            "intended_variation": "Use a distinct supported numerical instance.",
+            "source_evidence_ids": ["chunk_linear"],
+            "required_instance_distinctions": ["different_numerical_instance"],
+            "forced_duplicate_slot_ids": ["s1", "s2"],
+            "previous_task_questions": [
+                {"slot_id": "s1", "question": "Solve 2x + 5 = 15.", "final_answer": "x=5"},
+                {"slot_id": "s2", "question": "Solve 3x + 1 = 10.", "final_answer": "x=3"},
+            ],
+        },
+    }
+
+    assert exam_builder._is_semantic_plan_duplicate("s3", plan_by_slot, [existing]) is False
+
+
+def test_bare_intentional_reuse_label_does_not_make_identity_a_duplicate():
+    existing = {"slot_id": "s1", "question": "Existing question"}
+    plan_by_slot = {
+        "s1": {"slot_id": "s1", "task_id": "task_linear"},
+        "s2": {
+            "slot_id": "s2",
+            "task_id": "task_linear",
+            "task_reused": True,
+            "reuse_mode": "intentional_practice_variation",
+        },
+    }
+
+    assert exam_builder._is_semantic_plan_duplicate("s2", plan_by_slot, [existing]) is False
+
+
+def test_plan_context_preserves_complete_previous_questions_for_reuse():
+    prior_question = {
+        "slot_id": "s1",
+        "question_id": "model1_equation_1",
+        "question": "Solve 2x + 5 = 15.",
+        "final_answer": "x=5",
+        "solution_steps": ["2x=10", "x=5"],
+    }
+    items = {
+        "equation": [
+            {"slot_id": "s1", "task_id": "task_linear"},
+            {
+                "slot_id": "s2",
+                "task_id": "task_linear",
+                "task_reused": True,
+                "forced_duplicate_slot_ids": ["s1"],
+                "previous_task_questions": [prior_question],
+            },
+        ]
+    }
+
+    result = exam_builder._attach_plan_review_context(items)
+
+    previous = result["equation"][1]["previous_task_questions"]
+    assert previous == [prior_question]
+    assert previous[0]["solution_steps"] == ["2x=10", "x=5"]
 
 
 def test_assemble_exam_fitb_section_and_essay():

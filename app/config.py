@@ -61,10 +61,16 @@ DEEPSEEK_MODEL: str = _env("DEEPSEEK_MODEL", "deepseek-flash") or "deepseek-flas
 if LLM_PROVIDER == "deepseek" and DEEPSEEK_MODEL not in {"deepseek-flash", "deepseek-v4-pro"}:
     raise ValueError("DEEPSEEK_MODEL must be 'deepseek-flash' or 'deepseek-v4-pro'")
 DEEPSEEK_CONCURRENCY_LIMIT: int = max(
-    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "5") or "5")
+    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "10") or "10")
 )
 DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: int = max(
     1, min(3, int(_env("DEEPSEEK_MAX_STRUCTURED_ATTEMPTS", "3") or "3"))
+)
+# The Catalog's incomplete-batch recovery applies to every compiler provider.
+# Keep this outer attempt budget independent from a provider's own structured
+# response retries, which remain controlled by provider-specific settings.
+CATALOG_BATCH_MAX_ATTEMPTS: int = max(
+    1, min(3, int(_env("CATALOG_BATCH_MAX_ATTEMPTS", "3") or "3"))
 )
 DEEPSEEK_MAX_TRANSIENT_RETRIES: int = max(
     0, int(_env("DEEPSEEK_MAX_TRANSIENT_RETRIES", "2") or "2")
@@ -97,13 +103,25 @@ VALIDATOR_BATCH_SIZE: int = max(
     1, int(_env("VALIDATOR_BATCH_SIZE", "8") or "8")
 )
 MAX_PARALLEL_GENERATION_CALLS: int = max(
-    1, min(5, int(_env("MAX_PARALLEL_GENERATION_CALLS", "5") or "5"))
+    1, min(10, int(_env("MAX_PARALLEL_GENERATION_CALLS", "10") or "10"))
 )
 MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: int = max(
-    1, min(5, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "5") or "5"))
+    1, min(10, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "10") or "10"))
 )
 MAX_PARALLEL_VALIDATOR_CALLS: int = max(
-    1, min(5, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "5") or "5"))
+    1, min(10, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "10") or "10"))
+)
+MAX_PARALLEL_CATALOG_CALLS: int = max(
+    1, min(50, int(_env("MAX_PARALLEL_CATALOG_CALLS", "50") or "50"))
+)
+MAX_PARALLEL_DUPLICATE_JUDGE_CALLS: int = max(
+    1, min(10, int(_env("MAX_PARALLEL_DUPLICATE_JUDGE_CALLS", "10") or "10"))
+)
+DUPLICATE_JUDGE_BATCH_SIZE: int = max(
+    1, int(_env("DUPLICATE_JUDGE_BATCH_SIZE", "8") or "8")
+)
+LLM_JOB_CONCURRENCY_LIMIT: int = max(
+    1, min(64, int(_env("LLM_JOB_CONCURRENCY_LIMIT", "10") or "10"))
 )
 TITLE_MODEL: str = _env("TITLE_MODEL", "mistralai/mistral-7b-instruct-v0.3") or "mistralai/mistral-7b-instruct-v0.3"
 # Base URL used ONLY by the title-generation client (section/subsection

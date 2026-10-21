@@ -382,3 +382,30 @@ def test_identical_math_equations_and_point_are_shortlisted_below_threshold(monk
     assert any(signal in pair["signals"] for signal in (
         "same_normalized_equation", "important_repeated_numbers"
     ))
+
+
+def test_authorized_distinct_numeric_instance_is_auditable_practice_variation():
+    facts = {
+        "same_core_knowledge": "yes",
+        "same_student_operation_or_method": "yes",
+        "same_target_or_result": "yes",
+        "genuinely_new_reasoning": "no",
+        "one_answer_substantially_gives_away_other": "no",
+    }
+    assert duplicate_judge.deterministic_pair_classification(facts) == "duplicate"
+    assert duplicate_judge.deterministic_pair_classification(
+        facts, authorized_practice_variation=True,
+    ) == "acceptable_practice_variation"
+
+
+def test_authorized_wording_only_copy_remains_duplicate():
+    facts = {
+        "same_core_knowledge": "yes",
+        "same_student_operation_or_method": "yes",
+        "same_target_or_result": "yes",
+        "genuinely_new_reasoning": "no",
+        "one_answer_substantially_gives_away_other": "yes",
+    }
+    assert duplicate_judge.deterministic_pair_classification(
+        facts, authorized_practice_variation=True,
+    ) == "duplicate"

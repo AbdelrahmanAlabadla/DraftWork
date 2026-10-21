@@ -223,14 +223,14 @@ def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch
     }, {"recursion_limit": 40})
 
     assert calls == [
-        "receive", "retrieve", "catalog", "plan", "adjust",
-        "review-1", "review-2", "review-3", "review-4", "generate",
+        "receive", "retrieve", "catalog", "plan",
+        "review-1", "review-2", "review-3", "review-4", "adjust", "review-5", "generate",
         "validate-1", "question-repair", "validate-2", "duplicate-scan-1",
         "duplicate-repair", "validate-3", "duplicate-scan-2", "assemble",
     ]
     assert validation_calls == 3
     assert duplicate_scan_calls == 2
-    assert len(review_inputs) == 4
+    assert len(review_inputs) == 5
     assert all(len(entry["items"]) == 2 for entry in review_inputs)
     assert result["warnings"] == ["controlled assembly completed with two valid questions"]
     finalization = next(payload for stage, event, payload in audit_events if event == "exam_assembled")
