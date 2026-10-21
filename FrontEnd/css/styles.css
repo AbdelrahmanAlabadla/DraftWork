@@ -993,11 +993,34 @@
       font-family: var(--mono);
       font-size: 13px;
       color: var(--accent);
+      align-items: flex-start;
     }
 
     .gen-status.show {
       display: flex;
     }
+
+    .gen-status-content { flex: 1; min-width: 0; }
+    .gen-status-summary { display: flex; align-items: center; gap: 12px; }
+    .generation-workflow {
+      list-style: none;
+      margin: 14px 0 0;
+      padding: 0;
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+    }
+    .generation-stage { display: grid; grid-template-columns: 20px 1fr; gap: 8px; }
+    .generation-stage-marker { text-align: center; font-weight: 700; }
+    .generation-stage.active { color: var(--accent); }
+    .generation-stage.complete { color: var(--success); }
+    .generation-stage.failed { color: var(--danger); }
+    .generation-stage.skipped { opacity: .55; }
+    .generation-stage-detail { display: block; margin-top: 2px; font-size: 12px; opacity: .8; }
+    .generation-stage.active .generation-stage-marker {
+      animation: pulse-stage 1s ease-in-out infinite;
+    }
+    @keyframes pulse-stage { 50% { opacity: .35; transform: scale(.85); } }
 
     .gen-status.complete {
       color: var(--success);

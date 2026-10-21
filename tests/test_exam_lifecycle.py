@@ -261,9 +261,15 @@ const summary = lifecycle.partialExamSummary({
   warnings: [{type: 'question_shortage', question_type: 'fill_in_the_blank', missing_count: 5}]
 });
 const fullSummary = lifecycle.partialExamSummary({status: 'complete', warnings: []});
+const fullMessage = lifecycle.completionSummaryMessage({
+  status: 'complete', metadata: {original_request: {total: 23}, quality_summary: {valid: 23}}
+});
+const partialMessage = lifecycle.completionSummaryMessage({
+  status: 'partial', metadata: {original_request: {total: 23}, quality_summary: {valid: 19}}
+});
 let undefinedRejected = false;
 try { lifecycle.examResourcePath(undefined); } catch (_) { undefinedRejected = true; }
-console.log(JSON.stringify({examId, path: lifecycle.examResourcePath(examId), summary, fullSummary, undefinedRejected}));
+console.log(JSON.stringify({examId, path: lifecycle.examResourcePath(examId), summary, fullSummary, fullMessage, partialMessage, undefinedRejected}));
 """
     module_url = module.resolve().as_uri()
     process = subprocess.run(
@@ -278,6 +284,8 @@ console.log(JSON.stringify({examId, path: lifecycle.examResourcePath(examId), su
     assert result["path"] == "/exams/exam_fixed"
     assert result["summary"]["generated"] == 18
     assert result["fullSummary"] is None
+    assert "23 of 23" in result["fullMessage"]
+    assert "19 of 23" in result["partialMessage"] and "4" in result["partialMessage"]
     assert result["undefinedRejected"] is True
 
 

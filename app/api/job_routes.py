@@ -401,6 +401,7 @@ def get_job(
         job = _job_for_actor(str(job_id), session_id, user_id)
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
+    pipeline_events = repositories.list_job_pipeline_events(str(job_id))
     return {
         "job_id": str(job["id"]),
         "document_id": str(job["document_id"]) if job.get("document_id") else None,
@@ -408,6 +409,7 @@ def get_job(
         "status": job["status"],
         "stage": job["stage"],
         "progress": job["progress"],
+        "pipeline_events": pipeline_events,
         "result": job.get("result_data") or None,
         "error": (
             {"code": job.get("error_code"), "message": job.get("error_message")}

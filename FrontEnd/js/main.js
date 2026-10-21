@@ -3,7 +3,7 @@ import {
   deleteJSON, getJSON, postJSON, waitForJob,
 } from "./api.js";
 import { state } from "./state.js";
-import { examResourcePath, renderPartialExamWarning, resolveExamId } from "./exam-lifecycle.js";
+import { completionSummaryMessage, examResourcePath, renderPartialExamWarning, resolveExamId } from "./exam-lifecycle.js";
 import { examStageLabel, initI18n, localizedError, t } from "./i18n.js";
 import { initUpload } from "./upload.js";
 import { initSettings } from "./settings.js";
@@ -54,33 +54,122 @@ function initGenerate() {
   let generationCompleted = false;
   let generationFailed = false;
 
-  function renderGenerationProgress(stage, progress) {
+  const workflowStages = [
+    { id: "retrieval", stages: ["analyzing_request", "retrieving_context"] },
+    { id: "catalog", stages: ["compiling_assessment_catalog"] },
+    { id: "planning", stages: ["planning_exam"] },
+    { id: "difficulty", stages: ["adjusting_difficulty"] },
+    { id: "review", stages: ["reviewing_plan"] },
+    { id: "generation", stages: ["generating_exam"] },
+    { id: "validation", stages: ["validating_exam", "validating_updates"] },
+    { id: "repair", stages: ["repairing_exam"] },
+    { id: "duplicates", stages: ["checking_duplicates"] },
+    { id: "duplicate_repair", stages: ["repairing_duplicates"] },
+    { id: "final", stages: ["finalizing_exam"] },
+    { id: "completed", stages: ["completed"] },
+  ];
+
+  function workflowIndex(stage) {
+    return workflowStages.findIndex((item) => item.stages.includes(stage));
+  }
+
+  function renderWorkflow(stage, events = [], jobStatus = "running") {
+    const list = document.getElementById("generationWorkflow");
+    if (!list) return;
+    const visited = new Set(events.map((event) => String(event.stage || "")));
+    visited.add(stage);
+    const activeIndex = workflowIndex(stage);
+    const failed = jobStatus === "failed";
+    list.replaceChildren(...workflowStages.map((item, index) => {
+      const row = document.createElement("li");
+      row.className = "generation-stage";
+      const wasVisited = item.stages.some((name) => visited.has(name));
+      let stateName = "pending";
+      if (failed && index === activeIndex) stateName = "failed";
+      else if (stage === "completed" && wasVisited) stateName = "complete";
+      else if (index === activeIndex) stateName = "active";
+      else if (wasVisited) stateName = "complete";
+      else if (activeIndex >= 0 && index < activeIndex) stateName = "skipped";
+      row.classList.add(stateName);
+
+      const marker = document.createElement("span");
+      marker.className = "generation-stage-marker";
+      marker.textContent = stateName === "complete" ? "✓" :
+        stateName === "active" ? "◌" : stateName === "failed" ? "!" : "○";
+      const body = document.createElement("span");
+      body.textContent = t(`exam_workflow.${item.id}`);
+      if (stateName === "skipped") {
+        const detail = document.createElement("small");
+        detail.className = "generation-stage-detail";
+        detail.textContent = t("exam_workflow.skipped");
+        body.appendChild(detail);
+      } else if (stateName === "active" && item.id === "review") {
+        const detail = document.createElement("small");
+        detail.className = "generation-stage-detail";
+        detail.textContent = t("exam_workflow.review_detail");
+        body.appendChild(detail);
+      } else if (stateName === "active" && stage === "validating_updates") {
+        const detail = document.createElement("small");
+        detail.className = "generation-stage-detail";
+        detail.textContent = t("exam_workflow.revalidation_detail");
+        body.appendChild(detail);
+      } else if (stateName === "active" && jobStatus === "retrying") {
+        const detail = document.createElement("small");
+        detail.className = "generation-stage-detail";
+        detail.textContent = t("exam_workflow.retry_detail");
+        body.appendChild(detail);
+      }
+      row.append(marker, body);
+      return row;
+    }));
+  }
+
+  function renderGenerationProgress(stage, progress, events = [], jobStatus = "running") {
     genStatus.classList.remove("failed");
-    genStatus.dataset.stage = stage;
+    const lastPipelineStage = [...events].reverse().find((event) =>
+      workflowIndex(String(event.stage || "")) >= 0
+    )?.stage;
+    const effectiveStage = workflowIndex(stage) >= 0
+      ? stage
+      : (lastPipelineStage || genStatus.dataset.stage || "queued");
+    genStatus.dataset.stage = effectiveStage;
     genStatus.dataset.progress = String(progress);
+    genStatus.dataset.events = JSON.stringify(events || []);
+    genStatus.dataset.jobStatus = jobStatus;
     const message = document.getElementById("genStatusMsg");
     if (message) message.textContent = t("status.exam_progress", {
-      stage: examStageLabel(stage), progress,
+      stage: examStageLabel(effectiveStage), progress,
     });
+    renderWorkflow(effectiveStage, events, jobStatus);
   }
 
   function renderGenerationFailure(message) {
     generationFailed = true;
-    genStatus.dataset.stage = "failed";
+    const failedStage = genStatus.dataset.stage || "queued";
+    genStatus.dataset.failedStage = failedStage;
     genStatus.dataset.progress = "";
     genStatus.classList.add("show", "failed");
     genStatus.classList.remove("complete");
     const statusMessage = document.getElementById("genStatusMsg");
     if (statusMessage) {
-      statusMessage.textContent = t("status.generation_failed", { detail: message });
+      statusMessage.textContent = t("status.generation_failed", {
+        detail: `${t("exam_workflow.failed_at", { stage: examStageLabel(failedStage) })}: ${message}`,
+      });
     }
+    renderWorkflow(
+      failedStage,
+      JSON.parse(genStatus.dataset.events || "[]"),
+      "failed"
+    );
   }
 
   document.addEventListener("draftwork:language-changed", () => {
     if (genStatus.dataset.stage) {
       renderGenerationProgress(
         genStatus.dataset.stage,
-        Number(genStatus.dataset.progress || 0)
+        Number(genStatus.dataset.progress || 0),
+        JSON.parse(genStatus.dataset.events || "[]"),
+        genStatus.dataset.jobStatus || "running"
       );
     }
   });
@@ -185,7 +274,9 @@ function initGenerate() {
         state.generationJobId = data.job_id;
         if (cancellationRequested) await cancelGenerationJob();
         const job = await waitForJob(data.job_id, (current) => {
-          renderGenerationProgress(current.stage, current.progress);
+          renderGenerationProgress(
+            current.stage, current.progress, current.pipeline_events || [], current.status
+          );
         });
         const examId = resolveExamId(data, job);
         const examResponse = await getJSON(examResourcePath(examId));
@@ -199,6 +290,8 @@ function initGenerate() {
         generationCompleted = true;
         genStatus.classList.add("complete");
         renderGenerationProgress("completed", 100);
+        const completedMessage = document.getElementById("genStatusMsg");
+        if (completedMessage) completedMessage.textContent = completionSummaryMessage(examResponse.data);
         // Let an already-open Eval Dashboard refresh immediately. The
         // dashboard still polls independently, so this is only a fast path.
         try {

@@ -22,13 +22,25 @@ export function partialExamSummary(record = {}) {
     (warning) => warning && typeof warning === "object"
       && warning.type === "question_shortage",
   );
-  const requested = Number(quality.requested ?? shortages.reduce(
+  const requested = Number(record.metadata?.original_request?.total ?? quality.requested ?? shortages.reduce(
     (total, warning) => total + Number(warning.requested_count ?? warning.requested ?? 0), 0,
   ));
   const generated = Number(quality.valid ?? Math.max(0, requested - shortages.reduce(
     (total, warning) => total + Number(warning.missing_count ?? warning.missing ?? 0), 0,
   )));
   return { requested, generated, shortages };
+}
+
+export function completionSummaryMessage(record = {}) {
+  const quality = record.metadata?.quality_summary || {};
+  const requested = Number(record.metadata?.original_request?.total ?? quality.requested ?? 0);
+  const generated = Number(quality.valid ?? requested);
+  if (record.status === "partial" || generated < requested) {
+    return t("status.exam_partial_complete", {
+      generated, requested, missing: Math.max(0, requested - generated),
+    });
+  }
+  return t("status.exam_full_complete", { generated, requested });
 }
 
 export function renderPartialExamWarning(record = {}) {
@@ -46,11 +58,22 @@ export function renderPartialExamWarning(record = {}) {
     const typeKey = `warning.qtype.${rawType}`;
     const translatedType = t(typeKey);
     const qtype = translatedType === typeKey ? rawType.replaceAll("_", " ") : translatedType;
-    return t("warning.partial.item", { missing, qtype });
+    const slots = (shortage.missing_slot_ids || []).join(", ");
+    const base = t("warning.partial.item", { missing, qtype });
+    return slots ? `${base} (${slots})` : base;
   });
   const fallbackMessages = (record.warnings || [])
     .filter((item) => item && typeof item === "object" && item.type === "difficulty_fallback")
-    .map((item) => String(item.message || "").trim())
+    .map((item) => {
+      const counts = Object.entries(item.fallback_counts || {})
+        .map(([level, count]) => `${count} ${t(`difficulty.${level}`)}`)
+        .join(", ");
+      return t("warning.difficulty_fallback", {
+        requested: t(`difficulty.${item.requested_difficulty}`),
+        matched: item[`${item.requested_difficulty}_count`] || 0,
+        substitutions: counts,
+      });
+    })
     .filter(Boolean);
   const missingCount = Math.max(0, summary.requested - summary.generated);
   const missingMessage = details.length
