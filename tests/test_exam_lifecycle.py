@@ -174,6 +174,14 @@ def test_partial_exam_is_saved_with_shortage_and_same_id(monkeypatch):
         "reason": "missing_questions",
     }
     assert saved["metadata"]["question_shortages"] == [shortage]
+    assert saved["metadata"]["original_request"] == {
+        "total": 23,
+        "question_counts": {
+            "mcq": 7, "true_false": 5, "fill_in_the_blank": 5,
+            "definition": 3, "why": 3,
+        },
+        "num_models": 1,
+    }
     assert {event["stage"] for event in audit_events} >= {
         "generation", "general_validation", "repair", "duplicate_scan"
     }
@@ -203,6 +211,30 @@ def test_completed_full_exam_has_no_shortage_warning():
     assert task_module._question_shortage_warnings(result, [("mcq", 2)], 1) == []
 
 
+def test_difficulty_warning_never_recalculates_requested_total_from_survivors():
+    warning = task_module._difficulty_fallback_warnings({
+        "slot_lifecycle": {
+            f"m1_mcq_{index}": {"terminal_status": "finalized"}
+            for index in range(1, 20)
+        },
+        "semantic_identities": [
+            {
+                "slot_id": f"m1_mcq_{index}",
+                "requested_difficulty": "easy",
+                "actual_difficulty": "easy" if index < 19 else "medium",
+                "difficulty_fallback_reason": (
+                    None if index < 19 else "source did not support safe simplification"
+                ),
+            }
+            for index in range(1, 20)
+        ],
+    })[0]
+    assert warning["type"] == "difficulty_fallback"
+    assert warning["reason"] == "difficulty_substitution"
+    assert "requested_count" not in warning
+    assert "message" not in warning
+
+
 NODE = shutil.which("node")
 
 
@@ -229,9 +261,15 @@ const summary = lifecycle.partialExamSummary({
   warnings: [{type: 'question_shortage', question_type: 'fill_in_the_blank', missing_count: 5}]
 });
 const fullSummary = lifecycle.partialExamSummary({status: 'complete', warnings: []});
+const fullMessage = lifecycle.completionSummaryMessage({
+  status: 'complete', metadata: {original_request: {total: 23}, quality_summary: {valid: 23}}
+});
+const partialMessage = lifecycle.completionSummaryMessage({
+  status: 'partial', metadata: {original_request: {total: 23}, quality_summary: {valid: 19}}
+});
 let undefinedRejected = false;
 try { lifecycle.examResourcePath(undefined); } catch (_) { undefinedRejected = true; }
-console.log(JSON.stringify({examId, path: lifecycle.examResourcePath(examId), summary, fullSummary, undefinedRejected}));
+console.log(JSON.stringify({examId, path: lifecycle.examResourcePath(examId), summary, fullSummary, fullMessage, partialMessage, undefinedRejected}));
 """
     module_url = module.resolve().as_uri()
     process = subprocess.run(
@@ -246,6 +284,8 @@ console.log(JSON.stringify({examId, path: lifecycle.examResourcePath(examId), su
     assert result["path"] == "/exams/exam_fixed"
     assert result["summary"]["generated"] == 18
     assert result["fullSummary"] is None
+    assert "23 of 23" in result["fullMessage"]
+    assert "19 of 23" in result["partialMessage"] and "4" in result["partialMessage"]
     assert result["undefinedRejected"] is True
 
 

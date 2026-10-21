@@ -46,6 +46,8 @@ def processing_versions() -> dict[str, str]:
     return {
         "parser": config.PARSER_PIPELINE_VERSION,
         "parser_code_sha256": code_hash("offline/parser.py"),
+        "parser_items_code_sha256": code_hash("offline/parser_items.py"),
+        "cleaner_code_sha256": code_hash("offline/cleaner.py"),
         "chunker": config.CHUNKER_PIPELINE_VERSION,
         "chunker_code_sha256": code_hash("offline/semantic_chunker.py"),
         "title_generator_code_sha256": code_hash("offline/title_generator.py"),
@@ -89,7 +91,6 @@ def load_processed_document(sha256: str) -> dict[str, Any] | None:
         or payload.get("file_sha256") != sha256.lower()
         or payload.get("processing_versions") != processing_versions()
         or not isinstance(payload.get("structure"), dict)
-        or not isinstance(payload.get("embeddings"), list)
     ):
         return None
     for embedding in payload.get("embeddings") or []:
@@ -99,11 +100,32 @@ def load_processed_document(sha256: str) -> dict[str, Any] | None:
     return payload
 
 
+def load_processed_document_by_key(
+    key: str, *, require_current_versions: bool = True
+) -> dict[str, Any] | None:
+    """Load an already validated cache artifact for PostgreSQL backfill."""
+    path = _cache_path(str(key))
+    if not path.exists():
+        return None
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return None
+    if (
+        payload.get("processed_document_key") != str(key)
+        or not isinstance(payload.get("structure"), dict)
+        or (require_current_versions and payload.get("processing_versions") != processing_versions())
+    ):
+        return None
+    return payload
+
+
 def save_processed_document(
     sha256: str,
     *,
     structure: dict[str, Any],
-    embeddings: list[dict[str, Any]],
+    embeddings: list[dict[str, Any]] | None = None,
     metadata: dict[str, Any],
 ) -> Path:
     key = processed_document_key(sha256)
@@ -114,7 +136,9 @@ def save_processed_document(
         "file_sha256": sha256.lower(),
         "processing_versions": processing_versions(),
         "structure": structure,
-        "embeddings": embeddings,
+        # Retained as an empty compatibility field so old cache readers fail
+        # safely while new restores never require vector-index embeddings.
+        "embeddings": embeddings or [],
         "metadata": metadata,
     }
     handle, temporary_name = tempfile.mkstemp(

@@ -215,7 +215,7 @@ def test_split_parents_all_similar_single_group(monkeypatch):
     assert len(split_parents(pages, threshold=0.5)) == 1
 
 
-def test_arabic_book_headings_override_high_semantic_similarity(monkeypatch):
+def test_arabic_book_headings_do_not_override_semantic_similarity(monkeypatch):
     pages = [
         _page([_heading("الوحدة 6"), _body("مقدمة الجهاز العصبي.")], 21),
         _page([_heading("القسم 1"), _heading("تركيب الجهاز العصبي"), _body("تتكون الخلية العصبية من أجزاء.")], 23),
@@ -223,9 +223,21 @@ def test_arabic_book_headings_override_high_semantic_similarity(monkeypatch):
     ]
     monkeypatch.setattr(sc, "dense_vector", lambda texts: [list(E)] * len(texts))
     groups = split_parents(pages, threshold=0.5)
-    assert len(groups) == 3
-    assert groups[1][0].text == "القسم 1"
-    assert groups[2][0].text == "2 القسم"
+    assert len(groups) == 1
+    assert groups[0][0].text == "الوحدة 6"
+
+
+def test_parent_policy_preserves_and_merges_tiny_source_groups(monkeypatch):
+    monkeypatch.setattr(sc, "PARENT_MERGE_TOKENS", 20)
+    groups = [
+        [Paragraph("tiny", order=0)],
+        [Paragraph("substantial source content " * 20, order=1)],
+        [Paragraph("tail", order=2)],
+    ]
+    parents = build_parents(groups, "d1")
+    assert [unit.order for parent in parents for unit in parent.source_items or []] == [0, 1, 2]
+    assert "tiny" in " ".join(parent.content for parent in parents)
+    assert "tail" in " ".join(parent.content for parent in parents)
 
 
 def test_build_children_uses_real_source_pages(monkeypatch):

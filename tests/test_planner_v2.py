@@ -269,7 +269,7 @@ def test_duplicate_task_key_crosses_question_types_and_ignores_difficulty():
     assert any("duplicates the planned reasoning task" in error for error in errors)
 
 
-def test_same_relationship_with_different_target_is_allowed():
+def test_same_task_family_targets_require_explicit_reuse_metadata():
     plans = [{
         "model_number": 1,
         "items": {
@@ -283,9 +283,10 @@ def test_same_relationship_with_different_target_is_allowed():
             )],
         },
     }]
-    assert planner.validate_plans(
+    errors = planner.validate_plans(
         plans, [("mcq", 1), ("word_problem", 1)], 1, {"chunk-a"}
-    ) == []
+    )
+    assert any("duplicates catalog task" in error for error in errors)
 
 
 def test_symbolic_formula_aliases_conflict_before_generation():

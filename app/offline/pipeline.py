@@ -9,13 +9,13 @@ from app.logging_conf import get_logger, set_request_id
 from app.offline.chunk_report import save_chunk_report
 from app.offline.cleaner import clean_pages
 from app.offline.dump_outputs import save_chunk_dump, save_parse_dump
-from app.offline.embeddings import embed_texts
 from app.offline.parser import LlamaParser
 from app.offline.parser_items import item_text, page_items
 from app.offline.processed_cache import (
     file_sha256,
     load_processed_document,
     materialize_for_document,
+    processing_versions,
     processed_document_key,
     save_processed_document,
 )
@@ -24,7 +24,7 @@ from app.offline.semantic_chunker import (
     verify_chunk_invariants,
 )
 from app.offline.structure_store import save_structure
-from app.offline.vector_store import VectorStore
+from app.offline.chunk_store import ChunkStore
 
 logger = get_logger("PIPELINE")
 
@@ -47,7 +47,7 @@ def run_pipeline(
     is_cancelled: Callable[[], bool] | None = None,
     file_sha256_value: str | None = None,
 ) -> dict[str, Any]:
-    """Execute PDF parsing, cleaning, chunking, embedding, and indexing."""
+    """Execute PDF parsing, cleaning, chunking, and PostgreSQL persistence."""
     set_request_id(document_id)
     path = Path(file_path)
     if not path.exists():
@@ -71,16 +71,12 @@ def run_pipeline(
         checkpoint("reusing_processed_document")
         t0 = time.perf_counter()
         chunks = materialize_for_document(cached["structure"], document_id)
-        embeddings = list(cached["embeddings"])
         children = chunks.get("children") or []
         parents = chunks.get("parents") or []
-        if len(children) != len(embeddings):
-            raise PipelineError("Cached processed document has mismatched chunks and embeddings")
-        store = VectorStore()
-        store.ensure_collection()
-        store.delete_document(document_id, session_id=session_id)
-        vectors_uploaded = store.upsert(
-            children, embeddings, session_id=session_id, job_id=job_id
+        chunks_stored = ChunkStore().replace_document(
+            chunks, document_id=document_id, session_id=session_id, job_id=job_id,
+            processed_document_key=processed_key,
+            processing_versions=cached.get("processing_versions") or {},
         )
         structures_path = save_structure(document_id, chunks)
         timings["cache_restore"] = time.perf_counter() - t0
@@ -96,7 +92,7 @@ def run_pipeline(
             "total_pages": int(metadata.get("total_pages") or 0),
             "total_parents": len(parents),
             "total_children": len(children),
-            "vectors_stored": vectors_uploaded,
+            "chunks_stored": chunks_stored,
             "document_language": metadata.get("document_language") or "en",
             "domain_type": metadata.get("domain_type") or "",
             "subject": metadata.get("subject") or "",
@@ -179,10 +175,15 @@ def run_pipeline(
             )
             for warning in warnings:
                 logger.warning("  - %s", warning)
+            fatal = [warning for warning in warnings if warning.startswith("FATAL ")]
+            if fatal:
+                raise PipelineError(
+                    "Processed document failed source-integrity recovery; existing stored data was retained"
+                )
         else:
             logger.info("Chunk invariants OK | document_id=%s", document_id)
 
-        # --- Stage 3b: Chunking evaluation report (before Qdrant) ------------
+        # --- Stage 3b: Chunking evaluation report ----------------------------
         t0 = time.perf_counter()
         chunk_report_path = save_chunk_report(document_id, chunks)
         timings["chunk_report"] = time.perf_counter() - t0
@@ -192,22 +193,9 @@ def run_pipeline(
         chunk_dump_path = save_chunk_dump(document_id, chunk_report_path)
         timings["chunk_dump"] = time.perf_counter() - t0
 
-        # --- Stage 4: Embed children only (retrieval units) ------------------
-        t0 = time.perf_counter()
-        child_texts = [c["content"] for c in children]
-        checkpoint()
-        embeddings = embed_texts(child_texts)
-        checkpoint()
-        timings["embeddings"] = time.perf_counter() - t0
-        if len(embeddings) != len(children):
-            raise PipelineError(
-                f"Embedding count mismatch: {len(embeddings)} vs {len(children)}"
-            )
-
         save_processed_document(
             content_sha256,
             structure=chunks,
-            embeddings=embeddings,
             metadata={
                 "total_pages": len(pages),
                 "document_language": document_language,
@@ -216,17 +204,16 @@ def run_pipeline(
             },
         )
 
-        # --- Stage 5: Store children in Qdrant -------------------------------
+        # --- Stage 4: Store parent and child chunks in PostgreSQL ------------
         t0 = time.perf_counter()
-        store = VectorStore()
         checkpoint()
-        store.ensure_collection()
-        store.delete_document(document_id, session_id=session_id)
-        vectors_uploaded = store.upsert(
-            children, embeddings, session_id=session_id, job_id=job_id
+        chunks_stored = ChunkStore().replace_document(
+            chunks, document_id=document_id, session_id=session_id, job_id=job_id,
+            processed_document_key=processed_key,
+            processing_versions=processing_versions(),
         )
         checkpoint()
-        timings["qdrant_upload"] = time.perf_counter() - t0
+        timings["postgres_chunk_store"] = time.perf_counter() - t0
 
         # --- Stage 6: Persist parent structure (sections) to JSON ------------
         t0 = time.perf_counter()
@@ -257,7 +244,7 @@ def run_pipeline(
         "total_pages": len(pages),
         "total_parents": len(parents),
         "total_children": len(children),
-        "vectors_stored": vectors_uploaded,
+            "chunks_stored": chunks_stored,
         "document_language": document_language,
         "domain_type": chunks["domain_type"],
         "subject": chunks["subject"],
@@ -276,16 +263,15 @@ def run_pipeline(
     logger.info("Chunking .......... %.3f sec", timings.get("chunking", 0))
     logger.info("Overlap Check ..... %.3f sec", timings.get("overlap_check", 0))
     logger.info("Chunk Report ...... %.3f sec", timings.get("chunk_report", 0))
-    logger.info("Embeddings ........ %.3f sec", timings.get("embeddings", 0))
-    logger.info("Qdrant Upload ..... %.3f sec", timings.get("qdrant_upload", 0))
+    logger.info("PostgreSQL Chunks . %.3f sec", timings.get("postgres_chunk_store", 0))
     logger.info("Structure Save .... %.3f sec", timings.get("structure_save", 0))
     logger.info("Total Pipeline .... %.3f sec", total)
     logger.info(
-        "pages=%d | parents=%d | children=%d | vectors_stored=%d | status=SUCCESS",
+        "pages=%d | parents=%d | children=%d | chunks_stored=%d | status=SUCCESS",
         len(pages),
         len(parents),
         len(children),
-        vectors_uploaded,
+        chunks_stored,
     )
     logger.info("=" * 70)
     return summary

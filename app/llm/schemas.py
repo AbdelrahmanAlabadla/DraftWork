@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, create_model
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
 
@@ -35,6 +35,24 @@ QuestionType = Literal[
 
 class StrictOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class TaskVariation(StrictOutputModel):
+    """One exact, source-supported assessment angle for a reusable task."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    target: NonEmptyString
+    operation: NonEmptyString
+    givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
+    question_types: list[QuestionType] = Field(default_factory=list)
+    evidence_chunk_ids: list[NonEmptyString] | None = Field(default=None, max_length=4)
+    reasoning_mode: ReasoningMode | None = None
+    student_work_product: NonEmptyString | None = None
+    representation: NonEmptyString | None = Field(default=None, alias="form")
+    application: NonEmptyString | None = Field(default=None, alias="context")
+    numeric_values_may_change: StrictBool = Field(default=False, alias="vary_numbers")
+    variation_id: str | None = None
 
 
 def strict_json_schema(model: type[BaseModel]) -> dict:
@@ -114,6 +132,12 @@ class PlanItem(StrictOutputModel):
     given_conditions: list[NonEmptyString] = Field(max_length=12)
     scenario_family: str | None = Field(max_length=160)
     required_givens: list[NonEmptyString] = Field(max_length=12)
+    allowed_variations: list[TaskVariation] = Field(default_factory=list)
+    permitted_variations: list[TaskVariation] = Field(default_factory=list)
+    primary_question_types: list[QuestionType] = Field(default_factory=list)
+    variable_givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
+    complexity_boundaries: list[NonEmptyString] = Field(default_factory=list, max_length=8)
+    exact_source_instance: bool = False
     text_answerable: bool
     reasoning_mode: ReasoningMode
     difficulty: Literal["easy", "medium", "hard"]
@@ -191,6 +215,7 @@ class SolutionCertificate(StrictOutputModel):
 
 class MCQQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     question: str = Field(min_length=1)
     options: MCQOptions
     correct_answer: Literal["A", "B", "C", "D"]
@@ -199,6 +224,7 @@ class MCQQuestion(StrictOutputModel):
 
 class TrueFalseQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     statement: str = Field(min_length=1)
     answer: Literal["True", "False"]
     solution_certificate: SolutionCertificate | None = None
@@ -206,6 +232,7 @@ class TrueFalseQuestion(StrictOutputModel):
 
 class FITBQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     stem: str = Field(min_length=1)
     distractor_1: str = Field(min_length=1)
     distractor_2: str = Field(min_length=1)
@@ -213,6 +240,7 @@ class FITBQuestion(StrictOutputModel):
 
 class WhyQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     question: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
     solution_certificate: SolutionCertificate | None = None
@@ -220,6 +248,7 @@ class WhyQuestion(StrictOutputModel):
 
 class DefinitionQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     term: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
     solution_certificate: SolutionCertificate | None = None
@@ -227,6 +256,7 @@ class DefinitionQuestion(StrictOutputModel):
 
 class EquationQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     equation: str = Field(min_length=1)
     solution_steps: list[NonEmptyString] = Field(min_length=1)
     final_answer: str = Field(min_length=1)
@@ -235,6 +265,7 @@ class EquationQuestion(StrictOutputModel):
 
 class WordProblemQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     question: str = Field(min_length=1)
     solution_steps: list[NonEmptyString] = Field(min_length=1)
     final_answer: str = Field(min_length=1)
@@ -243,6 +274,7 @@ class WordProblemQuestion(StrictOutputModel):
 
 class EssayQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
+    selected_variation_id: str | None = None
     question: str = Field(min_length=1)
     reference_answer: str = Field(min_length=1)
     key_points: list[NonEmptyString] = Field(min_length=1)
@@ -430,6 +462,47 @@ _REPAIR_QUESTIONS: dict[str, type[StrictOutputModel]] = {
     "essay": RepairEssayQuestion,
 }
 
+_REPAIR_PATCH_FIELDS: dict[str, dict[str, object]] = {
+    "mcq": {
+        "question": NonEmptyString, "options": MCQOptions,
+        "correct_answer": Literal["A", "B", "C", "D"],
+        "solution_certificate": SolutionCertificate,
+    },
+    "true_false": {
+        "statement": NonEmptyString, "answer": Literal["True", "False"],
+        "solution_certificate": SolutionCertificate,
+    },
+    "fill_in_the_blank": {
+        "question": NonEmptyString,
+        "distractors": Annotated[list[NonEmptyString], Field(min_length=2, max_length=2)],
+    },
+    "definition": {
+        "term": NonEmptyString, "reference_answer": NonEmptyString,
+        "solution_certificate": SolutionCertificate,
+    },
+    "why": {
+        "question": NonEmptyString, "reference_answer": NonEmptyString,
+        "solution_certificate": SolutionCertificate,
+    },
+    "equation": {
+        "equation": NonEmptyString,
+        "solution_steps": Annotated[list[NonEmptyString], Field(min_length=1)],
+        "final_answer": NonEmptyString,
+        "solution_certificate": SolutionCertificate,
+    },
+    "word_problem": {
+        "question": NonEmptyString,
+        "solution_steps": Annotated[list[NonEmptyString], Field(min_length=1)],
+        "final_answer": NonEmptyString,
+        "solution_certificate": SolutionCertificate,
+    },
+    "essay": {
+        "question": NonEmptyString, "reference_answer": NonEmptyString,
+        "key_points": Annotated[list[NonEmptyString], Field(min_length=1)],
+        "solution_certificate": SolutionCertificate,
+    },
+}
+
 
 def _literal(values: list[str]):
     unique = tuple(dict.fromkeys(str(value) for value in values if str(value)))
@@ -577,16 +650,27 @@ def global_exam_review_response_model(question_ids: list[str]):
     )
 
 
-def repair_response_model(items: list[tuple[str, str]]):
+def repair_response_model(items: list[tuple[str, str, list[str]]]):
+    """Build an exact, per-question patch contract from authorized fields."""
     repair_models = []
-    for index, (question_id, qtype) in enumerate(items, start=1):
+    for index, (question_id, qtype, fields) in enumerate(items, start=1):
+        definitions = _REPAIR_PATCH_FIELDS[qtype]
+        patch_fields = {
+            field: (definitions[field], ...)
+            for field in fields
+            if field in definitions
+        }
+        if not patch_fields:
+            raise ValueError(f"No authorized repair fields for {question_id}")
+        patch_model = create_model(
+            f"RepairPatch{index}", __base__=StrictOutputModel, **patch_fields,
+        )
         repair_models.append(
             create_model(
                 f"RepairItem{index}",
                 __base__=StrictOutputModel,
                 question_id=(_literal([question_id]), ...),
-                repaired_fields=(list[NonEmptyString], ...),
-                question=(_REPAIR_QUESTIONS[qtype], ...),
+                patch=(patch_model, ...),
             )
         )
     item_type = Union[tuple(repair_models)] if len(repair_models) > 1 else repair_models[0]

@@ -4,6 +4,8 @@ import json
 
 from typing import Any
 
+from app.language import source_notation
+
 SYSTEM_PROMPT = (
     "You are an assessment-aware exam question generator for teachers. "
     "Your task is to realize each supplied assessment-catalog task as a high-quality "
@@ -15,45 +17,56 @@ SYSTEM_PROMPT = (
     "- Neutral constructed numbers and givens are allowed for a self-contained quantitative "
     "problem when the catalog task and assessment guidance permit calculation or modeling. "
     "They are problem data, not claims about the source, and must not be presented as source facts.\n"
-    "- Preserve any plan givens marked as required or fixed. Never invent a missing scientific "
-    "constant, factual value, law, condition, or source-specific example.\n\n"
+    "- Preserve every required_givens value: these are invariant laws, constants, facts, or "
+    "constraints. variable_givens are authorized exercise parameters and may be replaced with "
+    "self-contained values that satisfy the relationship and constraints. When "
+    "exact_source_instance is true, preserve the source instance exactly.\n\n"
 
     "=== QUESTION GENERATION RULES ===\n"
     "- Generate completely NEW questions based on the document content.\n"
     "- Do NOT copy existing questions from the document.\n"
     "- Do NOT simply change a few words from sentences in the document.\n"
     "- Convert explanations and concepts into exam questions that test student understanding.\n"
-    "- Follow the assigned catalog task exactly. Preserve its concept/knowledge target, student "
-    "operation, target/result, reasoning mode, required output/work product, required givens, and "
-    "assigned evidence. Being on the same broad topic is not sufficient. For example, interpreting "
-    "a common solution region must not become checking whether one point satisfies a system.\n"
-    "- You may vary permitted wording, scenario details, and neutral constructed givens, but never "
-    "silently change what knowledge, operation, result, reasoning, or output the student is assessed on.\n"
+    "- For every task, preserve its concept/knowledge target, required knowledge, invariant givens, complexity "
+    "boundaries, question type, difficulty, and assigned evidence. The base operation, target, "
+    "reasoning mode, and work product may change only to a bounded allowed_variations object that "
+    "explicitly names the supported target, operation, givens, and any representation/application. "
+    "Being on the same broad topic is not sufficient: solving a system and interpreting "
+    "a common solution region are different assessment operations and require explicit support.\n"
+    "- You may vary permitted wording and scenario details. Change numerical variable_givens only "
+    "when the chosen variation says numeric_values_may_change=true. Never introduce an unlisted "
+    "concept, unsupported operation, advanced method, or factual claim.\n"
+    "- Each task supplies permitted_variations, including its primary angle. Choose exactly one whose "
+    "question_types contains the assigned question type. Return its variation_id in selected_variation_id. "
+    "Use that variation's evidence_chunk_ids when present; otherwise inherit the task's assigned evidence. "
+    "Make the question, answer, and solution match the selected target, operation, givens, reasoning, "
+    "representation, and application. Never select a variation from another task.\n"
     "- Recall is legitimate for Definition, Fill-in-the-Blank, and recall-oriented True/False "
     "tasks when the plan explicitly requests it. Do not inflate such tasks into unrelated reasoning.\n"
     "- If task_reused is true, inspect previous_task_questions (including rejected/conflict roles) "
     "and previous_task_plan_items, then follow suggested_assessment_angle and satisfy every "
     "required_instance_distinction through a different target, required "
     "method, representation, constraint structure, direction of reasoning, or application that "
-    "requires independent work. Different wording, names, scenarios, or numbers alone do not count.\n"
+    "requires independent work. Prefer a different source-supported representation or procedure. "
+    "When reuse_mode is intentional_practice_variation and the evidence supports only the same "
+    "method, a genuinely different numerical instance is allowed if every dependent answer, option, "
+    "calculation, and solution step is independently recalculated. Wording alone never counts. "
+    "Within one response, compare every same-task slot with the other same-task slots before returning; "
+    "do not repeat the same target, givens, reasoning path, and answer structure when an authorized "
+    "alternative remains. Previous selected_variation_id values are diversity context, not a one-use rule; "
+    "the same variation may be selected again for a genuinely different valid assessment.\n"
     "- Match the stored educational level and assessment style.\n\n"
 
     "=== QUESTION CLARITY RULES ===\n"
-    "- Every question must be self-contained.\n"
-    "- A student should understand the question without seeing the document context.\n"
-    "- Do not refer to the source material inside questions.\n"
-    "- Never use phrases such as:\n"
-    "  * 'According to the context'\n"
-    "  * 'According to the document'\n"
-    "  * 'Based on the provided information'\n"
-    "  * 'Based on the text'\n"
-    "  * 'In the passage'\n"
-    "  * 'From the given context'\n"
-    "- Never use phrases that describe the source of information, including "
-    "'according to the analysis', 'as shown in the figure', 'as discussed above', "
-    "'the following example shows', or similar phrases.\n"
-    "- Do not create reading-comprehension style questions.\n"
-    "- Do not mention that the information came from a PDF, document, chapter, or context.\n\n"
+    "- Every question must be self-contained: a student must understand and answer it "
+    "without seeing the source material.\n"
+    "- Never reference the source of information. Do not cite or allude to the document, "
+    "passage, context, chapter, PDF, or 'provided information', and avoid phrasings such as "
+    "'according to the context', 'in the passage', 'based on the text', 'as discussed above', "
+    "or 'the following example shows'.\n"
+    "- A question may reference a figure, table, equation, or data set that is actually printed "
+    "inside the question itself; that is part of a self-contained problem, not source citation.\n"
+    "- Do not create reading-comprehension questions.\n\n"
 
     "=== ANSWER QUALITY RULES ===\n"
     "- Correct answers must follow from the assigned evidence and the givens stated in the question.\n"
@@ -75,11 +88,16 @@ SYSTEM_PROMPT = (
     "- Self-check every question and answer before output.\n\n"
 
     "=== OUTPUT RULES ===\n"
-    "- Generate EXACTLY the requested number of questions.\n"
+    "- Generate exactly one valid question for every viable planned slot and copy each "
+    "slot_id exactly. If an MCQ task cannot support one best answer with three plausible "
+    "alternatives, report it through unsuitable_tasks instead of fabricating content; the "
+    "recovery mechanism reassigns that slot. Never invent content merely to fill a slot.\n"
     "- Return ONLY valid JSON.\n"
     "- Do not include markdown fences.\n"
     "- Do not include explanations before or after the JSON.\n"
-    "- Every required field must exist and contain a non-empty value."
+    "- Every required field must be present. A field the schema marks nullable may be null only "
+    "where that is the correct representation (for example solution_certificate on a "
+    "non-quantitative item). Never null a mandatory field to avoid producing required content."
 )
 
 _OUTPUT_DIRECTIVE = (
@@ -171,6 +189,68 @@ def _language_block(language: str | None) -> str:
     )
 
 
+def _notation_block(
+    language: str | None,
+    planned_items: list[dict[str, Any]] | None,
+    context: str = "",
+) -> str:
+    """Source-aware mathematical-notation policy for Arabic STEM output.
+
+    Arabic natural language does not mean all symbols become Arabic. The
+    source's own notation is authoritative: this derives a small deterministic
+    policy from the assigned evidence and instructs the model to preserve
+    variables, digits, units, and formula structure rather than transliterating
+    them. Only emitted for Arabic outputs.
+    """
+    if language != "ar":
+        return ""
+    source_text = context or ""
+    if planned_items:
+        gathered = [
+            str(value)
+            for item in planned_items
+            if isinstance(item.get("assigned_sources"), dict)
+            for value in (item.get("assigned_sources") or {}).values()
+        ]
+        if gathered:
+            source_text = "\n".join(gathered)
+    notation = source_notation(source_text)
+    if notation["digits"] == "western":
+        digit_rule = (
+            "Keep Western digits (0-9) exactly as the source uses them; do not "
+            "convert numbers to Arabic-Indic numerals (٠-٩)."
+        )
+    elif notation["digits"] == "arabic_indic":
+        digit_rule = (
+            "Keep the source's Arabic-Indic numerals (٠-٩) where it uses them; do "
+            "not convert them to Western digits."
+        )
+    elif notation["digits"] == "mixed":
+        digit_rule = (
+            "Preserve each number's original digit style exactly as the source "
+            "presents it; do not convert between Western and Arabic-Indic digits."
+        )
+    else:
+        digit_rule = (
+            "Preserve the source's digit style; do not change how numbers are written."
+        )
+    return (
+        "## Mathematical Notation (Arabic output)\n"
+        "Write the natural language in Arabic, but do NOT translate mathematical "
+        "notation. The source's own convention is authoritative:\n"
+        f"- Preserve every variable and symbol exactly as the source presents it. "
+        "When the source uses Latin letters (for example x, y, m, F), keep Latin "
+        "letters; never convert them to Arabic letters (x → س) or vice versa.\n"
+        f"- {digit_rule}\n"
+        "- Preserve units, operators, standard constants, functions, and formula "
+        "structure unchanged.\n"
+        "- Keep mathematical expressions written left-to-right inside RTL text and "
+        "always in valid LaTeX. Never change the mathematical meaning.\n"
+        "- If the source notation is ambiguous, leave existing expressions as they "
+        "are rather than forcing a transliteration.\n\n"
+    )
+
+
 def _version_note(model_number: int) -> str:
     return (
         f"This question set is Exam Model #{model_number} "
@@ -196,8 +276,6 @@ MCQ_RULES = (
     "- Distractors must be plausible and knowledge-based — they should represent "
     "common misconceptions or related-but-incorrect concepts, not obviously wrong "
     "or random unrelated facts.\n"
-    "- Correct answer letter (A/B/C/D) must be evenly distributed across a batch: "
-    "no single letter may appear more than 50% of the time.\n"
     "- Options must use parallel, readable forms. Numeric and symbolic options may be concise values "
     "or expressions rather than complete sentences.\n"
     "- Keep options reasonably parallel in length, grammar, detail, specificity, and tone. The "
@@ -749,11 +827,12 @@ def build_prompt(
         plan_block = (
             f"## Question Plan\n"
             f"Generate EXACTLY one question per entry below. Each entry is an isolated evidence "
-            f"boundary: use only that entry's assigned_sources and never borrow facts, equations, "
-            f"values, conditions, or examples from another entry. Follow its assessment_guidance, "
-            f"task_operation, relationship, target, reasoning_mode, reasoning_depth, "
-            f"reasoning_requirements, idea, and difficulty. The per-slot difficulty controls "
-            f"each question for fixed and mixed requests. "
+            f"boundary: use only the Evidence Registry chunks named by that entry's "
+            f"source_chunk_id and support_chunk_ids, and never borrow facts, equations, "
+            f"values, conditions, or examples from another entry. Follow the Assessment Guidance "
+            f"block and each entry's task_operation, relationship, target, reasoning_mode, "
+            f"reasoning_depth, reasoning_requirements, idea, and difficulty. The per-slot "
+            f"difficulty controls each question for fixed and mixed requests. "
             f"Do not deviate from the planned concepts and "
             f"do not introduce unplanned concepts.\n{plan_lines}\n\n"
         )
@@ -764,7 +843,7 @@ def build_prompt(
         isinstance(item.get("assigned_sources"), dict) for item in planned_items or []
     )
     source_context = (
-        "Evidence is attached separately to every plan entry below."
+        "Authorized evidence is listed once in the Evidence Registry below."
         if isolated_entries else context
     )
     user_prompt = (
@@ -775,6 +854,10 @@ def build_prompt(
         "the Required JSON Format at the end.\n\n"
 
         f"## Selected Source Content\n{source_context}\n\n"
+
+        f"{_evidence_registry_block(planned_items if isolated_entries else None)}"
+
+        f"{_assessment_guidance_block(planned_items)}"
 
         f"{plan_block}"
 
@@ -788,6 +871,8 @@ def build_prompt(
 
         f"{_language_block(language)}"
 
+        f"{_notation_block(language, planned_items, context)}"
+
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
         f"## Task\nGenerate exactly {count} {type_name} exam question(s) following "
@@ -799,55 +884,188 @@ def build_prompt(
     return SYSTEM_PROMPT, user_prompt
 
 
+def _json_value(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _format_planned_item(index: int, item: dict[str, Any]) -> str:
+    """Render one plan entry compactly, omitting empty/optional metadata.
+
+    The persisted plan record keeps every field; only the generator payload is
+    trimmed. Authoritative task identity, difficulty, reasoning requirements,
+    required givens, and the entry's evidence chunk IDs are always present; the
+    chunk text is rendered once by the prompt builders' Evidence Registry.
+    Reuse, repair, difficulty-adaptation, and FITB context is attached only when
+    it applies, so ordinary slots never carry empty recovery structures or the
+    full task inventory. Per-request assessment guidance is rendered once by the
+    prompt builders instead of being repeated on every entry.
+    """
+    tokens: list[str] = [f"slot_id={item.get('slot_id', '')}"]
+
+    # Authoritative catalog/FITB identity (omit absent identifiers only).
+    for key in (
+        "task_id",
+        "fitb_entry_id",
+        "task_family_id",
+        "coverage_id",
+        "concept_id",
+        "relationship_id",
+    ):
+        value = item.get(key)
+        if value not in (None, ""):
+            tokens.append(f"{key}={value}")
+
+    source_chunk_id = item.get("source_chunk_id")
+    if source_chunk_id not in (None, ""):
+        tokens.append(f"source_chunk_id={source_chunk_id}")
+    tokens.append(f"support_chunk_ids={item.get('support_chunk_ids', [])}")
+
     relationship = item.get("relationship")
-    relationship_text = "null" if relationship is None else str(relationship)
+    tokens.append(f"topic={item.get('topic', '')}")
+    tokens.append(f"concept={item.get('concept', item.get('topic', ''))}")
+    tokens.append(f"canonical_skill={item.get('canonical_skill', '')}")
+    tokens.append(f"knowledge_focus={item.get('knowledge_focus', '')}")
+    tokens.append(f"student_work_product={item.get('student_work_product', '')}")
+    tokens.append(f"relationship={'null' if relationship is None else relationship}")
+    tokens.append(f"target={item.get('target', '')}")
+    tokens.append(f"task_operation={item.get('task_operation', '')}")
+
+    given_conditions = item.get("given_conditions") or []
+    if given_conditions:
+        tokens.append(f"given_conditions={given_conditions}")
+    if item.get("scenario_family"):
+        tokens.append(f"scenario_family={item.get('scenario_family')}")
+    tokens.append(f"required_givens={item.get('required_givens', [])}")
+    tokens.append(f"variable_givens={item.get('variable_givens', [])}")
+    tokens.append(f"allowed_variations={item.get('allowed_variations', [])}")
+    tokens.append(f"complexity_boundaries={item.get('complexity_boundaries', [])}")
+    tokens.append(f"exact_source_instance={bool(item.get('exact_source_instance', False))}")
+
+    tokens.append(f"reasoning_mode={item.get('reasoning_mode', '')}")
+    tokens.append(f"reasoning_depth={item.get('reasoning_depth', '')}")
+    tokens.append(f"reasoning_requirements={item.get('reasoning_requirements', [])}")
+    prerequisites = item.get("prerequisites") or []
+    if prerequisites:
+        tokens.append(f"prerequisites={prerequisites}")
+
+    tokens.append(f"requested_difficulty={item.get('requested_difficulty', '')}")
+    tokens.append(f"difficulty={item.get('difficulty', '')}")
+    tokens.append(
+        f"actual_difficulty={item.get('actual_difficulty', item.get('difficulty', ''))}"
+    )
+    adaptation = item.get("difficulty_adaptation")
+    if adaptation:
+        tokens.append(f"difficulty_adaptation={_json_value(adaptation)}")
+    fallback_reason = item.get("difficulty_fallback_reason")
+    if fallback_reason:
+        tokens.append(f"difficulty_fallback_reason={fallback_reason}")
+
+    tokens.append(
+        f"idea_to_test={item.get('idea_to_test', item.get('concept_to_test', ''))}"
+    )
+
+    # FITB: the compiler-owned answer and clue basis (answer is never rewritten).
+    fitb_answer = item.get("fitb_answer")
+    if fitb_answer is not None:
+        tokens.append(f"fitb_answer={fitb_answer}")
+    clue_basis = item.get("clue_basis")
+    if clue_basis:
+        tokens.append(f"clue_basis={clue_basis}")
+
+    # Reuse / replacement / repair context (attached only when it applies).
+    if item.get("task_reused"):
+        tokens.append("task_reused=True")
+    if item.get("fitb_entry_reused"):
+        tokens.append("fitb_entry_reused=True")
+    if item.get("fitb_answer_reused"):
+        tokens.append("fitb_answer_reused=True")
+    for key in (
+        "reuse_mode",
+        "reuse_reason",
+        "reuse_justification",
+        "catalog_replacement_stage",
+        "reused_task_id",
+        "intended_variation",
+        "suggested_assessment_angle",
+    ):
+        value = item.get(key)
+        if value:
+            tokens.append(f"{key}={value}")
+    distinctions = item.get("required_instance_distinctions") or []
+    if distinctions:
+        tokens.append(f"required_instance_distinctions={distinctions}")
+
+    previous_plan = item.get("previous_task_plan_items") or []
+    if previous_plan:
+        tokens.append(f"previous_task_plan_items={_json_value(previous_plan)}")
+    previous_questions = item.get("previous_task_questions") or []
+    if previous_questions:
+        tokens.append(f"previous_task_questions={_json_value(previous_questions)}")
+
+    return f"{index}. " + " | ".join(tokens)
+
+
+def _evidence_registry_block(
+    planned_items: list[dict[str, Any]] | None,
+) -> str:
+    """Render each authorized source chunk's text exactly once per request.
+
+    Every plan entry names its evidence boundary through ``source_chunk_id`` and
+    ``support_chunk_ids``. Sharing the unique chunk text once (instead of
+    repeating it on every entry) removes duplicate evidence bytes while keeping
+    source isolation enforceable: a slot may use only the chunk IDs it names.
+    """
+    if not planned_items:
+        return ""
+    ordered: dict[str, str] = {}
+    for item in planned_items:
+        sources = item.get("assigned_sources")
+        if not isinstance(sources, dict):
+            continue
+        for chunk_id, text in sources.items():
+            key = str(chunk_id)
+            if key and key not in ordered:
+                ordered[key] = str(text)
+    if not ordered:
+        return ""
+    rendered = "\n\n".join(
+        f"[source_chunk_id={chunk_id}]\n{text}"
+        for chunk_id, text in ordered.items()
+    )
     return (
-        f"{index}. slot_id={item.get('slot_id', '')} | "
-        f"task_id={item.get('task_id', '')} | "
-        f"fitb_entry_id={item.get('fitb_entry_id', '')} | "
-        f"task_family_id={item.get('task_family_id', '')} | "
-        f"coverage_id={item.get('coverage_id', '')} | "
-        f"concept_id={item.get('concept_id', '')} | "
-        f"relationship_id={item.get('relationship_id')} | "
-        f"source_chunk_id={item.get('source_chunk_id', '')} | topic={item.get('topic', '')} | "
-        f"support_chunk_ids={item.get('support_chunk_ids', [])} | "
-        f"concept={item.get('concept', item.get('topic', ''))} | "
-        f"canonical_skill={item.get('canonical_skill', '')} | "
-        f"knowledge_focus={item.get('knowledge_focus', '')} | "
-        f"student_work_product={item.get('student_work_product', '')} | "
-        f"relationship={relationship_text} | target={item.get('target', '')} | "
-        f"task_operation={item.get('task_operation', '')} | "
-        f"given_conditions={item.get('given_conditions', [])} | "
-        f"scenario_family={item.get('scenario_family')} | "
-        f"required_givens={item.get('required_givens', [])} | "
-        f"text_answerable={item.get('text_answerable')} | "
-        f"reasoning_mode={item.get('reasoning_mode', '')} | "
-        f"reasoning_depth={item.get('reasoning_depth', '')} | "
-        f"reasoning_requirements={item.get('reasoning_requirements', [])} | "
-        f"prerequisites={item.get('prerequisites', [])} | "
-        f"requested_difficulty={item.get('requested_difficulty', '')} | "
-        f"difficulty={item.get('difficulty', '')} | "
-        f"actual_difficulty={item.get('actual_difficulty', item.get('difficulty', ''))} | "
-        f"difficulty_adaptation={json.dumps(item.get('difficulty_adaptation'), ensure_ascii=False)} | "
-        f"difficulty_fallback_reason={item.get('difficulty_fallback_reason')} | "
-        f"idea_to_test={item.get('idea_to_test', item.get('concept_to_test', ''))} | "
-        f"task_reused={bool(item.get('task_reused'))} | "
-        f"fitb_entry_reused={bool(item.get('fitb_entry_reused'))} | "
-        f"fitb_answer={item.get('fitb_answer')} | "
-        f"normalized_fitb_answer={item.get('normalized_fitb_answer')} | "
-        f"clue_basis={item.get('clue_basis')} | "
-        f"reuse_reason={item.get('reuse_reason')} | "
-        f"catalog_replacement_stage={item.get('catalog_replacement_stage')} | "
-        f"fitb_answer_reused={bool(item.get('fitb_answer_reused'))} | "
-        f"required_instance_distinctions={item.get('required_instance_distinctions', [])} | "
-        f"suggested_assessment_angle={item.get('suggested_assessment_angle')} | "
-        f"reuse_justification={item.get('reuse_justification')} | "
-        f"task_inventory={json.dumps(item.get('task_inventory', {}), ensure_ascii=False)} | "
-        f"previous_task_plan_items={json.dumps(item.get('previous_task_plan_items', []), ensure_ascii=False)} | "
-        f"previous_task_questions={json.dumps(item.get('previous_task_questions', []), ensure_ascii=False)} | "
-        f"assessment_guidance={json.dumps(item.get('assessment_guidance', {}), ensure_ascii=False)} | "
-        f"assigned_sources={json.dumps(item.get('assigned_sources', {}), ensure_ascii=False)}"
+        "## Evidence Registry (authorized source text)\n"
+        "Each plan entry may use only the chunks its source_chunk_id and support_chunk_ids "
+        "name below. Never borrow facts, equations, values, conditions, or examples from a "
+        "chunk assigned to another entry.\n\n"
+        f"{rendered}\n\n"
+    )
+
+
+def _assessment_guidance_block(planned_items: list[dict[str, Any]] | None) -> str:
+    """Render per-request assessment guidance once per question type.
+
+    Guidance is identical for every slot of a type, so emitting it once avoids
+    repeating the same profile metadata (including ``unsupported_visual_tasks``)
+    on every entry.
+    """
+    blocks: list[str] = []
+    seen_keys: set[str] = set()
+    for item in planned_items or []:
+        guidance = item.get("assessment_guidance")
+        if not isinstance(guidance, dict) or not guidance:
+            continue
+        key = _json_value(guidance)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        qtype = str(guidance.get("question_type") or "questions")
+        blocks.append(f"- {qtype}: {key}")
+    if not blocks:
+        return ""
+    return (
+        "## Assessment Guidance (applies to every slot of its question type)\n"
+        + "\n".join(blocks)
+        + "\n\n"
     )
 
 
@@ -860,14 +1078,19 @@ def _plan_block(planned_items: list[dict[str, Any]] | None) -> str:
     )
     return (
         "## Question Plan\n"
-        "Each entry is an isolated evidence boundary; never use another entry's assigned_sources. "
+        "Each entry is an isolated evidence boundary; never use another entry's evidence. "
+        "Use only the Evidence Registry chunks named by that entry's source_chunk_id and "
+        "support_chunk_ids. "
         "The metadata controls assessment guidance, task_operation, concept, relationship, target, "
         "reasoning mode, and difficulty. Use the compiler-selected FITB answer for each slot. "
         "When task_reused or fitb_entry_reused is true, use previous_task_questions and "
         "previous_task_plan_items to create a substantially different "
         "assessment angle; context_role identifies the rejected duplicate, its conflict, or earlier "
-        "items from a reused task. Treat all of them as negative examples. Changing wording, names, "
-        "or numbers alone is insufficient. Follow suggested_assessment_angle and every structured "
+        "items from a reused task. Treat all of them as negative examples. Prefer a different "
+        "source-supported representation or procedure. For an authorized intentional_practice_variation, "
+        "a genuinely different numerical instance may be used as the final fallback when the source "
+        "supports only the same method; recalculate all dependent fields. Wording alone is insufficient. "
+        "Follow suggested_assessment_angle and every structured "
         "required_instance_distinction as mandatory constraints. "
         f"Do not introduce concepts unrelated to the plan.\n{plan_lines}\n\n"
     )
@@ -879,7 +1102,7 @@ def _entry_bounded_context(
     if planned_items and all(
         isinstance(item.get("assigned_sources"), dict) for item in planned_items
     ):
-        return "Evidence is attached separately to every plan entry below."
+        return "Authorized evidence is listed once in the Evidence Registry below."
     return fallback
 
 
@@ -902,6 +1125,10 @@ def build_fitb_items_prompt(
 
         f"## Selected Source Content\n{_entry_bounded_context(planned_items, context)}\n\n"
 
+        f"{_evidence_registry_block(planned_items)}"
+
+        f"{_assessment_guidance_block(planned_items)}"
+
         f"{_plan_block(planned_items)}"
 
         f"## Fixed answer for each slot\n{assigned_line}\n\n"
@@ -921,6 +1148,8 @@ def build_fitb_items_prompt(
         f"{_planned_difficulty_block(difficulty, planned_items)}\n\n"
 
         f"{_language_block(language)}"
+
+        f"{_notation_block(language, planned_items, context)}"
 
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 
@@ -1006,7 +1235,8 @@ def build_obj_bundled_prompt(
     plan_block = (
         "## Question Plan\nGenerate EXACTLY the planned counts below in their "
         "respective sections. Treat each entry as an isolated evidence boundary and never use "
-        "another entry's assigned_sources. Follow every slot's assessment_guidance, "
+        "another entry's evidence; use only the Evidence Registry chunks named by that entry's "
+        "source_chunk_id and support_chunk_ids. Follow the Assessment Guidance block and every slot's "
         "task_operation, relationship, target, reasoning_mode, reasoning_depth, "
         "reasoning_requirements, idea_to_test, and difficulty. The per-slot difficulty "
         "controls each question for fixed and mixed requests. Test ONLY the stated topics and concepts; do not "
@@ -1024,6 +1254,10 @@ def build_obj_bundled_prompt(
 
         f"## Selected Source Content\n{_entry_bounded_context([*mcq_planned, *tf_planned], context)}\n\n"
 
+        f"{_evidence_registry_block([*mcq_planned, *tf_planned])}"
+
+        f"{_assessment_guidance_block([*mcq_planned, *tf_planned])}"
+
         f"{plan_block}\n\n"
 
         f"## Multiple Choice Rules\n{MCQ_RULES}\n\n"
@@ -1038,6 +1272,8 @@ def build_obj_bundled_prompt(
         f"{_planned_difficulty_block(difficulty, [*mcq_planned, *tf_planned])}\n\n"
 
         f"{_language_block(language)}"
+
+        f"{_notation_block(language, [*mcq_planned, *tf_planned], context)}"
 
         f"## Exam Version\n{_version_note(model_number)}\n\n"
 

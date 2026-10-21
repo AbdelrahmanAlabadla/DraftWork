@@ -234,8 +234,13 @@
       </div>
     </div>
 
-    <div class="gen-status" id="genStatus">
-      <div class="gen-spinner"></div><span id="genStatusMsg">Generating exam — this may take a moment...</span>
+    <div class="gen-status" id="genStatus" role="status" aria-live="polite">
+      <div class="gen-status-content">
+        <div class="gen-status-summary">
+          <div class="gen-spinner"></div><span id="genStatusMsg">Generating exam — this may take a moment...</span>
+        </div>
+        <ol class="generation-workflow" id="generationWorkflow"></ol>
+      </div>
       <button type="button" class="stop-generation-btn" id="stopGenerationBtn" data-i18n="gen.stop">Stop generation</button>
     </div>
     <button class="generate-btn" id="generateBtn" data-i18n="gen.button">Generate Exam →</button>

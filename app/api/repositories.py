@@ -652,11 +652,20 @@ def update_job_progress(job_id: str, stage: str, progress: int) -> None:
     with db.connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
+                "SELECT stage, (request_data->>'exam_id') AS exam_id, progress FROM jobs WHERE id = %s",
+                (job_id,),
+            )
+            current = cursor.fetchone()
+            persisted_progress = max(
+                int(current[2] or 0) if current else 0,
+                max(0, min(100, progress)),
+            )
+            cursor.execute(
                 """UPDATE jobs SET stage = %s, progress = %s,
                           heartbeat_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
                    WHERE id = %s AND status = 'running'""",
-                (stage, max(0, min(100, progress)), job_id),
+                (stage, persisted_progress, job_id),
             )
             cursor.execute(
                 """UPDATE exams SET status = 'running', stage = %s,
@@ -664,7 +673,29 @@ def update_job_progress(job_id: str, stage: str, progress: int) -> None:
                    WHERE job_id = %s AND status IN ('queued', 'running', 'retrying')""",
                 (stage, job_id),
             )
+            previous_stage = current[0] if current else None
+            exam_id = current[1] if current else None
+            if exam_id and previous_stage != stage:
+                cursor.execute(
+                    """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
+                       VALUES (%s, %s, 'pipeline_stage', %s)""",
+                    (exam_id, stage, Jsonb({"progress": persisted_progress})),
+                )
         conn.commit()
+
+
+def list_job_pipeline_events(job_id: str) -> list[dict[str, Any]]:
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT e.stage, e.payload, e.created_at
+                     FROM exam_audit_events e
+                     JOIN exams x ON x.id = e.exam_id
+                    WHERE x.job_id = %s AND e.event_type = 'pipeline_stage'
+                    ORDER BY e.created_at, e.id""",
+                (job_id,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
 
 def heartbeat_job(job_id: str) -> None:

@@ -141,6 +141,18 @@ def _response_from_prompt(prompt: str) -> dict:
     }
 
 
+def _batch_response_from_prompt(prompt: str) -> dict:
+    payload = json.loads(prompt)
+    results = []
+    for entry in payload["tasks"]:
+        single = {
+            "task": entry["task"],
+            "assigned_evidence": entry["assigned_evidence"],
+        }
+        results.append(_response_from_prompt(json.dumps(single)))
+    return {"results": results}
+
+
 def test_adjustment_schema_is_a_strict_patch_and_enumerates_assigned_evidence():
     state = _state()
     original = state["plans"][0]["items"]["equation"][0]
@@ -264,9 +276,8 @@ def test_old_full_task_contract_shapes_are_rejected_with_exact_schema_error(
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
     assert item["actual_difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "failed"
+    assert item["difficulty_adaptation"]["status"] == "retained"
     assert "structured_response_invalid" in item["adjustment_failure_reason"]
-    assert "evidence_support" in audit["reason"]
     assert "adjusted_task" in audit["reason"]
     assert audit["model_decision"] == "invalid_response"
 
@@ -274,7 +285,7 @@ def test_old_full_task_contract_shapes_are_rejected_with_exact_schema_error(
 @pytest.mark.parametrize(
     ("mutate", "expected"),
     [
-        (lambda value: value.update(slot_id="other-slot"), "slot_id"),
+        (lambda value: value.update(slot_id="other-slot"), "slot ID"),
         (lambda value: value.update(evidence_support=["unknown-chunk"]), "evidence_support"),
         (lambda value: value.update(achieved_difficulty="medium"), "achieved_difficulty"),
         (
@@ -293,7 +304,7 @@ def test_invalid_identity_evidence_and_difficulty_retain_original(
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
     assert item["actual_difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "failed"
+    assert item["difficulty_adaptation"]["status"] == "retained"
     combined = " ".join([
         item["adjustment_failure_reason"], audit["reason"],
         *audit["rejection_reasons"],
@@ -349,7 +360,7 @@ def test_agent_decline_for_unsupported_transformation_retains_original(monkeypat
     assert audit["model_decision"] == "declined"
 
 
-def test_five_adjustments_run_concurrently_and_merge_in_slot_order(monkeypatch):
+def test_three_task_batches_run_concurrently_and_merge_in_slot_order(monkeypatch):
     state = _multi_state(7)
     lock = threading.Lock()
     active = 0
@@ -359,15 +370,18 @@ def test_five_adjustments_run_concurrently_and_merge_in_slot_order(monkeypatch):
 
     def fake_request(_client, prompt, **_kwargs):
         nonlocal active, maximum
-        slot_id = json.loads(prompt)["task"]["immutable_identifiers"]["slot_id"]
+        slot_ids = [
+            entry["task"]["immutable_identifiers"]["slot_id"]
+            for entry in json.loads(prompt)["tasks"]
+        ]
         with lock:
             active += 1
             maximum = max(maximum, active)
-            calls.append(slot_id)
+            calls.extend(slot_ids)
             contexts.append(current_job_id())
         # Reverse completion order within each wave to prove merge order is stable.
-        time.sleep(0.015 * (8 - int(slot_id.rsplit("_", 1)[1])))
-        response = _response_from_prompt(prompt)
+        time.sleep(0.015 * (8 - int(slot_ids[0].rsplit("_", 1)[1])))
+        response = _batch_response_from_prompt(prompt)
         with lock:
             active -= 1
         return response
@@ -381,9 +395,9 @@ def test_five_adjustments_run_concurrently_and_merge_in_slot_order(monkeypatch):
     finally:
         set_job_context(prior_job)
 
-    assert maximum == 5
+    assert maximum == 3
     assert len(calls) == len(set(calls)) == 7
-    assert contexts == ["job-concurrency-test"] * 7
+    assert contexts == ["job-concurrency-test"] * 3
     assert list(result["difficulty_adjustment_attempts"].values()) == [1] * 7
     assert [row["slot_id"] for row in result["difficulty_adjustment_history"]] == [
         f"m1_equation_{index}" for index in range(1, 8)
@@ -397,23 +411,62 @@ def test_parallel_rate_limit_failure_does_not_discard_other_results(monkeypatch)
     state = _multi_state(6)
 
     def fake_request(_client, prompt, **_kwargs):
-        slot_id = json.loads(prompt)["task"]["immutable_identifiers"]["slot_id"]
-        if slot_id == "m1_equation_3":
-            raise DeepSeekRateLimitError("provider capacity reached")
-        return _response_from_prompt(prompt)
+        response = _batch_response_from_prompt(prompt)
+        for decision in response["results"]:
+            if decision["slot_id"] == "m1_equation_3":
+                decision.update({
+                    "adjustment_succeeded": False, "adjusted_fields": None,
+                    "evidence_support": [], "reason": "provider capacity reached",
+                })
+        return response
 
     monkeypatch.setattr(difficulty_adjustment, "MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", 5)
     monkeypatch.setattr(difficulty_adjustment, "request_structured", fake_request)
     result = difficulty_adjustment.adjust_plan_difficulty(state)
     history = result["difficulty_adjustment_history"]
-    assert [row["slot_id"] for row in history] == [
-        f"m1_equation_{index}" for index in range(1, 7)
-    ]
+    assert [row["slot_id"] for row in history].count("m1_equation_3") == 3
     assert [row["status"] for row in history].count("succeeded") == 5
     failed = next(row for row in history if row["slot_id"] == "m1_equation_3")
     assert failed["status"] == "failed"
-    assert "DeepSeekRateLimitError" in failed["reason"]
-    assert result["difficulty_adjustment_attempts"]["m1_equation_3"] == 1
+    assert "provider capacity" in failed["reason"]
+    assert result["difficulty_adjustment_attempts"]["m1_equation_3"] == 3
+
+
+def test_exhausted_adjustment_uses_requested_catalog_fallback(monkeypatch):
+    state = _state()
+    alternative = deepcopy(_catalog_task())
+    alternative.update({
+        "task_id": "task_easy_alternative",
+        "task_family_id": "family_easy_alternative",
+        "coverage_id": "coverage_easy_alternative",
+        "native_difficulty": "easy",
+        "reasoning_depth": "easy",
+        "supported_difficulties": ["easy"],
+    })
+    state["difficulty"] = "easy"
+    original = state["plans"][0]["items"]["equation"][0]
+    original["requested_difficulty"] = "easy"
+    original["difficulty_adaptation"]["to_difficulty"] = "easy"
+    state["assessment_catalog"]["tasks"].append(alternative)
+
+    def decline(_client, prompt, **_kwargs):
+        response = _batch_response_from_prompt(prompt)
+        for decision in response["results"]:
+            decision.update({
+                "adjustment_succeeded": False, "adjusted_fields": None,
+                "evidence_support": [], "achieved_difficulty": "easy",
+                "reason": "The requested simplification is unsupported.",
+            })
+        return response
+
+    monkeypatch.setattr(difficulty_adjustment, "request_structured", decline)
+    result = difficulty_adjustment.adjust_plan_difficulty(state)
+    item = result["plans"][0]["items"]["equation"][0]
+    assert result["difficulty_adjustment_attempts"][original["slot_id"]] == 3
+    assert item["selected_replacement_task_id"] == "task_easy_alternative"
+    assert item["base_catalog_task_id"] == "task_easy_alternative"
+    assert item["requested_difficulty"] == item["actual_difficulty"] == "easy"
+    assert item["difficulty_adaptation"]["status"] == "fallback"
 
 
 @pytest.mark.parametrize(
@@ -446,7 +499,7 @@ def test_fallback_preserves_native_level_and_routes_to_adjustment(native, reques
     ) == []
     assert graph._route_after_plan({
         "plans": plans, "plan_errors": [], "planning_issues": [], "plan_attempts": 1,
-    }) == "adjust_plan_difficulty"
+    }) == "review_plan"
 
 
 def test_mixed_allocation_preserves_native_levels_without_pending_adjustment():
@@ -537,7 +590,7 @@ def test_failed_job_ten_slot_shape_is_pending_adjustment_not_plan_repair():
     assert all((item["difficulty_adaptation"] or {}).get("status") == "pending" for item in items)
     assert graph._route_after_plan({
         "plans": plans, "plan_errors": [], "planning_issues": [], "plan_attempts": 1,
-    }) == "adjust_plan_difficulty"
+    }) == "review_plan"
 
 
 def _generated_equation_response(*, evidence_support=None) -> dict:

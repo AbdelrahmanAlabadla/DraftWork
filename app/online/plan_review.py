@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import re
+import time
 from copy import deepcopy
 from itertools import combinations
 from typing import Any, Literal
@@ -12,6 +15,7 @@ from app.llm.client import request_structured
 from app.llm.deepseek import DeepSeekIncompleteError, DeepSeekValidationError
 from app.llm.factory import create_plan_review_client
 from app.llm.schemas import NonEmptyString, StrictOutputModel
+from app.offline.embeddings import cosine_sim, embed_dense
 from app.online.assessment_catalog import (
     _difficulty_for,
     _inventory_after_reservation,
@@ -33,6 +37,10 @@ from app.online.planner import (
 PLAN_REVIEW_TEMPERATURE = 0.1
 PLAN_REVIEW_MAX_TOKENS = 45000
 MAX_PLAN_DUPLICATE_REPAIR_ATTEMPTS = 3
+PLAN_PAIR_SIMILARITY_THRESHOLD = 0.80
+PLAN_PAIR_NEIGHBORS_PER_SLOT = 2
+logger = logging.getLogger(__name__)
+_PLAN_EMBEDDING_CACHE: dict[str, list[float]] = {}
 
 _DUPLICATE_PLAN_ERROR_MARKERS = (
     "duplicates catalog task",
@@ -147,20 +155,11 @@ the target/result, reasoning path, and observable work product. IDs and matching
 signals only; never use them as an automatic overlap verdict. Different IDs may still produce the
 same assessment. The same concept or formula may be distinct when the operation and reasoning are
 meaningfully different. Changes only to wording, numbers, names, or surface scenario are overlap.
-For each real overlap, suggest exactly one slot to change and choose only a candidate ID listed for
-that slot (`replacement_task_id`, or `replacement_fitb_entry_id` for FITB).
-
-Priority is strict:
-1. If the slot has unused_task candidates, choose the semantically best UNUSED candidate.
-2. Only when no unused candidate is provided may you choose intentional_reuse.
-3. Never choose the exact task ID already used by a slot that this suggestion must separate from.
-4. A replacement must resolve the reported overlap without creating a new overlap elsewhere.
-
-Do not rewrite task metadata, question counts, slot IDs, evidence, or difficulty. Return a short
-assessment angle, not a finished question. For intentional reuse, explain why reuse is necessary
-and provide concrete instance distinctions from the referenced slots. Different wording, names,
-numbers, or surface scenario alone is not a valid distinction. Reuse metadata is not approval of
-the future question; the final Duplicate Judge remains independent.
+This call discovers and explains issues only. Do not select replacement tasks or repair the plan.
+Return `suggestions` as an empty list. DraftWork performs candidate selection after it has persisted
+the complete findings, using the catalog inventory and bounded repair lifecycle. Do not rewrite task
+metadata, question counts, slot IDs, evidence, or difficulty. The final Duplicate Judge remains
+independent.
 
 Independently inspect any task whose difficulty_adaptation status is adapted. Its actual cognitive
 work and reasoning requirements must match the claimed difficulty and remain supported by its exact
@@ -177,13 +176,8 @@ Examples:
   for wavelength` have the same operation and target. Mark overlap.
 - Same concept can be distinct: `derive P=Fv` and `calculate power from work/time` share power but
   require different operations and targets. Do not mark overlap solely for the shared concept.
-- Good unused replacement: replace a second kinetic-energy calculation with an unused task asking
-  students to interpret the sign of work from force direction.
-- Bad replacement: changing only the object name, numbers, or story while retaining the same
-  calculation is still overlap.
-- Intentional reuse: when every compatible task is already represented, reuse the least represented
-  task only with an explicit different method, representation, direction of reasoning, constraint
-  structure, or application that requires genuinely new reasoning.
+- Changing only the object name, numbers, or story while retaining the same calculation is still
+  overlap.
 """
 
 
@@ -221,6 +215,119 @@ def _potential_pairs(plan: dict[str, Any]) -> list[dict[str, Any]]:
             "code_conflict_signal": bool(_semantic_plan_conflict(left, right)),
         })
     return pairs
+
+
+def _slot_fingerprint(item: dict[str, Any]) -> str:
+    payload = {
+        key: item.get(key) for key in (
+            "slot_id", "task_id", "fitb_entry_id", "task_family_id", "coverage_id",
+            "concept", "task_operation", "operation", "target", "reasoning_mode",
+            "reasoning_requirements", "prerequisites", "student_work_product",
+            "required_givens", "variable_givens", "allowed_variations",
+            "complexity_boundaries", "exact_source_instance",
+            "given_conditions", "scenario_family",
+            "suggested_assessment_angle", "difficulty", "actual_difficulty",
+            "source_chunk_id", "support_chunk_ids",
+        )
+    }
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _slot_embedding_text(item: dict[str, Any]) -> str:
+    fields = (
+        "concept", "task_operation", "operation", "target", "reasoning_mode",
+        "reasoning_requirements", "prerequisites", "student_work_product",
+        "required_givens", "variable_givens", "allowed_variations",
+        "complexity_boundaries", "exact_source_instance",
+        "given_conditions", "scenario_family",
+        "suggested_assessment_angle", "idea_to_test", "relationship",
+    )
+    return "\n".join(
+        f"{field}: {json.dumps(item.get(field), ensure_ascii=False, default=str)}"
+        for field in fields if item.get(field) not in (None, "", [], {})
+    )
+
+
+def _known_conflict_pair_ids(
+    pairs: list[dict[str, Any]], known_conflicts: list[dict[str, Any]],
+) -> set[str]:
+    by_slots = {
+        frozenset((str(row.get("repair_slot_id") or ""), str(row.get("conflict_slot_id") or "")))
+        for row in known_conflicts
+    }
+    return {
+        pair["pair_id"] for pair in pairs
+        if frozenset((pair["left_slot_id"], pair["right_slot_id"])) in by_slots
+    }
+
+
+def _shortlist_plan_pairs(
+    plan: dict[str, Any], known_conflicts: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Use BGE-M3 for recall-oriented pair discovery; the LLM remains the judge."""
+    items = _items_for_model(plan)
+    all_pairs = _potential_pairs(plan)
+    if len(items) < 2:
+        return [], {"possible_pair_count": 0, "shortlisted_pair_count": 0}
+    fingerprints = [_slot_fingerprint(item) for item in items]
+    missing = [index for index, key in enumerate(fingerprints) if key not in _PLAN_EMBEDDING_CACHE]
+    if missing:
+        vectors = embed_dense([_slot_embedding_text(items[index]) for index in missing], max_length=768)
+        for index, vector in zip(missing, vectors):
+            _PLAN_EMBEDDING_CACHE[fingerprints[index]] = list(vector)
+    vectors = [_PLAN_EMBEDDING_CACHE[key] for key in fingerprints]
+    slot_index = {str(item.get("slot_id") or ""): index for index, item in enumerate(items)}
+    known_ids = _known_conflict_pair_ids(all_pairs, known_conflicts or [])
+    scores: dict[str, float] = {}
+    neighbours: dict[str, list[tuple[float, str]]] = {slot: [] for slot in slot_index}
+    for pair in all_pairs:
+        left, right = pair["left_slot_id"], pair["right_slot_id"]
+        score = float(cosine_sim(vectors[slot_index[left]], vectors[slot_index[right]]))
+        scores[pair["pair_id"]] = score
+        neighbours[left].append((score, pair["pair_id"]))
+        neighbours[right].append((score, pair["pair_id"]))
+    top_ids = {
+        pair_id for rows in neighbours.values()
+        for _score, pair_id in sorted(rows, key=lambda row: (-row[0], row[1]))[
+            :PLAN_PAIR_NEIGHBORS_PER_SLOT
+        ]
+    }
+    shortlisted = []
+    for pair in all_pairs:
+        signals = []
+        score = scores[pair["pair_id"]]
+        if score >= PLAN_PAIR_SIMILARITY_THRESHOLD:
+            signals.append("embedding_threshold")
+        if pair["pair_id"] in top_ids:
+            signals.append("top_neighbour")
+        if pair.get("identity_signal"):
+            signals.append("shared_identity")
+        if pair.get("code_conflict_signal"):
+            signals.append("deterministic_conflict")
+        if pair["pair_id"] in known_ids:
+            signals.append("known_conflict")
+        if signals:
+            shortlisted.append({
+                **pair,
+                "shortlist_reasons": signals,
+                "embedding_similarity": round(score, 4),
+            })
+    values = sorted(scores.values())
+    telemetry = {
+        "possible_pair_count": len(all_pairs),
+        "shortlisted_pair_count": len(shortlisted),
+        "threshold": PLAN_PAIR_SIMILARITY_THRESHOLD,
+        "top_neighbors_per_slot": PLAN_PAIR_NEIGHBORS_PER_SLOT,
+        "embedding_cache_hits": len(items) - len(missing),
+        "embedding_cache_misses": len(missing),
+        "similarity_min": round(values[0], 4) if values else None,
+        "similarity_max": round(values[-1], 4) if values else None,
+        "similarity_mean": round(sum(values) / len(values), 4) if values else None,
+    }
+    logger.info("Plan Review shortlist | %s", json.dumps(telemetry, sort_keys=True))
+    return shortlisted, telemetry
 
 
 def _active_model_plans(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -400,6 +507,10 @@ def _candidate_pool(
             "prerequisites": task.get("prerequisites"),
             "student_work_product": task.get("student_work_product"),
             "required_givens": task.get("required_givens"),
+            "variable_givens": task.get("variable_givens"),
+            "allowed_variations": task.get("allowed_variations"),
+            "complexity_boundaries": task.get("complexity_boundaries"),
+            "exact_source_instance": task.get("exact_source_instance", False),
             "scenario_family": task.get("scenario_family"),
             "evidence_chunk_ids": task.get("evidence_chunk_ids"),
             "task_family_id": task.get("task_family_id"),
@@ -426,33 +537,31 @@ def _prompt_payload(
     catalog: dict[str, Any], plan: dict[str, Any], pairs: list[dict[str, Any]],
     difficulty: str, valid_chunk_ids: set[str], *, evidence_by_id: dict[str, str] | None = None,
     rejection_reason: str = "", known_conflicts: list[dict[str, Any]] | None = None,
+    failed_task_ids: dict[str, set[str]] | None = None,
+    difficulty_slot_ids: set[str] | None = None,
 ) -> tuple[str, dict[str, tuple[str, dict[str, Any]]]]:
     qtypes = _question_type_by_slot(plan)
-    candidates: dict[str, list[dict[str, Any]]] = {}
     lookup: dict[str, tuple[str, dict[str, Any]]] = {}
     relevant_slots = sorted({
         value for pair in pairs for value in (pair["left_slot_id"], pair["right_slot_id"])
     })
-    for slot_id in relevant_slots:
-        rows, mode, _inventory = _candidate_pool(
-            catalog, plan, slot_id, qtypes[slot_id], difficulty, valid_chunk_ids
-        )
-        candidates[slot_id] = rows
-        for row in rows:
-            lookup[f"{slot_id}:{row['candidate_id']}"] = (mode, row)
     sources = evidence_by_id or {}
     registry = {}
+    difficulty_registry = {}
     for item in _items_for_model(plan):
         evidence_ids = list(dict.fromkeys(filter(None, [
             str(item.get("source_chunk_id") or ""),
             *map(str, item.get("support_chunk_ids") or []),
         ])))
-        registry[str(item.get("slot_id") or "")] = {
+        slot_id = str(item.get("slot_id") or "")
+        full_record = {
             key: item.get(key) for key in (
                 "task_id", "fitb_entry_id", "task_family_id", "coverage_id", "concept", "knowledge_focus",
                 "idea_to_test", "relationship", "task_operation", "operation", "target", "reasoning_mode",
                 "reasoning_depth", "reasoning_requirements", "prerequisites",
-                "student_work_product", "required_givens", "given_conditions", "scenario_family", "difficulty",
+                "student_work_product", "required_givens", "variable_givens",
+                "allowed_variations", "complexity_boundaries", "exact_source_instance",
+                "given_conditions", "scenario_family", "difficulty",
                 "requested_difficulty", "actual_difficulty", "difficulty_adaptation",
                 "plan_duplicate_repair_attempt", "plan_duplicate_repair_mode",
                 "plan_duplicate_conflict_with", "plan_duplicate_conflict_reason",
@@ -461,30 +570,44 @@ def _prompt_payload(
                 "numeric_diversification_allowed", "quantitative_structure_requirement",
             )
         }
-        registry[str(item.get("slot_id") or "")]["assigned_sources"] = {
+        full_record["question_type"] = qtypes.get(slot_id)
+        full_record["assigned_sources"] = {
             chunk_id: sources.get(chunk_id, "") for chunk_id in evidence_ids
         }
+        difficulty_registry[slot_id] = {
+            key: full_record.get(key) for key in (
+                "question_type", "concept", "task_operation", "operation", "target",
+                "reasoning_mode", "reasoning_depth", "reasoning_requirements",
+                "prerequisites", "student_work_product", "difficulty",
+                "requested_difficulty", "actual_difficulty", "difficulty_adaptation",
+            )
+        }
+        difficulty_registry[slot_id]["assigned_source_chunk_ids"] = evidence_ids
+        if slot_id in relevant_slots:
+            registry[slot_id] = full_record
     retry = (
         "\n\nThe previous suggestion was rejected by code for this exact reason:\n"
         f"{rejection_reason}\nReturn a corrected complete response."
         if rejection_reason else ""
     )
     prompt = (
-        "Review the complete plan registry and every candidate pair. Return exactly one "
-        "difficulty_verdict per plan-registry slot. Return semantic verdict rows only for "
+        "Review the supplied plan registry and every candidate pair. Return exactly one "
+        f"difficulty_verdict for each of these slots: {sorted(difficulty_slot_ids or set(registry))}. "
+        "Return semantic verdict rows only for "
         "pairs that are genuine semantic overlaps; an empty verdicts array means the whole plan is distinct. "
-        "Suggestions are required for every connected group containing a semantic_overlap=true "
-        "verdict; one changed slot may resolve several pair verdicts. Choose only from the candidate "
-        "list for that slot, preserving its listed selection_type. If all pairs are distinct, return "
-        "an empty suggestions array. For every known deterministic conflict, compare BOTH named "
+        "This call performs issue discovery only. Always return an empty suggestions array; "
+        "replacement selection happens after valid findings are persisted. For every known "
+        "deterministic conflict, compare BOTH named "
         "slots and use its exact explanation when choosing the repair. Deliberately change a "
         "meaningful conflicting dimension: idea, target, operation, relationship, reasoning path, "
         "givens, scenario/setup, task family, or quantitative structure. Do not randomly swap IDs "
         "or treat wording/numbers alone as semantic diversification.\n\n"
         f"Known deterministic conflicts:\n{json.dumps(known_conflicts or [], ensure_ascii=False)}\n\n"
-        f"Plan registry:\n{json.dumps(registry, ensure_ascii=False)}\n\n"
-        f"Candidate pairs:\n{json.dumps(pairs, ensure_ascii=False)}\n\n"
-        f"Allowed replacement candidates by slot:\n{json.dumps(candidates, ensure_ascii=False)}"
+        f"Pair-review registry (complete metadata for shortlisted slots):\n"
+        f"{json.dumps(registry, ensure_ascii=False)}\n\n"
+        f"Difficulty registry (all required slots):\n"
+        f"{json.dumps(difficulty_registry, ensure_ascii=False)}\n\n"
+        f"Candidate pairs:\n{json.dumps(pairs, ensure_ascii=False)}"
         f"{retry}"
     )
     return prompt, lookup
@@ -517,13 +640,19 @@ def _validate_response(
     response: PlanReviewResponse, catalog: dict[str, Any], plan: dict[str, Any],
     pairs: list[dict[str, Any]], difficulty: str, valid_chunk_ids: set[str],
     lookup: dict[str, tuple[str, dict[str, Any]]],
+    difficulty_slot_ids: set[str] | None = None,
 ) -> list[str]:
     errors: list[str] = []
-    expected_slot_ids = sorted(_question_type_by_slot(plan))
+    expected_slot_ids = sorted(difficulty_slot_ids or set(_question_type_by_slot(plan)))
     difficulty_slot_ids = [verdict.slot_id for verdict in response.difficulty_verdicts]
-    if sorted(difficulty_slot_ids) != expected_slot_ids:
+    known_slot_ids = set(_question_type_by_slot(plan))
+    if (
+        not set(expected_slot_ids).issubset(difficulty_slot_ids)
+        or any(slot_id not in known_slot_ids for slot_id in difficulty_slot_ids)
+        or len(difficulty_slot_ids) != len(set(difficulty_slot_ids))
+    ):
         errors.append(
-            f"difficulty_verdict slot IDs must be exactly {expected_slot_ids}; "
+            f"difficulty_verdict slot IDs must include {expected_slot_ids} and no unknown slots; "
             f"received {difficulty_slot_ids}."
         )
     expected_pair_ids = [pair["pair_id"] for pair in pairs]
@@ -540,6 +669,15 @@ def _validate_response(
     suggestion_slots = [suggestion.slot_id for suggestion in response.suggestions]
     if len(suggestion_slots) != len(set(suggestion_slots)):
         errors.append("Each slot_id may have at most one Plan Review suggestion.")
+    unused_candidate_ids = [
+        str(suggestion.replacement_fitb_entry_id or suggestion.replacement_task_id or "")
+        for suggestion in response.suggestions
+        if suggestion.selection_type == "unused_task"
+    ]
+    if len(unused_candidate_ids) != len(set(unused_candidate_ids)):
+        errors.append(
+            "Concurrent plan repairs must reserve distinct unused candidate IDs."
+        )
     for group in groups:
         if not any(slot_id in group for slot_id in suggestion_slots):
             errors.append(f"No suggestion resolves overlapping slots {sorted(group)}.")
@@ -661,6 +799,37 @@ def _validate_response(
     return errors
 
 
+def _validate_findings(
+    response: PlanReviewResponse, plan: dict[str, Any], pairs: list[dict[str, Any]],
+    *, difficulty_slot_ids: set[str] | None = None,
+) -> list[str]:
+    """Validate discovery independently from optional/legacy repair suggestions."""
+    errors: list[str] = []
+    expected_slots = sorted(difficulty_slot_ids or set(_question_type_by_slot(plan)))
+    returned_slots = [verdict.slot_id for verdict in response.difficulty_verdicts]
+    known_slots = set(_question_type_by_slot(plan))
+    if (
+        not set(expected_slots).issubset(returned_slots)
+        or any(slot_id not in known_slots for slot_id in returned_slots)
+        or len(returned_slots) != len(set(returned_slots))
+    ):
+        errors.append(
+            f"difficulty_verdict slot IDs must include {expected_slots} exactly once and no "
+            f"unknown slots; received {returned_slots}."
+        )
+    expected_pairs = {pair["pair_id"] for pair in pairs}
+    returned_pairs = [verdict.pair_id for verdict in response.verdicts]
+    if (
+        any(pair_id not in expected_pairs for pair_id in returned_pairs)
+        or len(returned_pairs) != len(set(returned_pairs))
+    ):
+        errors.append(
+            "pair_id values must be unique members of the shortlisted pair registry; "
+            f"received {returned_pairs}."
+        )
+    return errors
+
+
 def _apply_difficulty_verdicts(
     plan: dict[str, Any], verdicts: list[PlanDifficultyVerdict], requested: str,
 ) -> list[dict[str, Any]]:
@@ -684,12 +853,14 @@ def _apply_difficulty_verdicts(
             **verdict.model_dump(),
         }
         if not accepted:
+            prior_adaptation = dict(item.get("difficulty_adaptation") or {})
             item["difficulty"] = achieved
             item["actual_difficulty"] = achieved
             item["reasoning_depth"] = achieved
             if (
                 requested in {"easy", "medium", "hard"}
                 and int(item.get("adjustment_attempts") or 0) < 3
+                and prior_adaptation.get("status") not in {"failed", "fallback", "retained"}
             ):
                 item["difficulty_adaptation"] = {
                     "status": "pending", "from_difficulty": achieved,
@@ -701,7 +872,9 @@ def _apply_difficulty_verdicts(
                 item["difficulty_adaptation"] = {
                     **(item.get("difficulty_adaptation") or {}), "status": "failed",
                 }
-                item["difficulty_fallback_reason"] = verdict.reason
+                item["difficulty_fallback_reason"] = (
+                    item.get("difficulty_fallback_reason") or verdict.reason
+                )
         events.append({
             "slot_id": verdict.slot_id,
             "status": "difficulty_verified" if accepted else "difficulty_mismatch",
@@ -832,9 +1005,22 @@ def _apply_suggestion(
             "reused_task_id": task.get("task_id"),
             "reused_fitb_entry_id": task.get("fitb_entry_id"),
             "reuse_rule": (
-                "Follow every required instance distinction. Wording, names, numbers, or surface "
-                "scenario changes alone do not qualify."
+                "Follow every required distinction. Prefer a different supported representation or "
+                "procedure. If the source supports only the same method, an authorized genuinely "
+                "different numerical instance is allowed with all dependent results recalculated. "
+                "Wording alone does not qualify."
             ),
+            "reuse_mode": "intentional_practice_variation",
+            "task_usage_count": int(selection_rank.get("task_usage_count") or 0),
+            "variation_reason": "catalog_exhausted_controlled_reuse",
+            "intended_variation": suggestion.get("reuse_justification") or (
+                "Use the required source-supported distinctions from prior instances."
+            ),
+            "previous_question_ids": [],
+            "source_evidence_ids": list(dict.fromkeys([
+                *([replacement.get("source_chunk_id")] if replacement.get("source_chunk_id") else []),
+                *(replacement.get("support_chunk_ids") or []),
+            ])),
         })
     for values in (plan.get("items") or {}).values():
         for index, item in enumerate(values or []):
@@ -1078,7 +1264,16 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
             known_conflicts.append(conflict)
     history: list[dict[str, Any]] = list(state.get("plan_review_history") or [])
     duplicate_attempts = dict(state.get("plan_duplicate_repair_attempts") or {})
+    candidate_blacklist = {
+        str(slot_id): {str(task_id) for task_id in task_ids or [] if task_id}
+        for slot_id, task_ids in (state.get("plan_review_candidate_blacklist") or {}).items()
+    }
     unresolved_conflicts = list(state.get("unresolved_plan_duplicate_conflicts") or [])
+    pair_verdict_cache = deepcopy(state.get("plan_review_pair_verdicts") or {})
+    difficulty_verdict_cache = deepcopy(state.get("plan_review_difficulty_verdicts") or {})
+    slot_fingerprint_cache = deepcopy(state.get("plan_review_slot_fingerprints") or {})
+    review_issues = list(state.get("plan_review_issues") or [])
+    review_telemetry = list(state.get("plan_review_telemetry") or [])
     total_attempts = 0
     retry_required = False
     prior_rechecks = int(state.get("plan_review_rechecks") or 0)
@@ -1092,13 +1287,70 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
         if values
     }
     for plan_index, plan in enumerate(plans):
-        pairs = _potential_pairs(plan)
+        all_pairs = _potential_pairs(plan)
+        model_key = str(plan.get("model_number") or plan_index + 1)
+        cached_model_pairs = dict(pair_verdict_cache.get(model_key) or {})
+        current_fingerprints = {
+            str(item.get("slot_id") or ""): _slot_fingerprint(item)
+            for item in _items_for_model(plan)
+        }
+        prior_fingerprints = dict(slot_fingerprint_cache.get(model_key) or {})
+        modified_slots = {
+            str(item.get("slot_id") or "") for item in _items_for_model(plan)
+            if item.get("plan_duplicate_repair_attempt")
+            and not item.get("plan_duplicate_unresolved")
+        }
+        modified_slots.update({
+            slot_id for slot_id, fingerprint in current_fingerprints.items()
+            if prior_fingerprints and prior_fingerprints.get(slot_id) != fingerprint
+        })
+        requested_verification = set(state.get("difficulty_verification_slot_ids") or [])
+        model_slots = set(_question_type_by_slot(plan))
+        requested_verification &= model_slots
+        if cached_model_pairs and (modified_slots or requested_verification):
+            # A changed slot must be checked against every active slot. Pair
+            # prefiltering is only for the first holistic review.
+            pairs = [
+                pair for pair in all_pairs
+                if modified_slots & {pair["left_slot_id"], pair["right_slot_id"]}
+            ]
+            shortlist_stats = {
+                "possible_pair_count": len(all_pairs),
+                "shortlisted_pair_count": len(pairs),
+                "targeted_modified_slot_count": len(modified_slots),
+                "targeted_difficulty_slot_count": len(requested_verification),
+            }
+            history.append({
+                "model_number": plan.get("model_number"),
+                "status": "targeted_plan_revalidation",
+                "modified_slot_ids": sorted(modified_slots),
+                "reviewed_pair_ids": [pair["pair_id"] for pair in pairs],
+                "preserved_pair_count": len(all_pairs) - len(pairs),
+            })
+        else:
+            try:
+                pairs, shortlist_stats = _shortlist_plan_pairs(plan, known_conflicts)
+            except Exception as exc:
+                # Embedding discovery is an optimization. Preserve semantic
+                # coverage by reviewing all pairs if local embeddings fail.
+                pairs = all_pairs
+                shortlist_stats = {
+                    "possible_pair_count": len(all_pairs),
+                    "shortlisted_pair_count": len(all_pairs),
+                    "embedding_fallback": type(exc).__name__,
+                }
+                logger.warning("Plan Review embedding shortlist failed; reviewing all pairs | %s", type(exc).__name__)
+        difficulty_slots = (
+            (requested_verification & model_slots)
+            or modified_slots
+            or model_slots
+        )
         response: PlanReviewResponse | None = None
         reviewed_trial: dict[str, Any] | None = None
         last_overlap_ids: set[str] = set()
         last_difficulty_verdicts: list[PlanDifficultyVerdict] = []
         rejection = ""
-        failed_task_ids: dict[str, set[str]] = {}
+        failed_task_ids = candidate_blacklist
         exhausted_overlap_groups: list[set[str]] = []
         for attempt in (1, 2):
             total_attempts += 1
@@ -1107,12 +1359,20 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                 evidence_by_id=evidence_by_id,
                 rejection_reason=rejection,
                 known_conflicts=known_conflicts,
+                failed_task_ids=failed_task_ids,
+                difficulty_slot_ids=difficulty_slots,
             )
+            review_kind = (
+                "targeted" if cached_model_pairs and (modified_slots or requested_verification)
+                else "full"
+            )
+            client = create_plan_review_client(
+                domain=(state.get("assessment_profile") or {}).get("domain")
+            )
+            started_at = time.perf_counter()
             try:
                 raw = request_structured(
-                    create_plan_review_client(
-                        domain=(state.get("assessment_profile") or {}).get("domain")
-                    ), prompt,
+                    client, prompt,
                     response_model=PlanReviewResponse,
                     schema_name="plan_review",
                     agent="plan_reviewer",
@@ -1127,18 +1387,61 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                     else PlanReviewResponse.model_validate(raw)
                 )
             except (ValidationError, DeepSeekValidationError, DeepSeekIncompleteError) as exc:
+                from app.llm.scheduler import last_request_metrics
+                scheduler_metrics = last_request_metrics()
+                usage = dict(getattr(client, "last_usage", None) or {})
+                review_telemetry.append({
+                    "model_number": plan.get("model_number"), "attempt": attempt,
+                    "review_kind": review_kind, "status": "invalid_or_incomplete",
+                    "provider": getattr(client, "provider_name", type(client).__name__),
+                    "model": getattr(client, "model", None),
+                    "reasoning_effort": (
+                        client._reasoning_effort("plan_reviewer")
+                        if callable(getattr(client, "_reasoning_effort", None)) else
+                        getattr(client, "reasoning", None)
+                    ),
+                    "prompt_chars": len(prompt),
+                    "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+                    "queue_ms": scheduler_metrics.get("queue_ms"),
+                    "retry_count": max(attempt - 1, 0)
+                    + int(getattr(client, "last_transient_retries", 0) or 0)
+                    + max(int(getattr(client, "last_structured_attempts", 1) or 1) - 1, 0),
+                    **shortlist_stats, **usage,
+                })
                 rejection = f"Plan Review response failed schema validation: {exc}"
                 history.append({
                     "model_number": plan.get("model_number"), "attempt": attempt,
                     "status": "agent_suggestion_rejected", "reason": rejection,
                 })
                 continue
+            from app.llm.scheduler import last_request_metrics
+            scheduler_metrics = last_request_metrics()
+            usage = dict(getattr(client, "last_usage", None) or {})
+            review_telemetry.append({
+                "model_number": plan.get("model_number"), "attempt": attempt,
+                "review_kind": review_kind, "status": "response_received",
+                "provider": getattr(client, "provider_name", type(client).__name__),
+                "model": getattr(client, "model", None),
+                "reasoning_effort": (
+                    client._reasoning_effort("plan_reviewer")
+                    if callable(getattr(client, "_reasoning_effort", None)) else
+                    getattr(client, "reasoning", None)
+                ),
+                "prompt_chars": len(prompt),
+                "latency_ms": round((time.perf_counter() - started_at) * 1000, 3),
+                "queue_ms": scheduler_metrics.get("queue_ms"),
+                "retry_count": max(attempt - 1, 0)
+                + int(getattr(client, "last_transient_retries", 0) or 0)
+                + max(int(getattr(client, "last_structured_attempts", 1) or 1) - 1, 0),
+                **shortlist_stats, **usage,
+            })
             last_overlap_ids = {
                 verdict.pair_id for verdict in parsed.verdicts if verdict.semantic_overlap
             }
-            if sorted(verdict.slot_id for verdict in parsed.difficulty_verdicts) == sorted(
-                _question_type_by_slot(plan)
-            ):
+            returned_difficulty_slots = {
+                verdict.slot_id for verdict in parsed.difficulty_verdicts
+            }
+            if difficulty_slots.issubset(returned_difficulty_slots):
                 last_difficulty_verdicts = list(parsed.difficulty_verdicts)
             parsed_groups = _conflict_groups(pairs, last_overlap_ids)
             exhausted_overlap_groups = [
@@ -1146,40 +1449,95 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                 if max((int(duplicate_attempts.get(slot_id) or 0) for slot_id in group), default=0)
                 >= MAX_PLAN_DUPLICATE_REPAIR_ATTEMPTS
             ]
-            if exhausted_overlap_groups and last_difficulty_verdicts:
-                response = parsed
-                reviewed_trial = deepcopy(plan)
-                break
-            errors = _validate_response(
-                parsed, catalog, plan, pairs, difficulty, valid_chunk_ids, lookup
+            errors = _validate_findings(
+                parsed, plan, pairs, difficulty_slot_ids=difficulty_slots,
             )
             if not errors:
-                trial, trial_errors = _simulate_suggestions(
-                    plan, catalog, parsed, pairs, difficulty, valid_chunk_ids,
-                    state.get("tasks") or [], state.get("assessment_profile") or {},
-                    state.get("planning_issues") or [],
-                )
-                if not trial_errors:
-                    response = parsed
-                    reviewed_trial = trial
-                    break
-                errors.extend(
-                    f"Post-suggestion plan invalid: {error}" for error in trial_errors
-                )
+                # Discovery is authoritative independently of any legacy candidate
+                # suggestions a model may still emit. Candidate selection happens
+                # after these findings have been cached and persisted.
+                response = parsed.model_copy(update={"suggestions": []})
+                reviewed_trial = deepcopy(plan)
+                review_telemetry[-1]["status"] = "findings_accepted"
+                review_telemetry[-1]["ignored_suggestion_count"] = len(parsed.suggestions)
+                history.append({
+                    "model_number": plan.get("model_number"), "attempt": attempt,
+                    "status": "review_findings_accepted",
+                    "overlap_pair_ids": sorted(last_overlap_ids),
+                    "ignored_suggestion_count": len(parsed.suggestions),
+                })
+                break
             rejection = "; ".join(errors)
-            for suggestion in parsed.suggestions:
-                rejected_id = (
-                    suggestion.replacement_fitb_entry_id or suggestion.replacement_task_id
-                )
-                if rejected_id:
-                    failed_task_ids.setdefault(suggestion.slot_id, set()).add(
-                        rejected_id
-                    )
+            review_telemetry[-1]["status"] = "findings_rejected"
+            review_telemetry[-1]["rejection_reason"] = rejection
             history.append({
                 "model_number": plan.get("model_number"), "attempt": attempt,
-                "status": "agent_suggestion_rejected", "reason": rejection,
+                "status": "review_findings_rejected", "reason": rejection,
             })
         if response is not None:
+            returned_by_pair = {verdict.pair_id: verdict for verdict in response.verdicts}
+            for pair in pairs:
+                verdict = returned_by_pair.get(pair["pair_id"])
+                cached_model_pairs[pair["pair_id"]] = {
+                    "pair_id": pair["pair_id"],
+                    "left_slot_id": pair["left_slot_id"],
+                    "right_slot_id": pair["right_slot_id"],
+                    "semantic_overlap": bool(verdict and verdict.semantic_overlap),
+                    "reason": verdict.reason if verdict else "reviewed_distinct",
+                }
+            pair_verdict_cache[model_key] = cached_model_pairs
+            slot_fingerprint_cache[model_key] = {
+                str(item.get("slot_id") or ""): _slot_fingerprint(item)
+                for item in _items_for_model(plan)
+            }
+            model_difficulty_cache = dict(difficulty_verdict_cache.get(model_key) or {})
+            for verdict in response.difficulty_verdicts:
+                model_difficulty_cache[verdict.slot_id] = verdict.model_dump()
+            difficulty_verdict_cache[model_key] = model_difficulty_cache
+            reviewed_pair_ids = {pair["pair_id"] for pair in pairs}
+            if cached_model_pairs and modified_slots:
+                review_issues = [
+                    issue for issue in review_issues
+                    if not (
+                        str(issue.get("model_number")) == model_key
+                        and (
+                            issue.get("pair_id") in reviewed_pair_ids
+                            or bool(modified_slots & set(issue.get("affected_slot_ids") or []))
+                        )
+                    )
+                ]
+            else:
+                review_issues = [
+                    issue for issue in review_issues
+                    if str(issue.get("model_number")) != model_key
+                ]
+            review_issues.extend({
+                "model_number": model_key,
+                "issue_type": "semantic_overlap",
+                "pair_id": verdict.pair_id,
+                "affected_slot_ids": [
+                    next(pair["left_slot_id"] for pair in pairs if pair["pair_id"] == verdict.pair_id),
+                    next(pair["right_slot_id"] for pair in pairs if pair["pair_id"] == verdict.pair_id),
+                ],
+                "reason": verdict.reason,
+                "required_correction": "Change a meaningful assessment dimension and recheck this slot against the active plan.",
+            } for verdict in response.verdicts if verdict.semantic_overlap)
+            review_issues.extend({
+                "model_number": model_key,
+                "issue_type": "difficulty_mismatch",
+                "affected_slot_ids": [verdict.slot_id],
+                "reason": verdict.reason,
+                "claimed_difficulty": verdict.claimed_difficulty,
+                "achieved_difficulty": verdict.achieved_difficulty,
+                "required_correction": (
+                    "Use the verified achieved difficulty or route the slot through "
+                    "the on-demand Difficulty Adjustment Agent."
+                ),
+            } for verdict in response.difficulty_verdicts if (
+                verdict.achieved_difficulty != verdict.claimed_difficulty
+                or not verdict.reasoning_profile_supported
+                or not verdict.evidence_support_sufficient
+            ))
             overlap_ids = {v.pair_id for v in response.verdicts if v.semantic_overlap}
             overlap_neighbors: dict[str, set[str]] = {}
             for pair in pairs:
@@ -1188,6 +1546,24 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                 left, right = pair["left_slot_id"], pair["right_slot_id"]
                 overlap_neighbors.setdefault(left, set()).add(right)
                 overlap_neighbors.setdefault(right, set()).add(left)
+            # A previously repaired candidate that remains in a targeted
+            # overlap is rejected for this slot. Persist the rejection so a
+            # later repair cycle cannot select the same candidate again.
+            if cached_model_pairs and modified_slots:
+                for slot_id in set(overlap_neighbors) & modified_slots:
+                    item = _slot_item(plan, slot_id)
+                    candidate_id = str(
+                        (item or {}).get("fitb_entry_id")
+                        or (item or {}).get("task_id") or ""
+                    )
+                    if candidate_id:
+                        candidate_blacklist.setdefault(slot_id, set()).add(candidate_id)
+                        history.append({
+                            "model_number": plan.get("model_number"),
+                            "status": "repair_candidate_blacklisted",
+                            "slot_id": slot_id, "candidate_id": candidate_id,
+                            "reason": "Targeted Plan Review still found semantic overlap.",
+                        })
             plan = reviewed_trial or plan
             history.extend({
                 "model_number": plan.get("model_number"), **event,
@@ -1234,39 +1610,80 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                     item.setdefault("plan_review_reason", "no_semantic_overlap")
                 plans[plan_index] = plan
                 continue
-            for suggestion in response.suggestions:
-                applied = next(
-                    item for item in _items_for_model(plan)
-                    if str(item.get("slot_id") or "") == suggestion.slot_id
-                )
-                conflict_slots = overlap_neighbors.get(suggestion.slot_id, set())
-                repair_attempt = int(duplicate_attempts.get(suggestion.slot_id) or 0) + 1
-                duplicate_attempts[suggestion.slot_id] = repair_attempt
+            repair_changed = False
+            groups = _conflict_groups(pairs, overlap_ids)
+            for group in groups:
+                next_attempt = max(
+                    (int(duplicate_attempts.get(slot_id) or 0) for slot_id in group),
+                    default=0,
+                ) + 1
+                repair_slot = sorted(group)[-1]
+                conflict_slots = set(group) - {repair_slot}
                 verdict_reasons = [
                     verdict.reason for verdict in response.verdicts
-                    if verdict.semantic_overlap and suggestion.slot_id in {
-                        next((pair["left_slot_id"] for pair in pairs if pair["pair_id"] == verdict.pair_id), ""),
-                        next((pair["right_slot_id"] for pair in pairs if pair["pair_id"] == verdict.pair_id), ""),
+                    if verdict.semantic_overlap and verdict.pair_id in {
+                        pair["pair_id"] for pair in pairs
+                        if {pair["left_slot_id"], pair["right_slot_id"]}.issubset(group)
                     }
                 ]
                 conflict_reason = _conflict_reason_for_slots(
-                    known_conflicts, suggestion.slot_id, conflict_slots, verdict_reasons
+                    known_conflicts, repair_slot, conflict_slots, verdict_reasons
                 )
+                if next_attempt >= MAX_PLAN_DUPLICATE_REPAIR_ATTEMPTS:
+                    applied = _controlled_plan_diversification(
+                        plan, group, conflict_reason, _question_type_by_slot(plan), attempt=3
+                    )
+                    duplicate_attempts[str(applied.get("slot_id") or repair_slot)] = 3
+                    repair_changed = True
+                    history.append({
+                        "model_number": plan.get("model_number"),
+                        "status": "controlled_diversification_applied",
+                        "slot_id": applied.get("slot_id") or repair_slot,
+                        "conflict_slot_ids": sorted(conflict_slots),
+                        "plan_duplicate_repair_attempt": 3,
+                        "plan_duplicate_conflict_reason": conflict_reason,
+                    })
+                    continue
+                fallback = _fallback_suggestion(
+                    catalog, plan, group, difficulty, valid_chunk_ids, failed_task_ids
+                )
+                if fallback is None:
+                    applied = _controlled_plan_diversification(
+                        plan, group, conflict_reason, _question_type_by_slot(plan),
+                        attempt=next_attempt,
+                    )
+                    selected_slot = str(applied.get("slot_id") or repair_slot)
+                    duplicate_attempts[selected_slot] = next_attempt
+                    repair_changed = True
+                    history.append({
+                        "model_number": plan.get("model_number"),
+                        "status": "targeted_contract_diversification_applied",
+                        "slot_id": selected_slot, "slot_ids": sorted(group),
+                        "reason": conflict_reason,
+                        "plan_duplicate_repair_attempt": next_attempt,
+                    })
+                    continue
+                applied = _apply_suggestion(
+                    plan, catalog, fallback, difficulty, valid_chunk_ids,
+                    source="deterministic_repair_after_discovery",
+                )
+                selected_slot = str(fallback["slot_id"])
+                duplicate_attempts[selected_slot] = next_attempt
                 _annotate_plan_duplicate_repair(
-                    applied, attempt=repair_attempt,
-                    mode=("controlled_diversification" if repair_attempt >= 3
-                          else "targeted_semantic_repair"),
-                    conflict_slots=conflict_slots, reason=conflict_reason, unresolved=False,
+                    applied, attempt=next_attempt, mode="targeted_semantic_repair",
+                    conflict_slots=set(group) - {selected_slot},
+                    reason=conflict_reason, unresolved=False,
                 )
+                repair_changed = True
                 history.append({
-                    "model_number": plan.get("model_number"), "status": "agent_suggestion_applied",
-                    "slot_id": suggestion.slot_id,
-                    "replacement_task_id": suggestion.replacement_task_id,
-                    "replacement_fitb_entry_id": suggestion.replacement_fitb_entry_id,
-                    "selection_type": suggestion.selection_type,
-                    "suggested_assessment_angle": suggestion.suggested_assessment_angle,
+                    "model_number": plan.get("model_number"),
+                    "status": "targeted_repair_applied_after_discovery",
+                    "slot_id": selected_slot,
+                    "replacement_task_id": fallback["replacement_task_id"],
+                    "replacement_fitb_entry_id": fallback["replacement_fitb_entry_id"],
+                    "selection_type": fallback["selection_type"],
                     "task_inventory": deepcopy(applied.get("task_inventory") or {}),
-                    "plan_duplicate_repair_attempt": repair_attempt,
+                    "plan_duplicate_repair_attempt": next_attempt,
                     "plan_duplicate_conflict_reason": conflict_reason,
                 })
             for item in _items_for_model(plan):
@@ -1276,7 +1693,7 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
                 "model_number": plan.get("model_number"), "status": "agent_review_completed",
                 "overlap_pair_ids": sorted(overlap_ids),
             })
-            if overlap_ids and response.suggestions:
+            if overlap_ids and repair_changed:
                 retry_required = True
                 rechecks += 1
             elif not overlap_ids:
@@ -1424,5 +1841,15 @@ def review_plan(state: dict[str, Any]) -> dict[str, Any]:
         "plan_review_retry_required": retry_required,
         "plan_review_rechecks": rechecks,
         "plan_duplicate_repair_attempts": duplicate_attempts,
+        "plan_review_candidate_blacklist": {
+            slot_id: sorted(task_ids)
+            for slot_id, task_ids in candidate_blacklist.items()
+        },
         "unresolved_plan_duplicate_conflicts": unresolved_conflicts,
+        "plan_review_pair_verdicts": pair_verdict_cache,
+        "plan_review_difficulty_verdicts": difficulty_verdict_cache,
+        "plan_review_slot_fingerprints": slot_fingerprint_cache,
+        "plan_review_issues": review_issues,
+        "plan_review_telemetry": review_telemetry,
+        "difficulty_verification_slot_ids": [],
     }

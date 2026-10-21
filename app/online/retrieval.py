@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 
 from app.config import GENERATION_CONTEXT_TOKENS, PLANNER_CONTEXT_TOKENS
 from app.language import detect_language
 from app.logging_conf import get_logger
-from app.offline.vector_store import VectorStore
+from app.offline.chunk_store import ChunkStore
+from app.offline.processed_cache import load_processed_document_by_key, materialize_for_document
 from app.online.graph import ExamState
 
 logger = get_logger("RETRIEVAL")
@@ -68,13 +70,14 @@ def retrieve_selected(
     *,
     session_id: str | None = None,
     job_id: str | None = None,
+    processed_document_key: str | None = None,
 ) -> dict:
     """Pull the exact child chunks the user selected (by id, no search).
 
     Returns the selected tree context for question generation and planning.
     """
     t0 = time.perf_counter()
-    store = VectorStore()
+    store = ChunkStore()
     if session_id or job_id:
         children = store.get_by_child_ids(
             document_id,
@@ -85,6 +88,33 @@ def retrieve_selected(
     else:
         # Preserve the public pipeline contract for local callers and tests.
         children = store.get_by_child_ids(document_id, selected_child_ids)
+
+    if not children and processed_document_key:
+        cached = load_processed_document_by_key(processed_document_key)
+        if cached:
+            cached_structure = cached["structure"]
+            cached_document_ids = {
+                str(row.get("document_id") or "")
+                for row in [
+                    *(cached_structure.get("parents") or []),
+                    *(cached_structure.get("children") or []),
+                ]
+                if row.get("document_id")
+            }
+            structure = (
+                deepcopy(cached_structure)
+                if cached_document_ids == {document_id}
+                else materialize_for_document(cached_structure, document_id)
+            )
+            store.replace_document(
+                structure, document_id=document_id, session_id=session_id,
+                job_id=job_id, processed_document_key=processed_document_key,
+                processing_versions=cached.get("processing_versions") or {},
+            )
+            children = store.get_by_child_ids(
+                document_id, selected_child_ids, session_id=session_id, job_id=job_id,
+            )
+            logger.info("Backfilled cached document chunks into PostgreSQL | document_id=%s", document_id)
 
     if not children:
         logger.warning(
@@ -141,6 +171,7 @@ def retrieve_context(state: ExamState) -> dict:
             selected_child_ids,
             session_id=session_id,
             job_id=index_job_id,
+            processed_document_key=state.get("processed_document_key"),
         )
 
     logger.warning(

@@ -40,11 +40,10 @@ def _task(task_id: str, *, operation: str = "explain_cause", qtypes=None) -> dic
 
 def test_validator_and_repair_prompts_match_their_root_wrapper_schemas():
     validator_shape = json.loads(validator.VALIDATOR_OUTPUT_SCHEMA)
-    repair_shape = json.loads(validator.REPAIR_OUTPUT_SCHEMA)
     assert set(validator_shape) == {"verdicts"}
     assert isinstance(validator_shape["verdicts"], list)
-    assert set(repair_shape) == {"repairs"}
-    assert isinstance(repair_shape["repairs"], list)
+    assert '"repairs"' in validator.build_repair_prompt([])
+    assert '"patch"' in validator.build_repair_prompt([])
     assert "never return a bare root array" in validator.build_validator_prompt([])
     assert "never return a bare root array" in validator.build_repair_prompt([])
 
@@ -184,7 +183,7 @@ def test_mcq_balance_recomputes_certificate_mapping_before_validation():
     assert question["solution_certificate"]["matching_correct_option"] == "B"
 
 
-def test_general_repair_invalidates_old_certificate_and_uses_canonical_writeback(monkeypatch):
+def test_general_repair_preserves_unmodified_certificate_and_uses_patch_writeback(monkeypatch):
     original = {
         "question_id": "q1", "slot_id": "m1_why_1",
         "question": "Why does friction slow motion?", "reference_answer": "old",
@@ -197,11 +196,8 @@ def test_general_repair_invalidates_old_certificate_and_uses_canonical_writeback
     exam = {"model_number": 1, "questions": {"why": [original]}}
     monkeypatch.setattr(validator, "request_structured", lambda *_args, **_kwargs: {
         "repairs": [{
-            "question_id": "q1", "repaired_fields": ["reference_answer"],
-            "question": {
-                "question": original["question"],
+            "question_id": "q1", "patch": {
                 "reference_answer": "Friction opposes relative motion.",
-                "solution_certificate": original["solution_certificate"],
             },
         }]
     })
@@ -212,7 +208,7 @@ def test_general_repair_invalidates_old_certificate_and_uses_canonical_writeback
     }], client=object())
     assert result["repaired_ids"] == ["q1"]
     assert exam["questions"]["why"][0]["reference_answer"].startswith("Friction")
-    assert exam["questions"]["why"][0]["solution_certificate"] is None
+    assert exam["questions"]["why"][0]["solution_certificate"] == original["solution_certificate"]
 
 
 def test_question_type_contract_has_no_removed_type():
@@ -276,11 +272,7 @@ def test_fitb_stem_repair_preserves_authoritative_answer_and_entry_id(monkeypatc
     exam = {"model_number": 1, "questions": {"fill_in_the_blank": section}}
     monkeypatch.setattr(validator, "request_structured", lambda *_args, **_kwargs: {
         "repairs": [{
-            "question_id": "q1", "repaired_fields": ["question"],
-            "question": {
-                "stem": "The push or pull is ________.",
-                "distractor_1": "mass", "distractor_2": "energy",
-            },
+            "question_id": "q1", "patch": {"question": "The push or pull is ________."},
         }]
     })
     before = list(section["word_bank"])
@@ -306,12 +298,7 @@ def test_fitb_distractor_repair_rebuilds_section_bank_in_code(monkeypatch):
     exam = {"model_number": 1, "questions": {"fill_in_the_blank": section}}
     monkeypatch.setattr(validator, "request_structured", lambda *_args, **_kwargs: {
         "repairs": [{
-            "question_id": "q1", "repaired_fields": ["distractors"],
-            "question": {
-                "stem": "The push or pull is ________.",
-                "distractor_1": "motion",
-                "distractor_2": "matter",
-            },
+            "question_id": "q1", "patch": {"distractors": ["motion", "matter"]},
         }]
     })
     result = validator.repair_exam(exam, [{

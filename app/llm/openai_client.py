@@ -28,6 +28,8 @@ class OpenAIClient(DeepSeekClient):
         self.reasoning_effort = reasoning_effort
         self.last_usage: dict[str, int | str] | None = None
         self.usage_history: list[dict[str, int | str]] = []
+        self.last_transient_retries = 0
+        self.last_structured_attempts = 0
 
     def _reasoning_effort(self, agent: str) -> str:
         return self.reasoning_effort

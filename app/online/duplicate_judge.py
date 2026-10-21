@@ -7,6 +7,8 @@ import math
 import re
 import unicodedata
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from itertools import combinations
 from typing import Any, Literal
 
@@ -14,6 +16,7 @@ from pydantic import Field, create_model
 
 from app import config
 from app.llm.client import request_structured
+from app.config import DUPLICATE_JUDGE_BATCH_SIZE, MAX_PARALLEL_DUPLICATE_JUDGE_CALLS
 from app.llm.factory import create_llm_client
 from app.llm.schemas import StrictOutputModel
 from app.offline.embeddings import cosine_sim, embed_dense
@@ -21,7 +24,7 @@ from app.online.semantic_keys import formula_semantic_key
 
 logger = logging.getLogger("DUPLICATE_JUDGE")
 
-DUPLICATE_JUDGE_PROMPT_VERSION = "semantic-facts-v4"
+DUPLICATE_JUDGE_PROMPT_VERSION = "semantic-facts-v5-practice-variation"
 SEMANTIC_FACT_FIELDS = (
     "same_core_knowledge",
     "same_student_operation_or_method",
@@ -344,7 +347,9 @@ Question registry:
 """ + json.dumps(registry, ensure_ascii=False) + "\n\nPairs:\n" + json.dumps(pairs, ensure_ascii=False)
 
 
-def deterministic_pair_classification(analysis: dict[str, Any]) -> str:
+def deterministic_pair_classification(
+    analysis: dict[str, Any], *, authorized_practice_variation: bool = False,
+) -> str:
     yes = lambda key: str(analysis.get(key) or "").casefold() == "yes"
     same_knowledge = yes("same_core_knowledge")
     same_operation = yes("same_student_operation_or_method")
@@ -352,6 +357,8 @@ def deterministic_pair_classification(analysis: dict[str, Any]) -> str:
     new_reasoning = yes("genuinely_new_reasoning")
     gives_away = yes("one_answer_substantially_gives_away_other")
     if same_knowledge and same_operation and same_target and not new_reasoning:
+        if authorized_practice_variation and not gives_away:
+            return "acceptable_practice_variation"
         return "duplicate"
     # A give-away is actionable only when the two items still overlap in the
     # assessed work. Shared prerequisites are common in STEM exams and must not
@@ -360,7 +367,7 @@ def deterministic_pair_classification(analysis: dict[str, Any]) -> str:
         return "excessive_overlap"
     if same_knowledge and not new_reasoning:
         return "excessive_overlap"
-    return "acceptable_reuse"
+    return "acceptable_practice_variation" if authorized_practice_variation else "acceptable_reuse"
 
 
 def _fact_cache_key(pair: dict[str, Any], client: Any) -> str:
@@ -376,6 +383,7 @@ def _fact_cache_key(pair: dict[str, Any], client: Any) -> str:
             "question_type": item.get("question_type"),
             "stem": content(item.get("stem")),
             "answer": content(item.get("answer")),
+            "reuse_context": item.get("plan_review_reuse_context"),
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     model = str(
         getattr(client, "model", None)
@@ -468,6 +476,7 @@ def review_duplicate_candidates(
         return {"candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
                 "similarity_distribution": distribution, "usage": {},
                 "fact_cache": cache, "fact_cache_hits": 0, "fact_cache_misses": 0}
+    explicit_client = client
     client = client or create_llm_client()
     cached_by_pair: dict[str, dict[str, Any]] = {}
     uncached: list[dict[str, Any]] = []
@@ -486,21 +495,51 @@ def review_duplicate_candidates(
     fresh_by_pair: dict[str, dict[str, Any]] = {}
     usage: dict[str, Any] = {}
     if uncached:
-        uncached_ids = [pair["pair_id"] for pair in uncached]
-        raw = request_structured(
-            client, _prompt(uncached), response_model=duplicate_response_model(uncached_ids),
-            schema_name="actual_question_duplicate_judgment", agent="duplicate_judge",
-            operation="actual_question_duplicate_judgment", item_count=len(uncached),
-            expected_ids=uncached_ids, expected_id_field="pair_id",
-            system_prompt=(
-                "Extract only the five requested pairwise semantic facts using the supplied definitions. "
-                "Never assign a duplicate, overlap, or reuse label."
-            ), temperature=0.0,
-            max_tokens=min(16000, max(4096, len(uncached) * 260)),
-        )
-        verdicts = list((raw or {}).get("verdicts") or [])
-        fresh_by_pair = {str(item.get("pair_id")): item for item in verdicts}
-        usage = getattr(client, "last_usage", None) or {}
+        # Each response extracts independent pairwise facts. Classification and
+        # conflict grouping remain deterministic after all batches are merged,
+        # so splitting here cannot remove cross-pair reasoning.
+        batches = [
+            uncached[index:index + DUPLICATE_JUDGE_BATCH_SIZE]
+            for index in range(0, len(uncached), DUPLICATE_JUDGE_BATCH_SIZE)
+        ]
+
+        def review_batch(batch_index: int, batch: list[dict[str, Any]]):
+            batch_ids = [pair["pair_id"] for pair in batch]
+            batch_client = explicit_client or create_llm_client()
+            raw = request_structured(
+                batch_client, _prompt(batch),
+                response_model=duplicate_response_model(batch_ids),
+                schema_name="actual_question_duplicate_judgment",
+                agent="duplicate_judge",
+                operation="actual_question_duplicate_judgment",
+                item_count=len(batch), expected_ids=batch_ids,
+                expected_id_field="pair_id",
+                system_prompt=(
+                    "Extract only the five requested pairwise semantic facts using the supplied definitions. "
+                    "Never assign a duplicate, overlap, or reuse label."
+                ), temperature=0.0,
+                max_tokens=min(16000, max(4096, len(batch) * 260)),
+            )
+            return batch_index, list((raw or {}).get("verdicts") or []), (
+                getattr(batch_client, "last_usage", None) or {}
+            )
+
+        completed: dict[int, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
+        workers = min(MAX_PARALLEL_DUPLICATE_JUDGE_CALLS, len(batches))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(copy_context().run, review_batch, index, batch): index
+                for index, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                batch_index, verdicts, batch_usage = future.result()
+                completed[batch_index] = (verdicts, batch_usage)
+        usage = {"batches": []}
+        for batch_index in range(len(batches)):
+            verdicts, batch_usage = completed[batch_index]
+            for item in verdicts:
+                fresh_by_pair[str(item.get("pair_id"))] = item
+            usage["batches"].append(batch_usage)
     ordered = []
     for pair in candidates:
         pair_id = pair["pair_id"]
@@ -513,7 +552,15 @@ def review_duplicate_candidates(
         if pair_id in fresh_by_pair and has_all_facts:
             cache[cache_key_by_pair[pair_id]] = facts
         analysis = {"pair_id": pair_id, **facts}
-        analysis["classification"] = deterministic_pair_classification(analysis)
+        authorized = all(
+            bool(pair[side].get("plan_review_reuse_context", {}).get("authorized"))
+            for side in ("left", "right")
+            if pair[side].get("plan_review_reuse_context")
+        ) and any(pair[side].get("plan_review_reuse_context") for side in ("left", "right"))
+        analysis["classification"] = deterministic_pair_classification(
+            analysis, authorized_practice_variation=authorized,
+        )
+        analysis["authorized_practice_variation"] = authorized
         ordered.append(analysis)
     return {"candidate_pairs": candidates, "pair_verdicts": ordered,
             "duplicate_groups": build_duplicate_groups(candidates, ordered),

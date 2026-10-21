@@ -11,6 +11,8 @@ from typing import Any, Callable
 
 from app.config import (
     CHILD_MAX_SIZE,
+    CHILD_OVERLAP_MAX_CHARS,
+    CHILD_OVERLAP_MAX_WORDS,
     CHILD_MIN_TOKENS_DROP,
     CHILD_MIN_TOKENS_MERGE,
     PARENT_MAX_SIZE,
@@ -96,6 +98,7 @@ class Sentence:
     item_type: str = "text"
     heading_level: int | None = None
     atomic_id: str | None = None
+    unit_kind: str = "prose"
 
 
 @dataclass
@@ -408,6 +411,35 @@ def _assign_atomic_quote_units(paragraphs: list[Paragraph]) -> None:
             paragraphs[index].atomic_id = paragraphs[index - 1].atomic_id
 
 
+_EXERCISE_START_RE = re.compile(
+    r"^\s*(?:\*{0,2})?(?:exercise|question|problem|example)?\s*"
+    r"(?:\d{1,3}|[٠-٩]{1,3})\s*[.)](?:\*{0,2})?\s+\S",
+    re.IGNORECASE,
+)
+_SUBQUESTION_RE = re.compile(
+    r"^\s*(?:\*{0,2})?(?:[A-Za-z]|[أ-ي]|\d{1,2})\s*[.)](?:\*{0,2})?\s+\S"
+)
+
+
+def _assign_atomic_exercise_units(paragraphs: list[Paragraph]) -> None:
+    """Conservatively bind exercise statements and subsequent parts."""
+    active: str | None = None
+    for paragraph in paragraphs:
+        text = paragraph.text.strip()
+        if paragraph.strong_boundary or paragraph.item_type == "heading":
+            active = None
+            continue
+        if paragraph.item_type == "table":
+            paragraph.atomic_id = paragraph.atomic_id or f"table-{paragraph.order}"
+            continue
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if _EXERCISE_START_RE.match(first_line):
+            active = f"exercise-{paragraph.order}"
+            paragraph.atomic_id = active
+        elif active and (_SUBQUESTION_RE.match(first_line) or not _EXERCISE_START_RE.match(first_line)):
+            paragraph.atomic_id = active
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: Build the document's paragraph units (parser-agnostic).
 # ---------------------------------------------------------------------------
@@ -447,6 +479,7 @@ def extract_paragraphs(pages: list[dict[str, Any]]) -> list[Paragraph]:
                 order += 1
     _validate_heading_candidates(paragraphs, candidate_metadata)
     _assign_atomic_quote_units(paragraphs)
+    _assign_atomic_exercise_units(paragraphs)
     return paragraphs
 
 
@@ -472,6 +505,20 @@ def split_sentences(text: str) -> list[str]:
     """
     if not text:
         return []
+    segments = _protect_math_segments(text)
+    if any(kind == "math" for kind, _ in segments):
+        result: list[str] = []
+        for kind, segment in segments:
+            if kind == "math":
+                if segment.strip():
+                    result.append(segment.strip())
+            else:
+                result.extend(_split_prose_sentences(segment))
+        return result
+    return _split_prose_sentences(text)
+
+
+def _split_prose_sentences(text: str) -> list[str]:
     text = _mask_non_boundary_periods(text)
     # Preserve parser line boundaries when they introduce a bullet, numbered
     # question, or short heading without terminal punctuation.
@@ -495,6 +542,65 @@ def split_sentences(text: str) -> list[str]:
             continue
         out.append(part)
     return [_restore_mask(s) for s in out]
+
+
+_MATH_ENVIRONMENTS = frozenset({
+    "align", "align*", "aligned", "alignedat", "array", "cases", "dcases",
+    "equation", "equation*", "gather", "gather*", "gathered", "matrix",
+    "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix", "smallmatrix",
+    "split", "multline", "multline*",
+})
+_BEGIN_ENV_RE = re.compile(r"\\begin\{([^}]+)\}")
+
+
+def _protect_math_segments(text: str) -> list[tuple[str, str]]:
+    """Scan text into prose/math spans, preserving malformed trailing math."""
+    spans: list[tuple[str, str]] = []
+    i = 0
+    prose_start = 0
+
+    def add_math(start: int, end: int) -> None:
+        nonlocal prose_start
+        if start > prose_start:
+            spans.append(("prose", text[prose_start:start]))
+        spans.append(("math", text[start:end]))
+        prose_start = end
+
+    while i < len(text):
+        opener = None
+        closer = None
+        start = i
+        if text.startswith("$$", i):
+            opener, closer = "$$", "$$"
+        elif text.startswith(r"\[", i):
+            opener, closer = r"\[", r"\]"
+        elif text.startswith(r"\(", i):
+            opener, closer = r"\(", r"\)"
+        elif text[i] == "$" and (i == 0 or text[i - 1] != "\\"):
+            opener, closer = "$", "$"
+        else:
+            env_match = _BEGIN_ENV_RE.match(text, i)
+            if env_match and env_match.group(1) in _MATH_ENVIRONMENTS:
+                env = env_match.group(1)
+                end_token = rf"\end{{{env}}}"
+                end = text.find(end_token, env_match.end())
+                end = len(text) if end < 0 else end + len(end_token)
+                add_math(i, end)
+                i = end
+                continue
+        if opener:
+            search = i + len(opener)
+            end = text.find(closer, search)
+            while end >= 0 and end > 0 and text[end - 1] == "\\" and closer == "$":
+                end = text.find(closer, end + len(closer))
+            end = len(text) if end < 0 else end + len(closer)
+            add_math(start, end)
+            i = end
+            continue
+        i += 1
+    if prose_start < len(text):
+        spans.append(("prose", text[prose_start:]))
+    return spans or [("prose", text)]
 
 
 def _mask_non_boundary_periods(text: str) -> str:
@@ -546,51 +652,22 @@ def split_parents(
     encode_ms = (time.perf_counter() - t0) * 1000
     t0 = time.perf_counter()
 
-    # Only headings that passed deterministic candidate validation may own a
-    # parent boundary. Documents without reliable structural markers retain the
-    # semantic fallback; parser-reported level alone is never sufficient.
-    structured = sum(1 for p in paragraphs if p.strong_boundary) >= 2
     groups: list[list[Paragraph]] = [[paragraphs[0]]]
     for i in range(1, len(paragraphs)):
         sim = cosine_sim(vecs[i - 1], vecs[i])
         current = paragraphs[i]
         previous = paragraphs[i - 1]
-        structural = current.strong_boundary
-        if structural:
-            marker_re = re.compile(
-                r"^\s*(الوحدة|القسم|الفصل|الباب|chapter|section|unit|part)\s*([\d٠-٩]+)",
-                re.IGNORECASE,
-            )
-            current_marker = marker_re.match(current.text)
-            previous_marker = next(
-                (
-                    marker_re.match(unit.text)
-                    for unit in reversed(groups[-1])
-                    if unit.item_type == "heading" and marker_re.match(unit.text)
-                ),
-                None,
-            )
-            if (
-                current_marker
-                and previous_marker
-                and current_marker.group(1).lower() == previous_marker.group(1).lower()
-                and current_marker.group(2) == previous_marker.group(2)
-            ):
-                structural = False
-        role_boundary = False
         same_atomic_unit = bool(
             current.atomic_id
             and previous.atomic_id
             and current.atomic_id == previous.atomic_id
         )
-        split = structural or (not structured and sim < threshold)
+        # Restore the original BGE-M3 semantic walk. Parser headings remain
+        # title/context metadata and never force a parent boundary.
+        split = sim < threshold
         if same_atomic_unit:
             split = False
-            structural = False
-        reason = (
-            "atomic_quote" if same_atomic_unit else "heading" if structural else "content_role" if role_boundary
-            else "similarity" if split else "merge"
-        )
+        reason = "atomic_unit" if same_atomic_unit else "similarity" if split else "merge"
         logger.debug(
             "Parent boundary | i=%d | sim=%.4f | threshold=%.2f | action=%s | reason=%s",
             i,
@@ -653,30 +730,6 @@ def _group_role(group: list[Paragraph]) -> str:
     return "content"
 
 
-def _can_merge_parents(left: ParentChunk, right: ParentChunk) -> bool:
-    """Short chunks may merge only within one unprotected content region."""
-    if right.protected_boundary:
-        return False
-    if left.content_role != right.content_role:
-        return False
-    if left.content_role in {"supplementary", "table"}:
-        return False
-    if not left.content or not right.content:
-        return False
-    # The initial semantic walk already embedded every paragraph. Avoid a
-    # second per-parent model call here; require strong lexical continuity as a
-    # conservative additional gate for short-fragment merging.
-    def terms(value: str) -> set[str]:
-        return {
-            token.lower()
-            for token in re.findall(rf"[A-Za-z{_ARABIC_LETTER}]{{3,}}", value)
-        }
-
-    a = terms(left.content[-1200:])
-    b = terms(right.content[:1200])
-    return bool(a and b and len(a & b) / min(len(a), len(b)) >= 0.35)
-
-
 def _merged_parent(left: ParentChunk, right: ParentChunk) -> ParentChunk:
     units = list(left.source_items or []) + list(right.source_items or [])
     page_start, page_end = _paragraph_pages(units) if units else _page_range(left, right)
@@ -703,38 +756,31 @@ def _page_range(*parents: ParentChunk) -> tuple[int | None, int | None]:
 
 
 def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
-    """Enforce parent size bounds (drop / merge / hard ceiling).
+    """Merge short semantic groups and enforce the parent size ceiling.
 
     In document order:
-    - drop parents at or below PARENT_MIN_TOKENS_DROP,
+    - preserve every semantic group,
     - merge parents under PARENT_MERGE_TOKENS into the previous parent (or the
-      next one when no previous exists),
+      next one when the first parent is short),
     - split any parent above PARENT_MAX_SIZE at sentence boundaries.
 
     ``count_tokens`` estimates token counts from words via WORDS_PER_TOKEN.
     """
-    # 1. Keep structural/supplementary units even when short; only discard
-    # genuinely unstructured fragments below the floor.
-    kept = [
-        p for p in parents
-        if count_tokens(p.content) > PARENT_MIN_TOKENS_DROP
-        or p.protected_boundary
-        or p.content_role in {"supplementary", "table"}
-    ]
-    if not kept:
+    if not parents:
         return []
 
-    # 2. Merge short parents into a neighbour (prefer the previous).
+    # Restore the original semantic coalescing behavior: a short group joins
+    # its preceding semantic region without an additional lexical gate. Unlike
+    # the historical implementation, tiny groups are merged rather than lost.
     merged: list[ParentChunk] = []
-    for parent in kept:
-        if (
-            merged
-            and count_tokens(parent.content) < PARENT_MERGE_TOKENS
-            and _can_merge_parents(merged[-1], parent)
-        ):
+    for parent in parents:
+        if merged and count_tokens(parent.content) < PARENT_MERGE_TOKENS:
             merged[-1] = _merged_parent(merged[-1], parent)
             continue
         merged.append(parent)
+    if len(merged) >= 2 and count_tokens(merged[0].content) < PARENT_MERGE_TOKENS:
+        merged[1] = _merged_parent(merged[0], merged[1])
+        merged.pop(0)
 
     # 3. Split any parent that exceeds the hard ceiling at sentence boundaries.
     max_parent_words = max(1, int(PARENT_MAX_SIZE / WORDS_PER_TOKEN))
@@ -745,7 +791,12 @@ def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
             continue
         units: list[Paragraph] = []
         for unit in parent.source_items or [Paragraph(parent.content, parent.page_start)]:
-            if count_words(unit.text) <= max_parent_words:
+            protected_unit = (
+                unit.item_type == "table"
+                or bool(unit.atomic_id)
+                or any(kind == "math" for kind, _ in _protect_math_segments(unit.text))
+            )
+            if protected_unit or count_words(unit.text) <= max_parent_words:
                 units.append(unit)
                 continue
             for piece in split_sentences(unit.text):
@@ -762,6 +813,11 @@ def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
                             unit.order,
                             unit.role,
                             unit.strong_boundary and start == 0,
+                            unit.parser_item_type,
+                            unit.heading_score,
+                            unit.heading_decision,
+                            unit.heading_reasons,
+                            unit.atomic_id,
                         )
                     )
 
@@ -787,8 +843,6 @@ def _apply_parent_policy(parents: list[ParentChunk]) -> list[ParentChunk]:
             minimum_tail_words = max(1, int(PARENT_MERGE_TOKENS / WORDS_PER_TOKEN))
             while tail_words < minimum_tail_words and len(packed[-2]) > 1:
                 moving = packed[-2][-1]
-                if moving.strong_boundary:
-                    break
                 packed[-2].pop()
                 packed[-1].insert(0, moving)
                 tail_words += count_words(moving.text)
@@ -819,8 +873,8 @@ def build_parents(
 ) -> list[ParentChunk]:
     """Turn paragraph groups into parent chunks (no overlap between parents).
 
-    Size policy applied afterwards: drop < PARENT_MIN_TOKENS_DROP, merge
-    < PARENT_MERGE_TOKENS, and cap each parent at PARENT_MAX_SIZE.
+    Size policy applied afterwards: preserve/merge every short group and cap
+    each parent at PARENT_MAX_SIZE without splitting atomic source units.
     """
     parents: list[ParentChunk] = []
     for group in groups:
@@ -932,8 +986,22 @@ def _max_child_words() -> int:
 
 
 def _last_sentence_of(content: str) -> str:
+    if _contains_protected_content(content):
+        return ""
     sents = split_sentences(content)
-    return sents[-1] if sents else ""
+    last = sents[-1].strip() if sents else ""
+    if not last or count_words(last) > CHILD_OVERLAP_MAX_WORDS or len(last) > CHILD_OVERLAP_MAX_CHARS:
+        return ""
+    return last
+
+
+def _contains_protected_content(text: str) -> bool:
+    if any(kind == "math" for kind, _ in _protect_math_segments(text)):
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) >= 2 and any("|" in line for line in lines):
+        return True
+    return bool(lines and (_EXERCISE_START_RE.match(lines[0]) or _SUBQUESTION_RE.match(lines[0])))
 
 
 def count_tokens(text: str) -> int:
@@ -1028,42 +1096,60 @@ _LIST_MARKER_RE = re.compile(r"(?<![\d٠-٩])([\d٠-٩]{1,3})\s*[.)\]:-]\s+")
 # "state-of-the-art" and spaced dashes used inside ordinary prose remain unless
 # they clearly separate a list item. Captures the leading boundary so the
 # preceding whitespace/paren is preserved, not the bullet symbol.
-_BULLET_MARKER_RE = re.compile(r"(^|[\s(])([-•–—*])(?:\s+)(?=\S)")
+_BULLET_MARKER_RE = re.compile(
+    r"^(?P<indent>[ \t]*)(?P<marker>[\u2022*\-\u2013\u2014])(?P<space>[ \t]+)(?P<body>\S.*)$"
+)
 
 
 def strip_list_markers(text: str) -> str:
-    """Remove plain numbered-list markers (``1. `` / ``2) ``) and leading bullets.
+    """Remove only unambiguous line-leading bullets.
 
-    A numbered marker is removed only when its number is small (1-2 digits), is
-    NOT a structural number ("Chapter 3", "Section 2.1", ...), and is not a
-    year-like larger number. The marker's number is dropped but the copied text
-    remains. A leading bullet symbol (``-``, ``•``, ``–``, ``—``, ``*``) is
-    removed while its content stays.
+    Numbered exercise/subquestion labels are retained as source evidence. Dash
+    markers are preserved whenever their line resembles mathematics.
     """
     if not text:
         return text
+    lines: list[str] = []
+    for line in text.splitlines() or [text]:
+        match = _BULLET_MARKER_RE.match(line)
+        if not match:
+            lines.append(line)
+            continue
+        marker = match.group("marker")
+        body = match.group("body")
+        math_like = bool(
+            re.match(r"(?:[+\u2212-]?\d|\\|\$|[A-Za-z]\s*[=<>\u2264\u2265+\u2212*/])", body)
+            or re.search(r"\s(?:=|<|>|\u2264|\u2265|\+|\u2212|-)\s", body)
+        )
+        if marker in {"\u2022", "*"} or not math_like:
+            lines.append(f"{match.group('indent')}{body}")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
 
-    # Strip leading bullet markers, preserving the content and the leading
-    # boundary (start of text or the preceding whitespace/paren).
-    text = _BULLET_MARKER_RE.sub(lambda m: m.group(1), text)
 
-    # Guard against decimals/versions like "2.1" and "3.5" by requiring the
-    # marker not be preceded by a digit or a ".", and not be part of a larger
-    # number the structural token list protects.
-
-    def _replace(match: re.Match) -> str:
-        # Determine the word right before the match; if structural, keep it.
-        prefix = text[: match.start()]
-        prev_word = ""
-        if prefix.strip():
-            toks = [t for t in prefix.split() if t not in ('(', '[')]
-            if toks:
-                prev_word = toks[-1].rstrip('.')
-        if prev_word.lower() in _KEEP_STRUCTURAL_NUMBER_WORDS:
-            return match.group(0)  # keep "Chapter 3" intact
-        return ""  # strip the bare list marker
-
-    return _LIST_MARKER_RE.sub(_replace, text)
+def _split_exercise_blocks(text: str) -> list[tuple[str, str | None]]:
+    """Return ordered blocks and conservative per-item exercise identities."""
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return [(text, None)]
+    blocks: list[tuple[str, str | None]] = []
+    current: list[str] = []
+    atomic: str | None = None
+    exercise_index = 0
+    for line in lines:
+        stripped = line.strip()
+        if _EXERCISE_START_RE.match(stripped):
+            if current:
+                blocks.append(("\n".join(current).strip(), atomic))
+            exercise_index += 1
+            atomic = f"inline-exercise-{exercise_index}"
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append(("\n".join(current).strip(), atomic))
+    return [(block, aid) for block, aid in blocks if block]
 
 
 def _is_question_parent(content: str) -> bool:
@@ -1118,17 +1204,7 @@ def _meaningful_fragment(text: str) -> bool:
 def _apply_min_floor(
     groups: list[str], max_child_words: int, protected_prefixes: set[str] | None = None
 ) -> list[str]:
-    """Enforce the minimum child size on already-packed groups.
-
-    - at or below CHILD_MIN_TOKENS_DROP   -> drop the group entirely, UNLESS it
-      is a legitimate meaningful fragment (definition / question / heading),
-      which is preserved (merged into the next chunk) instead of discarded;
-    - between DROP and CHILD_MIN_TOKENS_MERGE -> merge into the previous (or
-      leading) chunk only when the merged chunk stays within ``max_child_words``;
-      otherwise the fragment keeps its own chunk so the size cap is never
-      exceeded by a merge.
-    Returns the filtered, still ordered list of chunk strings.
-    """
+    """Merge small child groups without ever deleting source content."""
     if not groups:
         return []
     protected_prefixes = protected_prefixes or set()
@@ -1136,12 +1212,8 @@ def _apply_min_floor(
     for g in groups:
         tk = count_tokens(g)
         protected = any(g.startswith(prefix) for prefix in protected_prefixes)
-        # Genuine junk at or below the drop floor is discarded; meaningful
-        # fragments (definitions / questions / headings) always survive.
-        if tk <= CHILD_MIN_TOKENS_DROP and not protected and not _meaningful_fragment(g):
-            continue
-        # Anything else under the merge floor is folded into the previous chunk,
-        # but never past the size ceiling.
+        # Cleaner output is source evidence. Short or malformed fragments may
+        # merge when safe, but they are never silently discarded here.
         if (
             tk <= CHILD_MIN_TOKENS_MERGE
             and out
@@ -1214,8 +1286,8 @@ def _dispatch_pages(
 def _prepare_child_sentences(text: str) -> list[str]:
     """Return the exact sentence stream ``build_children`` will pack.
 
-    Applies the same cleaning the child splitter uses: strips plain numbered-list
-    markers, drops junk/broken fragments, and removes sentence duplicates. This is
+    Applies the same cleaning the child splitter uses: strips unambiguous list
+    bullets and removes adjacent sentence duplicates. This is
     factored out so the whole book's sentences can be embedded exactly once,
     up-front, and then aligned to each parent's children by index.
     """
@@ -1224,8 +1296,6 @@ def _prepare_child_sentences(text: str) -> list[str]:
         return []
     selected: list[str] = []
     for s in split_sentences(combined):
-        if _is_junk_sentence(s):
-            continue
         norm = _normalize_sentence(s)
         if selected and _normalize_sentence(selected[-1]) == norm:
             continue
@@ -1241,15 +1311,44 @@ def _prepare_child_sentence_units(parent: ParentChunk) -> list[Sentence]:
         cleaned = strip_list_markers(unit.text)
         if not cleaned:
             continue
-        for piece in split_sentences(cleaned):
-            if _is_junk_sentence(piece):
-                continue
-            norm = _normalize_sentence(piece)
-            if selected and _normalize_sentence(selected[-1].text) == norm:
-                continue
-            selected.append(
-                Sentence(piece.strip(), unit.page, unit.item_type, unit.heading_level, unit.atomic_id)
+        if unit.item_type == "table":
+            selected.append(Sentence(
+                cleaned, unit.page, "table", unit.heading_level,
+                unit.atomic_id or f"table-{unit.order}", "table",
+            ))
+            continue
+        # A source unit containing math, or one already identified as an
+        # exercise/quotation unit, is indivisible at the child boundary. This
+        # preserves the relationship between its prose, givens and equations.
+        if unit.atomic_id or _source_math_spans(cleaned):
+            selected.append(Sentence(
+                cleaned, unit.page, unit.item_type, unit.heading_level,
+                unit.atomic_id or f"math-source-{unit.order}",
+                "exercise" if unit.atomic_id else "math",
+            ))
+            continue
+        for block_index, (block, exercise_id) in enumerate(_split_exercise_blocks(cleaned)):
+            effective_atomic = unit.atomic_id or (
+                f"{parent.parent_id}-{exercise_id}" if exercise_id else None
             )
+            math_spans = {
+                value.strip() for kind, value in _protect_math_segments(block)
+                if kind == "math" and value.strip()
+            }
+            for piece in split_sentences(block):
+                math_kind = piece.strip() in math_spans
+                norm = _normalize_sentence(piece)
+                if selected and _normalize_sentence(selected[-1].text) == norm:
+                    continue
+                selected.append(Sentence(
+                    piece.strip(), unit.page, unit.item_type, unit.heading_level,
+                    effective_atomic or (
+                        f"math-{unit.order}-{block_index}" if math_kind else None
+                    ),
+                    "math" if math_kind else (
+                        "exercise" if effective_atomic else "prose"
+                    ),
+                ))
     return selected
 
 
@@ -1371,7 +1470,7 @@ def build_children(
             and next_sent.atomic_id
             and current_atomic_id == next_sent.atomic_id
         )
-        if same_atomic_unit and count_words(candidate) <= max_child_words:
+        if same_atomic_unit:
             current_chunk = candidate
             current_heading_only = False
             current_kind = "content"
@@ -1482,7 +1581,7 @@ def build_children(
     }
     floored = _apply_min_floor(groups, max_child_words, heading_prefixes)
 
-    # Overlap: carry exactly the last sentence of the previous child forward
+    # Overlap: carry one bounded prose sentence from the previous original body.
     # into the next child (adds continuity for retrieval). The cap stays strict:
     # if the carried sentence would push the next child over ``max_child_words``
     # it is dropped from the overlap (it still lives in its own chunk), so no
@@ -1507,7 +1606,8 @@ def build_children(
                         max_child_words,
                     )
         overlapped.append(body)
-        previous_body = body
+        # Never propagate text that was itself copied as overlap.
+        previous_body = floored[len(overlapped) - 1].strip()
 
     filtered = overlapped
 
@@ -1586,6 +1686,156 @@ def _dedupe_across_levels(
         item.title = title
 
 
+def _integrity_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+_MATH_LINE_RE = re.compile(
+    r"(?=.*(?:\d|[A-Za-z]))(?=.*(?:=|<|>|≤|≥|\\(?:le|ge|times|frac)|\s[-−+]\s)).+"
+)
+
+
+def _source_math_spans(value: str) -> list[str]:
+    spans = [
+        _integrity_text(part) for kind, part in _protect_math_segments(value)
+        if kind == "math" and part.strip()
+    ]
+    for line in value.splitlines():
+        normalized = _integrity_text(line)
+        if normalized and _MATH_LINE_RE.fullmatch(normalized) and normalized not in spans:
+            spans.append(normalized)
+    return spans
+
+
+def _protected_source_unit(unit: Paragraph) -> bool:
+    if unit.item_type == "table" or unit.atomic_id:
+        return True
+    return bool(_source_math_spans(unit.text))
+
+
+def _expected_child_source_text(unit: Paragraph) -> str:
+    """Canonical source form expected after safe child-level normalization."""
+    value = unit.text if unit.item_type == "table" else strip_list_markers(unit.text)
+    return _integrity_text(value)
+
+
+def _source_unit_represented(unit: Paragraph, child_bodies: list[str]) -> bool:
+    expected = _expected_child_source_text(unit)
+    if not expected:
+        return True
+    if any(expected in body for body in child_bodies):
+        return True
+    pieces = [
+        _integrity_text(piece)
+        for piece in split_sentences(strip_list_markers(unit.text))
+        if _integrity_text(piece)
+    ]
+    return bool(pieces) and all(any(piece in body for body in child_bodies) for piece in pieces)
+
+
+def _recover_protected_source_units(
+    parents: list[ParentChunk], children: list[ChildChunk]
+) -> list[dict[str, Any]]:
+    """Rebuild affected parent children in place when integrity is incomplete.
+
+    Normal child packing keeps protected units whole. If an unexpected packing
+    failure still occurs, replace that parent's child sequence with an ordered,
+    source-unit-preserving reconstruction. Never append a duplicate source path.
+    """
+    diagnostics: list[dict[str, Any]] = []
+    by_parent: dict[str, list[ChildChunk]] = {}
+    for child in children:
+        by_parent.setdefault(child.parent_id, []).append(child)
+    affected: dict[str, list[int]] = {}
+    for parent in parents:
+        siblings = by_parent.setdefault(parent.parent_id, [])
+        for unit in parent.source_items or []:
+            if not _protected_source_unit(unit):
+                continue
+            expected = _expected_child_source_text(unit)
+            sibling_text = [_integrity_text(child.content) for child in siblings]
+            whole_required = unit.item_type == "table" or bool(unit.atomic_id)
+            math_spans = _source_math_spans(unit.text)
+            intact = (
+                any(expected in body for body in sibling_text)
+                if whole_required
+                else all(any(span in body for body in sibling_text) for span in math_spans)
+            )
+            if expected and intact:
+                continue
+            affected.setdefault(parent.parent_id, []).append(unit.order)
+
+    if not affected:
+        return diagnostics
+
+    max_child_words = _max_child_words()
+    rebuilt_by_parent: dict[str, list[ChildChunk]] = {}
+    for parent in parents:
+        missing_orders = affected.get(parent.parent_id)
+        if not missing_orders:
+            continue
+        packs: list[list[Paragraph]] = []
+        current: list[Paragraph] = []
+        current_words = 0
+        for unit in parent.source_items or []:
+            words = count_words(unit.text)
+            standalone = unit.item_type == "table"
+            if current and (standalone or current_words + words > max_child_words):
+                packs.append(current)
+                current, current_words = [], 0
+            if standalone:
+                packs.append([unit])
+                continue
+            current.append(unit)
+            current_words += words
+        if current:
+            packs.append(current)
+
+        rebuilt: list[ChildChunk] = []
+        for index, pack in enumerate(packs):
+            content = _group_content(pack)
+            pages = [unit.page for unit in pack if unit.page is not None]
+            role = "table" if any(unit.item_type == "table" for unit in pack) else parent.content_role
+            rebuilt.append(ChildChunk(
+                child_id=str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"genexam:integrity-rebuild:{parent.document_id}:{parent.parent_id}:{index}",
+                )),
+                parent_id=parent.parent_id,
+                document_id=parent.document_id,
+                title=None,
+                page_start=min(pages) if pages else parent.page_start,
+                page_end=max(pages) if pages else parent.page_end,
+                content=content,
+                book_heading=parent.book_heading,
+                heading_level=parent.heading_level,
+                content_role=role,
+                source_items=list(pack),
+                language=parent.language or detect_language(content),
+            ))
+        rebuilt_by_parent[parent.parent_id] = rebuilt
+        diagnostics.append({
+            "code": "protected_source_reconstruction",
+            "parent_id": parent.parent_id,
+            "source_orders": sorted(set(missing_orders)),
+            "replaced_children": len(by_parent.get(parent.parent_id, [])),
+            "rebuilt_children": len(rebuilt),
+            "message": "Rebuilt the affected parent child sequence from original cleaned source units.",
+        })
+
+    children[:] = [
+        child
+        for parent in parents
+        for child in rebuilt_by_parent.get(parent.parent_id, by_parent.get(parent.parent_id, []))
+    ]
+    parent_order = {parent.parent_id: index for index, parent in enumerate(parents)}
+    children.sort(key=lambda child: (
+        parent_order.get(child.parent_id, len(parent_order)),
+        min((item.order for item in (child.source_items or [])), default=10**9),
+    ))
+    return diagnostics
+
+
 # ---------------------------------------------------------------------------
 # Overlap verification (spot-check invariants from the pipeline).
 # ---------------------------------------------------------------------------
@@ -1630,10 +1880,54 @@ def verify_chunk_invariants(chunks: dict[str, Any]) -> list[str]:
             prev_c, cur_c = siblings[j - 1], siblings[j]
             expected = count_words(_last_sentence_of(prev_c.get("content", "")))
             actual = _word_overlap(prev_c.get("content", ""), cur_c.get("content", ""))
-            if actual > expected:
+            overlap_text = " ".join(cur_c.get("content", "").split()[:actual])
+            exceeds_sentence = expected > 0 and actual > expected
+            exceeds_bound = (
+                actual > CHILD_OVERLAP_MAX_WORDS
+                or len(overlap_text) > CHILD_OVERLAP_MAX_CHARS
+            )
+            if exceeds_sentence or exceeds_bound:
                 warnings.append(
-                    f"Child overlap exceeds one sentence ({actual}>{expected} words) "
+                    f"Child overlap exceeds one sentence or configured bound "
+                    f"({actual} words, {len(overlap_text)} chars) "
                     f"parent={pid} children={prev_c['child_id']}->{cur_c['child_id']}"
+                )
+    # Every parent source unit must remain represented in that parent's child
+    # sequence; protected units additionally remain whole.
+    for parent in parents:
+        pid = parent.get("parent_id")
+        sibling_text = [_integrity_text(c.get("content", "")) for c in by_parent.get(pid, [])]
+        for source in parent.get("source_items") or []:
+            source_text = str(source.get("text") or "")
+            source_type = source.get("type") or source.get("effective_type")
+            atomic_id = source.get("atomic_id")
+            protected = source_type == "table" or bool(atomic_id) or bool(
+                _source_math_spans(source_text)
+            )
+            source_unit = Paragraph(
+                text=source_text,
+                page=source.get("page"),
+                item_type=source_type or "text",
+                order=int(source.get("order") or 0),
+                atomic_id=atomic_id,
+            )
+            expected = _expected_child_source_text(source_unit)
+            whole_required = source_type == "table" or bool(atomic_id)
+            math_spans = _source_math_spans(source_text)
+            intact = (
+                any(expected in body for body in sibling_text)
+                if whole_required
+                else all(any(span in body for body in sibling_text) for span in math_spans)
+            )
+            if protected and expected and not intact:
+                warnings.append(
+                    "FATAL processing-induced source loss "
+                    f"parent={pid} source_order={source.get('order')} type={source_type}"
+                )
+            elif expected and not _source_unit_represented(source_unit, sibling_text):
+                warnings.append(
+                    "FATAL child source representation loss "
+                    f"parent={pid} source_order={source.get('order')} type={source_type}"
                 )
     return warnings
 
@@ -1872,14 +2166,15 @@ def _enforce_title_invariants(
             item.title = regenerated
             used.add(regenerated)
             continue
-        if level == "subsection":
-            item.title = None
-            continue
         emergency = clean = descriptive_fallback(
             item.content,
             item.book_heading or "",
             index=index,
-            max_words=FALLBACK_SECTION_MAX_WORDS,
+            max_words=(
+                FALLBACK_SUBSECTION_MAX_WORDS
+                if level == "subsection"
+                else FALLBACK_SECTION_MAX_WORDS
+            ),
             language=item.language,
         )
         suffix = 2
@@ -1930,6 +2225,8 @@ def build_semantic_structure(
         children.extend(
             build_children(parent, sentence_vecs=sentence_vecs.get(parent.parent_id))
         )
+
+    integrity_diagnostics = _recover_protected_source_units(parents, children)
 
     child_counts = Counter(c.parent_id for c in children)
     for c in children:
@@ -2013,6 +2310,7 @@ def build_semantic_structure(
     return {
         "domain_type": title_metadata["domain_type"],
         "subject": title_metadata["subject"],
+        "integrity_diagnostics": integrity_diagnostics,
         "parents": [
             {
                 "parent_id": p.parent_id,

@@ -82,7 +82,7 @@ This structure keeps each stage focused. It also lets DraftWork preserve valid w
 
 DraftWork does not repeatedly send the complete uploaded document to the language model.
 
-Documents are parsed with **LlamaParse**, cleaned, and divided into meaningful sections. **BGE-M3** creates dense and sparse embeddings, while **Qdrant** stores the vectors and performs hybrid retrieval. Processed documents are cached by their content and processing version, so identical uploads can reuse parsing and embedding work while still receiving separate document records.
+Documents are parsed with **LlamaParse**, cleaned, and divided into meaningful sections. Parent and child chunks are stored in **PostgreSQL**, and the selected chunks are loaded directly in document order. Processed documents are cached by their content and processing version, so identical uploads can reuse parsing and chunking work while still receiving separate document records. BGE-M3 remains available for semantic chunking and duplicate comparison.
 
 The planner receives the selected material to build its catalog and exam plan. Generation and validation then use the evidence assigned to each task, which keeps individual requests focused on the source material that supports that question.
 
@@ -116,7 +116,7 @@ The backend enforces ownership for:
 * Exports
 * Retrieved document data
 
-Long-running document processing and exam generation run as background jobs instead of blocking the main API. DraftWork uses **FastAPI**, **PostgreSQL**, **Celery**, **Redis**, **Qdrant**, **Clerk**, and **Docker** to support this workflow. Exam runs retain lifecycle and audit data for planning, validation, repair, and duplicate-review stages.
+Long-running document processing and exam generation run as background jobs instead of blocking the main API. DraftWork uses **FastAPI**, **PostgreSQL**, **Celery**, **Redis**, **Clerk**, and **Docker** to support this workflow. Exam runs retain lifecycle and audit data for planning, validation, repair, and duplicate-review stages.
 
 ## About the Project
 
@@ -159,10 +159,10 @@ flowchart LR
     D --> E[Celery Workers]
     E --> G[Processed Document Cache]
     G -->|cache miss| F[LlamaParse and Chunking]
-    F --> H[BGE-M3 Embeddings]
-    H --> G
-    G -->|cache hit or newly processed| I[Processed Structure and Embeddings]
-    I --> Q[Qdrant]
+    F <--> H[BGE-M3 Semantic Chunking]
+    F --> G
+    G -->|cache hit or newly processed| I[Processed Chunk Structure]
+    I --> P[(PostgreSQL chunks)]
     I --> K[Assessment Catalog]
     K --> L[Plan and Review]
     L --> M[Generate and Validate]
@@ -170,7 +170,7 @@ flowchart LR
     N --> C
 ```
 
-FastAPI serves the frontend and API. PostgreSQL stores application, account, exam, and audit data; Redis and Celery manage background work; and Qdrant stores document vectors used during retrieval. Clerk provides authentication while DraftWork keeps application ownership rules in its own database.
+FastAPI serves the frontend and API. PostgreSQL stores application, account, exam, audit, and document-chunk data; Redis and Celery manage background work. Clerk provides authentication while DraftWork keeps application ownership rules in its own database.
 
 ## Testing
 

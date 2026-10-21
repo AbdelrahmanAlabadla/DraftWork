@@ -120,7 +120,7 @@ def _catalog_fixture() -> tuple[dict, dict, dict]:
     return repeated, interpret, compare
 
 
-def test_agent_applies_valid_unused_task_and_preserves_canonical_identity(monkeypatch):
+def test_discovery_ignores_model_candidate_and_preserves_canonical_identity(monkeypatch):
     repeated, interpret, compare = _catalog_fixture()
     state = _state([repeated, interpret, compare], [repeated, repeated])
     before_slots = [
@@ -128,17 +128,18 @@ def test_agent_applies_valid_unused_task_and_preserves_canonical_identity(monkey
     ]
     monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(
-        plan_review, "request_structured", lambda *_args, **_kwargs: _response(interpret["task_id"])
+        plan_review, "request_structured", lambda *_args, **_kwargs: _response(compare["task_id"])
     )
 
     result = plan_review.review_plan(state)
     items = result["plans"][0]["items"]["mcq"]
 
     assert [item["slot_id"] for item in items] == before_slots
+    # Candidate selection belongs to deterministic repair, not discovery.
     assert items[1]["task_id"] == interpret["task_id"]
     assert items[1]["task_family_id"] == interpret["task_family_id"]
     assert items[1]["coverage_id"] == interpret["coverage_id"]
-    assert items[1]["plan_review_source"] == "agent"
+    assert items[1]["plan_review_source"] == "deterministic_repair_after_discovery"
     assert items[1]["plan_review_status"] == "reassigned_unused"
     assert items[1]["suggested_assessment_angle"]
     assert items[1]["forced_duplicate_slot_ids"] == ["m1_mcq_1"]
@@ -148,7 +149,7 @@ def test_agent_applies_valid_unused_task_and_preserves_canonical_identity(monkey
     reviewed = generation_items["mcq"][1]
     assert reviewed["previous_task_plan_items"][0]["slot_id"] == "m1_mcq_1"
     rendered = prompts._format_planned_item(1, reviewed)
-    assert "suggested_assessment_angle=Interpret the result instead of recalling it." in rendered
+    assert "suggested_assessment_angle=" in rendered
     assert "previous_task_plan_items=" in rendered
 
     exam = {"questions": {"mcq": [
@@ -159,14 +160,11 @@ def test_agent_applies_valid_unused_task_and_preserves_canonical_identity(monkey
     assert frozenset(("model1_mcq_1", "model1_mcq_2")) in forced
 
 
-def test_invalid_suggestion_retries_once_with_exact_rejection_reason(monkeypatch):
+def test_valid_review_with_invalid_candidate_uses_fallback_without_full_rereview(monkeypatch):
     repeated, interpret, _compare = _catalog_fixture()
     state = _state([repeated, interpret], [repeated, repeated])
     prompts: list[str] = []
-    responses = iter([
-        _response("task_missing"),
-        _response(interpret["task_id"]),
-    ])
+    responses = iter([_response("task_missing")])
 
     def fake_request(_client, prompt, **_kwargs):
         prompts.append(prompt)
@@ -177,10 +175,33 @@ def test_invalid_suggestion_retries_once_with_exact_rejection_reason(monkeypatch
 
     result = plan_review.review_plan(state)
 
-    assert len(prompts) == 2
-    assert "Candidate task_missing is not allowed for m1_mcq_2." in prompts[1]
-    assert result["plan_review_attempts"] == 2
+    assert len(prompts) == 1
+    assert result["plan_review_attempts"] == 1
     assert result["plans"][0]["items"]["mcq"][1]["task_id"] == interpret["task_id"]
+    assert result["plan_review_pair_verdicts"]["1"]["plan_pair_1"]["semantic_overlap"] is True
+    assert result["plan_review_telemetry"][0]["status"] == "findings_accepted"
+    assert result["plan_review_telemetry"][0]["ignored_suggestion_count"] == 1
+
+
+def test_incomplete_initial_review_gets_one_bounded_full_retry(monkeypatch):
+    repeated, interpret, _compare = _catalog_fixture()
+    state = _state([repeated, interpret], [repeated, repeated])
+    prompts = []
+    responses = iter([
+        {"verdicts": [], "suggestions": []},
+        _response(interpret["task_id"]),
+    ])
+    monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        plan_review, "request_structured",
+        lambda _client, prompt, **_kwargs: prompts.append(prompt) or next(responses),
+    )
+
+    result = plan_review.review_plan(state)
+
+    assert len(prompts) == 2
+    assert result["plan_review_attempts"] == 2
+    assert result["plan_review_telemetry"][0]["status"] == "findings_rejected"
 
 
 def test_two_invalid_suggestions_use_ranked_deterministic_fallback(monkeypatch):
@@ -198,10 +219,13 @@ def test_two_invalid_suggestions_use_ranked_deterministic_fallback(monkeypatch):
     result = plan_review.review_plan(state)
     changed = result["plans"][0]["items"]["mcq"][1]
 
-    assert changed["task_id"] == compare["task_id"]
-    assert changed["plan_review_source"] == "deterministic_fallback"
+    assert changed["task_id"] == interpret["task_id"]
+    assert changed["plan_review_source"] == "deterministic_repair_after_discovery"
     assert changed["catalog_replacement_stage"] == "plan_review_unused_task"
-    assert any(event["status"] == "fallback_applied" for event in result["plan_review_history"])
+    assert any(
+        event["status"] == "targeted_repair_applied_after_discovery"
+        for event in result["plan_review_history"]
+    )
 
 
 def test_fallback_does_not_reuse_the_directly_conflicting_task(monkeypatch):
@@ -251,26 +275,23 @@ def test_intentional_reuse_uses_nonconflicting_least_used_task_and_reaches_gener
     assert "previous_task_questions=" in rendered
 
 
-def test_plan_review_rejects_conflicting_slots_exact_task_before_apply(monkeypatch):
+def test_plan_review_keeps_findings_when_legacy_candidate_conflicts(monkeypatch):
     repeated, interpret, _compare = _catalog_fixture()
     state = _state([repeated, interpret], [repeated, interpret])
     bad = _response(
         repeated["task_id"], slot_id="m1_mcq_2", selection_type="intentional_reuse"
     )
-    responses = iter([bad, bad])
     prompts_seen = []
     monkeypatch.setattr(plan_review, "create_plan_review_client", lambda **_kwargs: object())
     monkeypatch.setattr(
         plan_review, "request_structured",
-        lambda _client, prompt, **_kwargs: prompts_seen.append(prompt) or next(responses),
+        lambda _client, prompt, **_kwargs: prompts_seen.append(prompt) or bad,
     )
 
     result = plan_review.review_plan(state)
-    assert any(
-        "directly conflicting slot" in event.get("reason", "")
-        for event in result["plan_review_history"]
-        if event["status"] == "agent_suggestion_rejected"
-    )
+    assert len(prompts_seen) == 1
+    assert result["plan_review_pair_verdicts"]["1"]["plan_pair_1"]["semantic_overlap"] is True
+    assert result["plan_review_telemetry"][0]["ignored_suggestion_count"] == 1
     assert result["plans"][0]["items"]["mcq"][0]["task_id"] == repeated["task_id"]
     assert result["plans"][0]["items"]["mcq"][1]["task_id"] == interpret["task_id"]
 
@@ -530,8 +551,9 @@ def test_duplicate_plan_error_repairs_only_conflicting_word_problem_and_rechecks
     assert first["plan_review_retry_required"] is True
     assert all(value in prompts_seen[0] for value in (
         "m1_word_problem_1", "m1_word_problem_4", duplicate_errors[0],
-        "calculate_distance", "compare_average_speed",
+        "calculate_distance",
     ))
+    assert "compare_average_speed" not in prompts_seen[0]
 
     state.update(first)
     second = plan_review.review_plan(state)
@@ -618,7 +640,7 @@ def test_plan_duplicate_recovery_is_bounded_and_unresolved_conflict_can_generate
     assert state["unresolved_plan_duplicate_conflicts"][0]["status"] == (
         "plan_duplicate_unresolved_kept"
     )
-    assert len(calls) == 7  # two rejected responses per repair, then one final audit review
+    assert len(calls) == 4  # one valid review per bounded repair/final verification cycle
 
     from app.online.graph import _route_after_plan_review
     assert _route_after_plan_review(state) == "generate_exams"

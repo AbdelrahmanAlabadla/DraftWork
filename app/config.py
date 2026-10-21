@@ -33,13 +33,6 @@ IS_PRODUCTION: bool = APP_ENV == "production"
 
 
 LLAMA_PARSE_API: str | None = _env("LLAMA_PARSE_API")
-QDRANT_URL: str = _env("QDRANT_URL", "http://localhost:6333") or "http://localhost:6333"
-QDRANT_COLLECTION: str = _env("QDRANT_COLLECTION", "genexam") or "genexam"
-QDRANT_API_KEY: str | None = _env("QDRANT_API_KEY")
-QDRANT_VERIFY_TLS: bool = _env_bool("QDRANT_VERIFY_TLS", True)
-QDRANT_TIMEOUT_SECONDS: int = max(
-    1, int(_env("QDRANT_TIMEOUT_SECONDS", "30") or "30")
-)
 
 # Base URL of the LM Studio server (native REST API /api/v1/chat is used).
 # A trailing /v1 (OpenAI-compatible form) is tolerated and stripped.
@@ -68,10 +61,16 @@ DEEPSEEK_MODEL: str = _env("DEEPSEEK_MODEL", "deepseek-flash") or "deepseek-flas
 if LLM_PROVIDER == "deepseek" and DEEPSEEK_MODEL not in {"deepseek-flash", "deepseek-v4-pro"}:
     raise ValueError("DEEPSEEK_MODEL must be 'deepseek-flash' or 'deepseek-v4-pro'")
 DEEPSEEK_CONCURRENCY_LIMIT: int = max(
-    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "5") or "5")
+    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "10") or "10")
 )
 DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: int = max(
     1, min(3, int(_env("DEEPSEEK_MAX_STRUCTURED_ATTEMPTS", "3") or "3"))
+)
+# The Catalog's incomplete-batch recovery applies to every compiler provider.
+# Keep this outer attempt budget independent from a provider's own structured
+# response retries, which remain controlled by provider-specific settings.
+CATALOG_BATCH_MAX_ATTEMPTS: int = max(
+    1, min(3, int(_env("CATALOG_BATCH_MAX_ATTEMPTS", "3") or "3"))
 )
 DEEPSEEK_MAX_TRANSIENT_RETRIES: int = max(
     0, int(_env("DEEPSEEK_MAX_TRANSIENT_RETRIES", "2") or "2")
@@ -104,13 +103,25 @@ VALIDATOR_BATCH_SIZE: int = max(
     1, int(_env("VALIDATOR_BATCH_SIZE", "8") or "8")
 )
 MAX_PARALLEL_GENERATION_CALLS: int = max(
-    1, min(5, int(_env("MAX_PARALLEL_GENERATION_CALLS", "5") or "5"))
+    1, min(10, int(_env("MAX_PARALLEL_GENERATION_CALLS", "10") or "10"))
 )
 MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: int = max(
-    1, min(5, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "5") or "5"))
+    1, min(10, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "10") or "10"))
 )
 MAX_PARALLEL_VALIDATOR_CALLS: int = max(
-    1, min(5, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "5") or "5"))
+    1, min(10, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "10") or "10"))
+)
+MAX_PARALLEL_CATALOG_CALLS: int = max(
+    1, min(50, int(_env("MAX_PARALLEL_CATALOG_CALLS", "50") or "50"))
+)
+MAX_PARALLEL_DUPLICATE_JUDGE_CALLS: int = max(
+    1, min(10, int(_env("MAX_PARALLEL_DUPLICATE_JUDGE_CALLS", "10") or "10"))
+)
+DUPLICATE_JUDGE_BATCH_SIZE: int = max(
+    1, int(_env("DUPLICATE_JUDGE_BATCH_SIZE", "8") or "8")
+)
+LLM_JOB_CONCURRENCY_LIMIT: int = max(
+    1, min(64, int(_env("LLM_JOB_CONCURRENCY_LIMIT", "10") or "10"))
 )
 TITLE_MODEL: str = _env("TITLE_MODEL", "mistralai/mistral-7b-instruct-v0.3") or "mistralai/mistral-7b-instruct-v0.3"
 # Base URL used ONLY by the title-generation client (section/subsection
@@ -131,13 +142,15 @@ EMBEDDING_BATCH_SIZE: int = max(
 # Content-addressed pipeline/cache versions.  Bump the narrowest version whose
 # output contract changed.  The embedding fingerprint also contains the model
 # name and vector dimension, so changing either invalidates processed artifacts.
-PARSER_PIPELINE_VERSION: str = _env("PARSER_PIPELINE_VERSION", "llamaparse-v1") or "llamaparse-v1"
-CHUNKER_PIPELINE_VERSION: str = _env("CHUNKER_PIPELINE_VERSION", "semantic-v3") or "semantic-v3"
+PARSER_PIPELINE_VERSION: str = _env("PARSER_PIPELINE_VERSION", "llamaparse-v2-canonical-items") or "llamaparse-v2-canonical-items"
+CHUNKER_PIPELINE_VERSION: str = _env("CHUNKER_PIPELINE_VERSION", "semantic-v5-restored-integrity") or "semantic-v5-restored-integrity"
 EMBEDDING_PIPELINE_VERSION: str = _env("EMBEDDING_PIPELINE_VERSION", "dense-sparse-v1") or "dense-sparse-v1"
-ASSESSMENT_CATALOG_VERSION: str = _env("ASSESSMENT_CATALOG_VERSION", "catalog-v8-unified-difficulty") or "catalog-v8-unified-difficulty"
+ASSESSMENT_CATALOG_VERSION: str = _env(
+    "ASSESSMENT_CATALOG_VERSION", "catalog-v11-task-family-variations"
+) or "catalog-v11-task-family-variations"
 ASSESSMENT_COMPILER_VERSION: str = (
-    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v3-atomic-task-ontology")
-    or "compiler-v3-atomic-task-ontology"
+    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v4-parallel-atomic-task-ontology")
+    or "compiler-v4-parallel-atomic-task-ontology"
 )
 PROCESSED_DOCUMENT_CACHE_DIR: str = (
     _env("PROCESSED_DOCUMENT_CACHE_DIR", "data/processed_documents")
@@ -252,12 +265,12 @@ PARSING_TIMEOUT_SECONDS: int = max(
     1, int(_env("PARSING_TIMEOUT_SECONDS", "120") or "120")
 )
 GENERATION_TIMEOUT_SECONDS: int = max(
-    1, int(_env("GENERATION_TIMEOUT_SECONDS", "800") or "800")
+    1, int(_env("GENERATION_TIMEOUT_SECONDS", "1300") or "1300")
 )
 JOB_HEARTBEAT_SECONDS: int = max(5, int(_env("JOB_HEARTBEAT_SECONDS", "30") or "30"))
 JOB_STALE_AFTER_SECONDS: int = max(
     GENERATION_TIMEOUT_SECONDS + 30,
-    int(_env("JOB_STALE_AFTER_SECONDS", "480") or "480"),
+    int(_env("JOB_STALE_AFTER_SECONDS", "1330") or "1330"),
 )
 ABANDONED_UPLOAD_AFTER_SECONDS: int = max(
     JOB_STALE_AFTER_SECONDS,
@@ -271,9 +284,6 @@ TEMP_EXPORT_RETENTION_SECONDS: int = max(
 )
 CLEANUP_BATCH_SIZE: int = max(
     1, min(1000, int(_env("CLEANUP_BATCH_SIZE", "100") or "100"))
-)
-ORPHAN_SCAN_MAX_POINTS: int = max(
-    100, int(_env("ORPHAN_SCAN_MAX_POINTS", "10000") or "10000")
 )
 
 # PostgreSQL is the durable source for evaluation history.  It is optional at
@@ -366,12 +376,6 @@ def validate_runtime_config() -> None:
             problems.append(f"Clerk authorized party must use HTTPS in production: {origin}")
     if not DATABASE_URL or "replace" in DATABASE_URL.lower() or "your_" in DATABASE_URL.lower():
         problems.append("DATABASE_URL must not contain placeholder credentials")
-    qdrant_url = urlparse(QDRANT_URL)
-    qdrant_is_local = qdrant_url.hostname in {"localhost", "127.0.0.1", "qdrant"}
-    if not qdrant_is_local and placeholder(QDRANT_API_KEY):
-        problems.append("QDRANT_API_KEY is required for remote Qdrant")
-    if not qdrant_is_local and qdrant_url.scheme != "https":
-        problems.append("QDRANT_URL must use HTTPS outside the local container network")
     if DATABASE_URL:
         database_url = urlparse(DATABASE_URL)
         database_is_local = database_url.hostname in {
@@ -427,6 +431,8 @@ WORDS_PER_TOKEN: float = float(_env("WORDS_PER_TOKEN", "1.3") or "1.3")
 # packed greedily up to this ceiling (derived word cap via WORDS_PER_TOKEN),
 # always cutting only at sentence boundaries.
 CHILD_MAX_SIZE: int = int(_env("CHILD_MAX_SIZE", "800") or "800")
+CHILD_OVERLAP_MAX_WORDS: int = int(_env("CHILD_OVERLAP_MAX_WORDS", "40") or "40")
+CHILD_OVERLAP_MAX_CHARS: int = int(_env("CHILD_OVERLAP_MAX_CHARS", "200") or "200")
 
 # Minimum child chunk sizes, expressed in TOKENS (converted to words via
 # WORDS_PER_TOKEN). Keeps tiny fragments out of the vector store:
@@ -445,9 +451,10 @@ QUESTION_PARENT_MIN_SHARE: float = float(
 
 # Parent chunk size bounds, expressed in TOKENS (converted to words via
 # WORDS_PER_TOKEN):
-# - at or below PARENT_MIN_TOKENS_DROP -> discarded entirely
+# - PARENT_MIN_TOKENS_DROP is retained for configuration compatibility; source
+#   groups are no longer discarded at this threshold
 # - under PARENT_MERGE_TOKENS -> merged into the previous parent (or next)
-# - PARENT_MAX_SIZE is a hard ceiling; any single parent above it is split.
+# - PARENT_MAX_SIZE is a packing target; indivisible source units may exceed it
 PARENT_MIN_TOKENS_DROP: int = int(_env("PARENT_MIN_TOKENS_DROP", "30") or "30")
 PARENT_MERGE_TOKENS: int = int(_env("PARENT_MERGE_TOKENS", "100") or "100")
 PARENT_MAX_SIZE: int = int(_env("PARENT_MAX_SIZE", "1200") or "1200")

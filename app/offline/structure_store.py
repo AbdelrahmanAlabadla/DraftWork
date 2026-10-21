@@ -18,10 +18,10 @@ def _path_for(document_id: str) -> Path:
 def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
     """Persist parent structure metadata (sections) to JSON.
 
-    Qdrant stores only child (subsection) embeddings. Parents live here as the
-    human-selectable section list for later retrieval scoping. Each section
+    PostgreSQL stores the complete parent/child records. This JSON remains the
+    human-selectable section projection used by the existing API. Each section
     embeds its subsections (with titles) in document order, so the frontend can
-    render the textbook hierarchy without querying Qdrant.
+    render the textbook hierarchy without a separate hierarchy query.
     """
     dir_path = Path(STRUCTURES_DIR)
     dir_path.mkdir(parents=True, exist_ok=True)

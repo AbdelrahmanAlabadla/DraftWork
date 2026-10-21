@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 from app.llm import deepseek
 from app.logging_conf import configure_logging
 from app.offline.processed_cache import file_sha256, processed_document_key
-from app.offline.vector_store import VectorStore
+from app.offline.chunk_store import ChunkStore
 from app.online import assessment_catalog, duplicate_judge, exam_builder, planner, validator
 from app.online.eval_stats import create_pipeline_eval
 from app.online.graph import get_exam_graph
@@ -52,8 +52,8 @@ def main() -> None:
         )
 
     selected_by_id = {str(chunk["child_id"]): chunk for chunk in chunks}
-    original_get = VectorStore.get_by_child_ids
-    VectorStore.get_by_child_ids = lambda self, _document_id, ids, **kwargs: [
+    original_get = ChunkStore.get_by_child_ids
+    ChunkStore.get_by_child_ids = lambda self, _document_id, ids, **kwargs: [
         copy.deepcopy(selected_by_id[value]) for value in ids if value in selected_by_id
     ]
 
@@ -145,7 +145,7 @@ def main() -> None:
                 if isinstance(node_update, dict):
                     state.update(node_update)
     finally:
-        VectorStore.get_by_child_ids = original_get
+        ChunkStore.get_by_child_ids = original_get
         state.pop("progress_callback", None)
         state["duration_seconds"] = round(time.perf_counter() - started, 3)
         write("final_state.json", state)

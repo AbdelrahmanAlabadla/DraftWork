@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import inspect
 import io
 import os
@@ -93,16 +92,16 @@ def test_cleanup_removes_assets_but_does_not_delete_saved_exam(monkeypatch):
         def list_prefixes(self, prefix, *, levels):
             return []
 
-    class Vectors:
+    class Chunks:
         def delete_document(self, document_id, session_id=None, raise_errors=False):
-            calls.append(("qdrant", document_id))
+            calls.append(("postgres_chunks", document_id))
             return 1
 
         def delete_orphaned_session_points(self, valid_scopes, *, max_points):
             return 0
 
     monkeypatch.setattr(cleanup, "get_file_storage", lambda: Storage())
-    monkeypatch.setattr(cleanup, "VectorStore", Vectors)
+    monkeypatch.setattr(cleanup, "ChunkStore", Chunks)
     monkeypatch.setattr(repositories, "start_cleanup_run", lambda: 1)
     monkeypatch.setattr(
         repositories,

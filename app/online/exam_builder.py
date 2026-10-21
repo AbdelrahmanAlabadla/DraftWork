@@ -19,8 +19,8 @@ from app.logging_conf import get_logger
 from app.online.assessment_catalog import (
     catalog_exhaustion_replacement,
     is_pure_text_fitb_value,
-    is_authorized_catalog_exhaustion_reuse,
     normalize_fitb_answer_key,
+    selected_variation,
 )
 from app.online.eval_stats import (
     create_pipeline_eval,
@@ -242,7 +242,12 @@ def _attach_plan_review_context(
         if references:
             item["previous_task_plan_items"] = references
             if item.get("task_reused") or item.get("fitb_entry_reused"):
-                item["previous_task_questions"] = [
+                existing_questions = list(item.get("previous_task_questions") or [])
+                represented_slots = {
+                    str(value.get("slot_id") or "")
+                    for value in existing_questions if isinstance(value, dict)
+                }
+                planned_placeholders = [
                     {
                         **reference,
                         "question_id": None,
@@ -254,12 +259,17 @@ def _attach_plan_review_context(
                     }
                     for reference in references
                     if (
-                        item.get("task_id")
-                        and reference.get("task_id") == item.get("task_id")
-                    ) or (
-                        item.get("fitb_entry_id")
-                        and reference.get("fitb_entry_id") == item.get("fitb_entry_id")
-                    )
+                        (
+                            item.get("task_id")
+                            and reference.get("task_id") == item.get("task_id")
+                        ) or (
+                            item.get("fitb_entry_id")
+                            and reference.get("fitb_entry_id") == item.get("fitb_entry_id")
+                        )
+                    ) and str(reference.get("slot_id") or "") not in represented_slots
+                ]
+                item["previous_task_questions"] = [
+                    *existing_questions, *planned_placeholders,
                 ]
     return plan_items
 
@@ -270,6 +280,40 @@ def _isolated_item_context(item: dict[str, Any]) -> str:
         f"[source_chunk_id={chunk_id}]\n{content}"
         for chunk_id, content in sources.items()
     )
+
+
+def _bind_selected_variation(
+    question: dict[str, Any], plan_item: dict[str, Any], question_type: str,
+) -> bool:
+    """Verify the Generator's choice and attach its effective evidence contract."""
+    if question_type == "fill_in_the_blank" or not plan_item.get("task_id"):
+        return True
+    if not plan_item.get("permitted_variations"):
+        # Compatibility for pre-v11 persisted plans and direct legacy callers.
+        return True
+    compatible = [
+        variation for variation in plan_item.get("permitted_variations") or []
+        if question_type in (variation.get("question_types") or [])
+    ]
+    selected_id = str(question.get("selected_variation_id") or "")
+    if not selected_id and len(compatible) == 1:
+        selected_id = str(compatible[0].get("variation_id") or "")
+        question["selected_variation_id"] = selected_id
+    variation = selected_variation(plan_item, selected_id, question_type)
+    if variation is None:
+        return False
+    inherited = [
+        value for value in [
+            plan_item.get("source_chunk_id"),
+            *(plan_item.get("support_chunk_ids") or []),
+        ] if value
+    ]
+    effective_ids = variation.get("evidence_chunk_ids")
+    question["selected_variation"] = variation
+    question["effective_evidence_chunk_ids"] = list(dict.fromkeys(map(
+        str, effective_ids if effective_ids is not None else inherited
+    )))
+    return True
 
 
 def _section_items(section: Any) -> list[dict[str, Any]]:
@@ -447,20 +491,12 @@ def _is_semantic_plan_duplicate(
     plan_by_slot: dict[str, dict[str, Any]],
     accepted: list[dict[str, Any]],
 ) -> bool:
-    """Prevent unapproved exact task reuse while honoring catalog exhaustion."""
-    candidate = plan_by_slot.get(slot_id) or {}
-    identity = str(candidate.get("fitb_entry_id") or candidate.get("task_id") or "")
-    if not identity:
-        return False
-    if candidate.get("fitb_entry_id") and candidate.get("fitb_entry_reused"):
-        return False
-    if is_authorized_catalog_exhaustion_reuse(candidate):
-        return False
-    for question in accepted:
-        other_sid = str(question.get("slot_id") or "")
-        other = plan_by_slot.get(other_sid) or {}
-        if str(other.get("fitb_entry_id") or other.get("task_id") or "") == identity:
-            return True
+    """Task identity alone never makes two realized questions duplicates.
+
+    Exact text, content overlap, same-batch comparisons, and the final Duplicate
+    Judge evaluate actual question instances. Reusing catalog identity therefore
+    cannot create a missing slot by itself.
+    """
     return False
 
 
@@ -655,6 +691,14 @@ def _generate_type_from_plan(
             sid = str(q.get("slot_id") or "")
             if sid not in pending or sid in accepted_by_slot:
                 warnings.append(f"{qtype} attempt {attempt}: unknown or repeated slot_id {sid!r}")
+                continue
+            if not _bind_selected_variation(q, pending[sid], qtype):
+                warnings.append(
+                    f"{qtype} attempt {attempt}: invalid or incompatible selected variation for slot {sid}"
+                )
+                record_generation_rejection(
+                    eval_stats, model_number, qtype, "invalid_variation", slot_id=sid
+                )
                 continue
             text = question_text(qtype, q)
             if contains_forbidden_phrase(text, language):
@@ -1803,8 +1847,27 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                         "answer_pattern": question.get("correct_answer")
                         or question.get("answer") or question.get("answers")
                         or question.get("reference_answer") or question.get("final_answer"),
+                        "options": deepcopy(question.get("options")),
+                        "solution_steps": deepcopy(question.get("solution_steps") or []),
+                        "solution_certificate": deepcopy(question.get("solution_certificate")),
+                        "selected_variation_id": question.get("selected_variation_id"),
+                        "selected_variation": deepcopy(question.get("selected_variation")),
+                        "task_operation": previous_plan.get("task_operation"),
+                        "target": previous_plan.get("target"),
+                        "student_work_product": previous_plan.get("student_work_product"),
+                        "source_evidence_ids": list(previous_plan.get("source_evidence_ids") or [
+                            value for value in [
+                                previous_plan.get("source_chunk_id"),
+                                *(previous_plan.get("support_chunk_ids") or []),
+                            ] if value
+                        ]),
                     })
                 replacement["previous_task_questions"] = previous_task_questions
+                replacement["previous_question_ids"] = [
+                    str(value.get("question_id")) for value in previous_task_questions
+                    if value.get("question_id")
+                ]
+                replacement["task_usage_count"] = len(previous_task_questions)
             enriched = _generation_plan_items(
                 [replacement], "mcq", retrieved_chunks, assessment_profile
             )[0]
@@ -2228,6 +2291,7 @@ def generate_exams(
     subject: str | None = None,
     progress_callback=None,
     audit_callback=None,
+    is_cancelled=None,
 ) -> dict[str, Any]:
     """Generate ``num_models`` complete, distinct exam versions.
 
@@ -2266,10 +2330,16 @@ def generate_exams(
         "plan_review_retry_required": False,
         "plan_review_rechecks": 0,
         "plan_duplicate_repair_attempts": {},
+        "plan_review_candidate_blacklist": {},
         "unresolved_plan_duplicate_conflicts": [],
         "difficulty_adjustment_history": [],
         "difficulty_adjustment_attempts": {},
         "plan_review_attempts": 0,
+        "plan_review_pair_verdicts": {},
+        "plan_review_difficulty_verdicts": {},
+        "plan_review_slot_fingerprints": {},
+        "plan_review_issues": [],
+        "plan_review_telemetry": [],
         "generated_exams": [],
         "rejection_feedback": None,
         "mcq_task_reassignments": [],
@@ -2309,6 +2379,7 @@ def generate_exams(
         "error": None,
         "progress_callback": progress_callback,
         "audit_callback": audit_callback,
+        "is_cancelled": is_cancelled,
     }
     result = get_exam_graph().invoke(initial)
 
@@ -2414,6 +2485,11 @@ def generate_exams(
             "reasoning_depth": item.get("reasoning_depth"),
             "reasoning_requirements": list(item.get("reasoning_requirements") or []),
             "prerequisites": list(item.get("prerequisites") or []),
+            "required_givens": list(item.get("required_givens") or []),
+            "variable_givens": list(item.get("variable_givens") or []),
+            "allowed_variations": list(item.get("allowed_variations") or []),
+            "complexity_boundaries": list(item.get("complexity_boundaries") or []),
+            "exact_source_instance": bool(item.get("exact_source_instance", False)),
             "derived_task_id": item.get("derived_task_id") or item.get("task_id"),
             "selected_replacement_task_id": item.get("selected_replacement_task_id"),
             "task_was_previously_used": bool(item.get("task_was_previously_used")),
@@ -2425,6 +2501,12 @@ def generate_exams(
             "scenario_family": item.get("scenario_family"),
             "task_reused": bool(item.get("task_reused")),
             "reuse_reason": item.get("reuse_reason"),
+            "reuse_mode": item.get("reuse_mode"),
+            "task_usage_count": int(item.get("task_usage_count") or 0),
+            "variation_reason": item.get("variation_reason"),
+            "previous_question_ids": list(item.get("previous_question_ids") or []),
+            "intended_variation": item.get("intended_variation"),
+            "source_evidence_ids": list(item.get("source_evidence_ids") or []),
             "catalog_replacement_stage": item.get("catalog_replacement_stage"),
             "fitb_answer_reused": bool(item.get("fitb_answer_reused")),
             "fitb_entry_reused": bool(item.get("fitb_entry_reused")),
@@ -2479,8 +2561,13 @@ def generate_exams(
         "difficulty_adjustment_history": list(result.get("difficulty_adjustment_history") or []),
         "difficulty_adjustment_attempts": dict(result.get("difficulty_adjustment_attempts") or {}),
         "plan_review_attempts": int(result.get("plan_review_attempts") or 0),
+        "plan_review_issues": list(result.get("plan_review_issues") or []),
+        "plan_review_telemetry": list(result.get("plan_review_telemetry") or []),
         "plan_duplicate_repair_attempts": dict(
             result.get("plan_duplicate_repair_attempts") or {}
+        ),
+        "plan_review_candidate_blacklist": dict(
+            result.get("plan_review_candidate_blacklist") or {}
         ),
         "unresolved_plan_duplicate_conflicts": list(
             result.get("unresolved_plan_duplicate_conflicts") or []
@@ -2488,6 +2575,12 @@ def generate_exams(
         "duplicate_repair_rounds": int(result.get("duplicate_repair_rounds") or 0),
         "duplicate_replacement_attempts": dict(
             result.get("duplicate_replacement_attempts") or {}
+        ),
+        "duplicate_candidate_blacklist": dict(
+            result.get("duplicate_candidate_blacklist") or {}
+        ),
+        "duplicate_replacement_failures": dict(
+            result.get("duplicate_replacement_failures") or {}
         ),
         "validation_repair_history": list(result.get("validation_repair_history") or []),
         "repair_manifest": list(result.get("repair_manifest") or []),

@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import numpy as np
 
 from app.offline import processed_cache
@@ -69,7 +68,7 @@ def test_pipeline_reuses_identical_pdf_content_across_document_ids(monkeypatch, 
     monkeypatch.setattr(processed_cache.config, "PROCESSED_DOCUMENT_CACHE_DIR", str(tmp_path / "cache"))
     pdf = tmp_path / "same.pdf"
     pdf.write_bytes(b"%PDF-1.4 identical content")
-    calls = {"parse": 0, "embed": 0}
+    calls = {"parse": 0, "store": 0}
 
     class Parser:
         def parse(self, _path):
@@ -77,9 +76,9 @@ def test_pipeline_reuses_identical_pdf_content_across_document_ids(monkeypatch, 
             return [{"page_number": 1, "items": [{"type": "text", "text": "Work and energy"}]}]
 
     class Store:
-        def ensure_collection(self): pass
-        def delete_document(self, *_args, **_kwargs): pass
-        def upsert(self, children, embeddings, **_kwargs): return len(children)
+        def replace_document(self, structure, **_kwargs):
+            calls["store"] += 1
+            return len(structure["children"])
 
     def structure(_pages, document_id, **_kwargs):
         return {
@@ -91,16 +90,11 @@ def test_pipeline_reuses_identical_pdf_content_across_document_ids(monkeypatch, 
             }],
         }
 
-    def embeddings(_texts):
-        calls["embed"] += 1
-        return [{"dense": [0.1, 0.2], "sparse": {1: 0.5}}]
-
     monkeypatch.setattr(pipeline, "LlamaParser", lambda: Parser())
     monkeypatch.setattr(pipeline, "clean_pages", lambda pages: pages)
     monkeypatch.setattr(pipeline, "build_semantic_structure", structure)
     monkeypatch.setattr(pipeline, "verify_chunk_invariants", lambda _chunks: [])
-    monkeypatch.setattr(pipeline, "embed_texts", embeddings)
-    monkeypatch.setattr(pipeline, "VectorStore", Store)
+    monkeypatch.setattr(pipeline, "ChunkStore", Store)
     monkeypatch.setattr(pipeline, "save_parse_dump", lambda *_args: tmp_path / "parse.json")
     monkeypatch.setattr(pipeline, "save_chunk_report", lambda *_args: tmp_path / "report.json")
     monkeypatch.setattr(pipeline, "save_chunk_dump", lambda *_args: tmp_path / "chunks.json")
@@ -114,4 +108,4 @@ def test_pipeline_reuses_identical_pdf_content_across_document_ids(monkeypatch, 
     assert first["processed_document_key"] == second["processed_document_key"]
     assert first["domain_type"] == second["domain_type"] == "stem"
     assert first["subject"] == second["subject"] == "physics"
-    assert calls == {"parse": 1, "embed": 1}
+    assert calls == {"parse": 1, "store": 2}

@@ -240,8 +240,9 @@ def test_missing_visual_repair_can_replace_complete_task_and_answer():
     replacement["slot_id"] = "m1_word_problem_1"
     fake = FakeClient(repair_result={"repairs": [{
         "question_id": "model1_word_problem_1",
-        "repaired_fields": ["question", "solution_steps", "final_answer"],
-        "question": replacement,
+        "patch": {key: replacement[key] for key in (
+            "question", "solution_steps", "final_answer"
+        )},
     }]})
     verdict = _verdict(
         "model1_word_problem_1", "FIX_QUESTION_AND_ANSWER",
@@ -422,7 +423,7 @@ def test_certificate_only_retry_verdict_is_retained_without_incorrect_step(monke
     assert report["coverage"][0]["missing_ids"] == []
 
 
-def test_general_repair_explicitly_nulls_stale_certificate(monkeypatch):
+def test_general_field_patch_preserves_unmodified_certificate(monkeypatch):
     qid = "model1_mcq_certificate"
     question = _mcq(qid, question="Old wording?", answer="A")
     question["solution_certificate"] = {
@@ -433,15 +434,9 @@ def test_general_repair_explicitly_nulls_stale_certificate(monkeypatch):
     }
     exam = _exam({"mcq": [question]})
     monkeypatch.setattr(val, "request_structured", lambda *_args, **_kwargs: {
-        "repairs": [{
-            "question_id": qid,
-            "repaired_fields": ["question"],
-            "question": {
-                "question": "Repaired wording?",
-                "options": dict(question["options"]),
-                "correct_answer": "A",
-                "solution_certificate": question["solution_certificate"],
-            },
+            "repairs": [{
+                "question_id": qid,
+                "patch": {"question": "Repaired wording?"},
         }]
     })
 
@@ -452,7 +447,7 @@ def test_general_repair_explicitly_nulls_stale_certificate(monkeypatch):
 
     assert outcome["repaired_ids"] == [qid]
     assert "solution_certificate" in exam["questions"]["mcq"][0]
-    assert exam["questions"]["mcq"][0]["solution_certificate"] is None
+    assert exam["questions"]["mcq"][0]["solution_certificate"] == question["solution_certificate"]
 
 
 def test_repaired_word_problems_receive_complete_quantitative_verdicts(monkeypatch):
@@ -545,9 +540,13 @@ def test_why_revalidation_uses_latest_authoritative_plan_task(monkeypatch):
         "student_operation": "explain_relationship",
         "target_or_result": "Explain how radiation energy changes as frequency increases.",
         "relationship": None, "reasoning_mode": "conceptual_reasoning",
-        "required_output": None, "required_givens": [], "scenario_family": None,
-        "difficulty": None,
-        "assigned_evidence_ids": ["chunk-current", "chunk-support"],
+            "required_output": None, "required_givens": [], "scenario_family": None,
+            "variable_givens": [], "allowed_variations": [],
+            "complexity_boundaries": [], "exact_source_instance": False,
+            "difficulty": None,
+            "assigned_evidence_ids": ["chunk-current", "chunk-support"],
+            "selected_variation_id": None, "selected_variation": None,
+            "effective_evidence_chunk_ids": ["chunk-current", "chunk-support"],
     }
     assert entry["assigned_sources"] == {
         "chunk-current": "E = hν",
@@ -567,13 +566,9 @@ def test_repair_exam_pins_deepseek_flash_without_pro_config(monkeypatch):
 
     monkeypatch.setattr(val, "create_llm_client", fake_factory)
     monkeypatch.setattr(val, "request_structured", lambda used_client, *_args, **_kwargs: {
-        "repairs": [{
-            "question_id": qid,
-            "repaired_fields": ["reference_answer"],
-            "question": {
-                "question": question["question"],
-                "reference_answer": "Peer review identifies errors before publication.",
-            },
+            "repairs": [{
+                "question_id": qid,
+                "patch": {"reference_answer": "Peer review identifies errors before publication."},
         }]
     } if used_client is client else None)
 
@@ -709,8 +704,7 @@ def test_id_survives_repair():
     exam = _exam({"true_false": [_tf("model1_true_false_1", answer="False")]})
     fake = FakeClient(
         repair_result=[
-            {"question_id": "model1_true_false_1", "repaired_fields": ["answer"],
-             "question": {"statement": "Cyanobacteria released oxygen through photosynthesis.", "answer": "True"}}
+            {"question_id": "model1_true_false_1", "patch": {"answer": "True"}}
         ]
     )
     verdicts = [_verdict("model1_true_false_1", "FIX_ANSWER", fields=["answer"],
@@ -749,10 +743,7 @@ def test_wrong_mcq_answer_repaired_answer_only():
     fake = FakeClient(
         validator_result=[_verdict("model1_mcq_2", "FIX_ANSWER", av=False, fields=["correct_answer"])],
         repair_result=[
-            {"question_id": "model1_mcq_2", "repaired_fields": ["correct_answer"],
-             "question": {"question": "Which metric is the harmonic mean of precision and recall?",
-                          "options": {"A": "Accuracy", "B": "F1 Score", "C": "Specificity", "D": "Log Loss"},
-                          "correct_answer": "C"}}
+            {"question_id": "model1_mcq_2", "patch": {"correct_answer": "C"}}
         ],
     )
     verdicts = validate_exam(exam, client=fake)["verdicts"]
@@ -790,9 +781,8 @@ def test_polygon_area_quantitative_repair_replaces_wrong_certificate_and_answer(
     }
     repair = {
         "question_id": "model1_mcq_polygon",
-        "repaired_fields": ["options", "correct_answer", "solution_certificate"],
-        "question": {
-            "question": question["question"], "options": dict(question["options"]),
+        "patch": {
+            "options": dict(question["options"]),
             "correct_answer": "A", "solution_certificate": repaired_certificate,
         },
     }
@@ -842,10 +832,9 @@ def test_mcq_two_valid_options_repairs_options():
         validator_result=[_verdict("model1_mcq_5", "FIX_OPTIONS", av=False,
                                    fields=["options", "correct_answer"])],
         repair_result=[
-            {"question_id": "model1_mcq_5", "repaired_fields": ["options", "correct_answer"],
-             "question": {"question": "Which metric is the harmonic mean of precision and recall?",
-                          "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
-                          "correct_answer": "A"}}
+            {"question_id": "model1_mcq_5", "patch": {
+                "options": {"A": "a", "B": "b", "C": "c", "D": "d"},
+                "correct_answer": "A"}}
         ],
     )
     verdicts = validate_exam(exam, client=fake)["verdicts"]
@@ -869,8 +858,7 @@ def test_tf_wrong_answer_repaired_answer_only():
     fake = FakeClient(
         validator_result=[_verdict("model1_true_false_2", "FIX_ANSWER", av=False, fields=["answer"])],
         repair_result=[
-            {"question_id": "model1_true_false_2", "repaired_fields": ["answer"],
-             "question": {"statement": "Cyanobacteria released oxygen through photosynthesis.", "answer": "True"}}
+            {"question_id": "model1_true_false_2", "patch": {"answer": "True"}}
         ],
     )
     verdicts = validate_exam(exam, client=fake)["verdicts"]
@@ -894,14 +882,9 @@ def test_fitb_repair_cannot_change_authoritative_answer():
     )])})
     exam["questions"]["fill_in_the_blank"]["items"][0]["fitb_entry_id"] = "fitb_perimeter"
     fake = FakeClient(
-        repair_result=[{
-            "question_id": "model1_fill_in_the_blank_1",
-            "repaired_fields": ["question"],
-            "question": {
-                "stem": "The distance around a shape is its ________.",
-                "distractor_1": "length",
-                "distractor_2": "volume",
-            },
+            repair_result=[{
+                "question_id": "model1_fill_in_the_blank_1",
+                "patch": {"question": "The distance around a shape is its ________."},
         }],
     )
     verdict = _verdict(
@@ -1226,9 +1209,8 @@ def test_why_irrelevant_reference_repaired_answer_only():
     fake = FakeClient(
         validator_result=[_verdict("model1_why_1", "FIX_ANSWER", av=False, fields=["reference_answer"])],
         repair_result=[
-            {"question_id": "model1_why_1", "repaired_fields": ["reference_answer"],
-             "question": {"question": "Why is peer review important?",
-                          "reference_answer": "Peer review lets experts catch errors."}}
+            {"question_id": "model1_why_1", "patch": {
+                "reference_answer": "Peer review lets experts catch errors."}}
         ],
     )
     verdicts = validate_exam(exam, client=fake)["verdicts"]
@@ -1243,9 +1225,8 @@ def test_essay_unrelated_answer_repaired():
     fake = FakeClient(
         validator_result=[_verdict("model1_essay_1", "FIX_ANSWER", av=False, fields=["reference_answer"])],
         repair_result=[
-            {"question_id": "model1_essay_1", "repaired_fields": ["reference_answer"],
-             "question": {"question": "Compare precision and recall.",
-                          "reference_answer": "A fixed answer.", "key_points": ["a", "b"]}}
+            {"question_id": "model1_essay_1", "patch": {
+                "reference_answer": "A fixed answer."}}
         ],
     )
     verdicts = validate_exam(exam, client=fake)["verdicts"]
@@ -1765,7 +1746,7 @@ def test_repair_batches_only_invalid_questions():
         "true_false": [_tf("model1_true_false_1")],
     })
     fake = FakeClient(repair_result=[])
-    verdicts = [_verdict("model1_mcq_1", "FIX_ANSWER", av=False, fields=["answer"]),
+    verdicts = [_verdict("model1_mcq_1", "FIX_ANSWER", av=False, fields=["correct_answer"]),
                 _pass_verdict("model1_mcq_2"),
                 _pass_verdict("model1_true_false_1")]
     repair_exam(exam, verdicts, client=fake)
@@ -1782,7 +1763,7 @@ def test_unvalidated_is_never_sent_to_repair():
         exam,
         [
             _verdict("missing", "UNVALIDATED", qv=False, av=False),
-            _verdict("bad", "FIX_ANSWER", av=False, fields=["answer"]),
+            _verdict("bad", "FIX_ANSWER", av=False, fields=["correct_answer"]),
         ],
         client=fake,
     )
@@ -1852,10 +1833,7 @@ def test_unknown_id_in_repair_response_rejected():
 
 def test_duplicate_id_in_repair_response_rejected():
     exam = _exam({"mcq": [_mcq("model1_mcq_1", answer="B")]})
-    good = {"question_id": "model1_mcq_1", "repaired_fields": ["correct_answer"],
-            "question": {"question": "Which metric is the harmonic mean of precision and recall?",
-                         "options": {"A": "Accuracy", "B": "F1 Score", "C": "Specificity", "D": "Log Loss"},
-                         "correct_answer": "A"}}
+    good = {"question_id": "model1_mcq_1", "patch": {"correct_answer": "A"}}
     fake = FakeClient(repair_result=[good, good])
     outcome = repair_exam(exam, [_verdict("model1_mcq_1", "FIX_ANSWER", av=False, fields=["correct_answer"])], client=fake)
     assert "model1_mcq_1" in outcome["repaired_ids"]  # first accepted
@@ -1890,12 +1868,11 @@ def test_word_problem_wrapper_path_authorizes_fix_question_stem():
     exam = _exam({"word_problem": [original]})
     fake = FakeClient(repair_result=[{
         "question_id": "model1_word_problem_1",
-        "repaired_fields": ["question.question"],
-        "question": repaired,
+        "patch": {"question": repaired["question"]},
     }])
     verdict = _verdict(
         "model1_word_problem_1", "FIX_QUESTION", qv=False,
-        fields=["question.question", "answer", "solution_certificate"],
+        fields=["question.question"],
     )
     outcome = repair_exam(exam, [verdict], client=fake)
     assert outcome["repaired_ids"] == ["model1_word_problem_1"]
@@ -1978,12 +1955,16 @@ def test_general_validator_receives_task_contract_and_accepts_task_drift_code():
         "target_or_result": "identify the common solution region",
         "relationship": None,
         "reasoning_mode": "interpretation",
-        "required_output": "description of the common region",
-        "required_givens": ["two inequalities"],
-        "scenario_family": None,
+            "required_output": "description of the common region",
+            "required_givens": ["two inequalities"],
+            "variable_givens": [], "allowed_variations": [],
+            "complexity_boundaries": [], "exact_source_instance": False,
+            "scenario_family": None,
         "difficulty": None,
-        "assigned_evidence_ids": ["chunk-a"],
-    }
+            "assigned_evidence_ids": ["chunk-a"],
+            "selected_variation_id": None, "selected_variation": None,
+            "effective_evidence_chunk_ids": ["chunk-a"],
+        }
     assert "Being on the same broad topic is not enough" in val.VALIDATOR_SYSTEM_PROMPT
 
 
@@ -2002,11 +1983,9 @@ def test_noop_repair_rejected():
     opts = {"A": "Accuracy", "B": "F1 Score", "C": "Specificity", "D": "Log Loss"}
     exam = _exam({"mcq": [_mcq("model1_mcq_2", answer="B", question="Original stem", options=opts)]})
     fake = FakeClient(repair_result=[
-        {"question_id": "model1_mcq_2", "repaired_fields": ["answer"],
-         "question": {"question": "Original stem", "options": dict(opts),
-                      "correct_answer": "B"}}  # byte-identical to the original
+        {"question_id": "model1_mcq_2", "patch": {"correct_answer": "B"}}
     ])
-    outcome = repair_exam(exam, [_verdict("model1_mcq_2", "FIX_ANSWER", av=False, fields=["answer"])], client=fake)
+    outcome = repair_exam(exam, [_verdict("model1_mcq_2", "FIX_ANSWER", av=False, fields=["correct_answer"])], client=fake)
     assert outcome["failed_ids"] == ["model1_mcq_2"]
     assert any("no change" in w for w in outcome["warnings"])
     assert exam["questions"]["mcq"][0]["correct_answer"] == "B"
@@ -2060,10 +2039,9 @@ def test_mcq_ambiguous_options_repair_accepted():
                                options={"A": "2", "B": "4", "C": "7", "D": "9"},
                                answer="B")]})
     fake = FakeClient(repair_result=[
-        {"question_id": "model1_mcq_2", "repaired_fields": ["options", "correct_answer"],
-         "question": {"question": "Which of the following numbers is prime?",
-                      "options": {"A": "2", "B": "4", "C": "6", "D": "9"},
-                      "correct_answer": "A"}}  # exactly one correct option remains
+        {"question_id": "model1_mcq_2", "patch": {
+            "options": {"A": "2", "B": "4", "C": "6", "D": "9"},
+            "correct_answer": "A"}}
     ])
     verdicts = [_verdict("model1_mcq_2", "FIX_OPTIONS", av=False, fields=["options", "correct_answer"])]
     outcome = repair_exam(exam, verdicts, client=fake)
@@ -2080,11 +2058,10 @@ def test_mcq_missing_answer_option_repair_accepted():
                                         "C": "Golgi apparatus", "D": "Lysosome"},
                                answer="A")]})
     fake = FakeClient(repair_result=[
-        {"question_id": "model1_mcq_4", "repaired_fields": ["options", "correct_answer"],
-         "question": {"question": "Which organelle produces most of a cell's ATP?",
-                      "options": {"A": "Nucleus", "B": "Mitochondria",
-                                  "C": "Golgi apparatus", "D": "Lysosome"},
-                      "correct_answer": "B"}}  # real answer added to the set
+        {"question_id": "model1_mcq_4", "patch": {
+            "options": {"A": "Nucleus", "B": "Mitochondria",
+                        "C": "Golgi apparatus", "D": "Lysosome"},
+            "correct_answer": "B"}}
     ])
     verdicts = [_verdict("model1_mcq_4", "FIX_OPTIONS", av=False, fields=["options", "correct_answer"])]
     outcome = repair_exam(exam, verdicts, client=fake)
@@ -2106,9 +2083,7 @@ def test_mcq_fix_options_rejects_reordering_known_bad_distractors():
         options=options, answer="C",
     )]})
     fake = FakeClient(repair_result=[{
-        "question_id": "m1_mcq_5", "repaired_fields": ["options", "correct_answer"],
-        "question": {
-            "question": "Which radiation includes visible light?",
+        "question_id": "m1_mcq_5", "patch": {
             "options": {"A": options["B"], "B": options["A"], "C": options["C"], "D": options["D"]},
             "correct_answer": "C",
         },
@@ -2143,9 +2118,7 @@ def test_mcq_fix_options_accepts_new_same_concept_distractors():
         options=options, answer="C",
     )]})
     fake = FakeClient(repair_result=[{
-        "question_id": "m1_mcq_5", "repaired_fields": ["options", "correct_answer"],
-        "question": {
-            "question": "Which radiation includes visible light?",
+        "question_id": "m1_mcq_5", "patch": {
             "options": {
                 "A": "Infrared radiation only", "B": "Ultraviolet radiation only",
                 "C": "Electromagnetic radiation", "D": "Ionizing radiation only",
@@ -2194,8 +2167,7 @@ def test_mcq_answer_verdict_does_not_authorize_option_rewrite():
 def test_repair_normalizes_before_write_back():
     exam = _exam({"true_false": [_tf("model1_true_false_1", answer="False")]})
     fake = FakeClient(repair_result=[
-        {"question_id": "model1_true_false_1", "repaired_fields": ["answer"],
-         "question": {"statement": "Cyanobacteria released oxygen through photosynthesis.", "answer": "true"}}
+        {"question_id": "model1_true_false_1", "patch": {"answer": "true"}}
     ])
     repair_exam(exam, [_verdict("model1_true_false_1", "FIX_ANSWER", av=False, fields=["answer"])], client=fake)
     assert exam["questions"]["true_false"][0]["answer"] == "True"  # normalized via normalizer
@@ -2361,10 +2333,7 @@ def test_repair_flow_revalidates_repaired_model(monkeypatch):
     fake = FakeClient(
         validator_result=[_verdict("model1_mcq_1", "FIX_ANSWER", av=False, fields=["correct_answer"])],
         repair_result=[
-            {"question_id": "model1_mcq_1", "repaired_fields": ["correct_answer"],
-             "question": {"question": "Which metric is the harmonic mean of precision and recall?",
-                          "options": {"A": "Accuracy", "B": "F1 Score", "C": "Specificity", "D": "Log Loss"},
-                          "correct_answer": "C"}}
+            {"question_id": "model1_mcq_1", "patch": {"correct_answer": "C"}}
         ],
     )
     validate_calls = {"n": 0}
@@ -2404,8 +2373,7 @@ def test_repair_flow_revalidates_repaired_model(monkeypatch):
 def test_repair_attempts_bounded_per_model(monkeypatch):
     fake = FakeClient(validator_result=[_verdict("model1_tf_1", "FIX_ANSWER", av=False, fields=["answer"])],
                       repair_result=[
-                          {"question_id": "model1_tf_1", "repaired_fields": ["answer"],
-                           "question": {"statement": "Stmt", "answer": "True"}}
+                          {"question_id": "model1_tf_1", "patch": {"answer": "True"}}
                       ])
     monkeypatch.setattr(val, "create_llm_client", lambda **_kwargs: fake)
 
@@ -2428,10 +2396,7 @@ def test_model_repairs_never_mix(monkeypatch):
         validator_result=[_verdict("model1_mcq_1", "FIX_ANSWER", av=False, fields=["correct_answer"])],
         validator_retry_result=[_pass_verdict("model2_mcq_1")],
         repair_result=[
-            {"question_id": "model1_mcq_1", "repaired_fields": ["correct_answer"],
-             "question": {"question": "Which metric is the harmonic mean of precision and recall?",
-                          "options": {"A": "Accuracy", "B": "F1 Score", "C": "Specificity", "D": "Log Loss"},
-                          "correct_answer": "A"}}
+            {"question_id": "model1_mcq_1", "patch": {"correct_answer": "A"}}
         ],
     )
     monkeypatch.setattr(val, "create_llm_client", lambda **_kwargs: fake)

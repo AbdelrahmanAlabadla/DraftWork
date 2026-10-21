@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from app.llm import deepseek
 from app.logging_conf import configure_logging
-from app.offline.vector_store import VectorStore
+from app.offline.chunk_store import ChunkStore
 from app.online import assessment_catalog, duplicate_judge, exam_builder, planner, validator
 from app.online.eval_stats import create_pipeline_eval
 from app.online.graph import get_exam_graph
@@ -91,8 +91,8 @@ def run(subject: str, *, output_name: str | None = None) -> None:
         (output / name).write_text(json.dumps(safe(value), ensure_ascii=False, indent=2), encoding="utf-8")
 
     by_id = {str(chunk["child_id"]): chunk for chunk in chunks}
-    original_get = VectorStore.get_by_child_ids
-    VectorStore.get_by_child_ids = lambda self, _doc, ids, **kwargs: [
+    original_get = ChunkStore.get_by_child_ids
+    ChunkStore.get_by_child_ids = lambda self, _doc, ids, **kwargs: [
         copy.deepcopy(by_id[value]) for value in ids if value in by_id
     ]
     configure_logging("INFO")
@@ -172,7 +172,7 @@ def run(subject: str, *, output_name: str | None = None) -> None:
                 if isinstance(node_update, dict):
                     state.update(node_update)
     finally:
-        VectorStore.get_by_child_ids = original_get
+        ChunkStore.get_by_child_ids = original_get
         deepseek.DeepSeekClient._request_with_backoff = original_network
         logging.getLogger().removeHandler(handler)
         handler.close()
