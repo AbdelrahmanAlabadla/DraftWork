@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import re
+from html.parser import HTMLParser
 from typing import Any
 
 
@@ -59,13 +62,108 @@ def item_type(item: dict[str, Any]) -> str:
 
 
 def item_text(item: dict[str, Any]) -> str:
-    """Return canonical item text from the verified ``value`` field."""
+    """Return canonical text while retaining LlamaParse's original fields.
+
+    Tables commonly carry ``value=null`` and place their actual content in
+    ``md``, ``csv`` or ``rows``.  Choosing one deterministic representation at
+    this boundary prevents downstream cleaners from silently dropping them.
+    """
     value = item.get("value")
-    if value is None:
-        return ""
-    if not isinstance(value, str):
+    if value is not None and not isinstance(value, str):
         raise ParserSchemaError("LlamaParse item 'value' must be a string or null")
-    return value.strip()
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if item.get("type") != "table":
+        return ""
+    return canonical_table_text(item)
+
+
+def canonical_table_text(item: dict[str, Any]) -> str:
+    """Return the richest usable table representation without truncation."""
+    md = item.get("md")
+    if isinstance(md, str) and md.strip():
+        return md.strip()
+    csv_text = item.get("csv")
+    if isinstance(csv_text, str) and csv_text.strip():
+        return csv_text.strip()
+    rows = item.get("rows")
+    rendered = _render_table_rows(rows)
+    if rendered:
+        return rendered
+    html = item.get("html")
+    if isinstance(html, str) and html.strip():
+        converted = _table_html_to_markdown(html)
+        return converted or html.strip()
+    # Preserve any unusual parser representation rather than discarding it.
+    for key in ("text", "content", "raw"):
+        candidate = item.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    if rows is not None:
+        return json.dumps(rows, ensure_ascii=False, default=str)
+    return ""
+
+
+def _render_table_rows(rows: Any) -> str:
+    if not isinstance(rows, list) or not rows:
+        return ""
+    normalized: list[list[str]] = []
+    for row in rows:
+        if isinstance(row, dict):
+            cells = list(row.values())
+        elif isinstance(row, (list, tuple)):
+            cells = list(row)
+        else:
+            return ""
+        normalized.append([str(cell if cell is not None else "").replace("|", r"\|") for cell in cells])
+    width = max((len(row) for row in normalized), default=0)
+    if not width:
+        return ""
+    normalized = [row + [""] * (width - len(row)) for row in normalized]
+    lines = ["| " + " | ".join(row) + " |" for row in normalized]
+    lines.insert(1, "| " + " | ".join(["---"] * width) + " |")
+    return "\n".join(lines)
+
+
+class _TableHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[list[str]] = []
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag = tag.lower()
+        if tag == "tr":
+            self._row = []
+        elif tag in {"th", "td"} and self._row is not None:
+            self._cell = []
+        elif tag == "br" and self._cell is not None:
+            self._cell.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        if tag in {"th", "td"} and self._row is not None and self._cell is not None:
+            self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._row:
+                self.rows.append(self._row)
+            self._row = None
+
+
+def _table_html_to_markdown(value: str) -> str:
+    parser = _TableHTMLParser()
+    try:
+        parser.feed(value)
+        parser.close()
+    except Exception:
+        return ""
+    return _render_table_rows(parser.rows)
 
 
 def validate_pages(pages: list[dict[str, Any]]) -> dict[str, int]:

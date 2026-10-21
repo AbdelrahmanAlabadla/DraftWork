@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
+from html.parser import HTMLParser
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
@@ -239,12 +240,70 @@ def clean_text(text: str) -> str:
     """Full normalization of a plain-text block (used by the chunker)."""
     if not text:
         return ""
-    text = normalize_unicode(text)
+    text = _clean_known_html(normalize_unicode(text))
     text = fix_hyphenation(text)
     text = fix_line_breaks(text)
     text = normalize_whitespace(text)
     text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
     return text
+
+
+class _KnownMarkupCleaner(HTMLParser):
+    """Unwrap only known parser formatting tags; preserve math comparisons."""
+
+    _KNOWN = {"u", "mark", "a", "b", "strong", "i", "em", "span", "div", "p", "br", "img"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        low = tag.lower()
+        if low not in self._KNOWN:
+            self.parts.append(self.get_starttag_text())
+            return
+        if low in {"br", "div", "p"}:
+            self.parts.append("\n")
+        elif low == "img":
+            values = dict(attrs)
+            label = values.get("alt") or values.get("title")
+            if label:
+                self.parts.append(f"[Figure: {label}]")
+
+    def handle_endtag(self, tag: str) -> None:
+        low = tag.lower()
+        if low not in self._KNOWN:
+            self.parts.append(f"</{tag}>")
+        elif low in {"div", "p"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        self.parts.append(f"&{name};")
+
+
+_KNOWN_TAG_RE = re.compile(r"</?(?:u|mark|a|b|strong|i|em|span|div|p|br|img)(?:\s[^<>]*?)?/?>", re.I)
+
+
+def _clean_known_html(text: str) -> str:
+    if not _KNOWN_TAG_RE.search(text):
+        return text
+    parser = _KnownMarkupCleaner()
+    try:
+        parser.feed(text)
+        parser.close()
+    except Exception:
+        return text
+    return "".join(parser.parts)
+
+
+def _clean_table_text(text: str) -> str:
+    """Normalize encoding/markup but preserve all table lines and cells."""
+    text = _clean_known_html(normalize_unicode(text))
+    text = _CONTROL_GARBAGE_RE.sub("", text)
+    return "\n".join(line.rstrip() for line in text.splitlines()).strip()
 
 
 def strip_inline_footnotes(text: str) -> tuple[str, int]:
@@ -268,11 +327,22 @@ def strip_inline_garbage(text: str) -> tuple[str, int]:
     caller can decide whether the paragraph is too damaged to keep.
     """
     repl = len(_REPLACEMENT_CHAR_RE.findall(text))
-    text = _REPLACEMENT_CHAR_RE.sub("", text)
+    # Preserve replacement characters: they describe malformed/OCR source and
+    # must not be silently turned into different content.
     text = _CONTROL_GARBAGE_RE.sub("", text)
     text = _URL_RE.sub(" ", text)
     text = _MULTISPACE_RE.sub(" ", text)
     return text.strip(), repl
+
+
+def text_quality_diagnostics(text: str) -> list[str]:
+    """Detect likely OCR/encoding trouble without rewriting user content."""
+    diagnostics: list[str] = []
+    if _REPLACEMENT_CHAR_RE.search(text):
+        diagnostics.append("suspected_ocr_replacement_character")
+    if re.search(r"(?:Ã.|Â.|Ø.|Ù.){2,}", text):
+        diagnostics.append("suspected_encoding_or_rtl_corruption")
+    return diagnostics
 
 
 def strip_mcq_suffix(text: str) -> tuple[str, bool]:
@@ -290,7 +360,10 @@ def strip_mcq_suffix(text: str) -> tuple[str, bool]:
         return text, False
     markers = list(_MCQ_OPTION_INLINE_RE.finditer(text))
     has_answer = _MCQ_ANSWER_RE.search(text)
-    has_mcq = len(markers) >= 3 or (len(markers) >= 2 and has_answer)
+    # Lettered subquestions are educational source, not answer-key garbage.
+    # Only trim an option block when the source explicitly identifies an
+    # answer; otherwise preserve the complete multipart exercise.
+    has_mcq = len(markers) >= 2 and bool(has_answer)
     if not has_mcq:
         return text, False
 
@@ -490,6 +563,22 @@ def clean_pages_with_stats(
                 continue
             kind = _item_kind(item)
 
+            if kind == "table":
+                base = _clean_table_text(raw)
+                stats.paragraphs_processed += 1
+                if not base:
+                    # Keep the raw representation and a diagnostic rather than
+                    # silently discarding a malformed parser table.
+                    base = raw
+                fresh = _fresh_item(item, base)
+                diagnostics = list(fresh.get("processing_diagnostics") or [])
+                if not base:
+                    diagnostics.append("table_has_no_usable_text_representation")
+                if diagnostics:
+                    fresh["processing_diagnostics"] = diagnostics
+                items_out.append(fresh)
+                continue
+
             base = clean_text(raw)
             stats.paragraphs_processed += 1
 
@@ -520,13 +609,13 @@ def clean_pages_with_stats(
                 stats.by_category[category] += 1
                 continue
 
-            # Multiple-choice answer block attached to a paragraph: strip its
-            # tail (or drop the whole block when there is no leading prose).
+            # An explicit answer-key suffix may be removed, but a multipart
+            # exercise must never disappear merely because it uses a./b./c.
             stripped, was_mcq = strip_mcq_suffix(base)
             if was_mcq:
-                stats.paragraphs_removed += 1
                 stats.by_category[CATEGORY_MCQ] += 1
-                continue
+                if not stripped:
+                    stripped = base
 
             # Inline extraction artifacts (replacement chars, control bytes,
             # bare URLs).
@@ -536,10 +625,7 @@ def clean_pages_with_stats(
                 stats.by_category[CATEGORY_EMPTY] += 1
                 continue
             # Paragraph too damaged by mojibake (e.g. "I� APAr") to be useful.
-            if repl_n >= 1 and count_alpha_words(stripped) < 6:
-                stats.paragraphs_removed += 1
-                stats.by_category[CATEGORY_OCR] += 1
-                continue
+            quality_diagnostics = text_quality_diagnostics(raw)
 
             stripped, n_foot = strip_inline_footnotes(stripped)
             if n_foot:
@@ -558,7 +644,12 @@ def clean_pages_with_stats(
                 stats.by_category[CATEGORY_DUPLICATE] += 1
                 continue
 
-            items_out.append(_fresh_item(item, stripped))
+            fresh = _fresh_item(item, stripped)
+            if quality_diagnostics:
+                fresh["processing_diagnostics"] = sorted(set(
+                    list(fresh.get("processing_diagnostics") or []) + quality_diagnostics
+                ))
+            items_out.append(fresh)
             seen_paragraphs.add(stripped)
 
         if items_out:
@@ -595,6 +686,8 @@ def clean_pages(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _fresh_item(item: dict[str, Any], value: str) -> dict[str, Any]:
     new_item = dict(item)
     new_item["value"] = value
-    if "md" in new_item:
-        new_item["md"] = value
+    new_item["canonical_content_source"] = next(
+        (key for key in ("value", "md", "csv", "rows", "html", "raw") if item.get(key)),
+        "unknown",
+    )
     return new_item

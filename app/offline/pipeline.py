@@ -175,10 +175,15 @@ def run_pipeline(
             )
             for warning in warnings:
                 logger.warning("  - %s", warning)
+            fatal = [warning for warning in warnings if warning.startswith("FATAL ")]
+            if fatal:
+                raise PipelineError(
+                    "Processed document failed source-integrity recovery; existing stored data was retained"
+                )
         else:
             logger.info("Chunk invariants OK | document_id=%s", document_id)
 
-        # --- Stage 3b: Chunking evaluation report (before Qdrant) ------------
+        # --- Stage 3b: Chunking evaluation report ----------------------------
         t0 = time.perf_counter()
         chunk_report_path = save_chunk_report(document_id, chunks)
         timings["chunk_report"] = time.perf_counter() - t0

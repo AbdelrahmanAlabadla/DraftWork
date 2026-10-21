@@ -124,13 +124,15 @@ EMBEDDING_BATCH_SIZE: int = max(
 # Content-addressed pipeline/cache versions.  Bump the narrowest version whose
 # output contract changed.  The embedding fingerprint also contains the model
 # name and vector dimension, so changing either invalidates processed artifacts.
-PARSER_PIPELINE_VERSION: str = _env("PARSER_PIPELINE_VERSION", "llamaparse-v1") or "llamaparse-v1"
-CHUNKER_PIPELINE_VERSION: str = _env("CHUNKER_PIPELINE_VERSION", "semantic-v3") or "semantic-v3"
+PARSER_PIPELINE_VERSION: str = _env("PARSER_PIPELINE_VERSION", "llamaparse-v2-canonical-items") or "llamaparse-v2-canonical-items"
+CHUNKER_PIPELINE_VERSION: str = _env("CHUNKER_PIPELINE_VERSION", "semantic-v5-restored-integrity") or "semantic-v5-restored-integrity"
 EMBEDDING_PIPELINE_VERSION: str = _env("EMBEDDING_PIPELINE_VERSION", "dense-sparse-v1") or "dense-sparse-v1"
-ASSESSMENT_CATALOG_VERSION: str = _env("ASSESSMENT_CATALOG_VERSION", "catalog-v8-unified-difficulty") or "catalog-v8-unified-difficulty"
+ASSESSMENT_CATALOG_VERSION: str = _env(
+    "ASSESSMENT_CATALOG_VERSION", "catalog-v11-task-family-variations"
+) or "catalog-v11-task-family-variations"
 ASSESSMENT_COMPILER_VERSION: str = (
-    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v3-atomic-task-ontology")
-    or "compiler-v3-atomic-task-ontology"
+    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v4-parallel-atomic-task-ontology")
+    or "compiler-v4-parallel-atomic-task-ontology"
 )
 PROCESSED_DOCUMENT_CACHE_DIR: str = (
     _env("PROCESSED_DOCUMENT_CACHE_DIR", "data/processed_documents")
@@ -411,6 +413,8 @@ WORDS_PER_TOKEN: float = float(_env("WORDS_PER_TOKEN", "1.3") or "1.3")
 # packed greedily up to this ceiling (derived word cap via WORDS_PER_TOKEN),
 # always cutting only at sentence boundaries.
 CHILD_MAX_SIZE: int = int(_env("CHILD_MAX_SIZE", "800") or "800")
+CHILD_OVERLAP_MAX_WORDS: int = int(_env("CHILD_OVERLAP_MAX_WORDS", "40") or "40")
+CHILD_OVERLAP_MAX_CHARS: int = int(_env("CHILD_OVERLAP_MAX_CHARS", "200") or "200")
 
 # Minimum child chunk sizes, expressed in TOKENS (converted to words via
 # WORDS_PER_TOKEN). Keeps tiny fragments out of the vector store:
@@ -429,9 +433,10 @@ QUESTION_PARENT_MIN_SHARE: float = float(
 
 # Parent chunk size bounds, expressed in TOKENS (converted to words via
 # WORDS_PER_TOKEN):
-# - at or below PARENT_MIN_TOKENS_DROP -> discarded entirely
+# - PARENT_MIN_TOKENS_DROP is retained for configuration compatibility; source
+#   groups are no longer discarded at this threshold
 # - under PARENT_MERGE_TOKENS -> merged into the previous parent (or next)
-# - PARENT_MAX_SIZE is a hard ceiling; any single parent above it is split.
+# - PARENT_MAX_SIZE is a packing target; indivisible source units may exceed it
 PARENT_MIN_TOKENS_DROP: int = int(_env("PARENT_MIN_TOKENS_DROP", "30") or "30")
 PARENT_MERGE_TOKENS: int = int(_env("PARENT_MERGE_TOKENS", "100") or "100")
 PARENT_MAX_SIZE: int = int(_env("PARENT_MAX_SIZE", "1200") or "1200")

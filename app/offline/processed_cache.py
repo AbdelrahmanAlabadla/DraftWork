@@ -46,6 +46,8 @@ def processing_versions() -> dict[str, str]:
     return {
         "parser": config.PARSER_PIPELINE_VERSION,
         "parser_code_sha256": code_hash("offline/parser.py"),
+        "parser_items_code_sha256": code_hash("offline/parser_items.py"),
+        "cleaner_code_sha256": code_hash("offline/cleaner.py"),
         "chunker": config.CHUNKER_PIPELINE_VERSION,
         "chunker_code_sha256": code_hash("offline/semantic_chunker.py"),
         "title_generator_code_sha256": code_hash("offline/title_generator.py"),
