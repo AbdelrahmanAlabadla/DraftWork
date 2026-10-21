@@ -251,6 +251,37 @@ def request_structured(
     timeout: int = 600,
 ) -> object:
     """Use provider structured output while preserving the local call behavior."""
+    from app.llm.scheduler import llm_request_slot
+
+    with llm_request_slot(agent=agent, operation=operation):
+        return _request_structured_unlimited(
+            client, prompt, json_schema=json_schema, response_model=response_model,
+            schema_name=schema_name, agent=agent, item_count=item_count,
+            operation=operation, expected_ids=expected_ids,
+            expected_id_field=expected_id_field, local_json=local_json,
+            system_prompt=system_prompt, temperature=temperature,
+            max_tokens=max_tokens, timeout=timeout,
+        )
+
+
+def _request_structured_unlimited(
+    client: object,
+    prompt: str,
+    *,
+    json_schema: dict | None = None,
+    response_model: type | None = None,
+    schema_name: str,
+    agent: str = "generator",
+    item_count: int = 1,
+    operation: str = "default",
+    expected_ids: list[str] | None = None,
+    expected_id_field: str | None = None,
+    local_json: bool = False,
+    system_prompt: str | None = None,
+    temperature: float = 0.1,
+    max_tokens: int = 4096,
+    timeout: int = 600,
+) -> object:
     if json_schema is None:
         if response_model is None:
             raise ValueError("response_model or json_schema is required")

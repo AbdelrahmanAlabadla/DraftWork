@@ -24,6 +24,7 @@ from app.offline.pipeline import PipelineCancelled, run_pipeline
 from app.offline.parser import ParserError
 from app.offline.chunk_store import ChunkStore
 from app.online.exam_builder import generate_exams
+from app.online.assessment_catalog import CatalogCompilationCancelled
 from app.metrics import increment, observe
 
 
@@ -370,6 +371,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                             payload=payload,
                         )
                     ),
+                    is_cancelled=lambda: repositories.job_is_cancelled(job_id),
                 )
         if repositories.job_is_cancelled(job_id):
             increment("genexam_jobs", type="exam_generation", status="cancelled")
@@ -508,6 +510,9 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "exam_id": exam_id,
             "exam_status": status,
         }
+    except CatalogCompilationCancelled:
+        increment("genexam_jobs", type="exam_generation", status="cancelled")
+        return {"job_id": job_id, "status": "cancelled"}
     except (DeadlineExceeded, SoftTimeLimitExceeded) as exc:
         repositories.fail_job(job_id, "TIMEOUT", "Generation exceeded its configured time limit")
         increment("genexam_jobs", type="exam_generation", status="failed")

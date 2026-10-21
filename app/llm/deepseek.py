@@ -19,6 +19,7 @@ from openai import (
 )
 from pydantic import BaseModel, ValidationError
 
+from app import config
 from app.config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
@@ -102,6 +103,9 @@ class DeepSeekClient:
     supports_temperature = True
     provider_name = "deepseek"
     _concurrency = threading.BoundedSemaphore(DEEPSEEK_CONCURRENCY_LIMIT)
+    _catalog_concurrency = threading.BoundedSemaphore(
+        config.MAX_PARALLEL_CATALOG_CALLS
+    )
 
     def __init__(self, *, model: str | None = None) -> None:
         if not DEEPSEEK_API_KEY:
@@ -112,9 +116,16 @@ class DeepSeekClient:
         self.model = str(model or DEEPSEEK_MODEL)
         self.api_key = DEEPSEEK_API_KEY
         self.last_usage: dict[str, int | str] | None = None
+        self.last_transient_retries = 0
+        self.last_structured_attempts = 0
 
-    async def _sdk_request(self, *, timeout: int, **kwargs):
-        await asyncio.to_thread(self._concurrency.acquire)
+    async def _sdk_request(self, *, timeout: int, agent: str = "", **kwargs):
+        concurrency = (
+            self._catalog_concurrency
+            if agent == "assessment_compiler"
+            else self._concurrency
+        )
+        await asyncio.to_thread(concurrency.acquire)
         try:
             async with AsyncOpenAI(
                 api_key=self.api_key,
@@ -124,12 +135,17 @@ class DeepSeekClient:
             ) as client:
                 return await client.responses.create(**kwargs)
         finally:
-            self._concurrency.release()
+            concurrency.release()
 
-    async def _request_with_backoff(self, *, timeout: int, **kwargs):
+    async def _request_with_backoff(
+        self, *, timeout: int, agent: str = "", **kwargs
+    ):
+        self.last_transient_retries = 0
         for transient_attempt in range(DEEPSEEK_MAX_TRANSIENT_RETRIES + 1):
             try:
-                return await self._sdk_request(timeout=timeout, **kwargs)
+                return await self._sdk_request(
+                    timeout=timeout, agent=agent, **kwargs
+                )
             except AuthenticationError as exc:
                 raise DeepSeekAuthenticationError(
                     "DeepSeek rejected DEEPSEEK_API_KEY"
@@ -159,6 +175,7 @@ class DeepSeekClient:
 
             if transient_attempt >= DEEPSEEK_MAX_TRANSIENT_RETRIES:
                 raise mapped from cause
+            self.last_transient_retries = transient_attempt + 1
             delay = DEEPSEEK_RETRY_BASE_SECONDS * (2 ** transient_attempt)
             logger.warning(
                 "DeepSeek transient failure | type=%s | retry=%d/%d | delay=%.2fs",
@@ -371,6 +388,7 @@ class DeepSeekClient:
             else DEEPSEEK_MAX_STRUCTURED_ATTEMPTS
         )
         for attempt in range(1, attempt_limit + 1):
+            self.last_structured_attempts = attempt
             current_input = (
                 prompt
                 if attempt == 1
@@ -419,7 +437,9 @@ class DeepSeekClient:
                 )
                 if self.supports_temperature:
                     request_kwargs["temperature"] = temperature
-                response = await self._request_with_backoff(**request_kwargs)
+                response = await self._request_with_backoff(
+                    agent=agent, **request_kwargs
+                )
             except BadRequestError as exc:
                 message = str(exc)
                 if "schema" in message.lower() or "text.format" in message.lower():
