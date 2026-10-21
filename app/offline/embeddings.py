@@ -217,7 +217,7 @@ def embed_texts(
                 "dense": dense[i].tolist(),
                 # BGE-M3 emits NumPy scalar keys/weights (commonly float16 on
                 # CUDA). Normalize them at the boundary so cache JSON and the
-                # Qdrant client both receive ordinary Python numeric values.
+                # Semantic consumers receive ordinary Python numeric values.
                 "sparse": (
                     {int(token_id): float(weight) for token_id, weight in sparse[i].items()}
                     if sparse is not None

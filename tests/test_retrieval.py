@@ -73,7 +73,7 @@ def test_retrieve_context_needs_selection(monkeypatch):
             calls["n"] += 1
             return []
 
-    monkeypatch.setattr("app.online.retrieval.VectorStore", Store)
+    monkeypatch.setattr("app.online.retrieval.ChunkStore", Store)
     out = retrieve_context({"document_id": "doc", "selected_child_ids": None})
     assert out["error"]
     assert calls["n"] == 0
@@ -89,14 +89,13 @@ def test_retrieve_selected_returns_structured_context(monkeypatch):
                 _child("c2", "Section A", "Sub B", "Body B."),
             ]
 
-    monkeypatch.setattr("app.online.retrieval.VectorStore", Store)
+    monkeypatch.setattr("app.online.retrieval.ChunkStore", Store)
     out = retrieve_selected("doc", ["c1", "c2"])
     assert out["error"] is None
     assert len(out["retrieved_chunks"]) == 2
     assert "## Section A" in out["context"]
     assert "### Sub A" in out["context"]
     assert "Body A." in out["context"]
-
 
 def test_retrieve_selected_retains_context_beyond_old_3000_token_cap(monkeypatch):
     content = " ".join(f"word{i}" for i in range(3500))
@@ -105,7 +104,7 @@ def test_retrieve_selected_retains_context_beyond_old_3000_token_cap(monkeypatch
         def get_by_child_ids(self, document_id, child_ids):
             return [_child("c1", "Section A", None, content)]
 
-    monkeypatch.setattr("app.online.retrieval.VectorStore", Store)
+    monkeypatch.setattr("app.online.retrieval.ChunkStore", Store)
     out = retrieve_selected("doc", ["c1"])
 
     assert out["error"] is None
@@ -118,7 +117,7 @@ def test_retrieve_selected_no_chunks_returns_error(monkeypatch):
         def get_by_child_ids(self, document_id, child_ids):
             return []
 
-    monkeypatch.setattr("app.online.retrieval.VectorStore", Store)
+    monkeypatch.setattr("app.online.retrieval.ChunkStore", Store)
     out = retrieve_selected("doc", ["missing"])
     assert out["error"]
     assert out["context"] == ""
@@ -129,7 +128,7 @@ def test_retrieve_context_passes_selected_ids(monkeypatch):
         def get_by_child_ids(self, document_id, child_ids):
             return [_child(cid, "S", None, f"Body {cid}.") for cid in child_ids]
 
-    monkeypatch.setattr("app.online.retrieval.VectorStore", Store)
+    monkeypatch.setattr("app.online.retrieval.ChunkStore", Store)
     out = retrieve_context({
         "document_id": "doc",
         "question_type": "mcq",

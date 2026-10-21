@@ -22,7 +22,7 @@ from app.cleanup import run_cleanup
 from app.logging_conf import get_logger, set_job_context, set_request_id
 from app.offline.pipeline import PipelineCancelled, run_pipeline
 from app.offline.parser import ParserError
-from app.offline.vector_store import VectorStore
+from app.offline.chunk_store import ChunkStore
 from app.online.exam_builder import generate_exams
 from app.metrics import increment, observe
 
@@ -510,9 +510,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
 @celery_app.task(name="genexam.cleanup_cancelled_document", ignore_result=True)
 def cleanup_cancelled_document(document_id: str, session_id: str) -> dict[str, int]:
     """Remove regenerable artifacts left by a cancelled ingestion job."""
-    deleted_vectors = VectorStore().delete_document(
-        document_id, session_id=session_id, raise_errors=True
-    )
+    deleted_chunks = ChunkStore().delete_document(document_id)
     deleted_files = get_file_storage().delete_tree(
         f"sessions/{session_id}/documents/{document_id}"
     )
@@ -521,9 +519,9 @@ def cleanup_cancelled_document(document_id: str, session_id: str) -> dict[str, i
         "Cancelled ingestion artifacts removed | document_id=%s | files=%d | vectors=%d",
         document_id,
         deleted_files,
-        deleted_vectors,
+        deleted_chunks,
     )
-    return {"files": deleted_files, "vectors": deleted_vectors}
+    return {"files": deleted_files, "chunks": deleted_chunks}
 
 
 @celery_app.task(name="genexam.recover_stale_jobs")

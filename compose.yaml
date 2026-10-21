@@ -12,8 +12,6 @@ services:
       APP_ENV: ${APP_ENV:-local}
       HOST: 0.0.0.0
       PORT: 8000
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/draftwork
       CELERY_BROKER_URL: redis://redis:6379/0
       STORAGE_BACKEND: local
@@ -29,6 +27,7 @@ services:
       MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: ${MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS:-5}
       MAX_PARALLEL_VALIDATOR_CALLS: ${MAX_PARALLEL_VALIDATOR_CALLS:-5}
       DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: ${DEEPSEEK_MAX_STRUCTURED_ATTEMPTS:-3}
+      CATALOG_BATCH_MAX_ATTEMPTS: ${CATALOG_BATCH_MAX_ATTEMPTS:-3}
       DEEPSEEK_MAX_TRANSIENT_RETRIES: ${DEEPSEEK_MAX_TRANSIENT_RETRIES:-2}
       DEEPSEEK_RETRY_BASE_SECONDS: ${DEEPSEEK_RETRY_BASE_SECONDS:-1.0}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
@@ -43,8 +42,6 @@ services:
     volumes:
       - ./data:/app/data
     depends_on:
-      qdrant:
-        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -69,8 +66,6 @@ services:
       - .env
     environment:
       APP_ENV: ${APP_ENV:-local}
-      QDRANT_URL: http://qdrant:6333
-      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/draftwork
       CELERY_BROKER_URL: redis://redis:6379/0
       STORAGE_BACKEND: local
@@ -85,6 +80,7 @@ services:
       MAX_PARALLEL_GENERATION_CALLS: ${MAX_PARALLEL_GENERATION_CALLS:-5}
       MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: ${MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS:-5}
       MAX_PARALLEL_VALIDATOR_CALLS: ${MAX_PARALLEL_VALIDATOR_CALLS:-5}
+      CATALOG_BATCH_MAX_ATTEMPTS: ${CATALOG_BATCH_MAX_ATTEMPTS:-3}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       STEM_REVIEW_MODEL: ${STEM_REVIEW_MODEL:-gpt-6-luna}
@@ -100,15 +96,13 @@ services:
       PLANNER_CONTEXT_TOKENS: ${PLANNER_CONTEXT_TOKENS:-120000}
       GENERATION_CONTEXT_TOKENS: ${GENERATION_CONTEXT_TOKENS:-120000}
       PARSING_TIMEOUT_SECONDS: 120
-      GENERATION_TIMEOUT_SECONDS: 800
+      GENERATION_TIMEOUT_SECONDS: 1300
       JOB_HEARTBEAT_SECONDS: 30
-      JOB_STALE_AFTER_SECONDS: 480
+      JOB_STALE_AFTER_SECONDS: 1330
     volumes:
       - ./data:/app/data
       - huggingface-cache:/home/app/.cache/huggingface
     depends_on:
-      qdrant:
-        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -156,20 +150,6 @@ services:
       retries: 10
     restart: unless-stopped
 
-  qdrant:
-    image: qdrant/qdrant:v1.18.0
-    container_name: genexam-qdrant
-    ports:
-      - "${QDRANT_PORT:-6333}:6333"
-    volumes:
-      - qdrant-data:/qdrant/storage
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-    restart: unless-stopped
-
   postgres:
     image: postgres:17
     container_name: genexam-postgres
@@ -190,6 +170,5 @@ services:
 
 volumes:
   postgres-data:
-  qdrant-data:
   huggingface-cache:
   redis-data:

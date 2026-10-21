@@ -14,7 +14,6 @@ from app.api.main import app
 from app.api.routes import GenerateRequest
 from app.file_storage.local import LocalFileStorage
 from app.jobs.tasks import generate_exam, ingest_document
-from app.offline.vector_store import VectorStore
 
 
 def _session_fakes(monkeypatch):
@@ -84,16 +83,19 @@ def test_generation_limits_match_agreed_configuration():
     assert config.GENERATION_REQUESTS_PER_MINUTE == 2
 
 
-def test_generation_task_has_800_second_hard_timeout():
-    assert generate_exam.time_limit == 800
-    assert generate_exam.soft_time_limit == 790
+def test_generation_task_has_1300_second_hard_timeout():
+    assert generate_exam.time_limit == 1300
+    assert generate_exam.soft_time_limit == 1290
 
 
-def test_online_llm_parallelism_defaults_are_bounded_to_five():
-    assert config.MAX_PARALLEL_GENERATION_CALLS == 5
-    assert config.MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS == 5
-    assert config.MAX_PARALLEL_VALIDATOR_CALLS == 5
-    assert config.DEEPSEEK_CONCURRENCY_LIMIT == 5
+def test_online_llm_parallelism_defaults_are_bounded_to_ten():
+    assert config.MAX_PARALLEL_GENERATION_CALLS == 10
+    assert config.MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS == 10
+    assert config.MAX_PARALLEL_VALIDATOR_CALLS == 10
+    assert config.MAX_PARALLEL_CATALOG_CALLS == 50
+    assert config.MAX_PARALLEL_DUPLICATE_JUDGE_CALLS == 10
+    assert config.LLM_JOB_CONCURRENCY_LIMIT == 10
+    assert config.DEEPSEEK_CONCURRENCY_LIMIT == 10
 
 
 def test_ingestion_task_does_not_limit_downstream_pipeline_runtime():
@@ -153,28 +155,12 @@ def test_local_storage_rejects_keys_outside_root(tmp_path):
         storage.put_file("../escape.pdf", source)
 
 
-def test_qdrant_payload_contains_full_isolation_scope():
-    captured = []
-
-    class Client:
-        def upsert(self, *, collection_name, points):
-            captured.extend(points)
-
-    store = VectorStore.__new__(VectorStore)
-    store.client = Client()
-    store.collection = "test"
-    store.upsert(
-        [{
-            "document_id": "doc-1",
-            "parent_id": "parent-1",
-            "child_id": "33333333-3333-4333-8333-333333333333",
-            "content": "content",
-        }],
-        [{"dense": [0.1, 0.2]}],
-        session_id="session-1",
-        job_id="job-1",
-    )
-    payload = captured[0].payload
-    assert payload["session_id"] == "session-1"
-    assert payload["document_id"] == "doc-1"
-    assert payload["job_id"] == "job-1"
+def test_postgres_chunk_migration_has_document_isolation_and_lookup_indexes():
+    migration = (
+        Path(__file__).parents[1]
+        / "migrations" / "versions" / "0005_postgres_document_chunks.py"
+    ).read_text(encoding="utf-8")
+    assert "document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE" in migration
+    assert "document_chunks_document_order_idx" in migration
+    assert "document_chunks_section_idx" in migration
+    assert "document_chunks_subsection_idx" in migration

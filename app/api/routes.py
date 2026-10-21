@@ -17,10 +17,6 @@ from app import db
 from app.config import (
     CELERY_BROKER_URL,
     MAX_UPLOAD_BYTES,
-    QDRANT_URL,
-    QDRANT_API_KEY,
-    QDRANT_VERIFY_TLS,
-    QDRANT_TIMEOUT_SECONDS,
     UPLOAD_DIR,
 )
 from app.logging_conf import get_logger, set_request_id
@@ -193,20 +189,6 @@ def health() -> JSONResponse:
     except Exception:
         statuses["redis"] = "error"
         increment("genexam_health_dependency_failures", dependency="redis")
-
-    try:
-        from qdrant_client import QdrantClient
-
-        QdrantClient(
-            url=QDRANT_URL,
-            api_key=QDRANT_API_KEY,
-            timeout=QDRANT_TIMEOUT_SECONDS,
-            verify=QDRANT_VERIFY_TLS,
-        ).get_collections()
-        statuses["qdrant"] = "ok"
-    except Exception:
-        statuses["qdrant"] = "error"
-        increment("genexam_health_dependency_failures", dependency="qdrant")
 
     try:
         storage = get_file_storage()

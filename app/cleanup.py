@@ -9,7 +9,7 @@ from app.api import repositories
 from app.file_storage import get_file_storage
 from app.logging_conf import get_logger
 from app.metrics import increment, observe
-from app.offline.vector_store import VectorStore
+from app.offline.chunk_store import ChunkStore
 
 
 logger = get_logger("CLEANUP")
@@ -39,10 +39,9 @@ def run_cleanup() -> dict[str, Any]:
     stats: dict[str, int] = {
         "documents": 0,
         "storage_objects": 0,
-        "qdrant_documents": 0,
+        "postgres_chunk_documents": 0,
         "temporary_exports": 0,
         "orphan_storage_prefixes": 0,
-        "orphan_qdrant_points": 0,
     }
     try:
         storage = get_file_storage()
@@ -50,16 +49,12 @@ def run_cleanup() -> dict[str, Any]:
             abandoned_after_seconds=config.ABANDONED_UPLOAD_AFTER_SECONDS,
             limit=config.CLEANUP_BATCH_SIZE,
         )
-        vector_store: VectorStore | None = None
+        chunk_store = ChunkStore()
         for document in candidates:
             document_id = str(document["id"])
             session_id = str(document["session_id"])
-            if vector_store is None:
-                vector_store = VectorStore()
-            vector_store.delete_document(
-                document_id, session_id=session_id, raise_errors=True
-            )
-            stats["qdrant_documents"] += 1
+            chunk_store.delete_document(document_id)
+            stats["postgres_chunk_documents"] += 1
             stats["storage_objects"] += storage.delete_tree(
                 f"sessions/{session_id}/documents/{document_id}"
             )
@@ -89,12 +84,6 @@ def run_cleanup() -> dict[str, Any]:
                 if scope not in valid_scopes:
                     stats["storage_objects"] += storage.delete_tree(prefix)
                     stats["orphan_storage_prefixes"] += 1
-        if vector_store is None:
-            vector_store = VectorStore()
-        stats["orphan_qdrant_points"] = vector_store.delete_orphaned_session_points(
-            valid_scopes,
-            max_points=config.ORPHAN_SCAN_MAX_POINTS,
-        )
         stats.update(
             repositories.cleanup_database_records(
                 terminal_job_days=config.TERMINAL_JOB_RETENTION_DAYS

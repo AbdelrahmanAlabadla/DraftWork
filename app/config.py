@@ -33,13 +33,6 @@ IS_PRODUCTION: bool = APP_ENV == "production"
 
 
 LLAMA_PARSE_API: str | None = _env("LLAMA_PARSE_API")
-QDRANT_URL: str = _env("QDRANT_URL", "http://localhost:6333") or "http://localhost:6333"
-QDRANT_COLLECTION: str = _env("QDRANT_COLLECTION", "genexam") or "genexam"
-QDRANT_API_KEY: str | None = _env("QDRANT_API_KEY")
-QDRANT_VERIFY_TLS: bool = _env_bool("QDRANT_VERIFY_TLS", True)
-QDRANT_TIMEOUT_SECONDS: int = max(
-    1, int(_env("QDRANT_TIMEOUT_SECONDS", "30") or "30")
-)
 
 # Base URL of the LM Studio server (native REST API /api/v1/chat is used).
 # A trailing /v1 (OpenAI-compatible form) is tolerated and stripped.
@@ -272,9 +265,6 @@ TEMP_EXPORT_RETENTION_SECONDS: int = max(
 CLEANUP_BATCH_SIZE: int = max(
     1, min(1000, int(_env("CLEANUP_BATCH_SIZE", "100") or "100"))
 )
-ORPHAN_SCAN_MAX_POINTS: int = max(
-    100, int(_env("ORPHAN_SCAN_MAX_POINTS", "10000") or "10000")
-)
 
 # PostgreSQL is the durable source for evaluation history.  It is optional at
 # runtime so a telemetry outage never prevents the core exam-generation flow.
@@ -366,12 +356,6 @@ def validate_runtime_config() -> None:
             problems.append(f"Clerk authorized party must use HTTPS in production: {origin}")
     if not DATABASE_URL or "replace" in DATABASE_URL.lower() or "your_" in DATABASE_URL.lower():
         problems.append("DATABASE_URL must not contain placeholder credentials")
-    qdrant_url = urlparse(QDRANT_URL)
-    qdrant_is_local = qdrant_url.hostname in {"localhost", "127.0.0.1", "qdrant"}
-    if not qdrant_is_local and placeholder(QDRANT_API_KEY):
-        problems.append("QDRANT_API_KEY is required for remote Qdrant")
-    if not qdrant_is_local and qdrant_url.scheme != "https":
-        problems.append("QDRANT_URL must use HTTPS outside the local container network")
     if DATABASE_URL:
         database_url = urlparse(DATABASE_URL)
         database_is_local = database_url.hostname in {
