@@ -1095,6 +1095,23 @@
       display: flex;
     }
 
+    .sections-error {
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      margin-bottom: 16px;
+      border: 1px solid rgba(220, 38, 38, .35);
+      border-radius: 10px;
+      color: #b91c1c;
+      background: rgba(220, 38, 38, .06);
+    }
+
+    .sections-error.show {
+      display: flex;
+    }
+
     .sections-toolbar {
       margin-bottom: 8px;
       text-align: end;

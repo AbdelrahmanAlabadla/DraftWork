@@ -8,12 +8,15 @@ def test_generation_progress_has_real_stage_labels_in_english_and_arabic():
     source = (ROOT / "Frontend/js/i18n.js").read_text(encoding="utf-8")
     for key in (
         "retrieving_context", "compiling_assessment_catalog", "planning_exam",
-        "adjusting_difficulty", "reviewing_plan", "generating_exam",
+        "adjusting_difficulty", "generating_exam",
         "validating_exam", "repairing_exam", "checking_duplicates",
         "repairing_duplicates", "finalizing_exam", "completed",
     ):
         assert source.count(f'"exam_stage.{key}"') == 2
     assert 'return normalized.replaceAll("_", " ");' in source
+    assert source.count('"exam_stage.validating_updates"') == 2
+    assert "Revalidating repaired questions" in source
+    assert '"warning.duplicates"' in source
 
 
 def test_generation_progress_uses_persisted_events_and_reuses_loop_stages():

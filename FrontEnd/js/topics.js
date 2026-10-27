@@ -20,6 +20,7 @@ function countAllCheckboxes() {
 }
 
 export function showSectionsLoading() {
+  hideSectionsError();
   document.getElementById("sectionsLoading").classList.add("show");
   document.getElementById("sectionsTree").innerHTML = "";
   document.getElementById("sectionsCount").textContent = "";
@@ -29,18 +30,31 @@ export function hideSectionsLoading() {
   document.getElementById("sectionsLoading").classList.remove("show");
 }
 
-export function renderSectionsTree(data) {
+export function showSectionsError(message) {
+  hideSectionsLoading();
+  const panel = document.getElementById("sectionsError");
+  document.getElementById("sectionsErrorMessage").textContent = message;
+  panel.classList.add("show");
+}
+
+export function hideSectionsError() {
+  document.getElementById("sectionsError")?.classList.remove("show");
+}
+
+export function renderSectionsTree(data, { preserveSelection = false } = {}) {
   const tree = document.getElementById("sectionsTree");
+  const previousSelection = preserveSelection ? new Set(state.selectedChildren) : new Set();
   tree.innerHTML = "";
   state.selectedChildren.clear();
+  hideSectionsError();
 
   const sections = data.sections || [];
   const selectAllBtn = document.getElementById("selectAllBtn");
   if (selectAllBtn) selectAllBtn.style.display = sections.length ? "" : "none";
 
   if (!sections.length) {
-    hideSectionsLoading();
-    return;
+    showSectionsError(t("sections.empty"));
+    return false;
   }
 
   const frag = document.createDocumentFragment();
@@ -75,7 +89,8 @@ export function renderSectionsTree(data) {
       cbox.className = "child-check";
       cbox.dataset.child = sub.child_id;
       cbox.dataset.section = String(si);
-      cbox.checked = false;
+      cbox.checked = previousSelection.has(String(sub.child_id));
+      if (cbox.checked) state.selectedChildren.add(String(sub.child_id));
       lrow.appendChild(cbox);
       const ctitle = document.createElement("span");
       ctitle.className = "subsection-title";
@@ -120,8 +135,22 @@ export function renderSectionsTree(data) {
     });
   });
 
+  tree.querySelectorAll(".section-check").forEach((box) => {
+    const childIds = (box.dataset.childIds || "").split(",").filter(Boolean);
+    const visibleChildren = tree.querySelectorAll(
+      `.child-check[data-section="${box.dataset.section}"]`
+    );
+    if (!visibleChildren.length && childIds.length &&
+        childIds.every((id) => previousSelection.has(id))) {
+      box.checked = true;
+      childIds.forEach((id) => state.selectedChildren.add(id));
+    }
+    refreshSectionState(tree, box.dataset.section);
+  });
+
   hideSectionsLoading();
   updateSectionsCount();
+  return true;
 }
 
 function refreshSectionState(tree, si) {
