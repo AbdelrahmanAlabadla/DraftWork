@@ -177,6 +177,14 @@ class DeepSeekClient:
                 raise mapped from cause
             self.last_transient_retries = transient_attempt + 1
             delay = DEEPSEEK_RETRY_BASE_SECONDS * (2 ** transient_attempt)
+            if isinstance(cause, RateLimitError):
+                response = getattr(cause, "response", None)
+                headers = getattr(response, "headers", {}) or {}
+                retry_after = headers.get("retry-after") or headers.get("Retry-After")
+                try:
+                    delay = max(delay, min(60.0, float(retry_after)))
+                except (TypeError, ValueError):
+                    pass
             logger.warning(
                 "DeepSeek transient failure | type=%s | retry=%d/%d | delay=%.2fs",
                 type(mapped).__name__,
@@ -198,8 +206,6 @@ class DeepSeekClient:
             # structured JSON in a real 28-question run.
             return "none"
         if agent == "repairer":
-            return "low"
-        if agent == "plan_reviewer":
             return "low"
         return "high" if agent == "validator" else "none"
 
@@ -338,17 +344,23 @@ class DeepSeekClient:
         schema: dict[str, Any],
         expected_ids: list[str] | None,
     ) -> str:
+        # The provider already receives the authoritative JSON schema through
+        # ``text.format`` on every attempt. Repeating that schema and an
+        # unbounded prior response caused retry prompts to grow beyond the
+        # original request. Preserve the task, but cap diagnostic material.
+        task = original_prompt[:24000]
+        prior = previous_output[:8000]
+        reason = failure_reason[:2000]
         return (
-            f"{original_prompt}\n\n"
+            f"{task}\n\n"
             "## Corrective structured-output retry\n"
-            f"Previous response:\n{previous_output or '[no complete output returned]'}\n\n"
-            f"Previous response failed because:\n{failure_reason}\n\n"
+            f"Previous response (bounded excerpt):\n{prior or '[no complete output returned]'}\n\n"
+            f"Previous response failed because:\n{reason}\n\n"
             "Correct only that specific failure while preserving every valid field, "
             "ID, concept, difficulty, question type, and other correct data. This is "
             "the same logical task and must not create an extra question or plan slot.\n"
-            f"Expected IDs: {expected_ids or 'defined by the schema'}\n"
-            f"Expected JSON Schema:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
-            "Return output matching the same JSON Schema."
+            f"Expected IDs: {expected_ids or 'defined by the provider schema'}\n"
+            "Return output matching the same provider-supplied JSON Schema."
         )
 
     async def achat_structured(

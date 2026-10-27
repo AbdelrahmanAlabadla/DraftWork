@@ -3,6 +3,8 @@ from __future__ import annotations
 import random
 import re
 import time
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from copy import deepcopy
@@ -21,6 +23,7 @@ from app.online.assessment_catalog import (
     is_pure_text_fitb_value,
     normalize_fitb_answer_key,
     selected_variation,
+    validate_plan_catalog_bindings,
 )
 from app.online.eval_stats import (
     create_pipeline_eval,
@@ -42,6 +45,57 @@ from app.online.models import (
     render_markdown,
     split_valid_invalid,
 )
+
+PLAN_SCHEMA_VERSION = "plan-v12-typed-variation-contract"
+
+
+def _dispatch_generation_jobs(
+    jobs: list[Any], worker: Callable[[Any], Any], *, max_workers: int | None = None,
+) -> dict[int, Any]:
+    """Run a bounded work-conserving slot queue and retain submission identity."""
+    if not jobs:
+        return {}
+    limit = min(int(max_workers or MAX_PARALLEL_GENERATION_CALLS), len(jobs), 50)
+    completed: dict[int, Any] = {}
+    with ThreadPoolExecutor(max_workers=limit) as executor:
+        futures = {
+            executor.submit(copy_context().run, worker, job): index
+            for index, job in enumerate(jobs)
+        }
+        for future in as_completed(futures):
+            completed[futures[future]] = future.result()
+    return completed
+
+
+def immutable_exam_request(
+    *, job_id: str | None, document_id: str, tasks: list[tuple[str, int]],
+    num_models: int, selected_child_ids: list[str] | None, difficulty: str,
+    processed_document_key: str | None, domain_type: str | None, subject: str | None,
+    document_language: str | None = None,
+) -> dict[str, Any]:
+    """Return the generation-affecting identity for one job retry."""
+    from app import config
+    return {
+        "job_id": str(job_id or ""),
+        "document_id": str(document_id),
+        "processed_document_key": str(processed_document_key or ""),
+        "selected_child_ids": list(dict.fromkeys(map(str, selected_child_ids or []))),
+        "tasks": [[str(qtype), int(count)] for qtype, count in tasks],
+        "num_models": int(num_models),
+        "difficulty": str(difficulty),
+        "domain_type": str(domain_type or ""),
+        "subject": str(subject or ""),
+        "document_language": str(document_language or ""),
+        "generation_pipeline_version": config.GENERATION_PIPELINE_VERSION,
+        "validation_pipeline_version": config.VALIDATION_PIPELINE_VERSION,
+        "duplicate_pipeline_version": config.DUPLICATE_PIPELINE_VERSION,
+    }
+
+
+def request_fingerprint(request: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(
+        request, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
 from app.online.prompts import (
     DEFINITION_SCHEMA,
     EQUATION_SCHEMA,
@@ -213,7 +267,7 @@ def _generation_plan_items(
     return enriched
 
 
-def _attach_plan_review_context(
+def _attach_reuse_context(
     plan_items: dict[str, list[dict[str, Any]]],
 ) -> dict[str, list[dict[str, Any]]]:
     """Attach compact prior-slot plans without creating another task identity."""
@@ -289,19 +343,31 @@ def _bind_selected_variation(
     if question_type == "fill_in_the_blank" or not plan_item.get("task_id"):
         return True
     if not plan_item.get("permitted_variations"):
-        # Compatibility for pre-v11 persisted plans and direct legacy callers.
-        return True
+        return False
     compatible = [
         variation for variation in plan_item.get("permitted_variations") or []
         if question_type in (variation.get("question_types") or [])
     ]
+    planned_id = str(plan_item.get("selected_variation_id") or "")
     selected_id = str(question.get("selected_variation_id") or "")
-    if not selected_id and len(compatible) == 1:
+    if planned_id:
+        if selected_id and selected_id != planned_id:
+            return False
+        selected_id = planned_id
+        question["selected_variation_id"] = selected_id
+    elif not selected_id and len(compatible) == 1:
         selected_id = str(compatible[0].get("variation_id") or "")
         question["selected_variation_id"] = selected_id
     variation = selected_variation(plan_item, selected_id, question_type)
     if variation is None:
         return False
+    effective_variation = deepcopy(variation)
+    if plan_item.get("effective_instance_id"):
+        effective_variation["givens"] = list(
+            plan_item.get("effective_givens") or plan_item.get("given_conditions") or []
+        )
+        effective_variation["base_variation_id"] = selected_id
+        effective_variation["effective_instance_id"] = plan_item.get("effective_instance_id")
     inherited = [
         value for value in [
             plan_item.get("source_chunk_id"),
@@ -309,7 +375,10 @@ def _bind_selected_variation(
         ] if value
     ]
     effective_ids = variation.get("evidence_chunk_ids")
-    question["selected_variation"] = variation
+    question["base_selected_variation"] = variation
+    question["selected_variation"] = effective_variation
+    question["selected_variation_group_id"] = plan_item.get("selected_variation_group_id")
+    question["effective_instance_id"] = plan_item.get("effective_instance_id")
     question["effective_evidence_chunk_ids"] = list(dict.fromkeys(map(
         str, effective_ids if effective_ids is not None else inherited
     )))
@@ -381,26 +450,41 @@ def balance_mcq_answer_positions(
 
 
 def _assign_ids(model_number: int, qtype: str, section: Any) -> None:
-    """Stamp a stable `question_id` on every question missing one, in place.
+    """Stamp the planner-derived stable ``question_id`` on every question.
 
-    The per-type sequence continues from the highest existing ID so repair or
-    shortfall-fill that appends questions never collides or resets numbering.
+    Independent generation returns one section per slot, so section-local
+    counters restart at one and are unsafe.  The Planner slot is the durable
+    identity used by validation, repair, checkpoints, and duplicate review;
+    derive the public ID from it instead of generation completion order.
     """
     slug = _TYPE_ID_SLUGS.get(qtype, qtype)
     prefix = f"model{model_number}_{slug}_"
-    max_seq = 0
     for q in _section_items(section):
-        qid = q.get("question_id")
-        if qid and str(qid).startswith(prefix):
-            try:
-                max_seq = max(max_seq, int(str(qid)[len(prefix):]))
-            except ValueError:
-                pass
-    nxt = max_seq + 1
-    for q in _section_items(section):
-        if not q.get("question_id"):
-            q["question_id"] = f"{prefix}{nxt}"
-            nxt += 1
+        slot_id = str(q.get("slot_id") or "")
+        match = re.fullmatch(rf"m{model_number}_{re.escape(qtype)}_(\d+)", slot_id)
+        if not match:
+            raise ValueError(
+                f"Cannot assign a stable question ID: invalid {qtype} slot {slot_id!r}"
+            )
+        q["question_id"] = f"{prefix}{match.group(1)}"
+
+
+def _assert_unique_question_ids(questions: dict[str, Any]) -> None:
+    """Reject identity corruption before any validator receives the exam."""
+    owners: dict[str, str] = {}
+    for qtype, section in questions.items():
+        for item in _section_items(section):
+            qid = str(item.get("question_id") or "")
+            slot_id = str(item.get("slot_id") or "")
+            if not qid:
+                raise ValueError(f"Generated slot {slot_id!r} is missing question_id")
+            previous = owners.get(qid)
+            if previous is not None:
+                raise ValueError(
+                    f"Duplicate question_id {qid!r} belongs to slots "
+                    f"{previous!r} and {slot_id!r}"
+                )
+            owners[qid] = slot_id
 
 
 def _is_duplicate(qtype: str, question: dict[str, Any], seen: set[tuple[str, str]]) -> bool:
@@ -1272,6 +1356,15 @@ def _generate_obj_bundle(
                         f"obj bundle {qtype} attempt {attempt}: unknown slot_id {sid!r}"
                     )
                     continue
+                if qtype == "true_false":
+                    required = str(pending[qtype][sid].get("required_answer_polarity") or "")
+                    actual = str(q.get("answer") or "")
+                    if required and actual.casefold() != required.casefold():
+                        warnings.append(
+                            f"obj bundle true_false attempt {attempt}: slot {sid} "
+                            f"returned {actual!r}; required deterministic polarity {required}"
+                        )
+                        continue
                 already_accepted = [
                     *accepted["mcq"].values(),
                     *accepted["true_false"].values(),
@@ -1541,76 +1634,48 @@ def _repair_shortfalls(
         if not missing:
             break
 
-        obj_planned = {
-            qtype: missing[qtype]
-            for qtype in ("mcq", "true_false")
-            if qtype in missing
-        }
-        if obj_planned:
-            objective_items = [item for values in obj_planned.values() for item in values]
-            bundle, bwarn = _generate_obj_bundle(
-                obj_planned, slot_context(objective_items), difficulty, model_number,
-                within_model, seen, previous_questions, language=language,
-                eval_stats=eval_stats,
-                global_plan_by_slot=global_plan_by_slot,
-                mcq_task_replacer=mcq_task_replacer,
-            )
-            warnings.extend(bwarn)
-            for q in obj_planned:
-                section = bundle.get(q)
-                if not section:
-                    continue
-                for index, item in enumerate(_section_items(section)):
-                    if not item.get("slot_id") and index < len(obj_planned[q]):
-                        item["slot_id"] = obj_planned[q][index]["slot_id"]
-                before = _section_count(q, questions.get(q))
-                new_section = _append_section(questions.get(q), q, section)
-                questions[q] = new_section
-                if appended_by_type is not None:
-                    appended_by_type[q] = appended_by_type.get(q, 0) + max(
-                        _section_count(q, new_section) - before, 0
+        # Recovery keeps the same single-slot provider contract as initial
+        # generation. A missing sibling must never make another slot part of a
+        # bundled retry or expose it to regeneration.
+        for q, planned_items in missing.items():
+            for planned_item in planned_items:
+                one = [planned_item]
+                if q in {"mcq", "true_false"}:
+                    bundle, twarn = _generate_obj_bundle(
+                        {q: one}, slot_context(one), difficulty, model_number,
+                        within_model, seen, previous_questions, language=language,
+                        eval_stats=eval_stats, global_plan_by_slot=global_plan_by_slot,
+                        mcq_task_replacer=mcq_task_replacer,
                     )
-            within_model[:] = _reindex_within(questions)
-
-        if "fill_in_the_blank" in missing:
-            q = "fill_in_the_blank"
-            old = questions.get(q)
-            new_section, twarn = _generate_fitb_type(
-                len(missing[q]), missing[q], slot_context(missing[q]), difficulty, model_number,
-                within_model, previous_questions, language=language,
-                eval_stats=eval_stats,
-                global_plan_by_slot=global_plan_by_slot,
-            )
-            warnings.extend(twarn)
-            if new_section:
+                    section = bundle.get(q)
+                elif q == "fill_in_the_blank":
+                    section, twarn = _generate_fitb_type(
+                        1, one, slot_context(one), difficulty, model_number,
+                        within_model, previous_questions, language=language,
+                        eval_stats=eval_stats, global_plan_by_slot=global_plan_by_slot,
+                    )
+                else:
+                    section, twarn = _generate_type_from_plan(
+                        q, one, slot_context(one), difficulty, model_number,
+                        seen, within_model, previous_questions, language=language,
+                        eval_stats=eval_stats, global_plan_by_slot=global_plan_by_slot,
+                    )
+                warnings.extend(twarn)
+                items = _section_items(section)
+                if len(items) != 1:
+                    warnings.append(
+                        f"{q}: single-slot recovery for {planned_item['slot_id']} "
+                        f"returned {len(items)} questions; rejected"
+                    )
+                    continue
+                items[0]["slot_id"] = planned_item["slot_id"]
                 before = _section_count(q, questions.get(q))
-                questions[q] = _append_section(old, q, new_section)
+                questions[q] = _append_section(questions.get(q), q, section)
                 if appended_by_type is not None:
                     appended_by_type[q] = appended_by_type.get(q, 0) + max(
                         _section_count(q, questions[q]) - before, 0
                     )
                 within_model[:] = _reindex_within(questions)
-
-        for q in ("definition", "why", "equation", "word_problem", "essay"):
-            if q not in missing:
-                continue
-            planned = missing[q]
-            new_questions, twarn = _generate_type_from_plan(
-                q, planned, slot_context(planned), difficulty, model_number,
-                seen, within_model, previous_questions, language=language,
-                eval_stats=eval_stats,
-                global_plan_by_slot=global_plan_by_slot,
-            )
-            warnings.extend(twarn)
-            added = new_questions
-            for index, item in enumerate(added):
-                if not item.get("slot_id") and index < len(planned):
-                    item["slot_id"] = planned[index]["slot_id"]
-            questions.setdefault(q, [])
-            questions[q] = list(questions[q]) + added
-            if appended_by_type is not None:
-                appended_by_type[q] = appended_by_type.get(q, 0) + len(added)
-            within_model[:] = _reindex_within(questions)
 
     # Exhausted FITB stem repair is slot-local. Replace only the still-missing
     # entry, then give that replacement the normal bounded FITB generation.
@@ -1727,6 +1792,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     eval_stats = state.get("eval_stats")
 
     from app.online.planner import plan_structure_errors, validate_plans
+    from app.online.assessment_catalog import validate_plan_catalog_bindings
     planning_gate_errors = [
         *(state.get("plan_errors") or []),
         *plan_structure_errors(plans, tasks, int(num_models)),
@@ -1739,16 +1805,13 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             difficulty, assessment_profile, planning_issues,
         ),
     ]
-    if state.get("unresolved_plan_duplicate_conflicts"):
-        from app.online.plan_review import _is_duplicate_plan_error
-        planning_gate_errors = [
-            error for error in planning_gate_errors
-            if not _is_duplicate_plan_error(error)
-        ]
-        warnings.append(
-            "Plan duplicate diversification was exhausted; generation continued with "
-            "auditable unresolved plan similarity for the final Duplicate Judge."
-        )
+    if catalog:
+        planning_gate_errors.extend(validate_plan_catalog_bindings(
+            catalog, plans, {
+                str(chunk.get("child_id")) for chunk in retrieved_chunks
+                if chunk.get("child_id")
+            } or None,
+        ))
     if planning_gate_errors:
         raise RuntimeError(
             "Generator refused an invalid reviewed plan: "
@@ -1761,7 +1824,10 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             for issue in planning_issues
         )
 
-    generated_exams: list[dict[str, Any]] = []
+    generated_exams: list[dict[str, Any]] = deepcopy(state.get("generated_exams") or [])
+    generated_by_model = {
+        int(exam.get("model_number") or 0): exam for exam in generated_exams
+    }
     seen: set[tuple[str, str]] = set()
     previous_questions: list[dict[str, Any]] = []
     mcq_task_reassignments: list[dict[str, Any]] = list(
@@ -1775,7 +1841,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     for model_number in range(1, num_models + 1):
         plan = plans[model_number - 1] if model_number - 1 < len(plans) else None
         raw_plan_items = (plan or {}).get("items") or {}
-        plan_items = _attach_plan_review_context({
+        plan_items = _attach_reuse_context({
             qtype: _generation_plan_items(
                 list(items or []), qtype, retrieved_chunks, assessment_profile
             )
@@ -1787,9 +1853,41 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             for item in values
             if item.get("slot_id")
         }
-        model_warnings: list[str] = []
-        questions: dict[str, Any] = {}
-        within_model: list[dict[str, Any]] = []
+        durable_exam = generated_by_model.get(model_number) or {}
+        model_warnings: list[str] = list(durable_exam.get("warnings") or [])
+        questions: dict[str, Any] = deepcopy(durable_exam.get("questions") or {})
+        within_model: list[dict[str, Any]] = [
+            item for section in questions.values() for item in _section_items(section)
+        ]
+        durable_slots = {
+            str(item.get("slot_id") or "") for item in within_model if item.get("slot_id")
+        }
+        for durable_qtype, durable_section in questions.items():
+            for durable_item in _section_items(durable_section):
+                _remember_question(durable_qtype, durable_item, seen)
+                previous_questions.append(deepcopy(durable_item))
+
+        def persist_generation_checkpoint() -> None:
+            audit = state.get("audit_callback")
+            if not audit:
+                return
+            checkpoint_exam = {
+                "model_number": model_number,
+                "questions": deepcopy(questions),
+                "warnings": list(model_warnings),
+            }
+            checkpoint_exams = [
+                deepcopy(exam) for exam in generated_exams
+                if int(exam.get("model_number") or 0) != model_number
+            ] + [checkpoint_exam]
+            audit("generation", "generation_checkpoint", {
+                "checkpoint_state": {
+                    "generated_exams": checkpoint_exams,
+                    "plans": deepcopy(plans),
+                    "mcq_task_reassignments": deepcopy(mcq_task_reassignments),
+                    "fitb_recovery_history": deepcopy(fitb_recovery_history),
+                }
+            })
         unsuitable_task_ids_by_slot: dict[str, set[str]] = {}
         exhausted_fitb_entries_by_slot: dict[str, set[str]] = {}
 
@@ -1938,75 +2036,66 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             })
             return enriched
 
+        # The Catalog planner has already reserved stable slots and tasks. Submit
+        # one immutable job per slot. The executor is work-conserving: whenever a
+        # call finishes the next queued slot starts, up to the configured ceiling.
+        # Provider and per-job admission gates remain authoritative beneath it.
         obj_types = ("mcq", "true_false")
-        obj_planned = {q: plan_items.get(q) or [] for q in obj_types}
-        if any(obj_planned[q] for q in obj_types):
-            obj_items = [item for values in obj_planned.values() for item in values]
-            obj_context = _context_for_items(obj_items, retrieved_chunks, context)
-            bundle, model_warnings_ = _generate_obj_bundle(
-                obj_planned,
-                obj_context,
-                difficulty,
-                model_number,
-                within_model,
-                seen,
-                previous_questions,
-                language=language,
-                eval_stats=eval_stats,
-                global_plan_by_slot=global_plan_by_slot,
-                mcq_task_replacer=replace_unsuitable_mcq_task,
-            )
-            model_warnings.extend(model_warnings_)
-            for section_key in obj_types:
-                section_val = bundle.get(section_key)
-                if not section_val:
-                    continue
-                questions[section_key] = section_val
-                _assign_ids(model_number, section_key, section_val)
-                if section_key == "fill_in_the_blank":
-                    within_model.extend(section_val.get("items") or [])
-                else:
-                    within_model.extend(section_val)
-
-        # The catalog planner has already reserved stable slots and tasks. Each
-        # remaining question type is therefore independent at generation time.
-        # Give every call an immutable snapshot of the already accepted MCQ/TF
-        # context, then merge results in request order so IDs and output ordering
-        # remain deterministic regardless of completion order.
         base_within_model = deepcopy(within_model)
         base_seen = set(seen)
         base_previous_questions = deepcopy(previous_questions)
-        generation_jobs: list[tuple[str, list[dict[str, Any]], str]] = []
+        generation_jobs: list[tuple[str, dict[str, Any], str]] = []
         for qtype, _count in tasks:
-            if qtype in obj_types:
-                continue
-            planned = plan_items.get(qtype) or []
+            planned = [
+                item for item in plan_items.get(qtype) or []
+                if str(item.get("slot_id") or "") not in durable_slots
+            ]
             if not planned:
                 model_warnings.append(f"{qtype}: no planned concepts; skipped.")
                 continue
-            generation_jobs.append((
-                qtype,
-                planned,
-                _context_for_items(planned, retrieved_chunks, context),
-            ))
+            for slot_index, item in enumerate(planned):
+                item_snapshot = deepcopy(item)
+                lifecycle_record = ((state.get("slot_lifecycle") or {}).get(
+                    str(item.get("slot_id") or "")
+                ) or {})
+                item_snapshot["assignment_revision"] = lifecycle_record.get("assignment_revision")
+                item_snapshot["assignment_fingerprint"] = lifecycle_record.get("assignment_fingerprint")
+                if qtype == "true_false":
+                    item_snapshot["required_answer_polarity"] = (
+                        "True" if slot_index % 2 == 0 else "False"
+                    )
+                generation_jobs.append((
+                    qtype, item_snapshot,
+                    _context_for_items([item], retrieved_chunks, context),
+                ))
 
-        def generate_independent_type(
-            qtype: str, planned: list[dict[str, Any]], type_context: str,
+        def generate_independent_slot(
+            qtype: str, item: dict[str, Any], slot_context: str,
         ) -> tuple[Any, list[str]]:
+            cancellation_check = state.get("is_cancelled")
+            if callable(cancellation_check) and cancellation_check():
+                raise RuntimeError("generation cancelled or worker ownership lost before slot launch")
             local_within = deepcopy(base_within_model)
             local_previous = deepcopy(base_previous_questions)
             if qtype == "fill_in_the_blank":
                 section, type_warnings = _generate_fitb_type(
-                    len(planned), planned, type_context, difficulty, model_number,
+                    1, [item], slot_context, difficulty, model_number,
                     local_within, local_previous, language=language,
                     eval_stats=eval_stats,
                     global_plan_by_slot=global_plan_by_slot,
                 )
                 return section or {"word_bank": [], "items": []}, type_warnings
+            if qtype in obj_types:
+                bundle, slot_warnings = _generate_obj_bundle(
+                    {qtype: [item]}, slot_context, difficulty, model_number,
+                    local_within, set(base_seen), local_previous,
+                    language=language, eval_stats=eval_stats,
+                    global_plan_by_slot=global_plan_by_slot,
+                    mcq_task_replacer=replace_unsuitable_mcq_task,
+                )
+                return list(bundle.get(qtype) or []), slot_warnings
             return _generate_type_from_plan(
-                qtype,
-                planned,
-                type_context,
+                qtype, [item], slot_context,
                 difficulty,
                 model_number,
                 set(base_seen),
@@ -2017,49 +2106,65 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 global_plan_by_slot=global_plan_by_slot,
             )
 
-        generated_by_type: dict[str, tuple[Any, list[str]]] = {}
+        generated_by_job: dict[int, tuple[Any, list[str]]] = {}
         if generation_jobs:
             worker_count = min(MAX_PARALLEL_GENERATION_CALLS, len(generation_jobs))
             logger.info(
-                "Parallel type generation | model=%d | calls=%d | max_workers=%d | types=%s",
+                "Parallel slot generation | model=%d | calls=%d | max_workers=%d | slots=%s",
                 model_number, len(generation_jobs), worker_count,
-                [qtype for qtype, _planned, _context in generation_jobs],
+                [str(item.get("slot_id") or "") for _qtype, item, _context in generation_jobs],
             )
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(
-                        copy_context().run,
-                        generate_independent_type,
-                        qtype,
-                        planned,
-                        type_context,
-                    ): qtype
-                    for qtype, planned, type_context in generation_jobs
-                }
-                for future in as_completed(futures):
-                    qtype = futures[future]
-                    try:
-                        generated_by_type[qtype] = future.result()
-                    except Exception as exc:
-                        logger.exception(
-                            "Parallel question generation failed | model=%d | type=%s",
-                            model_number, qtype,
-                        )
-                        empty = ({"word_bank": [], "items": []}
-                                 if qtype == "fill_in_the_blank" else [])
-                        generated_by_type[qtype] = (
-                            empty, [f"{qtype}: generation failed ({exc})"]
-                        )
+            def run_generation_job(job: tuple[str, dict[str, Any], str]):
+                qtype, item, slot_context = job
+                try:
+                    return generate_independent_slot(qtype, item, slot_context)
+                except Exception as exc:
+                    logger.exception(
+                        "Parallel question generation failed | model=%d | type=%s | slot=%s",
+                        model_number, qtype, item.get("slot_id"),
+                    )
+                    empty = ({"word_bank": [], "items": []}
+                             if qtype == "fill_in_the_blank" else [])
+                    return empty, [f"{qtype}: generation failed ({exc})"]
 
-        for qtype, _planned, _type_context in generation_jobs:
-            section, type_warnings = generated_by_type[qtype]
-            questions[qtype] = section
+            generated_by_job = _dispatch_generation_jobs(
+                generation_jobs, run_generation_job, max_workers=worker_count,
+            )
+
+        for index, (qtype, _item, _slot_context) in enumerate(generation_jobs):
+            section, type_warnings = generated_by_job[index]
+            current_lifecycle = ((state.get("slot_lifecycle") or {}).get(
+                str(_item.get("slot_id") or "")
+            ) or {})
+            if (
+                _item.get("assignment_fingerprint")
+                and current_lifecycle.get("assignment_fingerprint")
+                and _item.get("assignment_fingerprint")
+                != current_lifecycle.get("assignment_fingerprint")
+            ):
+                model_warnings.append(
+                    f"{qtype}: rejected stale generation result for {_item.get('slot_id')}."
+                )
+                continue
+            for generated_item in _section_items(section):
+                generated_item["assignment_revision"] = _item.get("assignment_revision")
+                generated_item["assignment_fingerprint"] = _item.get("assignment_fingerprint")
+            questions[qtype] = _append_section(questions.get(qtype), qtype, section)
             _assign_ids(model_number, qtype, section)
             model_warnings.extend(type_warnings)
             section_items = _section_items(section)
             within_model.extend(section_items)
             for item in section_items:
                 _remember_question(qtype, item, seen)
+        # FITB calls produce independent items; only the coordinator owns the
+        # section-level bank so out-of-order workers cannot race shared state.
+        if questions.get("fill_in_the_blank"):
+            fitb_items = _section_items(questions.get("fill_in_the_blank"))
+            questions["fill_in_the_blank"] = {
+                "word_bank": _synchronize_fitb_shared_bank(fitb_items),
+                "items": fitb_items,
+            }
+        persist_generation_checkpoint()
 
         # Snapshot accepted output from the original generation calls before
         # count trimming/filling. Shortfall generation must not improve this.
@@ -2129,6 +2234,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             })
         for section_key, section_val in questions.items():
             _assign_ids(model_number, section_key, section_val)
+        _assert_unique_question_ids(questions)
         balance_mcq_answer_positions(questions, model_number)
         if eval_stats is not None:
             record_shortfall_result(
@@ -2148,13 +2254,16 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             total,
             elapsed,
         )
-        generated_exams.append(
-            {
-                "model_number": model_number,
-                "questions": questions,
-                "warnings": model_warnings,
-            }
-        )
+        generated_exams = [
+            exam for exam in generated_exams
+            if int(exam.get("model_number") or 0) != model_number
+        ]
+        generated_exams.append({
+            "model_number": model_number,
+            "questions": questions,
+            "warnings": model_warnings,
+        })
+        generated_exams.sort(key=lambda exam: int(exam.get("model_number") or 0))
         previous_questions.extend(within_model)
 
     warnings.extend(generated_exams[-1]["warnings"] if generated_exams else [])
@@ -2289,9 +2398,12 @@ def generate_exams(
     processed_document_key: str | None = None,
     domain_type: str | None = None,
     subject: str | None = None,
+    document_language: str | None = None,
+    job_id: str | None = None,
     progress_callback=None,
     audit_callback=None,
     is_cancelled=None,
+    resume_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Generate ``num_models`` complete, distinct exam versions.
 
@@ -2301,7 +2413,18 @@ def generate_exams(
     """
     t0 = time.perf_counter()
     from app.online.lifecycle import initialize_slot_lifecycle
+    immutable_request = immutable_exam_request(
+        job_id=job_id, document_id=document_id, tasks=tasks, num_models=num_models,
+        selected_child_ids=selected_child_ids, difficulty=difficulty,
+        processed_document_key=processed_document_key, domain_type=domain_type,
+        subject=subject, document_language=document_language,
+    )
+    immutable_fingerprint = request_fingerprint(immutable_request)
     initial = {
+        "job_id": str(job_id or ""),
+        "immutable_request": immutable_request,
+        "request_fingerprint": immutable_fingerprint,
+        "plan_schema_version": PLAN_SCHEMA_VERSION,
         "document_id": document_id,
         "tasks": list(tasks),
         "num_models": num_models,
@@ -2312,7 +2435,7 @@ def generate_exams(
         "domain_type": str(domain_type or ""),
         "subject": str(subject or ""),
         "difficulty": difficulty,
-        "document_language": "en",
+        "document_language": str(document_language or "en"),
         "retrieved_chunks": [],
         "context": "",
         "planner_context": "",
@@ -2320,26 +2443,18 @@ def generate_exams(
         "assessment_catalog_key": "",
         "assessment_catalog_cache_hit": False,
         "assessment_compiler_cache_hit": False,
+        "assessment_catalog_compatibility_cache_hit": False,
         "plans": [],
         "assessment_profile": {},
         "planning_issues": [],
         "plan_errors": [],
         "plan_attempts": 0,
+        "plan_failed_candidate_ids": [],
         "unrepairable_plan_slots": [],
-        "plan_review_history": [],
-        "plan_review_retry_required": False,
-        "plan_review_rechecks": 0,
         "plan_duplicate_repair_attempts": {},
-        "plan_review_candidate_blacklist": {},
         "unresolved_plan_duplicate_conflicts": [],
         "difficulty_adjustment_history": [],
         "difficulty_adjustment_attempts": {},
-        "plan_review_attempts": 0,
-        "plan_review_pair_verdicts": {},
-        "plan_review_difficulty_verdicts": {},
-        "plan_review_slot_fingerprints": {},
-        "plan_review_issues": [],
-        "plan_review_telemetry": [],
         "generated_exams": [],
         "rejection_feedback": None,
         "mcq_task_reassignments": [],
@@ -2381,6 +2496,57 @@ def generate_exams(
         "audit_callback": audit_callback,
         "is_cancelled": is_cancelled,
     }
+    if resume_state:
+        checkpoint_fingerprint = str(resume_state.get("request_fingerprint") or "")
+        checkpoint_request = resume_state.get("immutable_request")
+        if (
+            checkpoint_fingerprint != immutable_fingerprint
+            or checkpoint_request != immutable_request
+            or str(resume_state.get("plan_schema_version") or "") != PLAN_SCHEMA_VERSION
+        ):
+            raise RuntimeError(
+                "Checkpoint compatibility failure: immutable exam request or plan schema does not match this job."
+            )
+        checkpoint_catalog = resume_state.get("assessment_catalog") or {}
+        checkpoint_plans = resume_state.get("plans") or []
+        checkpoint_chunks = {
+            str(chunk.get("child_id"))
+            for chunk in resume_state.get("retrieved_chunks") or []
+            if chunk.get("child_id")
+        }
+        if checkpoint_plans:
+            checkpoint_key = str(resume_state.get("assessment_catalog_key") or "")
+            catalog_key = str(checkpoint_catalog.get("cache_key") or "")
+            catalog_processed_key = str(
+                checkpoint_catalog.get("processed_document_key") or ""
+            )
+            binding_errors = validate_plan_catalog_bindings(
+                checkpoint_catalog, checkpoint_plans, checkpoint_chunks or None,
+            )
+            if (
+                not checkpoint_catalog
+                or not checkpoint_key
+                or checkpoint_key != catalog_key
+                or catalog_processed_key != str(processed_document_key or "")
+                or binding_errors
+            ):
+                details = "; ".join(binding_errors) or "Catalog or processed-document identity differs."
+                raise RuntimeError(
+                    "Checkpoint compatibility failure: " + details
+                )
+        # Only state loaded through the current job's database relation reaches
+        # this boundary. Request identity and callbacks always come from the
+        # active invocation.
+        initial.update({
+            key: deepcopy(value) for key, value in resume_state.items()
+            if key not in {
+                "document_id", "tasks", "num_models", "selected_child_ids",
+                "session_id", "index_job_id", "processed_document_key",
+                "job_id", "immutable_request", "request_fingerprint", "plan_schema_version",
+                "difficulty", "domain_type", "subject",
+                "progress_callback", "audit_callback", "is_cancelled",
+            }
+        })
     result = get_exam_graph().invoke(initial)
 
     error = result.get("error")
@@ -2457,6 +2623,30 @@ def generate_exams(
         deepcopy(item) for item in (result.get("repair_manifest") or [])
         if item.get("status") != "resolved"
     ]
+    from app.online.duplicate_pipeline import _current_conflict_groups
+    unresolved_duplicates = _current_conflict_groups(
+        list(result.get("unresolved_duplicate_conflicts") or []),
+        {int(exam.get("model_number") or 1): exam for exam in result.get("generated_exams") or []},
+    )
+    duplicate_question_ids = sorted({
+        str(question_id)
+        for conflict in unresolved_duplicates
+        for question_id in conflict.get("question_ids") or [] if question_id
+    })
+    duplicate_quality = {
+        "status": "warning" if unresolved_duplicates else "clear",
+        "unresolved_count": len(unresolved_duplicates),
+        "affected_question_ids": duplicate_question_ids,
+    }
+    if unresolved_duplicates:
+        warnings = [*warnings, {
+            "type": "unresolved_duplicates",
+            **duplicate_quality,
+            "message": (
+                f"Duplicate review retained {len(unresolved_duplicates)} unresolved possible "
+                "overlap group(s) after replacement attempts."
+            ),
+        }]
     semantic_identities = [
         {
             "model_number": plan.get("model_number"),
@@ -2512,9 +2702,10 @@ def generate_exams(
             "fitb_entry_reused": bool(item.get("fitb_entry_reused")),
             "normalized_fitb_answer": item.get("normalized_fitb_answer"),
             "clue_basis": item.get("clue_basis"),
-            "plan_review_status": item.get("plan_review_status"),
-            "plan_review_reason": item.get("plan_review_reason"),
-            "plan_review_source": item.get("plan_review_source"),
+            "selected_variation_id": item.get("selected_variation_id"),
+            "selected_variation_group_id": item.get("selected_variation_group_id"),
+            "effective_instance_id": item.get("effective_instance_id"),
+            "effective_givens": list(item.get("effective_givens") or []),
             "suggested_assessment_angle": item.get("suggested_assessment_angle"),
             "reuse_justification": item.get("reuse_justification"),
             "required_instance_distinctions": list(
@@ -2548,6 +2739,7 @@ def generate_exams(
         "status": quality_status,
         "quality_status": quality_status,
         "quality_summary": quality_summary,
+        "duplicate_quality": duplicate_quality,
         "missing_slot_ids": missing_slot_ids,
         "invalid_slot_ids": invalid_slot_ids,
         "invalid_questions": invalid_questions,
@@ -2557,17 +2749,10 @@ def generate_exams(
         "unrepairable_plan_slots": unrepairable_plan_slots,
         "semantic_identities": semantic_identities,
         "duplicate_repair_history": list(result.get("duplicate_repair_history") or []),
-        "plan_review_history": list(result.get("plan_review_history") or []),
         "difficulty_adjustment_history": list(result.get("difficulty_adjustment_history") or []),
         "difficulty_adjustment_attempts": dict(result.get("difficulty_adjustment_attempts") or {}),
-        "plan_review_attempts": int(result.get("plan_review_attempts") or 0),
-        "plan_review_issues": list(result.get("plan_review_issues") or []),
-        "plan_review_telemetry": list(result.get("plan_review_telemetry") or []),
         "plan_duplicate_repair_attempts": dict(
             result.get("plan_duplicate_repair_attempts") or {}
-        ),
-        "plan_review_candidate_blacklist": dict(
-            result.get("plan_review_candidate_blacklist") or {}
         ),
         "unresolved_plan_duplicate_conflicts": list(
             result.get("unresolved_plan_duplicate_conflicts") or []
@@ -2582,6 +2767,7 @@ def generate_exams(
         "duplicate_replacement_failures": dict(
             result.get("duplicate_replacement_failures") or {}
         ),
+        "unresolved_duplicate_conflicts": unresolved_duplicates,
         "validation_repair_history": list(result.get("validation_repair_history") or []),
         "repair_manifest": list(result.get("repair_manifest") or []),
         "repair_replacement_memory": dict(result.get("repair_replacement_memory") or {}),
@@ -2596,6 +2782,9 @@ def generate_exams(
         "assessment_catalog_key": result.get("assessment_catalog_key") or "",
         "assessment_catalog_cache_hit": bool(result.get("assessment_catalog_cache_hit")),
         "assessment_compiler_cache_hit": bool(result.get("assessment_compiler_cache_hit")),
+        "assessment_catalog_compatibility_cache_hit": bool(
+            result.get("assessment_catalog_compatibility_cache_hit")
+        ),
         "assessment_catalog_usage": dict((result.get("assessment_catalog") or {}).get("compiler_usage") or {}),
     }
 

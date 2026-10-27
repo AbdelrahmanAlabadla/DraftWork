@@ -6,6 +6,8 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from app.api.repositories import sanitize_jsonb
+
 from app import db
 from app.online.eval_stats import COUNT_FIELDS, REASON_FIELDS, add_derived_rates, derived_rates
 
@@ -120,7 +122,10 @@ def insert_evaluation_run(row: dict[str, Any]) -> None:
         "validator_operational_failures", "model_performance",
         "question_type_performance",
     }
-    values = [Jsonb(row[column]) if column in json_columns else row[column] for column in columns]
+    values = [
+        Jsonb(sanitize_jsonb(row[column])) if column in json_columns else row[column]
+        for column in columns
+    ]
     placeholders = ", ".join(["%s"] * len(columns))
     with db.connection() as conn:
         with conn.cursor() as cursor:

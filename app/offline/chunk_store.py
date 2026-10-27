@@ -4,6 +4,8 @@ from typing import Any
 
 from psycopg.types.json import Jsonb
 
+from app.api.repositories import sanitize_jsonb
+
 from app import db
 from app.logging_conf import get_logger
 
@@ -21,6 +23,7 @@ class ChunkStore:
         document_id: str,
         session_id: str | None = None,
         job_id: str | None = None,
+        claim_generation: int | None = None,
         processed_document_key: str | None = None,
         processing_versions: dict[str, Any] | None = None,
     ) -> int:
@@ -29,6 +32,39 @@ class ChunkStore:
         parent_by_id = {str(row.get("parent_id") or ""): row for row in parents}
         with db.connection() as conn:
             with conn.cursor() as cursor:
+                # A transaction-scoped advisory lock serializes only this
+                # document. It releases automatically on commit or rollback.
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (str(document_id),),
+                )
+                if job_id:
+                    cursor.execute(
+                        """SELECT j.status, j.claim_generation, d.active_index_job_id
+                             FROM jobs j JOIN documents d ON d.id = j.document_id
+                            WHERE j.id = %s AND j.document_id = %s
+                            FOR UPDATE OF j, d""",
+                        (job_id, document_id),
+                    )
+                    authority = cursor.fetchone()
+                    worker_authorized = bool(
+                        authority
+                        and authority[0] == "running"
+                        and claim_generation is not None
+                        and int(authority[1]) == int(claim_generation)
+                        and str(authority[2] or "") == str(job_id)
+                    )
+                    cache_recovery_authorized = bool(
+                        authority
+                        and authority[0] == "completed"
+                        and claim_generation is None
+                        and str(authority[2] or "") == str(job_id)
+                    )
+                    if not (worker_authorized or cache_recovery_authorized):
+                        from app.api.repositories import StaleJobExecution
+                        raise StaleJobExecution(
+                            f"Indexing job {job_id} is not authorized to publish document {document_id}"
+                        )
                 cursor.execute("DELETE FROM document_chunks WHERE document_id = %s", (document_id,))
                 for order, parent in enumerate(parents):
                     parent_id = str(parent.get("parent_id") or "")
@@ -48,7 +84,8 @@ class ChunkStore:
                             parent.get("content") or "", int(parent.get("parent_order") or order),
                             parent.get("page_start"), parent.get("page_end"),
                             parent.get("source_reference"), processed_document_key,
-                            Jsonb(processing_versions or {}), Jsonb(parent),
+                            Jsonb(sanitize_jsonb(processing_versions or {})),
+                            Jsonb(sanitize_jsonb(parent)),
                         ),
                     )
                 for order, child in enumerate(children):
@@ -72,7 +109,8 @@ class ChunkStore:
                             child.get("content") or "", int(child.get("child_order") or order),
                             child.get("page_start") or child.get("page"), child.get("page_end"),
                             child.get("source_reference"), processed_document_key,
-                            Jsonb(processing_versions or {}), Jsonb(child),
+                            Jsonb(sanitize_jsonb(processing_versions or {})),
+                            Jsonb(sanitize_jsonb(child)),
                         ),
                     )
             conn.commit()

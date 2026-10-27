@@ -46,13 +46,15 @@ export function completionSummaryMessage(record = {}) {
 export function renderPartialExamWarning(record = {}) {
   const warning = document.getElementById("examPartialWarning");
   const summary = partialExamSummary(record);
+  const duplicateQuality = record.metadata?.duplicate_quality || {};
+  const duplicateCount = Number(duplicateQuality.unresolved_count || 0);
   if (!warning) return;
-  if (!summary) {
+  if (!summary && !duplicateCount) {
     warning.hidden = true;
     warning.textContent = "";
     return;
   }
-  const details = summary.shortages.map((shortage) => {
+  const details = (summary?.shortages || []).map((shortage) => {
     const missing = shortage.missing_count ?? shortage.missing ?? 0;
     const rawType = String(shortage.question_type || "question");
     const typeKey = `warning.qtype.${rawType}`;
@@ -75,17 +77,18 @@ export function renderPartialExamWarning(record = {}) {
       });
     })
     .filter(Boolean);
-  const missingCount = Math.max(0, summary.requested - summary.generated);
+  const missingCount = summary ? Math.max(0, summary.requested - summary.generated) : 0;
   const missingMessage = details.length
     ? t("warning.partial.missing", { details: details.join(", ") })
     : (missingCount ? t("warning.partial.missing", { details: String(missingCount) }) : "");
   warning.textContent = [
-    t("warning.partial.summary", {
+    summary ? t("warning.partial.summary", {
       generated: summary.generated,
       requested: summary.requested,
-    }),
+    }) : "",
     missingMessage,
     ...fallbackMessages,
+    duplicateCount ? t("warning.duplicates", { count: duplicateCount }) : "",
   ].filter(Boolean).join(" ");
   warning.hidden = false;
 }

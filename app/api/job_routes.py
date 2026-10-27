@@ -23,7 +23,9 @@ from app.api.export_routes import (
 )
 from app.api.session_middleware import optional_user_id, require_session_id
 from app.file_storage import get_file_storage
+from app.file_validation import InvalidPdfError, validate_pdf
 from app.jobs import service as job_service
+from app.offline.structure_store import build_structure_payload
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
 from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
 
@@ -122,7 +124,7 @@ def _validate_child_selection(document: dict[str, Any], child_ids: list[str]) ->
     if not structure_key:
         raise HTTPException(status_code=409, detail="Document structure is unavailable")
     try:
-        structure = get_file_storage().read_json(str(structure_key))
+        structure = _section_structure(document, str(structure_key))
     except (OSError, ValueError, TypeError) as exc:
         raise HTTPException(status_code=409, detail="Document structure is unavailable") from exc
     if not isinstance(structure, dict) or not isinstance(structure.get("sections"), list):
@@ -137,6 +139,17 @@ def _validate_child_selection(document: dict[str, Any], child_ids: list[str]) ->
     missing = [child_id for child_id in child_ids if child_id not in available]
     if missing:
         raise HTTPException(status_code=400, detail="One or more selected sections are invalid")
+
+
+def _section_structure(document: dict[str, Any], structure_key: str) -> dict[str, Any]:
+    """Read the picker projection, adapting the short-lived raw-chunk format."""
+    structure = get_file_storage().read_json(structure_key)
+    if isinstance(structure, dict) and isinstance(structure.get("sections"), list):
+        return structure
+    if (isinstance(structure, dict) and isinstance(structure.get("parents"), list)
+            and isinstance(structure.get("children"), list)):
+        return build_structure_payload(str(document["id"]), structure)
+    return structure
 
 
 def _generation_payload(body: GenerateRequest) -> dict[str, Any]:
@@ -237,10 +250,10 @@ async def create_document(
                     )
                 digest.update(chunk)
                 destination.write(chunk)
-        with temporary.open("rb") as source:
-            signature = source.read(5)
-        if size == 0 or signature != b"%PDF-":
-            raise HTTPException(status_code=400, detail="The uploaded file is not a valid PDF")
+        try:
+            validate_pdf(temporary)
+        except InvalidPdfError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         storage.put_file(storage_key, temporary)
 
     try:
@@ -315,7 +328,7 @@ def get_document(
     structure = {}
     key = document.get("structure_storage_key")
     if document["status"] == "ready" and key:
-        structure = get_file_storage().read_json(str(key))
+        structure = _section_structure(document, str(key))
     return {
         "document_id": str(document["id"]),
         "status": document["status"],

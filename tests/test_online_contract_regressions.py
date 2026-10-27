@@ -259,6 +259,42 @@ def test_stale_catalog_cache_version_is_rejected(monkeypatch, tmp_path):
     assert assessment_catalog._read_cache(key) is None
 
 
+def test_cached_catalog_must_match_current_retrieval_evidence():
+    payload = {
+        "processed_document_key": "processed-v2",
+        "selected_chunk_ids": ["c1", "c2"],
+        "tasks": [{
+            "evidence_chunk_ids": ["c1"],
+            "allowed_variations": [{"evidence_chunk_ids": ["c1"]}],
+        }],
+        "fitb_bank": [{"evidence_chunk_id": "c2"}],
+    }
+    assert assessment_catalog._cached_catalog_matches_evidence(
+        payload, "processed-v2", ["c1", "c2"]
+    )
+    assert not assessment_catalog._cached_catalog_matches_evidence(
+        payload, "processed-v2", ["c1"]
+    )
+    assert not assessment_catalog._cached_catalog_matches_evidence(
+        payload, "processed-v3", ["c1", "c2"]
+    )
+
+
+def test_cached_catalog_rejects_variation_evidence_outside_parent_task():
+    payload = {
+        "processed_document_key": "processed-v2",
+        "selected_chunk_ids": ["c1", "c2"],
+        "tasks": [{
+            "evidence_chunk_ids": ["c1"],
+            "allowed_variations": [{"evidence_chunk_ids": ["c2"]}],
+        }],
+        "fitb_bank": [],
+    }
+    assert not assessment_catalog._cached_catalog_matches_evidence(
+        payload, "processed-v2", ["c1", "c2"]
+    )
+
+
 def test_fitb_stem_repair_preserves_authoritative_answer_and_entry_id(monkeypatch):
     section = {
         "word_bank": ["force", "mass", "energy"],
@@ -358,6 +394,18 @@ def test_slot_lifecycle_has_one_terminal_status_and_deduplicated_history():
     record = twice["m1_why_1"]
     assert record["terminal_status"] == "finalized"
     assert len(record["repair_attempts"]) == 1
+
+
+def test_slot_lifecycle_accepts_legacy_string_plan_failure_record():
+    records = initialize_slot_lifecycle([("word_problem", 1)], 1)
+    result = reconcile_slot_lifecycle(records, {
+        "unrepairable_plan_slots": ["m1_word_problem_1"],
+    }, stage="planning")
+
+    record = result["m1_word_problem_1"]
+    assert record["terminal_status"] == "planning_failed"
+    assert record["failure_stage"] == "planning"
+    assert record["failure_code"] == "plan_repair_exhausted"
 
 
 @pytest.mark.parametrize(

@@ -112,7 +112,9 @@ def test_variation_requires_target_operation_and_valid_boolean():
 def test_finalize_emits_18_field_contract_plus_derived_identity_and_support():
     task = _finalize([_compact_task()])["tasks"][0]
     assert task["text_answerable"] is True
-    assert task["allowed_variations"] == [_variation()]
+    assert task["allowed_variations"][0]["target"] == "value of x"
+    assert task["allowed_variations"][0]["variation_group_id"].startswith("variation_group_")
+    assert task["allowed_variations"][0]["variation_id"].startswith("variation_")
     assert task["supported_difficulties"] == ["medium"]
     assert not {"topic", "reasoning_depth", "reasoning_requirements"} & task.keys()
     assert all(task.get(field) for field in
@@ -133,7 +135,7 @@ def test_compact_task_flows_through_planner_with_derived_plan_reasoning():
     assert item["topic"] == "linear equality"
     assert item["reasoning_depth"] == "medium"
     assert item["reasoning_requirements"] == ["solve_equation: value of x"]
-    assert item["allowed_variations"] == [_variation()]
+    assert item["allowed_variations"] == finalized["tasks"][0]["allowed_variations"]
 
 
 def test_batch_schemas_accept_explicit_completed_zero_task_batches():

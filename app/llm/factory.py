@@ -70,11 +70,6 @@ def create_llm_client(
     )
 
 
-def create_plan_review_client(*, domain: str | None = None):
-    """Create the domain-routed plan reviewer."""
-    return create_llm_client(domain=domain, stage="plan_reviewer")
-
-
 def create_duplicate_replacement_client(*, domain: str | None = None):
     """Create the domain-routed duplicate replacement selector."""
     return create_llm_client(domain=domain, stage="duplicate_replacement")

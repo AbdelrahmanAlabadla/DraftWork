@@ -36,11 +36,11 @@ SYSTEM_PROMPT = (
     "- You may vary permitted wording and scenario details. Change numerical variable_givens only "
     "when the chosen variation says numeric_values_may_change=true. Never introduce an unlisted "
     "concept, unsupported operation, advanced method, or factual claim.\n"
-    "- Each task supplies permitted_variations, including its primary angle. Choose exactly one whose "
-    "question_types contains the assigned question type. Return its variation_id in selected_variation_id. "
-    "Use that variation's evidence_chunk_ids when present; otherwise inherit the task's assigned evidence. "
-    "Make the question, answer, and solution match the selected target, operation, givens, reasoning, "
-    "representation, and application. Never select a variation from another task.\n"
+    "- Each task supplies permitted_variations and a plan-bound selected_variation_id. Realize only "
+    "that selected variation and echo its variation_id in selected_variation_id; never substitute or "
+    "invent another angle. Use its evidence_chunk_ids when present; otherwise inherit the task's "
+    "assigned evidence. Make the question, answer, and solution match the selected target, operation, "
+    "givens, reasoning, representation, and application.\n"
     "- Recall is legitimate for Definition, Fill-in-the-Blank, and recall-oriented True/False "
     "tasks when the plan explicitly requests it. Do not inflate such tasks into unrelated reasoning.\n"
     "- If task_reused is true, inspect previous_task_questions (including rejected/conflict roles) "
@@ -938,6 +938,15 @@ def _format_planned_item(index: int, item: dict[str, Any]) -> str:
     tokens.append(f"required_givens={item.get('required_givens', [])}")
     tokens.append(f"variable_givens={item.get('variable_givens', [])}")
     tokens.append(f"allowed_variations={item.get('allowed_variations', [])}")
+    if item.get("permitted_variations"):
+        tokens.append(f"permitted_variations={item.get('permitted_variations')}")
+    if item.get("selected_variation_id"):
+        tokens.append(f"selected_variation_id={item.get('selected_variation_id')}")
+    if item.get("selected_variation_group_id"):
+        tokens.append(f"selected_variation_group_id={item.get('selected_variation_group_id')}")
+    if item.get("effective_instance_id"):
+        tokens.append(f"effective_instance_id={item.get('effective_instance_id')}")
+        tokens.append(f"effective_givens={item.get('effective_givens') or item.get('given_conditions', [])}")
     tokens.append(f"complexity_boundaries={item.get('complexity_boundaries', [])}")
     tokens.append(f"exact_source_instance={bool(item.get('exact_source_instance', False))}")
 

@@ -512,6 +512,32 @@ def validate_assessment_profile(
     return errors
 
 
+def _ensure_effective_variation(entry: dict[str, Any]) -> None:
+    """Rehydrate a persisted plan item from its bound catalog variation."""
+    variation_id = str(entry.get("selected_variation_id") or "")
+    permitted = entry.get("permitted_variations")
+    if (
+        not variation_id
+        or not isinstance(permitted, list)
+        or entry.get("effective_instance_id")
+    ):
+        return
+    variation = next((
+        value for value in permitted
+        if isinstance(value, dict) and value.get("variation_id") == variation_id
+    ), None)
+    if variation is None:
+        return
+    from app.online.assessment_catalog import _apply_effective_variation, _stable_id
+    if not variation.get("variation_group_id"):
+        # Explicit migration for persisted pre-v12 plans. Retain the historical
+        # selected variation ID while adding a stable parent-group identity.
+        variation["variation_group_id"] = _stable_id(
+            "variation_group", entry.get("task_id") or "legacy", variation_id
+        )
+    _apply_effective_variation(entry, entry, variation)
+
+
 def validate_plans(
     plans: list[dict[str, Any]],
     tasks: list[tuple[str, int]],
@@ -572,6 +598,7 @@ def validate_plans(
             for index, entry in enumerate(values, start=1):
                 sid = str(entry.get("slot_id") or slot_id(number, qtype, index))
                 is_fitb_entry = qtype == "fill_in_the_blank"
+                _ensure_effective_variation(entry)
                 if is_fitb_entry:
                     # FITB bank entries deliberately have their own identity and
                     # must never acquire a synthetic assessment-task identity.
@@ -585,7 +612,8 @@ def validate_plans(
                     )
                     identity_complete = apply_canonical_task_ids(entry)
                     if identity_complete and preserved_family_id:
-                        entry["derived_task_id"] = entry.get("task_id")
+                        if not entry.get("effective_instance_id"):
+                            entry["derived_task_id"] = entry.get("task_id")
                         entry["task_family_id"] = preserved_family_id
                 metadata_complete = all(
                     entry.get(field)
@@ -742,8 +770,8 @@ def validate_plans(
                     replacement_stage in {
                         "unused_task_used_concept",
                         "regenerated_original_task_after_duplicate",
-                        "plan_review_unused_task",
-                        "plan_review_intentional_reuse",
+                        "deterministic_unused_task",
+                        "deterministic_intentional_reuse",
                     }
                     and entry.get("forced_duplicate_slot_ids")
                 )
@@ -779,7 +807,38 @@ def validate_plans(
                     errors.append(
                         f"Slot {sid} requires givens but does not provide grounded given_conditions."
                     )
-                if _VISUAL_DEPENDENCY_RE.search(str(entry.get("idea_to_test") or "")) and not required_givens:
+                if (
+                    not is_fitb_entry and entry.get("task_id")
+                    and (entry.get("permitted_variations") or entry.get("selected_variation_id"))
+                ):
+                    selected_id = str(entry.get("selected_variation_id") or "")
+                    selected = next((
+                        value for value in (entry.get("permitted_variations") or [])
+                        if isinstance(value, dict)
+                        and str(value.get("variation_id") or "") == selected_id
+                        and qtype in (value.get("question_types") or [])
+                    ), None)
+                    if selected is None:
+                        errors.append(
+                            f"Slot {sid} does not bind one eligible {qtype} variation."
+                        )
+                    elif entry.get("effective_instance_id"):
+                        adaptation = entry.get("difficulty_adaptation") or {}
+                        if (
+                            adaptation.get("status") != "adapted"
+                            or adaptation.get("base_variation_id") != selected_id
+                            or adaptation.get("effective_instance_id")
+                            != entry.get("effective_instance_id")
+                            or list(entry.get("effective_givens") or [])
+                            != list(entry.get("given_conditions") or [])
+                        ):
+                            errors.append(
+                                f"Slot {sid} has inconsistent effective-instance metadata."
+                            )
+                if (
+                    _VISUAL_DEPENDENCY_RE.search(str(entry.get("idea_to_test") or ""))
+                    and not (required_givens or given_conditions)
+                ):
                     errors.append(
                         f"Slot {sid} appears to depend on a visual representation but does not "
                         "list the text givens needed to make it self-contained."
@@ -861,7 +920,7 @@ def validate_plans(
         for qtype in VALID_TYPES:
             if qtype == "fill_in_the_blank":
                 # FITB answer reuse is tracked by normalized bank identity and
-                # independently reviewed by the Plan Review and Duplicate Judge.
+                # independently reviewed by deterministic validation and the Duplicate Judge.
                 continue
             concepts_by_type.setdefault(qtype, [])
             for index, entry in enumerate(model["items"].get(qtype) or [], start=1):
@@ -925,7 +984,8 @@ def finalize_plans(
                     )
                     apply_canonical_task_ids(item)
                     if preserved_family_id:
-                        item["derived_task_id"] = item.get("task_id")
+                        if not item.get("effective_instance_id"):
+                            item["derived_task_id"] = item.get("task_id")
                         item["task_family_id"] = preserved_family_id
             items[qtype] = values
         finalized.append({"model_number": model["model_number"], "items": items})
@@ -1458,6 +1518,14 @@ def _merge_plan_replacements(
                 if str(value).strip()
             ],
             "allowed_variations": deepcopy(replacement.get("allowed_variations") or []),
+            "permitted_variations": deepcopy(
+                replacement.get("permitted_variations") or []
+            ),
+            "selected_variation_id": replacement.get("selected_variation_id"),
+            "selected_variation_group_id": replacement.get("selected_variation_group_id"),
+            "primary_question_types": deepcopy(
+                replacement.get("primary_question_types") or []
+            ),
             "complexity_boundaries": [
                 str(value).strip() for value in (replacement.get("complexity_boundaries") or [])
                 if str(value).strip()
@@ -1467,6 +1535,32 @@ def _merge_plan_replacements(
             "reasoning_mode": str(replacement.get("reasoning_mode") or "").strip(),
             "difficulty": str(replacement.get("difficulty") or "").strip().lower(),
             "idea_to_test": str(replacement.get("idea_to_test") or "").strip(),
+            "requested_difficulty": replacement.get("requested_difficulty"),
+            "actual_difficulty": replacement.get("actual_difficulty"),
+            "base_catalog_task_id": replacement.get("base_catalog_task_id"),
+            "base_task_family_id": replacement.get("base_task_family_id"),
+            "difficulty_adaptation": deepcopy(replacement.get("difficulty_adaptation")),
+            "difficulty_fallback_reason": replacement.get("difficulty_fallback_reason"),
+            "reasoning_depth": (
+                replacement.get("reasoning_depth")
+                or str(replacement.get("difficulty") or "").strip().lower()
+            ),
+            "reasoning_requirements": list(
+                replacement.get("reasoning_requirements") or [
+                    f"{str(replacement.get('task_operation') or '').strip()}: "
+                    f"{str(replacement.get('target') or '').strip()}"
+                ]
+            ),
+            "prerequisites": list(replacement.get("prerequisites") or []),
+            "derived_task_id": replacement.get("derived_task_id"),
+            "effective_instance_id": replacement.get("effective_instance_id"),
+            "effective_givens": list(replacement.get("effective_givens") or []),
+            "selected_replacement_task_id": replacement.get("selected_replacement_task_id"),
+            "task_was_previously_used": bool(
+                replacement.get("task_was_previously_used", False)
+            ),
+            "adjustment_attempts": int(replacement.get("adjustment_attempts") or 0),
+            "adjustment_failure_reason": replacement.get("adjustment_failure_reason"),
         }
         for field in (
             "plan_repair_conflicts_with", "plan_repair_conflict_reason",
@@ -1544,6 +1638,7 @@ def _semantic_catalog_replacement(
         _difficulty_for,
         _replacement_representation_rank,
         compatible_task_inventory,
+        eligible_task_variations,
         materialize_plan_item,
     )
 
@@ -1568,7 +1663,7 @@ def _semantic_catalog_replacement(
         level = _difficulty_for(task, difficulty)
         if (
             not task_id or task_id == str(current.get("task_id") or "")
-            or qtype not in (task.get("allowed_question_types") or [])
+            or not eligible_task_variations(task, qtype)
             or level is None or task.get("text_answerable") is not True
             or not evidence or any(value not in valid_chunk_ids for value in evidence)
         ):
@@ -1670,6 +1765,163 @@ def _semantic_catalog_replacement(
     return replacement
 
 
+def _deterministic_variation_replacements(
+    state: ExamState, sid: str, qtype: str, errors: list[str],
+) -> list[dict[str, Any]]:
+    """Try other self-contained angles of the same catalog task before an LLM repair."""
+    from app.online.assessment_catalog import (
+        _difficulty_for,
+        eligible_task_variation_candidates,
+        materialize_plan_item,
+    )
+
+    if _conflicting_slot_ids(errors, sid):
+        return []
+    current = _plan_items_by_slot(state.get("plans") or []).get(sid) or {}
+    catalog = state.get("assessment_catalog") or {}
+    base_id = str(
+        current.get("base_catalog_task_id") or current.get("task_id") or ""
+    )
+    task = next((
+        value for value in catalog.get("tasks") or []
+        if str(value.get("task_id") or "") == base_id
+    ), None)
+    if task is None:
+        return []
+    difficulty = str(state.get("difficulty") or "mix")
+    level = (
+        _difficulty_for(task, difficulty)
+        or str(current.get("difficulty") or "medium")
+    )
+    current_signature = (
+        current.get("selected_variation_id"),
+        current.get("target"),
+        current.get("task_operation"),
+        tuple(current.get("given_conditions") or []),
+    )
+    replacements: list[dict[str, Any]] = []
+    valid_chunk_ids = {
+        str(chunk.get("child_id")) for chunk in state.get("retrieved_chunks") or []
+        if chunk.get("child_id")
+    }
+    for variation in eligible_task_variation_candidates(
+        task, qtype, assessment_profile=state.get("assessment_profile") or {},
+        valid_chunk_ids=valid_chunk_ids,
+    ):
+        replacement = materialize_plan_item(
+            task, sid, level,
+            selected_variation_id=variation.get("variation_id"),
+        )
+        signature = (
+            replacement.get("selected_variation_id"),
+            replacement.get("target"),
+            replacement.get("task_operation"),
+            tuple(replacement.get("given_conditions") or []),
+        )
+        if signature != current_signature:
+            replacements.append(replacement)
+    return replacements
+
+
+def _deterministic_catalog_replacements(
+    state: ExamState, plans: list[dict[str, Any]], sid: str, qtype: str,
+    errors: list[str],
+) -> list[dict[str, Any]]:
+    """Rank every valid document task without restricting replacement topic."""
+    from app.online.assessment_catalog import (
+        _difficulty_for, _native_difficulty, eligible_task_variation_candidates,
+        materialize_plan_item, normalize_planner_diversity_text,
+        score_task_variation_candidate,
+    )
+
+    current = _plan_items_by_slot(plans).get(sid) or {}
+    represented = [
+        item for other_sid, item in _plan_items_by_slot(plans).items()
+        if other_sid != sid
+    ]
+    valid_chunks = {
+        str(chunk.get("child_id")) for chunk in state.get("retrieved_chunks") or []
+        if chunk.get("child_id")
+    }
+    requested = str(state.get("difficulty") or "mix")
+    failed = set(map(str, state.get("plan_failed_candidate_ids") or []))
+
+    def count(field: str, value: Any) -> int:
+        return sum(str(item.get(field) or "") == str(value or "") for item in represented)
+
+    def normalized_count(field: str, value: Any) -> int:
+        key = normalize_planner_diversity_text(value)
+        return sum(
+            normalize_planner_diversity_text(item.get(field)) == key
+            for item in represented if key
+        )
+
+    ranked: list[tuple[int, str, str, dict[str, Any]]] = []
+    for task in (state.get("assessment_catalog") or {}).get("tasks") or []:
+        task_id = str(task.get("task_id") or "")
+        if not task_id or task_id == str(current.get("base_catalog_task_id") or current.get("task_id") or ""):
+            continue
+        exact_level = _difficulty_for(task, requested)
+        level = exact_level or _native_difficulty(task)
+        if level is None:
+            continue
+        for variation in eligible_task_variation_candidates(
+            task, qtype, assessment_profile=state.get("assessment_profile") or {},
+            valid_chunk_ids=valid_chunks,
+        ):
+            candidate_key = (
+                f"{sid}:{task_id}:{variation.get('variation_id') or ''}"
+            )
+            if candidate_key in failed:
+                continue
+            scenario = variation.get("application")
+            if scenario is None:
+                scenario = task.get("scenario_family")
+            target = variation.get("target") or task.get("target")
+            group_id = str(variation.get("variation_group_id") or "")
+            score = score_task_variation_candidate(
+                task, variation, requested_difficulty=requested,
+                task_uses=sum(
+                    str(item.get("base_catalog_task_id") or item.get("task_id") or "") == task_id
+                    for item in represented
+                ),
+                scenario_uses=normalized_count("scenario_family", scenario),
+                target_uses=normalized_count("target", target),
+                variation_group_uses=count("selected_variation_group_id", group_id),
+            )["score"]
+            replacement = materialize_plan_item(
+                task, sid, level, selected_variation_id=variation.get("variation_id")
+            )
+            replacement["planner_candidate_score"] = score
+            replacement["planner_candidate_attempt_id"] = candidate_key
+            replacement["catalog_replacement_stage"] = "deterministic_ranked_cross_task"
+            replacement["requested_difficulty"] = requested
+            if requested in {"easy", "medium", "hard"} and exact_level is None:
+                replacement.update({
+                    "difficulty_fallback_reason": (
+                        "Plan repair used the nearest source-supported task after no unused "
+                        f"{requested} candidate remained."
+                    ),
+                    "difficulty_adaptation": {
+                        "status": "fallback",
+                        "from_difficulty": level,
+                        "to_difficulty": requested,
+                        "base_task_id": task_id,
+                        "strategy": "catalog_plan_repair_fallback",
+                        "failed_strategies": [],
+                    },
+                })
+            conflict_ids = _conflicting_slot_ids(errors, sid)
+            if conflict_ids:
+                replacement["plan_repair_conflicts_with"] = conflict_ids
+                replacement["plan_repair_required_differences"] = [
+                    "Use a different eligible task and bound variation."
+                ]
+            ranked.append((-score, task_id, str(variation.get("variation_id") or ""), replacement))
+    ranked.sort(key=lambda value: value[:3])
+    return [value[3] for value in ranked]
+
+
 def _repair_plan_slot(
     state: ExamState,
     plans: list[dict[str, Any]],
@@ -1684,6 +1936,52 @@ def _repair_plan_slot(
     _model_number, qtype, _index = location
     catalog = state.get("assessment_catalog") or {}
     if catalog:
+        deterministic = _deterministic_variation_replacements(
+            {**state, "plans": plans}, sid, qtype, errors
+        )
+        for replacement in deterministic:
+            candidate = _merge_plan_replacements(plans, [replacement])
+            candidate = finalize_plans(candidate, state.get("tasks") or [])
+            candidate_errors = validate_plans(
+                candidate,
+                state.get("tasks") or [],
+                state.get("num_models") or 1,
+                {
+                    str(chunk.get("child_id"))
+                    for chunk in state.get("retrieved_chunks") or []
+                    if chunk.get("child_id")
+                },
+                state.get("difficulty") or "mix",
+                state.get("assessment_profile") or {},
+                state.get("planning_issues") or [],
+            )
+            other_errors = [error for error in candidate_errors if sid not in error]
+            if not any(sid in error for error in candidate_errors) and len(
+                other_errors
+            ) <= len([error for error in errors if sid not in error]):
+                return candidate, candidate_errors, True
+        for replacement in _deterministic_catalog_replacements(
+            {**state, "plans": plans}, plans, sid, qtype, errors
+        ):
+            candidate = finalize_plans(
+                _merge_plan_replacements(plans, [replacement]), state.get("tasks") or []
+            )
+            candidate_errors = validate_plans(
+                candidate, state.get("tasks") or [], state.get("num_models") or 1,
+                {
+                    str(chunk.get("child_id")) for chunk in state.get("retrieved_chunks") or []
+                    if chunk.get("child_id")
+                },
+                state.get("difficulty") or "mix",
+                state.get("assessment_profile") or {}, state.get("planning_issues") or [],
+            )
+            if not any(sid in error for error in candidate_errors) and len(candidate_errors) < len(errors):
+                return candidate, candidate_errors, True
+            attempt_id = str(replacement.get("planner_candidate_attempt_id") or "")
+            if attempt_id:
+                failed = state.setdefault("plan_failed_candidate_ids", [])
+                if attempt_id not in failed:
+                    failed.append(attempt_id)
         replacement = _semantic_catalog_replacement(
             state, plans, sid, qtype, errors
         )
@@ -1871,6 +2169,29 @@ def repair_plan(state: ExamState) -> dict[str, Any]:
     """Repair invalid slots independently; fail if requested structure cannot be preserved."""
     errors = list(state.get("plan_errors") or [])
     plans = deepcopy(state.get("plans") or [])
+    if plans:
+        from app.online.assessment_catalog import validate_plan_catalog_bindings
+        valid_ids = {
+            str(chunk.get("child_id")) for chunk in state.get("retrieved_chunks") or []
+            if chunk.get("child_id")
+        }
+        fresh_errors = validate_plans(
+            plans, state.get("tasks") or [], int(state.get("num_models") or 1),
+            {
+                str(chunk.get("child_id")) for chunk in state.get("retrieved_chunks") or []
+                if chunk.get("child_id")
+            } or None,
+            state.get("difficulty") or "mix", state.get("assessment_profile") or {},
+            state.get("planning_issues") or [],
+        )
+        if state.get("assessment_catalog"):
+            fresh_errors.extend(validate_plan_catalog_bindings(
+                state.get("assessment_catalog") or {}, plans, valid_ids or None,
+            ))
+        fresh_errors = list(dict.fromkeys(fresh_errors))
+        # The loaded plan and current catalog/evidence are authoritative on
+        # resume. Persisted messages may describe an earlier repair round.
+        errors = fresh_errors
     attempt = (state.get("plan_attempts") or 0) + 1
     slot_ids = _invalid_slot_ids(errors)
     logger.info(
@@ -1887,13 +2208,55 @@ def repair_plan(state: ExamState) -> dict[str, Any]:
             "last_plan_raw": state.get("last_plan_raw") or "",
         }
 
+    def unrepairable_records(slot_ids: list[str]) -> list[dict[str, Any]]:
+        records: dict[str, dict[str, Any]] = {}
+        for existing in state.get("unrepairable_plan_slots") or []:
+            if isinstance(existing, dict):
+                existing_slot = str(existing.get("slot_id") or "")
+                if existing_slot:
+                    records[existing_slot] = deepcopy(existing)
+            else:
+                existing_slot = str(existing or "")
+                if existing_slot:
+                    records[existing_slot] = {
+                        "slot_id": existing_slot,
+                        "failure_code": "plan_repair_exhausted",
+                        "reason": "Persisted legacy plan-repair failure.",
+                    }
+        for unresolved_slot in slot_ids:
+            records[unresolved_slot] = {
+                "slot_id": unresolved_slot,
+                "failure_code": "plan_repair_exhausted",
+                "reason": " ".join(_slot_errors(errors, unresolved_slot)).strip()
+                or "No source-grounded replacement passed plan validation.",
+            }
+        return list(records.values())
+
+    original_plans = deepcopy(plans)
+    original_errors = list(errors)
     for sid in slot_ids:
         if sid not in set(_invalid_slot_ids(errors)):
             continue
         plans, errors, _accepted = _repair_plan_slot(state, plans, sid, errors)
 
     unresolved = _invalid_slot_ids(errors)
-    prior_unrepairable = list(state.get("unrepairable_plan_slots") or [])
+    if plans == original_plans and errors == original_errors and unresolved:
+        details = "; ".join(
+            f"{sid}: {' '.join(_slot_errors(errors, sid))}" for sid in unresolved
+        )
+        logger.error(
+            "Plan repair made no progress; refusing structurally incomplete plan | slots=%s",
+            unresolved,
+        )
+        return {
+            "plans": plans,
+            "plan_errors": errors,
+            "plan_attempts": MAX_PLAN_ATTEMPTS,
+            "unrepairable_plan_slots": unrepairable_records(unresolved),
+            "error": "Planner repair could not preserve every requested slot: " + details,
+            "last_plan_raw": state.get("last_plan_raw") or "",
+        }
+    prior_unrepairable = unrepairable_records([])
     if unresolved and attempt >= MAX_PLAN_ATTEMPTS:
         details = "; ".join(
             f"{sid}: {' '.join(_slot_errors(errors, sid))}" for sid in unresolved
@@ -1902,15 +2265,23 @@ def repair_plan(state: ExamState) -> dict[str, Any]:
             "Plan repair exhausted; refusing structurally incomplete plan | slots=%s",
             unresolved,
         )
-        raise RuntimeError(
-            "Planner repair could not preserve every requested slot: " + details
-        )
+        return {
+            "plans": plans,
+            "plan_errors": errors,
+            "plan_attempts": attempt,
+            "unrepairable_plan_slots": unrepairable_records(unresolved),
+            "error": "Planner repair could not preserve every requested slot: " + details,
+            "last_plan_raw": json.dumps(plans, ensure_ascii=False),
+        }
 
     return {
         "plans": plans,
         "plan_errors": errors,
         "plan_attempts": attempt,
         "unrepairable_plan_slots": prior_unrepairable,
+        "plan_failed_candidate_ids": list(
+            state.get("plan_failed_candidate_ids") or []
+        ),
         "last_plan_raw": json.dumps(plans, ensure_ascii=False),
     }
 

@@ -15,18 +15,14 @@ def _path_for(document_id: str) -> Path:
     return Path(STRUCTURES_DIR) / f"{document_id}.json"
 
 
-def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
-    """Persist parent structure metadata (sections) to JSON.
+def build_structure_payload(document_id: str, structure: dict[str, Any]) -> dict[str, Any]:
+    """Project canonical parent/child chunks into the section-picker contract.
 
     PostgreSQL stores the complete parent/child records. This JSON remains the
     human-selectable section projection used by the existing API. Each section
     embeds its subsections (with titles) in document order, so the frontend can
     render the textbook hierarchy without a separate hierarchy query.
     """
-    dir_path = Path(STRUCTURES_DIR)
-    dir_path.mkdir(parents=True, exist_ok=True)
-    path = _path_for(document_id)
-
     children = structure.get("children", [])
     sections = []
     for parent in structure.get("parents", []):
@@ -88,7 +84,7 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
             }
         )
 
-    payload = {
+    return {
         "document_id": document_id,
         "domain_type": structure.get("domain_type"),
         "subject": structure.get("subject"),
@@ -97,6 +93,14 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
         "sections": sections,
     }
 
+
+def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
+    """Persist parent structure metadata (sections) to JSON."""
+    dir_path = Path(STRUCTURES_DIR)
+    dir_path.mkdir(parents=True, exist_ok=True)
+    path = _path_for(document_id)
+    payload = build_structure_payload(document_id, structure)
+
     t0 = time.perf_counter()
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, ensure_ascii=False, indent=2)
@@ -104,7 +108,7 @@ def save_structure(document_id: str, structure: dict[str, Any]) -> Path:
         "Structure saved | document_id=%s | file=%s | sections=%d | children=%d | time=%.2fs",
         document_id,
         path.name,
-        len(sections),
+        len(payload["sections"]),
         payload["child_count"],
         time.perf_counter() - t0,
     )

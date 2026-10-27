@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from pypdf import PdfWriter
 
 from app import config
 from app.api import repositories
@@ -29,6 +30,14 @@ def _session_fakes(monkeypatch):
     return session
 
 
+def _valid_pdf_bytes() -> bytes:
+    output = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(output)
+    return output.getvalue()
+
+
 def test_versioned_upload_is_session_owned_and_queued(monkeypatch, tmp_path):
     session = _session_fakes(monkeypatch)
     monkeypatch.setattr(config, "LOCAL_STORAGE_ROOT", str(tmp_path / "storage"))
@@ -42,14 +51,15 @@ def test_versioned_upload_is_session_owned_and_queued(monkeypatch, tmp_path):
     monkeypatch.setattr("app.api.job_routes.job_service.enqueue_ingestion", lambda job_id: None)
 
     client = TestClient(app)
+    pdf = _valid_pdf_bytes()
     response = client.post(
         "/api/v1/documents",
-        files={"file": ("notes.pdf", io.BytesIO(b"%PDF-1.4\ncontent"), "application/pdf")},
+        files={"file": ("notes.pdf", io.BytesIO(pdf), "application/pdf")},
     )
 
     assert response.status_code == 202
     assert captured["session_id"] == session["id"]
-    assert captured["size_bytes"] == len(b"%PDF-1.4\ncontent")
+    assert captured["size_bytes"] == len(pdf)
     assert response.json()["status"] == "queued"
     assert "HttpOnly" in response.headers["set-cookie"]
 
@@ -88,14 +98,15 @@ def test_generation_task_has_1300_second_hard_timeout():
     assert generate_exam.soft_time_limit == 1290
 
 
-def test_online_llm_parallelism_defaults_are_bounded_to_ten():
-    assert config.MAX_PARALLEL_GENERATION_CALLS == 10
+def test_online_generation_parallelism_has_fifty_call_ceiling():
+    assert config.MAX_PARALLEL_GENERATION_CALLS == 50
+    assert config.LLM_JOB_CONCURRENCY_LIMIT == 50
     assert config.MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS == 10
     assert config.MAX_PARALLEL_VALIDATOR_CALLS == 10
     assert config.MAX_PARALLEL_CATALOG_CALLS == 50
     assert config.MAX_PARALLEL_DUPLICATE_JUDGE_CALLS == 10
-    assert config.LLM_JOB_CONCURRENCY_LIMIT == 10
-    assert config.DEEPSEEK_CONCURRENCY_LIMIT == 10
+    assert config.LLM_JOB_CONCURRENCY_LIMIT == 50
+    assert config.DEEPSEEK_CONCURRENCY_LIMIT == 50
 
 
 def test_ingestion_task_does_not_limit_downstream_pipeline_runtime():

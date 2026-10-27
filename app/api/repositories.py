@@ -19,6 +19,14 @@ class InvalidState(RuntimeError):
     pass
 
 
+class StaleJobExecution(InvalidState):
+    """Raised when a worker attempts to write after losing its job claim."""
+
+
+class StaleCheckpoint(InvalidState):
+    """Raised when a checkpoint revision is replayed or arrives out of order."""
+
+
 class JobLimitExceeded(RuntimeError):
     pass
 
@@ -35,6 +43,29 @@ class IdempotencyConflict(RuntimeError):
 
 class SessionOwnershipConflict(RuntimeError):
     pass
+
+
+def sanitize_jsonb(value: Any) -> Any:
+    """Return a PostgreSQL-JSON-safe copy without changing valid Unicode.
+
+    PostgreSQL text/JSONB cannot represent U+0000. Provider output can contain
+    that control character inside an otherwise valid Python/Pydantic string, so
+    replace only U+0000 with the Unicode replacement marker before persistence.
+    This keeps the surrounding formula visible and makes corruption explicit.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "\ufffd")
+    if isinstance(value, dict):
+        return {sanitize_jsonb(key): sanitize_jsonb(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_jsonb(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitize_jsonb(item) for item in value]
+    return value
+
+
+def _jsonb(value: Any) -> Jsonb:
+    return Jsonb(sanitize_jsonb(value))
 
 
 def hash_session_token(token: str) -> str:
@@ -451,7 +482,7 @@ def create_generation_job(
                    ) VALUES (%s, %s, %s, 'exam_generation', 'queued',
                              'queued', 0, %s, 2)
                    RETURNING *""",
-                (job_id, session_id, document_id, Jsonb(durable_request)),
+                (job_id, session_id, document_id, _jsonb(durable_request)),
             )
             job = cursor.fetchone()
             cursor.execute(
@@ -463,7 +494,7 @@ def create_generation_job(
                      FROM sessions s WHERE s.id = %s""",
                 (
                     exam_id, session_id, document_id, job_id,
-                    Jsonb(dict(request_data.get("metadata") or {})), session_id,
+                    _jsonb(dict(request_data.get("metadata") or {})), session_id,
                 ),
             )
             cursor.execute(
@@ -471,7 +502,7 @@ def create_generation_job(
                    VALUES (%s, 'queued', 'exam_created', %s)""",
                 (
                     exam_id,
-                    Jsonb({
+                    _jsonb({
                         "job_id": job_id,
                         "document_id": document_id,
                         "request": request_data,
@@ -573,7 +604,7 @@ def cancel_job(job_id: str) -> dict[str, Any]:
                                exam_id, stage, event_type, payload
                            ) SELECT id, 'cancelled', 'job_cancelled', %s
                                FROM exams WHERE job_id = %s""",
-                        (Jsonb({"reason": "Cancelled by user"}), job_id),
+                            (_jsonb({"reason": "Cancelled by user"}), job_id),
                     )
                 if job and job["type"] == "document_ingestion":
                     cursor.execute(
@@ -590,12 +621,20 @@ def cancel_job(job_id: str) -> dict[str, Any]:
     return dict(job)
 
 
-def job_is_cancelled(job_id: str) -> bool:
+def job_is_cancelled(job_id: str, *, claim_generation: int | None = None) -> bool:
     with db.connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT status FROM jobs WHERE id = %s", (job_id,))
+            cursor.execute(
+                "SELECT status, claim_generation FROM jobs WHERE id = %s", (job_id,)
+            )
             row = cursor.fetchone()
-    return row is None or row[0] == "cancelled"
+    return (
+        row is None
+        or row[0] == "cancelled"
+        or (claim_generation is not None and (
+            row[0] != "running" or int(row[1]) != int(claim_generation)
+        ))
+    )
 
 
 def mark_job_dispatched(job_id: str) -> None:
@@ -629,6 +668,7 @@ def claim_job(job_id: str, worker_id: str) -> dict[str, Any] | None:
                 """UPDATE jobs
                    SET status = 'running', stage = 'starting', progress = 1,
                        worker_id = %s, attempt_count = attempt_count + 1,
+                       claim_generation = claim_generation + 1,
                        started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
                        heartbeat_at = CURRENT_TIMESTAMP,
                        updated_at = CURRENT_TIMESTAMP
@@ -637,25 +677,40 @@ def claim_job(job_id: str, worker_id: str) -> dict[str, Any] | None:
                 (worker_id, job_id),
             )
             row = cursor.fetchone()
-            if row and row["type"] == "exam_generation":
-                cursor.execute(
-                    """UPDATE exams SET status = 'running', stage = 'starting',
-                              updated_at = CURRENT_TIMESTAMP
-                       WHERE job_id = %s""",
-                    (job_id,),
-                )
+            if row:
+                if row["type"] == "exam_generation":
+                    cursor.execute(
+                        """UPDATE exams SET status = 'running', stage = 'starting',
+                                  updated_at = CURRENT_TIMESTAMP
+                           WHERE job_id = %s""",
+                        (job_id,),
+                    )
+                elif row["type"] == "document_ingestion":
+                    cursor.execute(
+                        """UPDATE documents SET status = 'processing',
+                                  active_index_job_id = %s,
+                                  updated_at = CURRENT_TIMESTAMP
+                           WHERE id = %s""",
+                        (job_id, row["document_id"]),
+                    )
         conn.commit()
     return dict(row) if row else None
 
 
-def update_job_progress(job_id: str, stage: str, progress: int) -> None:
+def update_job_progress(
+    job_id: str, stage: str, progress: int, *, claim_generation: int
+) -> None:
     with db.connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT stage, (request_data->>'exam_id') AS exam_id, progress FROM jobs WHERE id = %s",
-                (job_id,),
+                """SELECT stage, (request_data->>'exam_id') AS exam_id, progress
+                     FROM jobs WHERE id = %s AND status = 'running'
+                      AND claim_generation = %s FOR UPDATE""",
+                (job_id, claim_generation),
             )
             current = cursor.fetchone()
+            if current is None:
+                raise StaleJobExecution(f"Job {job_id} is no longer owned by this execution")
             persisted_progress = max(
                 int(current[2] or 0) if current else 0,
                 max(0, min(100, progress)),
@@ -664,8 +719,8 @@ def update_job_progress(job_id: str, stage: str, progress: int) -> None:
                 """UPDATE jobs SET stage = %s, progress = %s,
                           heartbeat_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND status = 'running'""",
-                (stage, persisted_progress, job_id),
+                   WHERE id = %s AND status = 'running' AND claim_generation = %s""",
+                (stage, persisted_progress, job_id, claim_generation),
             )
             cursor.execute(
                 """UPDATE exams SET status = 'running', stage = %s,
@@ -679,7 +734,7 @@ def update_job_progress(job_id: str, stage: str, progress: int) -> None:
                 cursor.execute(
                     """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
                        VALUES (%s, %s, 'pipeline_stage', %s)""",
-                    (exam_id, stage, Jsonb({"progress": persisted_progress})),
+                    (exam_id, stage, _jsonb({"progress": persisted_progress})),
                 )
         conn.commit()
 
@@ -698,15 +753,70 @@ def list_job_pipeline_events(job_id: str) -> list[dict[str, Any]]:
             return [dict(row) for row in cursor.fetchall()]
 
 
-def heartbeat_job(job_id: str) -> None:
+def load_generation_checkpoint(
+    job_id: str, *, claim_generation: int, request_fingerprint: str
+) -> dict[str, Any]:
+    """Rebuild one job's latest durable graph state from its own audit events."""
+    state: dict[str, Any] = {}
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT checkpoint_revision, request_fingerprint
+                     FROM jobs WHERE id = %s AND status = 'running'
+                      AND claim_generation = %s FOR SHARE""",
+                (job_id, claim_generation),
+            )
+            owner = cursor.fetchone()
+            if owner is None:
+                raise StaleJobExecution(f"Job {job_id} is no longer owned by this execution")
+            if owner.get("request_fingerprint") not in {None, request_fingerprint}:
+                raise InvalidState(
+                    f"Checkpoint request fingerprint does not match job {job_id}"
+                )
+            cursor.execute(
+                """SELECT e.payload, e.checkpoint_revision
+                     FROM exam_audit_events e
+                     JOIN exams x ON x.id = e.exam_id
+                    WHERE x.job_id = %s
+                      AND e.job_id = %s
+                      AND e.request_fingerprint = %s
+                      AND e.checkpoint_revision IS NOT NULL
+                      AND e.event_type IN (
+                          'retrieval_completed', 'assessment_catalog_compiled',
+                          'plan_completed', 'plan_repaired',
+                          'difficulty_adjustment_completed', 'generation_checkpoint',
+                          'questions_generated', 'validation_completed', 'repair_completed',
+                          'duplicate_scan_completed', 'duplicate_replacement_completed'
+                      )
+                    ORDER BY e.checkpoint_revision, e.id""",
+                (job_id, job_id, request_fingerprint),
+            )
+            last_revision = 0
+            for row in cursor.fetchall():
+                revision = int(row.get("checkpoint_revision") or 0)
+                if revision <= last_revision:
+                    continue
+                last_revision = revision
+                payload = dict(row.get("payload") or {})
+                output = payload.get("node_output") or payload.get("checkpoint_state")
+                if isinstance(output, dict):
+                    state.update(output)
+    if state:
+        state["checkpoint_revision"] = last_revision
+    return state
+
+
+def heartbeat_job(job_id: str, *, claim_generation: int) -> None:
     with db.connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """UPDATE jobs SET heartbeat_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND status = 'running'""",
-                (job_id,),
+                   WHERE id = %s AND status = 'running' AND claim_generation = %s""",
+                (job_id, claim_generation),
             )
+            if cursor.rowcount != 1:
+                raise StaleJobExecution(f"Job {job_id} is no longer owned by this execution")
         conn.commit()
 
 
@@ -744,7 +854,7 @@ def recover_stale_jobs(stale_after_seconds: int) -> list[dict[str, Any]]:
                                    exam_id, stage, event_type, payload
                                ) SELECT id, 'retrying', 'worker_lost', %s
                                    FROM exams WHERE job_id = %s""",
-                            (Jsonb({"reason": "Worker heartbeat expired"}), row["id"]),
+                            (_jsonb({"reason": "Worker heartbeat expired"}), row["id"]),
                         )
                     requeue.append(dict(row))
                 else:
@@ -778,13 +888,15 @@ def recover_stale_jobs(stale_after_seconds: int) -> list[dict[str, Any]]:
                                    exam_id, stage, event_type, payload
                                ) SELECT id, 'failed', 'worker_lost', %s
                                    FROM exams WHERE job_id = %s""",
-                            (Jsonb({"reason": "Worker heartbeat expired"}), row["id"]),
+                            (_jsonb({"reason": "Worker heartbeat expired"}), row["id"]),
                         )
         conn.commit()
     return requeue
 
 
-def retry_job(job_id: str, error_code: str, error_message: str) -> None:
+def retry_job(
+    job_id: str, error_code: str, error_message: str, *, claim_generation: int
+) -> None:
     with db.connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -792,9 +904,12 @@ def retry_job(job_id: str, error_code: str, error_message: str) -> None:
                           error_code = %s, error_message = %s,
                           heartbeat_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND status = 'running'""",
-                (error_code, str(error_message)[:1000], job_id),
+                   WHERE id = %s AND status = 'running' AND claim_generation = %s
+                   RETURNING id""",
+                (error_code, str(error_message)[:1000], job_id, claim_generation),
             )
+            if cursor.fetchone() is None:
+                raise StaleJobExecution(f"Job {job_id} is no longer owned by this execution")
             cursor.execute(
                 """UPDATE exams SET status = 'retrying', stage = 'retrying',
                           updated_at = CURRENT_TIMESTAMP WHERE job_id = %s""",
@@ -805,7 +920,7 @@ def retry_job(job_id: str, error_code: str, error_message: str) -> None:
                    SELECT id, 'retrying', 'job_retrying', %s
                      FROM exams WHERE job_id = %s""",
                 (
-                    Jsonb({
+                    _jsonb({
                         "error_code": error_code,
                         "error_message": str(error_message)[:1000],
                     }),
@@ -816,7 +931,8 @@ def retry_job(job_id: str, error_code: str, error_message: str) -> None:
 
 
 def complete_ingestion_job(
-    job_id: str, *, structure_storage_key: str, stats: dict[str, Any]
+    job_id: str, *, claim_generation: int,
+    structure_storage_key: str, stats: dict[str, Any]
 ) -> bool:
     with db.connection() as conn:
         with conn.cursor() as cursor:
@@ -826,9 +942,9 @@ def complete_ingestion_job(
                           error_code = NULL, error_message = NULL,
                           finished_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND status = 'running'
+                   WHERE id = %s AND status = 'running' AND claim_generation = %s
                    RETURNING document_id""",
-                (Jsonb({"document_id": stats.get("document_id")}), job_id),
+                (_jsonb({"document_id": stats.get("document_id")}), job_id, claim_generation),
             )
             if cursor.fetchone() is None:
                 conn.commit()
@@ -840,15 +956,22 @@ def complete_ingestion_job(
                        error_code = NULL, error_message = NULL,
                        updated_at = CURRENT_TIMESTAMP
                    FROM jobs j
-                   WHERE j.id = %s AND d.id = j.document_id""",
-                (structure_storage_key, job_id, Jsonb(stats), job_id),
+                   WHERE j.id = %s AND j.claim_generation = %s
+                     AND d.id = j.document_id
+                     AND d.active_index_job_id = j.id""",
+                (structure_storage_key, job_id, _jsonb(stats), job_id, claim_generation),
             )
+            if cursor.rowcount != 1:
+                raise StaleJobExecution(
+                    f"Ingestion job {job_id} is no longer authorized to publish this document"
+                )
         conn.commit()
     return True
 
 
 def complete_generation_job(
     job_id: str, *, exam_id: str, document_id: str, session_id: str,
+    claim_generation: int,
     status: str, exams: list[dict[str, Any]], warnings: list[Any],
     metadata: dict[str, Any], evaluation: dict[str, Any],
 ) -> bool:
@@ -860,9 +983,9 @@ def complete_generation_job(
                           error_code = NULL, error_message = NULL,
                           finished_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND status = 'running'
+                   WHERE id = %s AND status = 'running' AND claim_generation = %s
                    RETURNING id""",
-                (Jsonb({"exam_id": exam_id, "status": status, "warnings": warnings}), job_id),
+                (_jsonb({"exam_id": exam_id, "status": status, "warnings": warnings}), job_id, claim_generation),
             )
             if cursor.fetchone() is None:
                 conn.commit()
@@ -873,8 +996,8 @@ def complete_generation_job(
                           updated_at = CURRENT_TIMESTAMP
                    WHERE id = %s AND job_id = %s""",
                 (
-                    status, Jsonb(metadata), Jsonb(exams), Jsonb(warnings),
-                    Jsonb(evaluation), exam_id, job_id,
+                    status, _jsonb(metadata), _jsonb(exams), _jsonb(warnings),
+                    _jsonb(evaluation), exam_id, job_id,
                 ),
             )
             if cursor.rowcount != 1:
@@ -884,7 +1007,7 @@ def complete_generation_job(
                    VALUES (%s, 'finalization', 'exam_saved', %s)""",
                 (
                     exam_id,
-                    Jsonb({
+                    _jsonb({
                         "status": status,
                         "metadata": metadata,
                         "warnings": warnings,
@@ -897,7 +1020,10 @@ def complete_generation_job(
     return True
 
 
-def fail_job(job_id: str, error_code: str, error_message: str) -> None:
+def fail_job(
+    job_id: str, error_code: str, error_message: str,
+    *, claim_generation: int | None = None,
+) -> None:
     safe_message = str(error_message)[:1000]
     with db.connection() as conn:
         with conn.cursor() as cursor:
@@ -906,11 +1032,20 @@ def fail_job(job_id: str, error_code: str, error_message: str) -> None:
                           error_code = %s, error_message = %s,
                           finished_at = CURRENT_TIMESTAMP,
                           updated_at = CURRENT_TIMESTAMP
-                   WHERE id = %s AND status IN ('queued', 'running', 'retrying')
+                   WHERE id = %s
+                     AND (
+                       (%s IS NULL AND status = 'queued')
+                       OR (%s IS NOT NULL AND status = 'running' AND claim_generation = %s)
+                     )
                    RETURNING type, document_id""",
-                (error_code, safe_message, job_id),
+                (
+                    error_code, safe_message, job_id, claim_generation,
+                    claim_generation, claim_generation,
+                ),
             )
             failed = cursor.fetchone()
+            if failed is None and claim_generation is not None:
+                raise StaleJobExecution(f"Job {job_id} is no longer owned by this execution")
             if failed and failed[0] == "document_ingestion":
                 cursor.execute(
                     """UPDATE documents SET status = 'failed', error_code = %s,
@@ -929,7 +1064,7 @@ def fail_job(job_id: str, error_code: str, error_message: str) -> None:
                        SELECT id, 'failed', 'job_failed', %s
                          FROM exams WHERE job_id = %s""",
                     (
-                        Jsonb({"error_code": error_code, "error_message": safe_message}),
+                        _jsonb({"error_code": error_code, "error_message": safe_message}),
                         job_id,
                     ),
                 )
@@ -945,14 +1080,51 @@ def get_exam_id_for_job(job_id: str) -> str | None:
 
 
 def append_exam_audit_event(
-    exam_id: str, *, stage: str, event_type: str, payload: dict[str, Any]
+    exam_id: str, *, job_id: str, claim_generation: int,
+    checkpoint_revision: int, request_fingerprint: str,
+    stage: str, event_type: str, payload: dict[str, Any]
 ) -> None:
     with db.connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                """INSERT INTO exam_audit_events (exam_id, stage, event_type, payload)
-                   VALUES (%s, %s, %s, %s)""",
-                (exam_id, stage, event_type, Jsonb(payload)),
+                """UPDATE jobs
+                      SET checkpoint_revision = %s,
+                          request_fingerprint = COALESCE(request_fingerprint, %s),
+                          updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s AND status = 'running'
+                      AND claim_generation = %s
+                      AND checkpoint_revision = %s - 1
+                      AND (request_fingerprint IS NULL OR request_fingerprint = %s)
+                    RETURNING id""",
+                (
+                    checkpoint_revision, request_fingerprint, job_id,
+                    claim_generation, checkpoint_revision, request_fingerprint,
+                ),
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    "SELECT claim_generation, checkpoint_revision, request_fingerprint FROM jobs WHERE id = %s",
+                    (job_id,),
+                )
+                current = cursor.fetchone()
+                if current and int(current[0]) == int(claim_generation):
+                    if current[2] not in {None, request_fingerprint}:
+                        raise InvalidState(
+                            f"Checkpoint request fingerprint does not match job {job_id}"
+                        )
+                    raise StaleCheckpoint(
+                        f"Checkpoint revision {checkpoint_revision} is stale for job {job_id}"
+                    )
+                raise StaleJobExecution(f"Job {job_id} is no longer owned by this execution")
+            cursor.execute(
+                """INSERT INTO exam_audit_events (
+                       exam_id, job_id, claim_generation, checkpoint_revision,
+                       request_fingerprint, stage, event_type, payload
+                   ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                (
+                    exam_id, job_id, claim_generation, checkpoint_revision,
+                    request_fingerprint, stage, event_type, _jsonb(payload),
+                ),
             )
         conn.commit()
 
@@ -1144,7 +1316,7 @@ def finish_cleanup_run(
                    WHERE id = %s""",
                 (
                     "failed" if error else "completed",
-                    Jsonb(stats or {}),
+                    _jsonb(stats or {}),
                     str(error)[:1000] if error else None,
                     cleanup_id,
                 ),

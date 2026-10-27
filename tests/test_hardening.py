@@ -35,6 +35,14 @@ def _session_fakes(monkeypatch):
     return session
 
 
+def _valid_pdf_bytes() -> bytes:
+    output = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    writer.write(output)
+    return output.getvalue()
+
+
 def test_complete_pdf_validation_has_no_page_count_limit(tmp_path):
     path = tmp_path / "many-pages.pdf"
     writer = PdfWriter()
@@ -163,7 +171,7 @@ def test_upload_idempotency_reuses_existing_job_without_dispatch(monkeypatch, tm
     response = client.post(
         "/api/v1/documents",
         headers={"Idempotency-Key": "upload-operation-123"},
-        files={"file": ("notes.pdf", io.BytesIO(b"%PDF-1.4\ncontent"), "text/plain")},
+        files={"file": ("notes.pdf", io.BytesIO(_valid_pdf_bytes()), "text/plain")},
     )
 
     assert response.status_code == 202
@@ -268,6 +276,8 @@ def test_generation_deadline_interrupts_running_task(monkeypatch):
     job = {
         "document_id": "document-1",
         "session_id": "session-1",
+        "claim_generation": 1,
+        "checkpoint_revision": 0,
         "request_data": {
             "tasks": [["mcq", 1]],
             "num_models": 1,
@@ -280,11 +290,14 @@ def test_generation_deadline_interrupts_running_task(monkeypatch):
     monkeypatch.setattr(task_module.config, "GENERATION_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(task_module.repositories, "claim_job", lambda *_: job)
     monkeypatch.setattr(task_module.repositories, "get_document", lambda *_: document)
-    monkeypatch.setattr(task_module.repositories, "update_job_progress", lambda *_: None)
+    monkeypatch.setattr(task_module.repositories, "update_job_progress", lambda *_, **__: None)
+    monkeypatch.setattr(
+        task_module.repositories, "load_generation_checkpoint", lambda *_, **__: {}
+    )
     monkeypatch.setattr(
         task_module.repositories,
         "fail_job",
-        lambda job_id, code, message: failures.append((job_id, code, message)),
+        lambda job_id, code, message, **_kwargs: failures.append((job_id, code, message)),
     )
     monkeypatch.setattr(task_module, "_heartbeat", lambda *_: nullcontext())
     monkeypatch.setattr(task_module, "generate_exams", lambda *args, **kwargs: time.sleep(2))

@@ -20,6 +20,7 @@ class FakeCursor:
 
     def execute(self, sql, params=()):
         self.executed.append((" ".join(sql.split()), params))
+        self.last_sql = sql
         if sql.lstrip().startswith("DELETE"):
             self.rowcount = 2
 
@@ -27,6 +28,10 @@ class FakeCursor:
         return self.rows
 
     def fetchone(self):
+        if "FROM jobs j JOIN documents d" in getattr(self, "last_sql", ""):
+            return (
+                "running", 1, "33333333-3333-4333-8333-333333333333",
+            )
         return (len(self.rows),)
 
 
@@ -76,12 +81,13 @@ def test_replace_document_persists_parent_child_relationships(monkeypatch):
         _structure(), document_id="11111111-1111-4111-8111-111111111111",
         session_id="22222222-2222-4222-8222-222222222222",
         job_id="33333333-3333-4333-8333-333333333333",
+        claim_generation=1,
         processed_document_key="cache-key", processing_versions={"chunker": "v1"},
     )
 
     assert count == 2
     assert connection.committed is True
-    assert cursor.executed[0][0].startswith("DELETE FROM document_chunks")
+    assert any(sql.startswith("DELETE FROM document_chunks") for sql, _ in cursor.executed)
     inserts = [params for sql, params in cursor.executed if sql.startswith("INSERT")]
     assert len(inserts) == 3
     assert inserts[0][4] == "parent-a"

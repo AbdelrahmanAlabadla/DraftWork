@@ -603,7 +603,7 @@ def test_distinct_word_problem_tasks_may_share_broad_coverage():
     assert not any("repeats catalog knowledge coverage" in error for error in errors)
 
 
-def test_semantic_plan_repair_selects_candidate_that_resolves_named_conflict(monkeypatch):
+def test_deterministic_plan_repair_selects_cross_topic_candidate_without_llm(monkeypatch):
     def task(name: str, operation: str, target: str, product: str) -> dict:
         value = {
             "knowledge_anchor": f"anchor {name}", "topic": "waves", "concept": name,
@@ -620,22 +620,16 @@ def test_semantic_plan_repair_selects_candidate_that_resolves_named_conflict(mon
     first = task("radio", "calculate_frequency", "frequency from wavelength", "numeric frequency")
     duplicate = task("xray", "calculate_frequency", "frequency from wavelength", "numeric frequency")
     distinct = task("spectrum", "interpret_spectrum", "identify element from line pattern", "evidence-based identification")
+    distinct["topic"] = "atomic spectra"
     plans = [{"model_number": 1, "items": {"word_problem": [
         assessment_catalog.materialize_plan_item(first, "m1_word_problem_1", "medium"),
         assessment_catalog.materialize_plan_item(duplicate, "m1_word_problem_2", "medium"),
     ]}}]
     error = "Slot m1_word_problem_2 duplicates the planned reasoning task in m1_word_problem_1; change the target."
-    monkeypatch.setattr(planner, "create_llm_client", lambda: object())
-    monkeypatch.setattr(planner, "request_structured", lambda *_args, **_kwargs: {
-        "repair": {
-            "slot_to_replace": "m1_word_problem_2",
-            "conflicts_with": ["m1_word_problem_1"],
-            "conflict_reason": "Both calculate frequency from wavelength using the same relationship.",
-            "what_must_be_different": ["Use a different operation and student work product."],
-            "replacement_task_id": distinct["task_id"],
-            "why_this_replacement_resolves_the_conflict": "It interprets a spectrum instead of repeating the calculation.",
-        }
-    })
+    monkeypatch.setattr(
+        planner, "create_llm_client",
+        lambda: pytest.fail("deterministic cross-task repair must not call an LLM"),
+    )
     state = {
         "assessment_catalog": {"tasks": [first, duplicate, distinct]},
         "tasks": [("word_problem", 2)], "num_models": 1, "difficulty": "medium",
@@ -670,17 +664,25 @@ def test_exhausted_plan_repair_never_prunes_requested_slot(monkeypatch):
         "_repair_plan_slot",
         lambda _state, current, _sid, current_errors: (current, current_errors, False),
     )
-    with pytest.raises(RuntimeError, match="could not preserve every requested slot"):
-        planner.repair_plan({
-            "document_id": "doc",
-            "tasks": [("mcq", 1), ("word_problem", 1)],
-            "num_models": 1,
-            "plans": plans,
-            "plan_errors": errors,
-            "plan_attempts": 2,
-            "retrieved_chunks": [{"child_id": "chunk-a", "content": "source"}],
-        })
+    result = planner.repair_plan({
+        "document_id": "doc",
+        "tasks": [("mcq", 1), ("word_problem", 1)],
+        "num_models": 1,
+        "plans": plans,
+        "plan_errors": errors,
+        "plan_attempts": 2,
+        "retrieved_chunks": [{"child_id": "chunk-a", "content": "source"}],
+    })
+    assert "could not preserve every requested slot" in result["error"]
+    assert result["plan_errors"]
+    assert "m1_word_problem_1" in result["plan_errors"][0]
+    assert result["plan_attempts"] == planner.MAX_PLAN_ATTEMPTS
     assert plans[0]["items"]["word_problem"] == [bad]
+    assert result["unrepairable_plan_slots"] == [{
+        "slot_id": "m1_word_problem_1",
+        "failure_code": "plan_repair_exhausted",
+        "reason": result["plan_errors"][0],
+    }]
 
 
 def test_prior_missing_slot_does_not_block_unrelated_duplicate_plan_repair(monkeypatch):
@@ -1167,3 +1169,58 @@ def test_unsupported_requested_type_returns_structured_issue_without_missing_slo
         [{"model_number": 1, "items": {"essay": []}}],
         [("essay", 1)], 1, {"chunk-a"}, "mix", profile, issues,
     ) == []
+
+
+def _self_invalid_variation_task() -> dict:
+    value = {
+        "knowledge_anchor": "distance between points",
+        "concept": "coordinate geometry", "relationship": None,
+        "task_operation": "derive_distance", "student_work_product": "distance",
+        "target": "distance between two points",
+        "reasoning_mode": "symbolic_manipulation",
+        "allowed_question_types": ["mcq"], "primary_question_types": ["mcq"],
+        "evidence_chunk_ids": ["chunk-a"], "required_givens": [],
+        "allowed_variations": [{
+            "target": "distance between (3, 2) and (-3, 5)",
+            "operation": "calculate_distance",
+            "givens": ["points (3, 2) and (-3, 5)"],
+            "question_types": ["mcq"], "reasoning_mode": "calculation",
+            "student_work_product": "distance",
+        }],
+        "scenario_family": None, "text_answerable": True,
+        "supported_difficulties": ["medium"],
+    }
+    value.update(assessment_catalog.canonical_task_ids(value) or {})
+    return value
+
+
+def test_materialization_refuses_explicit_incomplete_variation_before_repair():
+    task = _self_invalid_variation_task()
+    default = assessment_catalog.materialize_plan_item(
+        task, "m1_mcq_1", "medium"
+    )
+    primary = next(
+        value for value in default["permitted_variations"]
+        if value["target"] == task["target"]
+    )
+    current = assessment_catalog.materialize_plan_item(
+        task, "m1_mcq_1", "medium",
+        selected_variation_id=primary["variation_id"],
+    )
+    assert current["selected_variation_id"] != primary["variation_id"]
+    assert current["given_conditions"] == ["points (3, 2) and (-3, 5)"]
+
+
+def test_merge_preserves_bound_catalog_variation_fields():
+    task = _self_invalid_variation_task()
+    replacement = assessment_catalog.materialize_plan_item(
+        task, "m1_mcq_1", "medium"
+    )
+    merged = planner._merge_plan_replacements([], [replacement])
+    item = merged[0]["items"]["mcq"][0]
+
+    assert item["selected_variation_id"] == replacement["selected_variation_id"]
+    assert item["permitted_variations"] == replacement["permitted_variations"]
+    assert item["primary_question_types"] == ["mcq"]
+    assert item["base_catalog_task_id"] == task["task_id"]
+    assert item["reasoning_depth"] == "medium"

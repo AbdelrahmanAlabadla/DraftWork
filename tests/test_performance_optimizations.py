@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from app.llm import scheduler
-from app.online import assessment_catalog, duplicate_judge, plan_review, validator
+from app.online import assessment_catalog, duplicate_judge, validator
 from app.online import duplicate_pipeline
 
 
@@ -87,6 +86,22 @@ def test_catalog_batches_respect_partial_selection_and_skip_empty_parents():
         ["p0-c0", "p1-c1"], ["p2-c0", "p2-c1", "p2-c2"]
     ]
     assert all(row["parent_id"] != "p3" for batch in batches for row in batch)
+
+
+def test_catalog_batch_membership_is_stable_across_selection_order():
+    chunks = _parent_chunks(5)
+    for index, chunk in enumerate(chunks):
+        chunk["child_order"] = index
+    reversed_chunks = list(reversed(chunks))
+
+    assert assessment_catalog._catalog_source_membership(chunks) == (
+        assessment_catalog._catalog_source_membership(reversed_chunks)
+    )
+    assert [
+        row["child_id"]
+        for batch in assessment_catalog._balanced_catalog_batches(reversed_chunks)
+        for row in batch
+    ] == [row["child_id"] for row in chunks]
 
 
 def test_parent_relationship_changes_compiler_cache_identity():
@@ -362,59 +377,3 @@ def test_catalog_finalizer_does_not_truncate_at_legacy_48_task_cap():
         key="k", processed_document_key="doc", selected_chunk_ids=["c1"], usage=None,
     )
     assert len(finalized["tasks"]) == 60
-
-
-def _review_slot(index: int, **overrides):
-    item = {
-        "slot_id": f"s{index}", "question_type": "why", "task_id": f"t{index}",
-        "task_family_id": f"f{index}", "coverage_id": f"c{index}",
-        "concept": f"concept {index}", "task_operation": f"explain {index}",
-        "target": f"target {index}", "reasoning_mode": "causal_reasoning",
-        "reasoning_requirements": [f"reason {index}"],
-        "student_work_product": "short explanation", "source_chunk_id": "chunk1",
-        "support_chunk_ids": [], "difficulty": "medium", "actual_difficulty": "medium",
-    }
-    item.update(overrides)
-    return item
-
-
-def test_plan_pair_shortlist_keeps_known_conflict_below_threshold(monkeypatch):
-    plan_review._PLAN_EMBEDDING_CACHE.clear()
-    plan = {"model_number": 1, "items": {"why": [_review_slot(1), _review_slot(2)]}}
-    monkeypatch.setattr(plan_review, "embed_dense", lambda *_args, **_kwargs: [[1, 0], [0, 1]])
-
-    pairs, stats = plan_review._shortlist_plan_pairs(plan, [{
-        "repair_slot_id": "s2", "conflict_slot_id": "s1", "reason": "known duplicate",
-    }])
-
-    assert len(pairs) == 1
-    assert pairs[0]["embedding_similarity"] < plan_review.PLAN_PAIR_SIMILARITY_THRESHOLD
-    assert "known_conflict" in pairs[0]["shortlist_reasons"]
-    assert stats["possible_pair_count"] == 1
-
-
-def test_plan_pair_shortlist_always_keeps_shared_identity(monkeypatch):
-    plan_review._PLAN_EMBEDDING_CACHE.clear()
-    left = _review_slot(1, task_family_id="shared")
-    right = _review_slot(2, task_family_id="shared")
-    plan = {"model_number": 1, "items": {"why": [left, right]}}
-    monkeypatch.setattr(plan_review, "embed_dense", lambda *_args, **_kwargs: [[1, 0], [0, 1]])
-
-    pairs, _stats = plan_review._shortlist_plan_pairs(plan)
-
-    assert "shared_identity" in pairs[0]["shortlist_reasons"]
-
-
-def test_plan_pair_shortlist_reduces_twenty_one_slot_review(monkeypatch):
-    plan_review._PLAN_EMBEDDING_CACHE.clear()
-    items = [_review_slot(index) for index in range(21)]
-    plan = {"model_number": 1, "items": {"why": items}}
-    vectors = [[1.0 if i == j else 0.0 for j in range(21)] for i in range(21)]
-    monkeypatch.setattr(plan_review, "embed_dense", lambda *_args, **_kwargs: vectors)
-
-    pairs, stats = plan_review._shortlist_plan_pairs(plan)
-
-    assert stats["possible_pair_count"] == 210
-    assert 0 < len(pairs) < 210
-    assert stats["shortlisted_pair_count"] == len(pairs)
-    assert all("top_neighbour" in pair["shortlist_reasons"] for pair in pairs)

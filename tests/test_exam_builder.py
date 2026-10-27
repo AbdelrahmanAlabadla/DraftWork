@@ -338,12 +338,15 @@ def test_exhausted_transport_retries_do_not_multiply_generation_attempts(monkeyp
 
 
 def test_generation_node_snapshots_before_shortfall(monkeypatch):
-
-    def fake_bundle(*args, **kwargs):
-        return {"mcq": [_mcq("initial")], "true_false": [], "fill_in_the_blank": None}, []
+    def fake_bundle(planned, *args, **kwargs):
+        item = _mcq("initial")
+        item["slot_id"] = planned["mcq"][0]["slot_id"]
+        return {"mcq": [item], "true_false": [], "fill_in_the_blank": None}, []
 
     def fake_shortfall(questions, *args, **kwargs):
-        questions["mcq"].append(_mcq("shortfall"))
+        item = _mcq("shortfall")
+        item["slot_id"] = "m1_mcq_3"
+        questions["mcq"].append(item)
         kwargs["appended_by_type"]["mcq"] += 1
         return []
 
@@ -371,8 +374,8 @@ def test_generation_node_snapshots_before_shortfall(monkeypatch):
         }
     )
     model = public_eval(out["eval_stats"])["models"]["1"]
-    assert model["generated_first"] == 1
-    assert model["missing_first"] == 1
+    assert model["generated_first"] == 2
+    assert model["missing_first"] == 0
     assert model["shortfall_generated"] == 1
     assert model["shortfall_still_missing"] == 0
 
@@ -381,45 +384,37 @@ def test_generation_node_records_complete_twenty_question_mixed_shape(monkeypatc
     """The live 10/3/3/3/1 shape is counted before shortfall repair."""
     calls = {"bundle": 0, "free": []}
 
-    def fake_bundle(*args, **kwargs):
+    def fake_bundle(planned, *args, **kwargs):
         calls["bundle"] += 1
-        return {
-            "mcq": [_mcq(f"MCQ {i}") for i in range(1, 11)],
-            "true_false": [
-                {"statement": f"Statement {i}", "answer": "True"}
-                for i in range(1, 4)
-            ],
-            "fill_in_the_blank": {
-                "word_bank": ["one", "two", "three", "four", "five"],
-                "items": [
-                    {"question": f"Complete ________ {i}", "answers": ["one"]}
-                    for i in range(1, 4)
-                ],
-            },
-        }, []
+        if planned.get("mcq"):
+            slot = planned["mcq"][0]["slot_id"]
+            item = _mcq(f"MCQ {slot}")
+            item["slot_id"] = slot
+            return {"mcq": [item], "true_false": []}, []
+        slot = planned["true_false"][0]["slot_id"]
+        return {"mcq": [], "true_false": [{
+            "slot_id": slot, "statement": f"Statement {slot}", "answer": "True",
+        }]}, []
 
     def fake_free(qtype, planned, *args, **kwargs):
         calls["free"].append((qtype, len(planned)))
         if qtype == "essay":
-            return [
-                {
+            return [{
+                    "slot_id": planned[0]["slot_id"],
                     "question": "Essay question",
                     "reference_answer": "Essay answer",
                     "key_points": ["point"],
-                }
-            ], []
+                }], []
         return [
-            {"question": f"Why does effect {i} occur?", "reference_answer": "Answer"}
-            for i in range(1, len(planned) + 1)
+            {"slot_id": item["slot_id"], "question": f"Why does effect {i} occur?", "reference_answer": "Answer"}
+            for i, item in enumerate(planned, 1)
         ], []
 
-    def fake_fitb(*args, **kwargs):
+    def fake_fitb(_count, planned, *args, **kwargs):
+        slot = planned[0]["slot_id"]
         return {
-            "word_bank": ["one", "two", "three", "four", "five"],
-            "items": [
-                {"question": f"Complete ________ {i}", "answers": ["one"]}
-                for i in range(1, 4)
-            ],
+            "word_bank": ["one", "two", "three"],
+            "items": [{"slot_id": slot, "question": f"Complete ________ {slot}", "answers": ["one"]}],
         }, []
 
     monkeypatch.setattr(exam_builder, "_generate_obj_bundle", fake_bundle)
@@ -459,8 +454,8 @@ def test_generation_node_records_complete_twenty_question_mixed_shape(monkeypatc
 
     model = public_eval(out["eval_stats"])["models"]["1"]
     assert calls == {
-        "bundle": 1,
-        "free": [("why", 3), ("essay", 1)],
+        "bundle": 13,
+        "free": [("why", 1), ("why", 1), ("why", 1), ("essay", 1)],
     }
     assert model["requested_questions"] == 20
     assert model["generated_first"] == 20
@@ -662,6 +657,16 @@ def test_task_id_reuse_alone_never_blocks_a_question_instance():
 
 def test_four_distinct_questions_can_share_one_task_id_in_one_batch(monkeypatch):
     task_id = "task_contextual_system"
+    variation = {
+        "variation_id": "variation_equation",
+        "variation_group_id": "group_equation",
+        "question_types": ["equation"],
+        "operation": "apply_supported_linear_system_method",
+        "target": "a supported system result",
+        "givens": ["two linear constraints"],
+        "reasoning_mode": "calculation",
+        "student_work_product": "worked result",
+    }
     planned = [
         {
             "slot_id": f"m1_equation_{index}", "task_id": task_id,
@@ -676,6 +681,9 @@ def test_four_distinct_questions_can_share_one_task_id_in_one_batch(monkeypatch)
             "variable_givens": ["context totals and unknown counts"],
             "required_givens": ["two linear constraints"],
             "complexity_boundaries": ["no nonlinear systems"],
+            "selected_variation_id": variation["variation_id"],
+            "selected_variation_group_id": variation["variation_group_id"],
+            "permitted_variations": [variation],
         }
         for index in range(1, 5)
     ]
@@ -770,7 +778,7 @@ def test_plan_context_preserves_complete_previous_questions_for_reuse():
         ]
     }
 
-    result = exam_builder._attach_plan_review_context(items)
+    result = exam_builder._attach_reuse_context(items)
 
     previous = result["equation"][1]["previous_task_questions"]
     assert previous == [prior_question]

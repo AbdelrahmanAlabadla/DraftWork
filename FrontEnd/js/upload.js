@@ -3,24 +3,43 @@ import {
   deleteJSON, getJSON, waitForJob,
 } from "./api.js";
 import { state } from "./state.js";
-import { renderSectionsTree, showSectionsLoading, hideSectionsLoading } from "./topics.js";
+import {
+  renderSectionsTree, showSectionsLoading, hideSectionsLoading, showSectionsError,
+  hideSectionsError,
+} from "./topics.js";
 import { authHeaders } from "./auth.js";
 import { localizedError, stageLabel, t } from "./i18n.js";
 
 let uploadController = null;
 let uploadOperation = null;
 let cancellationRequested = false;
+let documentRequestVersion = 0;
+const RESTORED_DOCUMENT_KEY = "draftwork:current-document";
 
 function clearUploadUi(fileInput) {
+  documentRequestVersion += 1;
   state.uploadDone = false;
   state.currentDocId = null;
   state.uploadJobId = null;
+  state.selectedChildren.clear();
   document.getElementById("sectionsTree").innerHTML = "";
   document.getElementById("sectionsCount").textContent = "";
   document.getElementById("sectionsLoading").classList.remove("show");
+  hideSectionsError();
   document.getElementById("filePill").classList.remove("show");
   setUploadStatus("", "");
   fileInput.value = "";
+  try { sessionStorage.removeItem(RESTORED_DOCUMENT_KEY); } catch (_) { /* no-op */ }
+}
+
+async function loadDocumentSections(documentId, version, options = {}) {
+  const response = await getJSON(`/documents/${encodeURIComponent(documentId)}`);
+  if (version !== documentRequestVersion || documentId !== state.currentDocId) return false;
+  if (!response.ok || response.data.status !== "ready") {
+    showSectionsError(localizedError(response.data.detail, "sections.load_failed"));
+    return false;
+  }
+  return renderSectionsTree(response.data.structure || {}, options);
 }
 
 function setUploadStage(stage, type = "loading") {
@@ -73,6 +92,33 @@ export function initUpload() {
     uploadOperation = null;
     clearUploadUi(fileInput);
   });
+  document.getElementById("retrySectionsBtn").addEventListener("click", async () => {
+    if (!state.currentDocId) return;
+    showSectionsLoading();
+    const loaded = await loadDocumentSections(state.currentDocId, documentRequestVersion, {
+      preserveSelection: true,
+    }).catch((error) => {
+      showSectionsError(localizedError(error.message, "sections.load_failed"));
+      return false;
+    });
+    if (loaded) state.uploadDone = true;
+  });
+  restoreUploadedDocument().catch(() => {});
+}
+
+async function restoreUploadedDocument() {
+  let documentId = "";
+  try { documentId = sessionStorage.getItem(RESTORED_DOCUMENT_KEY) || ""; } catch (_) { return; }
+  if (!documentId || state.currentDocId) return;
+  const version = ++documentRequestVersion;
+  state.currentDocId = documentId;
+  showSectionsLoading();
+  const loaded = await loadDocumentSections(documentId, version);
+  if (version !== documentRequestVersion) return;
+  if (loaded) {
+    state.uploadDone = true;
+    setUploadStage("completed", "success");
+  }
 }
 
 function handleFile(file) {
@@ -87,6 +133,9 @@ function handleFile(file) {
 }
 
 async function uploadFile(file) {
+  const version = ++documentRequestVersion;
+  state.uploadDone = false;
+  state.currentDocId = null;
   cancellationRequested = false;
   setUploadStage("uploading");
   showSectionsLoading();
@@ -108,29 +157,27 @@ async function uploadFile(file) {
     uploadController = null;
     const data = await res.json();
     if (res.ok) {
+      if (version !== documentRequestVersion) return;
       completeIdempotentOperation(operation);
       uploadOperation = null;
       state.uploadJobId = data.job_id;
       setUploadStage("queued");
       await waitForJob(data.job_id, (job) => {
-        setUploadStage(job.stage);
+        if (version === documentRequestVersion) setUploadStage(job.stage);
       });
-      const documentResponse = await getJSON(`/documents/${data.document_id}`);
-      if (!documentResponse.ok) {
-        throw new Error(localizedError(
-          documentResponse.data.detail, "status.load_document_failed"
-        ));
-      }
+      if (version !== documentRequestVersion) return;
       setUploadStage("completed", "success");
       state.uploadDone = true;
       state.currentDocId = data.document_id;
-      renderSectionsTree(documentResponse.data.structure || {});
+      try { sessionStorage.setItem(RESTORED_DOCUMENT_KEY, data.document_id); } catch (_) { /* no-op */ }
+      await loadDocumentSections(data.document_id, version);
     } else {
       if (res.status < 500) completeIdempotentOperation(operation);
       setUploadStatus("error", localizedError(data.detail, "status.upload_failed"));
       hideSectionsLoading();
     }
   } catch (e) {
+    if (version !== documentRequestVersion) return;
     if (cancellationRequested || e?.name === "AbortError" || e instanceof JobCancelledError) {
       completeIdempotentOperation(operation);
       uploadOperation = null;

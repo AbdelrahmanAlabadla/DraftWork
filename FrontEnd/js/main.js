@@ -59,7 +59,6 @@ function initGenerate() {
     { id: "catalog", stages: ["compiling_assessment_catalog"] },
     { id: "planning", stages: ["planning_exam"] },
     { id: "difficulty", stages: ["adjusting_difficulty"] },
-    { id: "review", stages: ["reviewing_plan"] },
     { id: "generation", stages: ["generating_exam"] },
     { id: "validation", stages: ["validating_exam", "validating_updates"] },
     { id: "repair", stages: ["repairing_exam"] },

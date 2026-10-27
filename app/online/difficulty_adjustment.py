@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from copy import deepcopy
@@ -18,7 +20,10 @@ from app.llm.schemas import (
     generation_response_model,
 )
 from app.online.planner import finalize_plans, validate_plans
-from app.online.assessment_catalog import build_task_usage_index, materialize_plan_item
+from app.online.assessment_catalog import (
+    build_task_usage_index, eligible_task_variation_candidates, materialize_plan_item,
+    replacement_candidate_score,
+)
 
 MAX_DIFFICULTY_ADJUSTMENT_ATTEMPTS = 3
 DIFFICULTY_ADJUSTMENT_BATCH_SIZE = 3
@@ -104,7 +109,7 @@ prerequisite, and reasoning requirement is supported by assigned evidence. reaso
 kind of reasoning; reasoning_depth is its demand. Never use length, large numbers, or labels alone.
 Preserve the question-type contract. Equation stays equation-centered valid LaTeX; Word Problem,
 MCQ, True/False, Why, Definition, FITB, and Essay retain their forms. Return failure when adjustment
-would require unsupported knowledge. You propose; Plan Reviewer and Validators independently decide.
+would require unsupported knowledge. You propose; deterministic checks and Validators independently decide.
 
 For planned tasks, return only a controlled patch in adjusted_fields. Never reconstruct the task and
 never return or modify IDs, question type, concept, core operation, target, work product, or source
@@ -118,6 +123,20 @@ the same. `evidence_support` may contain only exact chunk-ID strings present as 
 
 def _direction(actual: str, requested: str) -> str:
     return "none" if actual == requested else f"{actual}_to_{requested}"
+
+
+def _question_instance_numbers(question: dict[str, Any]) -> list[str]:
+    """Numbers in question content, excluding correlation/provenance identifiers."""
+    ignored = {
+        "slot_id", "question_id", "task_id", "base_catalog_task_id",
+        "derived_task_id", "selected_variation_id", "selected_variation_group_id",
+        "effective_instance_id", "difficulty", "actual_difficulty",
+        "requested_difficulty",
+    }
+    content = {key: value for key, value in question.items() if key not in ignored}
+    return sorted(re.findall(
+        r"(?<![\w.])-?\d+(?:\.\d+)?", json.dumps(content, sort_keys=True)
+    ))
 
 
 def _literal(values: list[str]):
@@ -193,6 +212,22 @@ def _acceptance_diagnostics(
         "slot_id", "base_catalog_task_id", "task_family_id",
         "base_task_family_id", "question_type", "concept", "task_operation",
         "target", "student_work_product", "source_chunk_id", "support_chunk_ids",
+        "selected_variation_id", "selected_variation_group_id", "permitted_variations",
+    )
+    givens_changed = (
+        list(proposed.get("given_conditions") or [])
+        != list(original.get("given_conditions") or [])
+        or list(proposed.get("required_givens") or [])
+        != list(original.get("required_givens") or [])
+    )
+    selected = next((
+        value for value in original.get("permitted_variations") or []
+        if value.get("variation_id") == original.get("selected_variation_id")
+    ), {})
+    numeric_change_authorized = bool(
+        not original.get("exact_source_instance")
+        and selected.get("numeric_values_may_change") is True
+        and original.get("variable_givens")
     )
     return {
         "adjustment_succeeded": decision.adjustment_succeeded,
@@ -201,6 +236,7 @@ def _acceptance_diagnostics(
         "immutable_contract_preserved": all(
             proposed.get(field) == original.get(field) for field in immutable_fields
         ),
+        "effective_givens_authorized": not givens_changed or numeric_change_authorized,
         "achieved_difficulty_matches": decision.achieved_difficulty == requested,
         "task_difficulty_matches": proposed.get("difficulty") == requested,
         "task_actual_difficulty_matches": proposed.get("actual_difficulty") == requested,
@@ -404,6 +440,16 @@ def _apply_adjustment_result(
     )
     if accepted:
         proposed = deepcopy(proposed)
+        effective_givens = list(proposed.get("given_conditions") or [])
+        instance_payload = json.dumps({
+            "task_id": original.get("base_catalog_task_id") or original.get("task_id"),
+            "variation_id": original.get("selected_variation_id"),
+            "givens": effective_givens,
+            "difficulty": requested,
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        effective_instance_id = "derived_" + hashlib.sha256(
+            instance_payload.encode("utf-8")
+        ).hexdigest()[:16]
         proposed["support_chunk_ids"] = list(original.get("support_chunk_ids") or [])
         proposed.update({
             "requested_difficulty": requested,
@@ -418,6 +464,9 @@ def _apply_adjustment_result(
             "difficulty_fallback_reason": None,
             "adjustment_attempts": attempt,
             "adjustment_failure_reason": None,
+            "derived_task_id": effective_instance_id,
+            "effective_instance_id": effective_instance_id,
+            "effective_givens": effective_givens,
             "difficulty_adaptation": {
                 "status": "adapted",
                 "from_difficulty": actual,
@@ -435,6 +484,9 @@ def _apply_adjustment_result(
                 ) if decision.adjusted_fields else [],
                 "evidence_support": list(decision.evidence_support),
                 "evidence_justification": decision.evidence_justification,
+                "base_variation_id": original.get("selected_variation_id"),
+                "effective_instance_id": effective_instance_id,
+                "effective_givens": effective_givens,
             },
         })
         item.clear()
@@ -489,6 +541,8 @@ def _apply_catalog_fallbacks(
         "medium": ("medium", "easy", "hard"),
     }[requested]
     tasks = list((catalog or {}).get("tasks") or [])
+    profile = (catalog or {}).get("assessment_profile") or {}
+    valid_chunks = set(map(str, (catalog or {}).get("selected_chunk_ids") or [])) or None
     for plan in plans:
         for qtype, values in (plan.get("items") or {}).items():
             for index, item in enumerate(values or []):
@@ -496,24 +550,54 @@ def _apply_catalog_fallbacks(
                 if adaptation.get("status") != "failed" or int(item.get("adjustment_attempts") or 0) < 3:
                     continue
                 current_id = str(item.get("task_id") or "")
-                compatible = [task for task in tasks if (
-                    qtype in (task.get("allowed_question_types") or [])
-                    and task.get("evidence_chunk_ids")
-                    and str(task.get("task_id") or "") != current_id
-                )]
+                compatible = [
+                    (task, variation)
+                    for task in tasks
+                    if str(task.get("task_id") or "") != current_id
+                    for variation in eligible_task_variation_candidates(
+                        task, qtype, assessment_profile=profile,
+                        valid_chunk_ids=valid_chunks,
+                    )
+                ]
+                occupied_task_ids = {
+                    str(other.get("base_catalog_task_id") or other.get("task_id") or "")
+                    for other_plan in plans
+                    for other_values in (other_plan.get("items") or {}).values()
+                    for other in other_values or []
+                    if str(other.get("slot_id") or "") != str(item.get("slot_id") or "")
+                }
                 chosen = None
+                chosen_variation = None
                 chosen_level = None
-                for level in order:
-                    level_tasks = [task for task in compatible if str(
-                        task.get("native_difficulty") or task.get("reasoning_depth") or ""
-                    ) == level]
-                    if level_tasks:
-                        chosen = min(level_tasks, key=lambda task: (
-                            int((usage.get(str(task.get("task_id") or "")) or {}).get("count") or 0),
-                            -len(task.get("evidence_chunk_ids") or []),
-                            str(task.get("task_id") or ""),
-                        ))
-                        chosen_level = level
+                # Prefer an unused nearby-difficulty task over an exact-level
+                # task already occupied by another slot. The honest fallback
+                # level is persisted for downstream validation and reporting.
+                for require_unused in (True, False):
+                    for level in order:
+                        level_tasks = [
+                            entry for entry in compatible
+                            if str(
+                                entry[0].get("native_difficulty")
+                                or entry[0].get("reasoning_depth") or ""
+                            ) == level
+                            and (
+                                str(entry[0].get("task_id") or "")
+                                not in occupied_task_ids
+                            ) is require_unused
+                        ]
+                        if level_tasks:
+                            chosen, chosen_variation = min(level_tasks, key=lambda entry: (
+                                -replacement_candidate_score(
+                                    entry[0], entry[1], plans,
+                                    excluding_slot_id=str(item.get("slot_id") or ""),
+                                    requested_difficulty=requested,
+                                )["score"],
+                                str(entry[0].get("task_id") or ""),
+                                str(entry[1].get("variation_id") or ""),
+                            ))
+                            chosen_level = level
+                            break
+                    if chosen is not None:
                         break
                 if chosen is None:
                     item["difficulty_adaptation"] = {**adaptation, "status": "retained"}
@@ -522,7 +606,12 @@ def _apply_catalog_fallbacks(
                         or "No compatible catalog alternative remained after three adjustment attempts."
                     )
                     continue
-                replacement = materialize_plan_item(chosen, str(item.get("slot_id") or ""), chosen_level)
+                replacement = materialize_plan_item(
+                    chosen, str(item.get("slot_id") or ""), chosen_level,
+                    selected_variation_id=str(
+                        chosen_variation.get("variation_id") or ""
+                    ),
+                )
                 replacement.update({
                     "requested_difficulty": requested,
                     "selected_replacement_task_id": chosen.get("task_id"),
@@ -566,7 +655,7 @@ def adjust_plan_difficulty(state: dict[str, Any]) -> dict[str, Any]:
                 if int(attempts.get(sid) or 0) >= MAX_DIFFICULTY_ADJUSTMENT_ATTEMPTS:
                     item["difficulty_adaptation"] = {**adaptation, "status": "failed"}
                     item["difficulty_fallback_reason"] = (
-                        "Difficulty adjustment exhausted after independent Plan Review."
+                        "Difficulty adjustment exhausted after deterministic acceptance checks."
                     )
                     item["adjustment_failure_reason"] = item["difficulty_fallback_reason"]
                     continue
@@ -719,6 +808,18 @@ def adjust_generated_question(*, state: dict[str, Any], qtype: str, question: di
                 "evidence_justification": decision.evidence_justification,
             }
         adjusted = decision.adjusted_question.model_dump()
+        numbers_changed = (
+            _question_instance_numbers(adjusted) != _question_instance_numbers(question)
+        )
+        selected = next((
+            value for value in plan.get("permitted_variations") or []
+            if value.get("variation_id") == plan.get("selected_variation_id")
+        ), {})
+        numeric_change_authorized = bool(
+            not plan.get("exact_source_instance")
+            and selected.get("numeric_values_may_change") is True
+            and plan.get("variable_givens")
+        )
         checks = {
             "slot_id_preserved": adjusted.get("slot_id") == slot_id,
             "actual_difficulty_matches": decision.actual_difficulty == requested,
@@ -729,6 +830,10 @@ def adjust_generated_question(*, state: dict[str, Any], qtype: str, question: di
             "evidence_support_assigned": set(map(str, decision.evidence_support)).issubset(
                 set(evidence)
             ),
+            # Numerical instance changes are authorized and materialized at
+            # plan adjustment time. A post-generation rewrite may deepen the
+            # reasoning, but must retain that already-bound instance.
+            "numeric_instance_authorized": not numbers_changed or numeric_change_authorized,
         }
         rejection_reasons = _rejection_reasons(checks)
         if rejection_reasons:
@@ -740,6 +845,25 @@ def adjust_generated_question(*, state: dict[str, Any], qtype: str, question: di
                 "acceptance_checks": checks,
             }
         adjusted["question_id"] = question.get("question_id")
+        effective_givens = [str(adjusted.get(key)) for key in (
+            "equation", "question", "statement", "context", "term"
+        ) if adjusted.get(key)]
+        effective_instance_id = None
+        if numbers_changed:
+            payload = json.dumps({
+                "task_id": plan.get("base_catalog_task_id") or plan.get("task_id"),
+                "variation_id": plan.get("selected_variation_id"),
+                "question": adjusted,
+            }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            effective_instance_id = "derived_" + hashlib.sha256(
+                payload.encode("utf-8")
+            ).hexdigest()[:16]
+            adjusted["effective_instance_id"] = effective_instance_id
+            adjusted["effective_givens"] = effective_givens
+        for key in ("task_id", "base_catalog_task_id", "selected_variation_id",
+                    "selected_variation_group_id"):
+            if plan.get(key) is not None:
+                adjusted[key] = plan.get(key)
         return adjusted, {
             "status": "succeeded", "actual_difficulty": requested,
             "from_difficulty": actual, "direction": _direction(actual, requested),
@@ -750,6 +874,8 @@ def adjust_generated_question(*, state: dict[str, Any], qtype: str, question: di
             "evidence_justification": decision.evidence_justification,
             "reason": decision.reason,
             "acceptance_checks": checks,
+            "effective_instance_id": effective_instance_id,
+            "effective_givens": effective_givens if effective_instance_id else [],
             "verification_pending": True,
         }
     except Exception as exc:

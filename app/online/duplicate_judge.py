@@ -122,7 +122,9 @@ def actual_question_registry(exam: dict[str, Any]) -> list[dict[str, Any]]:
             registry.append({
                 "question_id": qid, "slot_id": str(item.get("slot_id") or ""),
                 "question_type": qtype, "stem": stem, "answer": answer,
-                "plan_review_reuse_context": item.get("plan_review_reuse_context"),
+                "reuse_context": item.get("reuse_context"),
+                "selected_variation_group_id": item.get("selected_variation_group_id"),
+                "effective_instance_id": item.get("effective_instance_id"),
                 "embedding_text": f"Question:\n{stem}\n\nCorrect answer and solution:\n{answer}".strip(),
             })
     return registry
@@ -227,6 +229,12 @@ def shortlist_duplicate_pairs(
             forced_question_pairs or set()
         ):
             signals.append("forced_catalog_reuse")
+        if (
+            left.get("selected_variation_group_id")
+            and left.get("selected_variation_group_id")
+            == right.get("selected_variation_group_id")
+        ):
+            signals.append("shared_variation_group")
         if discovery >= config.DUPLICATE_EMBEDDING_THRESHOLD:
             signals.append("embedding_threshold")
         if _formula_keys(f"{left['stem']}\n{left['answer']}") & _formula_keys(f"{right['stem']}\n{right['answer']}"):
@@ -291,14 +299,16 @@ def _prompt(candidates: list[dict[str, Any]]) -> str:
             registry[item["question_id"]] = {
                 "question_type": item["question_type"], "stem": item["stem"],
                 "complete_correct_answer_and_solution": item["answer"],
-                "plan_review_reuse_context": item.get("plan_review_reuse_context"),
+                "reuse_context": item.get("reuse_context"),
+                "selected_variation_group_id": item.get("selected_variation_group_id"),
+                "effective_instance_id": item.get("effective_instance_id"),
             }
         pairs.append({
             "pair_id": pair["pair_id"], "left_question_id": pair["left"]["question_id"],
             "right_question_id": pair["right"]["question_id"],
         })
     return """Analyze the actual student-facing questions and complete correct answers/solutions.
-An optional plan_review_reuse_context states an intended distinction. It is context only: verify that
+An optional reuse_context states an intended distinction. It is context only: verify that
 the actual questions realize it, and never treat intentional reuse as an automatic pass. Do not infer
 missing Planner metadata. Do not choose duplicate/excessive/acceptable labels. Return exactly
 five factual yes/no fields for every pair, using these definitions consistently:
@@ -383,7 +393,7 @@ def _fact_cache_key(pair: dict[str, Any], client: Any) -> str:
             "question_type": item.get("question_type"),
             "stem": content(item.get("stem")),
             "answer": content(item.get("answer")),
-            "reuse_context": item.get("plan_review_reuse_context"),
+            "reuse_context": item.get("reuse_context"),
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     model = str(
         getattr(client, "model", None)
@@ -392,6 +402,8 @@ def _fact_cache_key(pair: dict[str, Any], client: Any) -> str:
     )
     material = "\n".join([
         DUPLICATE_JUDGE_PROMPT_VERSION,
+        "duplicate-screen-v2-bge-m3",
+        "pair-ledger-v2",
         model,
         *sorted(contents),
     ])
@@ -553,10 +565,10 @@ def review_duplicate_candidates(
             cache[cache_key_by_pair[pair_id]] = facts
         analysis = {"pair_id": pair_id, **facts}
         authorized = all(
-            bool(pair[side].get("plan_review_reuse_context", {}).get("authorized"))
+            bool(pair[side].get("reuse_context", {}).get("authorized"))
             for side in ("left", "right")
-            if pair[side].get("plan_review_reuse_context")
-        ) and any(pair[side].get("plan_review_reuse_context") for side in ("left", "right"))
+            if pair[side].get("reuse_context")
+        ) and any(pair[side].get("reuse_context") for side in ("left", "right"))
         analysis["classification"] = deterministic_pair_classification(
             analysis, authorized_practice_variation=authorized,
         )

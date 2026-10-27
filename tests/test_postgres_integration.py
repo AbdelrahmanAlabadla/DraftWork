@@ -15,6 +15,15 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+def test_jsonb_nul_is_normalized_before_postgres_persistence():
+    payload = {"formula": "x" + chr(0) + "+y", "nested": ["valid", chr(0)]}
+    with db.connection() as connection:
+        stored = connection.execute(
+            "SELECT %s::jsonb", (repositories._jsonb(payload),)
+        ).fetchone()[0]
+    assert stored == {"formula": "x\ufffd+y", "nested": ["valid", "\ufffd"]}
+
+
 def test_core_repository_ownership_and_active_job_limit():
     session = repositories.create_session(
         repositories.hash_session_token(secrets.token_urlsafe(32))
@@ -124,9 +133,10 @@ def test_clerk_session_claim_preserves_exam_across_session_deletion():
             },
         )
         exam_id = str(generation_job["exam_id"])
-        repositories.claim_job(str(generation_job["id"]), "integration-worker")
+        claimed = repositories.claim_job(str(generation_job["id"]), "integration-worker")
         repositories.complete_generation_job(
             str(generation_job["id"]),
+            claim_generation=int(claimed["claim_generation"]),
             exam_id=exam_id,
             document_id=str(document["id"]),
             session_id=session_id,
@@ -205,7 +215,7 @@ def test_failed_exam_keeps_canonical_id_and_stage_audit_history():
         assert generation_job["request_data"]["exam_id"] == exam_id
         assert repositories.get_exam_for_session(exam_id, session_id)["status"] == "queued"
 
-        repositories.claim_job(str(generation_job["id"]), "integration-worker")
+        claimed = repositories.claim_job(str(generation_job["id"]), "integration-worker")
         evidence = {
             "generated_questions": [{"question_id": "model1_mcq_1", "question": "Q?"}],
             "validator_verdicts": [{"question_id": "model1_mcq_1", "action": "FIX_ANSWER"}],
@@ -213,10 +223,14 @@ def test_failed_exam_keeps_canonical_id_and_stage_audit_history():
             "duplicate": {"candidate_pairs": [], "fact_cache_hits": 0},
         }
         repositories.append_exam_audit_event(
-            exam_id, stage="generation", event_type="questions_generated", payload=evidence
+            exam_id, job_id=str(generation_job["id"]),
+            claim_generation=int(claimed["claim_generation"]),
+            checkpoint_revision=1, request_fingerprint="integration-request",
+            stage="generation", event_type="questions_generated", payload=evidence
         )
         repositories.fail_job(
-            str(generation_job["id"]), "GENERATION_FAILED", "controlled failure"
+            str(generation_job["id"]), "GENERATION_FAILED", "controlled failure",
+            claim_generation=int(claimed["claim_generation"]),
         )
 
         record = repositories.get_exam_for_session(exam_id, session_id)
