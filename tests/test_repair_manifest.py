@@ -110,11 +110,11 @@ def test_repair_budget_is_per_slot(monkeypatch):
         })
     out = val.repair_invalid_questions({
         "generated_exams": [exam], "plans": [], "repair_manifest": manifest,
-        "question_repair_attempts": {"m1_true_false_1": 3}, "warnings": [],
+        "question_repair_attempts": {"m1_true_false_1": val.MAX_QUESTION_REPAIR_ATTEMPTS}, "warnings": [],
     })
     assert calls == ["model1_true_false_2"]
     assert out["question_repair_attempts"] == {
-        "m1_true_false_1": 3, "m1_true_false_2": 1
+            "m1_true_false_1": val.MAX_QUESTION_REPAIR_ATTEMPTS, "m1_true_false_2": 1
     }
 
 

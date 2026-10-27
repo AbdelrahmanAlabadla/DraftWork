@@ -43,6 +43,7 @@ def run_pipeline(
     *,
     session_id: str | None = None,
     job_id: str | None = None,
+    claim_generation: int | None = None,
     on_stage: Callable[[str], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
     file_sha256_value: str | None = None,
@@ -75,6 +76,7 @@ def run_pipeline(
         parents = chunks.get("parents") or []
         chunks_stored = ChunkStore().replace_document(
             chunks, document_id=document_id, session_id=session_id, job_id=job_id,
+            claim_generation=claim_generation,
             processed_document_key=processed_key,
             processing_versions=cached.get("processing_versions") or {},
         )
@@ -97,6 +99,7 @@ def run_pipeline(
             "domain_type": metadata.get("domain_type") or "",
             "subject": metadata.get("subject") or "",
             "structure_file": str(structures_path),
+            "structure_data": chunks,
             "chunk_report_file": "",
             "chunk_dump_file": "",
             "timings": {k: round(v, 3) for k, v in timings.items()},
@@ -209,6 +212,7 @@ def run_pipeline(
         checkpoint()
         chunks_stored = ChunkStore().replace_document(
             chunks, document_id=document_id, session_id=session_id, job_id=job_id,
+            claim_generation=claim_generation,
             processed_document_key=processed_key,
             processing_versions=processing_versions(),
         )
@@ -249,6 +253,7 @@ def run_pipeline(
         "domain_type": chunks["domain_type"],
         "subject": chunks["subject"],
         "structure_file": str(structures_path),
+        "structure_data": chunks,
         "chunk_report_file": str(chunk_report_path),
         "chunk_dump_file": str(chunk_dump_path),
         "timings": {k: round(v, 3) for k, v in timings.items()},

@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import json
 import socket
 import threading
 import time
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any
 
 from billiard.exceptions import SoftTimeLimitExceeded
 from celery import Task
+from psycopg import InterfaceError, OperationalError
 
 from app import config
 from app.cleanup import _delete_pipeline_artifacts
@@ -23,7 +22,10 @@ from app.logging_conf import get_logger, set_job_context, set_request_id
 from app.offline.pipeline import PipelineCancelled, run_pipeline
 from app.offline.parser import ParserError
 from app.offline.chunk_store import ChunkStore
-from app.online.exam_builder import generate_exams
+from app.offline.structure_store import build_structure_payload
+from app.online.exam_builder import (
+    generate_exams, immutable_exam_request, request_fingerprint,
+)
 from app.online.assessment_catalog import CatalogCompilationCancelled
 from app.metrics import increment, observe
 
@@ -134,11 +136,13 @@ class TrackedJobTask(Task):
         if args:
             try:
                 job = repositories.get_job(str(args[0]))
-                if job and job["status"] == "running":
+                generation = getattr(self.request, "claim_generation", None)
+                if job and job["status"] == "running" and generation is not None:
                     repositories.fail_job(
                         str(args[0]),
                         _error_code(exc),
                         _public_error_message(exc, "Background job"),
+                        claim_generation=int(generation),
                     )
             except Exception:
                 logger.exception("Could not persist task failure | task_id=%s", task_id)
@@ -167,6 +171,30 @@ def _error_code(exc: BaseException) -> str:
     return "GENERATION_FAILED"
 
 
+def _is_retryable_generation_error(exc: BaseException) -> bool:
+    """Retry only transport/service failures, never deterministic data defects."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (OperationalError, InterfaceError)):
+            return True
+        current = current.__cause__ or current.__context__
+    return _error_code(exc) in {"TIMEOUT", "PROVIDER_UNAVAILABLE"}
+
+
+def _complete_generation_with_transient_retry(*args, **kwargs) -> bool:
+    """Retry the final idempotent transaction without rerunning paid stages."""
+    for attempt in range(3):
+        try:
+            return repositories.complete_generation_job(*args, **kwargs)
+        except (OperationalError, InterfaceError):
+            if attempt == 2:
+                raise
+            time.sleep(1 << attempt)
+    raise AssertionError("unreachable")
+
+
 def _public_error_message(exc: BaseException, operation: str) -> str:
     code = _error_code(exc)
     if code == "TIMEOUT":
@@ -189,13 +217,16 @@ def _public_error_message(exc: BaseException, operation: str) -> str:
 
 
 @contextmanager
-def _heartbeat(job_id: str):
+def _heartbeat(job_id: str, claim_generation: int):
     stop = threading.Event()
 
     def pulse() -> None:
         while not stop.wait(config.JOB_HEARTBEAT_SECONDS):
             try:
-                repositories.heartbeat_job(job_id)
+                repositories.heartbeat_job(job_id, claim_generation=claim_generation)
+            except repositories.StaleJobExecution:
+                stop.set()
+                return
             except Exception:
                 logger.exception("Job heartbeat failed | job_id=%s", job_id)
 
@@ -206,6 +237,33 @@ def _heartbeat(job_id: str):
     finally:
         stop.set()
         thread.join(timeout=1)
+
+
+class _CheckpointWriter:
+    """Serialize and monotonically number one execution's durable events."""
+
+    def __init__(
+        self, *, job_id: str, exam_id: str, claim_generation: int,
+        request_fingerprint_value: str, revision: int,
+    ) -> None:
+        self.job_id = job_id
+        self.exam_id = exam_id
+        self.claim_generation = claim_generation
+        self.request_fingerprint = request_fingerprint_value
+        self.revision = revision
+        self._lock = threading.Lock()
+
+    def append(self, stage: str, event_type: str, payload: dict[str, Any]) -> None:
+        with self._lock:
+            next_revision = self.revision + 1
+            repositories.append_exam_audit_event(
+                self.exam_id, job_id=self.job_id,
+                claim_generation=self.claim_generation,
+                checkpoint_revision=next_revision,
+                request_fingerprint=self.request_fingerprint,
+                stage=stage, event_type=event_type, payload=payload,
+            )
+            self.revision = next_revision
 
 
 @celery_app.task(
@@ -223,25 +281,28 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
         existing = repositories.get_job(job_id)
         return {"job_id": job_id, "status": (existing or {}).get("status", "missing")}
 
+    claim_generation = int(job["claim_generation"])
+    self.request.claim_generation = claim_generation
     document = repositories.get_document(str(job["document_id"]))
     if document is None:
-        repositories.fail_job(job_id, "DOCUMENT_NOT_FOUND", "Document record is missing")
+        repositories.fail_job(job_id, "DOCUMENT_NOT_FOUND", "Document record is missing", claim_generation=claim_generation)
         return {"job_id": job_id, "status": "failed"}
     set_job_context(job_id, str(document["id"]))
 
     storage = get_file_storage()
     try:
-        repositories.update_job_progress(job_id, "validating", 5)
-        with _heartbeat(job_id):
+        repositories.update_job_progress(job_id, "validating", 5, claim_generation=claim_generation)
+        with _heartbeat(job_id, claim_generation):
             with storage.materialize(str(document["source_storage_key"])) as source_path:
                 validate_pdf(source_path)
-                if repositories.job_is_cancelled(job_id):
+                if repositories.job_is_cancelled(job_id, claim_generation=claim_generation):
                     raise PipelineCancelled("Document processing was cancelled")
                 summary = run_pipeline(
                     source_path,
                     str(document["id"]),
                     session_id=str(document["session_id"]),
                     job_id=job_id,
+                    claim_generation=claim_generation,
                     file_sha256_value=str(document.get("sha256") or "") or None,
                     on_stage=lambda stage: repositories.update_job_progress(
                         job_id, stage, {
@@ -250,22 +311,28 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
                             "detecting_headings": 40,
                             "chunking": 50,
                             "generating_titles": 75,
-                        }.get(stage, 10),
+                        }.get(stage, 10), claim_generation=claim_generation,
                     ),
-                    is_cancelled=lambda: repositories.job_is_cancelled(job_id),
+                    is_cancelled=lambda: repositories.job_is_cancelled(
+                        job_id, claim_generation=claim_generation
+                    ),
                 )
 
-        structure_path = Path(str(summary["structure_file"]))
-        structure = json.loads(structure_path.read_text(encoding="utf-8"))
+        # Use this execution's in-memory result. The diagnostic structure file
+        # is document-scoped and may be rewritten by another indexing attempt.
+        structure = build_structure_payload(
+            str(document["id"]), dict(summary.pop("structure_data"))
+        )
         structure_key = (
             f"sessions/{document['session_id']}/documents/{document['id']}/"
             f"jobs/{job_id}/structure.json"
         )
         storage.put_json(structure_key, structure)
-        if repositories.job_is_cancelled(job_id):
+        if repositories.job_is_cancelled(job_id, claim_generation=claim_generation):
             raise PipelineCancelled("Document processing was cancelled")
         completed = repositories.complete_ingestion_job(
-            job_id, structure_storage_key=structure_key, stats=summary
+            job_id, claim_generation=claim_generation,
+            structure_storage_key=structure_key, stats=summary
         )
         if completed is False:
             return {"job_id": job_id, "status": "cancelled"}
@@ -285,12 +352,15 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
         increment("genexam_jobs", type="document_ingestion", status="cancelled")
         return {"job_id": job_id, "status": "cancelled"}
     except InvalidPdfError as exc:
-        repositories.fail_job(job_id, "INVALID_FILE", str(exc))
+        repositories.fail_job(job_id, "INVALID_FILE", str(exc), claim_generation=claim_generation)
         increment("genexam_jobs", type="document_ingestion", status="failed")
         return {"job_id": job_id, "status": "failed"}
     except SoftTimeLimitExceeded as exc:
-        repositories.fail_job(job_id, "TIMEOUT", "Document processing timed out")
+        repositories.fail_job(job_id, "TIMEOUT", "Document processing timed out", claim_generation=claim_generation)
         raise exc
+    except repositories.StaleJobExecution:
+        logger.warning("Ingestion execution fenced | job_id=%s", job_id)
+        return {"job_id": job_id, "status": "superseded"}
     except Exception as exc:
         logger.error(
             "Ingestion job failed | job_id=%s | error=%s", job_id, exc,
@@ -298,10 +368,10 @@ def ingest_document(self: Task, job_id: str) -> dict[str, Any]:
             extra={"event": "job_failed", "stage": "failed"},
         )
         if self.request.retries < self.max_retries:
-            repositories.retry_job(job_id, _error_code(exc), _public_error_message(exc, "Document processing"))
+            repositories.retry_job(job_id, _error_code(exc), _public_error_message(exc, "Document processing"), claim_generation=claim_generation)
             increment("genexam_jobs", type="document_ingestion", status="retrying")
             raise self.retry(exc=exc, countdown=15 * (2 ** self.request.retries))
-        repositories.fail_job(job_id, _error_code(exc), _public_error_message(exc, "Document processing"))
+        repositories.fail_job(job_id, _error_code(exc), _public_error_message(exc, "Document processing"), claim_generation=claim_generation)
         increment("genexam_jobs", type="document_ingestion", status="failed")
         return {"job_id": job_id, "status": "failed"}
 
@@ -323,6 +393,8 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         existing = repositories.get_job(job_id)
         return {"job_id": job_id, "status": (existing or {}).get("status", "missing")}
 
+    claim_generation = int(job["claim_generation"])
+    self.request.claim_generation = claim_generation
     request_data = dict(job.get("request_data") or {})
     exam_id = str(
         request_data.get("exam_id")
@@ -330,18 +402,42 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         or ""
     )
     if not exam_id:
-        repositories.fail_job(job_id, "EXAM_NOT_FOUND", "Pre-created exam record is missing")
+        repositories.fail_job(job_id, "EXAM_NOT_FOUND", "Pre-created exam record is missing", claim_generation=claim_generation)
         return {"job_id": job_id, "status": "failed"}
     document = repositories.get_document(str(job["document_id"]))
     if document is None:
-        repositories.fail_job(job_id, "DOCUMENT_NOT_FOUND", "Document record is missing")
+        repositories.fail_job(job_id, "DOCUMENT_NOT_FOUND", "Document record is missing", claim_generation=claim_generation)
         return {"job_id": job_id, "status": "failed"}
     set_job_context(job_id, str(document["id"]))
 
     try:
-        repositories.update_job_progress(job_id, "analyzing_request", 5)
+        repositories.update_job_progress(job_id, "analyzing_request", 5, claim_generation=claim_generation)
         tasks = [tuple(item) for item in request_data["tasks"]]
-        with _heartbeat(job_id):
+        immutable_request = immutable_exam_request(
+            job_id=job_id, document_id=str(document["id"]), tasks=tasks,
+            num_models=int(request_data["num_models"]),
+            selected_child_ids=list(request_data["child_ids"]),
+            difficulty=str(request_data["difficulty"]),
+            processed_document_key=str(
+                (document.get("stats") or {}).get("processed_document_key") or ""
+            ) or None,
+            domain_type=str((document.get("stats") or {}).get("domain_type") or "") or None,
+            subject=str((document.get("stats") or {}).get("subject") or "") or None,
+            document_language=str(
+                (document.get("stats") or {}).get("document_language") or ""
+            ) or None,
+        )
+        fingerprint = request_fingerprint(immutable_request)
+        checkpoint_state = repositories.load_generation_checkpoint(
+            job_id, claim_generation=claim_generation,
+            request_fingerprint=fingerprint,
+        )
+        checkpoint_writer = _CheckpointWriter(
+            job_id=job_id, exam_id=exam_id, claim_generation=claim_generation,
+            request_fingerprint_value=fingerprint,
+            revision=int(job.get("checkpoint_revision") or 0),
+        )
+        with _heartbeat(job_id, claim_generation):
             with deadline(config.GENERATION_TIMEOUT_SECONDS, "Exam generation"):
                 result = generate_exams(
                     str(document["id"]),
@@ -360,20 +456,20 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                     subject=str(
                         (document.get("stats") or {}).get("subject") or ""
                     ) or None,
+                    document_language=str(
+                        (document.get("stats") or {}).get("document_language") or ""
+                    ) or None,
+                    job_id=job_id,
                     progress_callback=lambda stage, progress: repositories.update_job_progress(
-                        job_id, stage, progress
+                        job_id, stage, progress, claim_generation=claim_generation
                     ),
-                    audit_callback=lambda stage, event_type, payload: (
-                        repositories.append_exam_audit_event(
-                            exam_id,
-                            stage=stage,
-                            event_type=event_type,
-                            payload=payload,
-                        )
+                    audit_callback=checkpoint_writer.append,
+                    is_cancelled=lambda: repositories.job_is_cancelled(
+                        job_id, claim_generation=claim_generation
                     ),
-                    is_cancelled=lambda: repositories.job_is_cancelled(job_id),
+                    resume_state=checkpoint_state,
                 )
-        if repositories.job_is_cancelled(job_id):
+        if repositories.job_is_cancelled(job_id, claim_generation=claim_generation):
             increment("genexam_jobs", type="exam_generation", status="cancelled")
             return {"job_id": job_id, "status": "cancelled"}
         exams = result.get("exams") or []
@@ -390,8 +486,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             *difficulty_warnings,
         ]
         if shortage_warnings:
-            repositories.append_exam_audit_event(
-                exam_id,
+            checkpoint_writer.append(
                 stage="finalization",
                 event_type="question_shortage",
                 payload={"warnings": shortage_warnings},
@@ -399,6 +494,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         metadata = dict(request_data.get("metadata") or {})
         metadata["document_language"] = result.get("document_language") or "en"
         metadata["quality_summary"] = dict(result.get("quality_summary") or {})
+        metadata["duplicate_quality"] = dict(result.get("duplicate_quality") or {})
         metadata["original_request"] = {
             "total": sum(int(count) for _qtype, count in tasks) * int(request_data["num_models"]),
             "question_counts": {
@@ -414,15 +510,8 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "unrepairable_plan_slots": list(result.get("unrepairable_plan_slots") or []),
             "semantic_identities": list(result.get("semantic_identities") or []),
             "duplicate_repair_history": list(result.get("duplicate_repair_history") or []),
-            "plan_review_history": list(result.get("plan_review_history") or []),
-            "plan_review_attempts": int(result.get("plan_review_attempts") or 0),
-            "plan_review_issues": list(result.get("plan_review_issues") or []),
-            "plan_review_telemetry": list(result.get("plan_review_telemetry") or []),
             "plan_duplicate_repair_attempts": dict(
                 result.get("plan_duplicate_repair_attempts") or {}
-            ),
-            "plan_review_candidate_blacklist": dict(
-                result.get("plan_review_candidate_blacklist") or {}
             ),
             "unresolved_plan_duplicate_conflicts": list(
                 result.get("unresolved_plan_duplicate_conflicts") or []
@@ -439,6 +528,9 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "duplicate_replacement_failures": dict(
                 result.get("duplicate_replacement_failures") or {}
             ),
+            "unresolved_duplicate_conflicts": list(
+                result.get("unresolved_duplicate_conflicts") or []
+            ),
             "validation_repair_history": list(result.get("validation_repair_history") or []),
             "repair_manifest": list(result.get("repair_manifest") or []),
             "repair_replacement_memory": dict(result.get("repair_replacement_memory") or {}),
@@ -453,6 +545,9 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "assessment_catalog_key": result.get("assessment_catalog_key"),
             "assessment_catalog_cache_hit": result.get("assessment_catalog_cache_hit"),
             "assessment_compiler_cache_hit": result.get("assessment_compiler_cache_hit"),
+            "assessment_catalog_compatibility_cache_hit": result.get(
+                "assessment_catalog_compatibility_cache_hit"
+            ),
             "assessment_catalog_usage": result.get("assessment_catalog_usage") or {},
             "slot_lifecycle": dict(result.get("slot_lifecycle") or {}),
             "developer_diagnostics": list(result.get("developer_diagnostics") or []),
@@ -469,8 +564,9 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                 missing.get("slot_id"), missing.get("failure_code"), missing.get("reason"),
             )
         status = "partial" if shortage_warnings or not result.get("complete") else "complete"
-        completed = repositories.complete_generation_job(
+        completed = _complete_generation_with_transient_retry(
             job_id,
+            claim_generation=claim_generation,
             exam_id=exam_id,
             document_id=str(document["id"]),
             session_id=str(job["session_id"]),
@@ -514,20 +610,29 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         increment("genexam_jobs", type="exam_generation", status="cancelled")
         return {"job_id": job_id, "status": "cancelled"}
     except (DeadlineExceeded, SoftTimeLimitExceeded) as exc:
-        repositories.fail_job(job_id, "TIMEOUT", "Generation exceeded its configured time limit")
+        repositories.fail_job(job_id, "TIMEOUT", "Generation exceeded its configured time limit", claim_generation=claim_generation)
         increment("genexam_jobs", type="exam_generation", status="failed")
         raise exc
+    except (repositories.StaleJobExecution, repositories.StaleCheckpoint):
+        logger.warning("Generation execution fenced | job_id=%s", job_id)
+        return {"job_id": job_id, "status": "superseded"}
+    except repositories.InvalidState as exc:
+        repositories.fail_job(
+            job_id, "CHECKPOINT_INCOMPATIBLE", str(exc),
+            claim_generation=claim_generation,
+        )
+        return {"job_id": job_id, "status": "failed"}
     except Exception as exc:
         logger.error(
             "Generation job failed | job_id=%s | error=%s", job_id, exc,
             exc_info=True,
             extra={"event": "job_failed", "stage": "failed"},
         )
-        if self.request.retries < self.max_retries:
-            repositories.retry_job(job_id, _error_code(exc), _public_error_message(exc, "Exam generation"))
+        if self.request.retries < self.max_retries and _is_retryable_generation_error(exc):
+            repositories.retry_job(job_id, _error_code(exc), _public_error_message(exc, "Exam generation"), claim_generation=claim_generation)
             increment("genexam_jobs", type="exam_generation", status="retrying")
             raise self.retry(exc=exc, countdown=15)
-        repositories.fail_job(job_id, _error_code(exc), _public_error_message(exc, "Exam generation"))
+        repositories.fail_job(job_id, _error_code(exc), _public_error_message(exc, "Exam generation"), claim_generation=claim_generation)
         increment("genexam_jobs", type="exam_generation", status="failed")
         return {"job_id": job_id, "status": "failed"}
 

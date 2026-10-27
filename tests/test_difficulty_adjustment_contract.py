@@ -206,7 +206,7 @@ def test_plan_adjustment_input_is_focused_and_excludes_pipeline_metadata(monkeyp
     assert captured["occupied_task_summaries"] == []
 
 
-def test_valid_patch_changes_difficulty_details_but_preserves_owned_identity(monkeypatch):
+def test_unauthorized_givens_patch_is_rejected_and_preserves_instance(monkeypatch):
     state = _state()
     original = deepcopy(state["plans"][0]["items"]["equation"][0])
     response = _successful_response(state)
@@ -223,10 +223,34 @@ def test_valid_patch_changes_difficulty_details_but_preserves_owned_identity(mon
         "student_work_product", "source_chunk_id", "support_chunk_ids",
     ):
         assert item.get(field) == original.get(field)
-    assert item["given_conditions"] == [
-        "Use two supported nested linear transformations."
-    ]
-    assert item["actual_difficulty"] == "hard"
+    assert item["given_conditions"] == original["given_conditions"]
+    assert item["required_givens"] == original["required_givens"]
+    assert item["actual_difficulty"] == "medium"
+
+
+def test_authorized_numeric_patch_creates_traceable_effective_instance(monkeypatch):
+    state = _state()
+    item = state["plans"][0]["items"]["equation"][0]
+    item["variable_givens"] = ["coefficients"]
+    selected = next(
+        value for value in item["permitted_variations"]
+        if value["variation_id"] == item["selected_variation_id"]
+    )
+    selected["numeric_values_may_change"] = True
+    response = _successful_response(state)
+    response["adjusted_fields"]["given_conditions"] = ["-3x + 5 = 17"]
+    monkeypatch.setattr(
+        difficulty_adjustment, "request_structured", lambda *_args, **_kwargs: response
+    )
+
+    result = difficulty_adjustment.adjust_plan_difficulty(state)
+    adjusted = result["plans"][0]["items"]["equation"][0]
+
+    assert adjusted["selected_variation_id"] == item["selected_variation_id"]
+    assert adjusted["effective_givens"] == ["-3x + 5 = 17"]
+    assert adjusted["effective_instance_id"].startswith("derived_")
+    assert adjusted["derived_task_id"] == adjusted["effective_instance_id"]
+    assert adjusted["difficulty_adaptation"]["base_variation_id"] == item["selected_variation_id"]
 
 
 def test_no_op_reasoning_patch_is_rejected_and_original_is_retained(monkeypatch):
@@ -469,6 +493,53 @@ def test_exhausted_adjustment_uses_requested_catalog_fallback(monkeypatch):
     assert item["difficulty_adaptation"]["status"] == "fallback"
 
 
+def test_catalog_fallback_prefers_unused_nearby_level_over_used_exact_level():
+    occupied_easy = deepcopy(_catalog_task())
+    occupied_easy.update({
+        "task_id": "task_easy_occupied", "task_family_id": "family_easy_occupied",
+        "coverage_id": "coverage_easy_occupied", "native_difficulty": "easy",
+        "supported_difficulties": ["easy"], "reasoning_depth": "easy",
+    })
+    failed = deepcopy(_catalog_task())
+    failed.update({
+        "task_id": "task_failed", "task_family_id": "family_failed",
+        "coverage_id": "coverage_failed",
+    })
+    unused_medium = deepcopy(_catalog_task())
+    unused_medium.update({
+        "task_id": "task_medium_unused", "task_family_id": "family_medium_unused",
+        "coverage_id": "coverage_medium_unused",
+    })
+    plans, _issues = assessment_catalog.allocate_catalog_plan(
+        {"tasks": [occupied_easy, failed]}, [("equation", 2)], 1, "easy"
+    )
+    first, second = plans[0]["items"]["equation"]
+    first_slot, second_slot = first["slot_id"], second["slot_id"]
+    plans[0]["items"]["equation"][0] = assessment_catalog.materialize_plan_item(
+        occupied_easy, first_slot, "easy"
+    )
+    plans[0]["items"]["equation"][1] = assessment_catalog.materialize_plan_item(
+        failed, second_slot, "medium"
+    )
+    plans[0]["items"]["equation"][1].update({
+        "adjustment_attempts": 3,
+        "difficulty_adaptation": {
+            "status": "failed", "from_difficulty": "medium",
+            "to_difficulty": "easy", "failed_strategies": ["declined"],
+        },
+    })
+
+    difficulty_adjustment._apply_catalog_fallbacks(
+        plans, {"tasks": [occupied_easy, failed, unused_medium]}, "easy"
+    )
+
+    replacement = plans[0]["items"]["equation"][1]
+    assert replacement["base_catalog_task_id"] == "task_medium_unused"
+    assert replacement["actual_difficulty"] == "medium"
+    assert replacement["difficulty_adaptation"]["status"] == "fallback"
+    assert replacement["difficulty_fallback_reason"]
+
+
 @pytest.mark.parametrize(
     ("native", "requested"),
     [("medium", "easy"), ("easy", "medium"), ("easy", "hard"), ("hard", "easy")],
@@ -499,7 +570,7 @@ def test_fallback_preserves_native_level_and_routes_to_adjustment(native, reques
     ) == []
     assert graph._route_after_plan({
         "plans": plans, "plan_errors": [], "planning_issues": [], "plan_attempts": 1,
-    }) == "review_plan"
+    }) == "adjust_plan_difficulty"
 
 
 def test_mixed_allocation_preserves_native_levels_without_pending_adjustment():
@@ -590,7 +661,7 @@ def test_failed_job_ten_slot_shape_is_pending_adjustment_not_plan_repair():
     assert all((item["difficulty_adaptation"] or {}).get("status") == "pending" for item in items)
     assert graph._route_after_plan({
         "plans": plans, "plan_errors": [], "planning_issues": [], "plan_attempts": 1,
-    }) == "review_plan"
+    }) == "adjust_plan_difficulty"
 
 
 def _generated_equation_response(*, evidence_support=None) -> dict:
@@ -627,6 +698,11 @@ def _generated_adjustment_state() -> tuple[dict, dict, dict]:
     plan = {
         "requested_difficulty": "hard", "actual_difficulty": "medium",
         "source_chunk_id": "chunk-main", "support_chunk_ids": ["chunk-support"],
+        "task_id": "task-equation", "selected_variation_id": "variation-equation",
+        "variable_givens": ["coefficients"],
+        "permitted_variations": [{
+            "variation_id": "variation-equation", "numeric_values_may_change": True,
+        }],
     }
     question = {
         "slot_id": "m1_equation_1", "question_id": "q-original",
@@ -653,6 +729,8 @@ def test_generated_adjustment_uses_strict_decision_and_preserves_question_id(mon
     assert audit["verification_pending"] is True
     assert audit["evidence_support"] == ["chunk-main", "chunk-support"]
     assert audit["changed_reasoning_requirements"]
+    assert adjusted["effective_instance_id"].startswith("derived_")
+    assert audit["effective_instance_id"] == adjusted["effective_instance_id"]
     assert all(audit["acceptance_checks"].values())
 
 

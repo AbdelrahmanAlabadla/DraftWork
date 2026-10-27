@@ -85,6 +85,64 @@ def test_catalog_compiles_once_then_reuses_exact_selection(monkeypatch, tmp_path
     assert first["assessment_catalog_key"] == second["assessment_catalog_key"]
 
 
+def test_same_version_compatible_catalog_is_migrated_without_provider_call(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(catalog.config, "ASSESSMENT_CATALOG_CACHE_DIR", str(tmp_path))
+    calls = []
+    monkeypatch.setattr(
+        catalog, "create_assessment_compiler_client",
+        lambda **_kwargs: SimpleNamespace(last_usage={}),
+    )
+    monkeypatch.setattr(catalog, "request_structured", lambda *_args, **_kwargs: calls.append(1) or {
+        "assessment_profile": _profile("c1"),
+        "tasks": [{
+            "knowledge_anchor": "work equals force times displacement along force",
+            "concept": "mechanical work", "relationship": "W = F d cos theta",
+            "task_operation": "explain", "student_work_product": "explanation",
+            "target": "meaning of work", "reasoning_mode": "conceptual_reasoning",
+            "allowed_question_types": ["why"], "evidence_chunk_ids": ["c1"],
+            "required_givens": [], "allowed_variations": [], "variable_givens": [],
+            "complexity_boundaries": [], "exact_source_instance": False,
+            "scenario_family": None, "text_answerable": True,
+            "native_difficulty": "medium", "prerequisites": [],
+        }],
+        "fitb_bank": [], "batch_complete": True,
+    })
+    state = {
+        "processed_document_key": "processed-compatible", "document_id": "doc",
+        "retrieved_chunks": [{
+            "child_id": "c1", "parent_id": "p1", "child_order": 1,
+            "content": "Work is W = Fd cos theta.",
+        }],
+        "document_language": "en", "domain_type": "stem", "subject": "mathematics",
+    }
+    first = catalog.prepare_assessment_catalog(state)
+    exact_path = catalog._path_for(first["assessment_catalog_key"])
+    legacy_path = tmp_path / "ff" / ("f" * 64 + ".json")
+    legacy_path.parent.mkdir(parents=True)
+    payload = json.loads(exact_path.read_text(encoding="utf-8"))
+    payload["cache_key"] = "f" * 64
+    legacy_path.write_text(json.dumps(payload), encoding="utf-8")
+    exact_path.unlink()
+    for compiler_file in (tmp_path / "compiler").rglob("*.json"):
+        compiler_file.unlink()
+
+    monkeypatch.setattr(
+        catalog, "request_structured",
+        lambda *_args, **_kwargs: pytest.fail("compatible Catalog must not call a provider"),
+    )
+    migrated = catalog.prepare_assessment_catalog(state)
+
+    assert calls == [1]
+    assert migrated["assessment_catalog_cache_hit"] is True
+    assert migrated["assessment_compiler_cache_hit"] is True
+    assert migrated["assessment_catalog_compatibility_cache_hit"] is True
+    assert migrated["assessment_catalog"]["compiler_usage"] == {
+        "source": "compatible_finalized_catalog", "provider_calls": 0,
+    }
+
+
 def test_completed_empty_selection_returns_clear_insufficient_content(monkeypatch, tmp_path):
     monkeypatch.setattr(catalog.config, "ASSESSMENT_CATALOG_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(
@@ -933,10 +991,24 @@ def test_variation_ids_evidence_inheritance_and_question_type_union():
     )
     task = finalized["tasks"][0]
     assert set(task["allowed_question_types"]) == {"equation", "word_problem", "mcq"}
-    assert len({v["variation_id"] for v in task["allowed_variations"]}) == 2
-    assert task["allowed_variations"][0]["evidence_chunk_ids"] == ["chunk_12"]
-    assert task["allowed_variations"][1]["evidence_chunk_ids"] is None
-    inherited = catalog.permitted_task_variations(task, "word_problem")[1]
+    assert len({v["variation_id"] for v in task["allowed_variations"]}) == 3
+    assert all(len(v["question_types"]) == 1 for v in task["allowed_variations"])
+    grouped = {}
+    for variation in task["allowed_variations"]:
+        grouped.setdefault(variation["variation_group_id"], set()).update(
+            variation["question_types"]
+        )
+    assert {"mcq", "word_problem"} in grouped.values()
+    initial_balance = [
+        value for value in task["allowed_variations"]
+        if value["target"] == "initial balance"
+    ]
+    assert all(value["evidence_chunk_ids"] == ["chunk_12"] for value in initial_balance)
+    inherited = next(
+        value for value in catalog.permitted_task_variations(task, "word_problem")
+        if value["target"] == "meeting count until zero balance"
+    )
+    assert inherited["evidence_chunk_ids"] is None
     assert inherited["target"] == "meeting count until zero balance"
 
 
@@ -979,6 +1051,77 @@ def test_generator_binds_compatible_variation_and_effective_evidence():
     assert _bind_selected_variation(
         {"selected_variation_id": chosen["variation_id"]}, plan, "equation"
     ) is False
+    other = next(
+        v for v in plan["permitted_variations"]
+        if v["variation_id"] != plan["selected_variation_id"]
+    )
+    assert _bind_selected_variation(
+        {"selected_variation_id": other["variation_id"]}, plan, "word_problem"
+    ) is False
+
+
+def test_materialize_binds_self_contained_variation_when_primary_lacks_givens():
+    task = {
+        "task_id": "task_points", "task_family_id": "family_points",
+        "coverage_id": "coverage_points", "concept_id": "concept_points",
+        "knowledge_anchor": "distance between points",
+        "concept": "coordinate geometry", "relationship": None,
+        "task_operation": "derive_distance", "student_work_product": "distance",
+        "target": "distance between two points",
+        "reasoning_mode": "symbolic_manipulation",
+        "allowed_question_types": ["mcq"], "primary_question_types": ["mcq"],
+        "evidence_chunk_ids": ["c1"], "required_givens": [],
+        "allowed_variations": [{
+            "target": "distance between (3, 2) and (-3, 5)",
+            "operation": "calculate_distance",
+            "givens": ["points (3, 2) and (-3, 5)"],
+            "question_types": ["mcq"],
+            "reasoning_mode": "calculation",
+            "student_work_product": "distance",
+        }],
+        "scenario_family": None, "text_answerable": True,
+    }
+
+    item = catalog.materialize_plan_item(task, "m1_mcq_1", "medium")
+
+    assert item["selected_variation_id"] == next(
+        value["variation_id"] for value in item["permitted_variations"]
+        if value["target"] == "distance between (3, 2) and (-3, 5)"
+    )
+    assert item["target"] == "distance between (3, 2) and (-3, 5)"
+    assert item["task_operation"] == "calculate_distance"
+    assert item["given_conditions"] == ["points (3, 2) and (-3, 5)"]
+
+
+def test_materialize_prefers_visual_variation_with_text_givens():
+    task = {
+        "task_id": "task_graph", "task_family_id": "family_graph",
+        "coverage_id": "coverage_graph", "concept_id": "concept_graph",
+        "knowledge_anchor": "linear equations from graphs",
+        "concept": "linear equations", "relationship": None,
+        "task_operation": "interpret_graph", "student_work_product": "equation",
+        "target": "equation represented by the graph",
+        "reasoning_mode": "representation_interpretation",
+        "allowed_question_types": ["mcq"], "primary_question_types": ["mcq"],
+        "evidence_chunk_ids": ["c1"], "required_givens": [],
+        "allowed_variations": [{
+            "target": "equation 2x - 6y = 12",
+            "operation": "interpret_equation",
+            "givens": ["the graph shows 2x - 6y = 12"],
+            "question_types": ["mcq"],
+            "reasoning_mode": "representation_interpretation",
+            "student_work_product": "equation",
+        }],
+        "scenario_family": None, "text_answerable": True,
+    }
+
+    item = catalog.materialize_plan_item(task, "m1_mcq_1", "medium")
+
+    assert item["selected_variation_id"] == next(
+        value["variation_id"] for value in item["permitted_variations"]
+        if value["target"] == "equation 2x - 6y = 12"
+    )
+    assert item["given_conditions"] == ["the graph shows 2x - 6y = 12"]
 
 
 def test_arabic_variation_metadata_and_evidence_are_preserved():
@@ -1009,3 +1152,66 @@ def test_identity_is_stable_when_unordered_restriction_lists_are_reordered():
         catalog._normalize_variations([variation])[0]["variation_id"]
         == catalog._normalize_variations([reversed_givens])[0]["variation_id"]
     )
+
+
+def test_profile_uses_effective_type_specific_variation_operation():
+    task = _family_task_with_variations()
+    finalized = catalog._finalize_catalog(
+        {"assessment_profile": _profile("chunk_12"), "tasks": [task]},
+        key="catalog", processed_document_key="processed",
+        selected_chunk_ids=["chunk_12", "chunk_13"], usage=None,
+    )
+    profile = finalized["assessment_profile"]["question_types"]
+    assert "calculate" in profile["word_problem"]["task_operations"]
+    assert "calculate" in profile["mcq"]["task_operations"]
+    assert "model_linear_balance" not in profile["word_problem"]["task_operations"]
+
+
+def test_planner_score_curves_and_conservative_normalization():
+    variation = {
+        "target": "Solve linear equations", "application": None,
+        "variation_group_id": "group-1",
+    }
+    task = {"native_difficulty": "medium", "scenario_family": None}
+    expected_task = [30, 20, 12, 6, 0]
+    expected_variation = [20, 12, 5, 0, 0]
+    for uses in range(5):
+        scored = catalog.score_task_variation_candidate(
+            task, variation, requested_difficulty="medium",
+            task_uses=uses, variation_group_uses=uses,
+        )
+        assert scored["components"]["task_reuse"] == expected_task[uses]
+        assert scored["components"]["variation_reuse"] == expected_variation[uses]
+    assert catalog.score_task_variation_candidate(
+        {**task, "native_difficulty": "easy"}, variation,
+        requested_difficulty="medium",
+    )["components"]["difficulty"] == 8
+    assert catalog.score_task_variation_candidate(
+        {**task, "native_difficulty": "hard"}, variation,
+        requested_difficulty="easy",
+    )["components"]["difficulty"] == 2
+    assert catalog.score_task_variation_candidate(
+        task, {"target": None, "application": None}, requested_difficulty="mix",
+    )["components"] == {
+        "task_reuse": 30, "difficulty": 0, "scenario_diversity": 10,
+        "target_diversity": 7, "variation_reuse": 20,
+    }
+    assert (
+        catalog.normalize_planner_diversity_text("Solve linear equations")
+        == catalog.normalize_planner_diversity_text("Solving linear equations")
+    )
+    assert (
+        catalog.normalize_planner_diversity_text("حَلُّ المُعَادَلاتِ الخطية")
+        == catalog.normalize_planner_diversity_text("حل المعادلات الخطية")
+    )
+    assert catalog.normalize_planner_diversity_text("x + 1") != catalog.normalize_planner_diversity_text("x - 1")
+
+
+def test_variation_scoping_is_idempotent_for_reuse_counting():
+    task = _family_task_with_variations()
+    task.update(catalog.canonical_task_ids(task) or {})
+    first = catalog.permitted_task_variations(task)
+    second = catalog.permitted_task_variations({**task, "allowed_variations": first})
+    assert [value["variation_group_id"] for value in first] == [
+        value["variation_group_id"] for value in second
+    ]

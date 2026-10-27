@@ -123,6 +123,53 @@ def test_retrieve_selected_no_chunks_returns_error(monkeypatch):
     assert out["context"] == ""
 
 
+def test_retrieve_selected_rejects_a_partial_result(monkeypatch):
+    class Store:
+        def get_by_child_ids(self, document_id, child_ids):
+            return [_child("c1", "S", None, "one")]
+
+    monkeypatch.setattr("app.online.retrieval.ChunkStore", Store)
+    out = retrieve_selected("doc", ["c1", "c2"])
+    assert out["retrieved_chunks"] == []
+    assert "c2" in out["error"]
+
+
+def test_retrieve_selected_recovers_missing_chunks_from_exact_cache(monkeypatch):
+    calls = {"reads": 0, "replaced": False}
+
+    class Store:
+        def get_by_child_ids(self, document_id, child_ids, **kwargs):
+            calls["reads"] += 1
+            if calls["reads"] == 1:
+                return [_child("c1", "S", None, "one")]
+            return [
+                _child("c1", "S", None, "one"),
+                _child("c2", "S", None, "two"),
+            ]
+
+        def replace_document(self, structure, **kwargs):
+            calls["replaced"] = True
+
+    monkeypatch.setattr("app.online.retrieval.ChunkStore", Store)
+    monkeypatch.setattr(
+        "app.online.retrieval.load_processed_document_by_key",
+        lambda key: {
+            "structure": {
+                "parents": [],
+                "children": [
+                    {**_child("c1", "S", None, "one"), "document_id": "doc"},
+                    {**_child("c2", "S", None, "two"), "document_id": "doc"},
+                ],
+            },
+            "processing_versions": {"chunker": "current"},
+        },
+    )
+    out = retrieve_selected("doc", ["c1", "c2"], processed_document_key="exact")
+    assert out["error"] is None
+    assert [row["child_id"] for row in out["retrieved_chunks"]] == ["c1", "c2"]
+    assert calls["replaced"] is True
+
+
 def test_retrieve_context_passes_selected_ids(monkeypatch):
     class Store:
         def get_by_child_ids(self, document_id, child_ids):

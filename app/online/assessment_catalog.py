@@ -105,7 +105,7 @@ def is_authorized_catalog_exhaustion_reuse(item: dict[str, Any]) -> bool:
         and item.get("reuse_reason") == "no_unused_compatible_task"
         and item.get("reused_due_to_catalog_exhaustion") is True
         and item.get("catalog_replacement_stage") in {
-            "reused_task_after_catalog_exhaustion", "plan_review_intentional_reuse",
+            "reused_task_after_catalog_exhaustion", "deterministic_intentional_reuse",
             "semantic_plan_repair_intentional_reuse",
         }
         and str(item.get("reused_task_id") or "") == task_id
@@ -150,7 +150,7 @@ def is_authorized_fitb_entry_reuse(item: dict[str, Any]) -> bool:
         and item.get("reuse_reason") == "no_unused_compatible_fitb_entry"
         and item.get("catalog_replacement_stage") in {
             "reused_fitb_entry_after_bank_exhaustion",
-            "plan_review_intentional_reuse",
+            "deterministic_intentional_reuse",
         }
         and str(item.get("reused_fitb_entry_id") or "") == entry_id
         and item.get("required_instance_distinctions")
@@ -206,6 +206,8 @@ def compatible_task_inventory(
             "reuse_reason": "no_unused_compatible_fitb_entry" if not unused_ids and compatible_ids else None,
         }
     indexed_ids = set((catalog.get("tasks_by_question_type") or {}).get(qtype) or [])
+    profile = catalog.get("assessment_profile") or {}
+    valid_chunks = set(map(str, catalog.get("selected_chunk_ids") or [])) or None
     compatible_ids = {
         str(task.get("task_id"))
         for task in catalog.get("tasks") or []
@@ -213,6 +215,9 @@ def compatible_task_inventory(
         and (
             str(task.get("task_id")) in indexed_ids
             if indexed_ids else qtype in (task.get("allowed_question_types") or [])
+        )
+        and eligible_task_variation_candidates(
+            task, qtype, assessment_profile=profile, valid_chunk_ids=valid_chunks,
         )
         and _difficulty_for(task, requested_difficulty) is not None
     }
@@ -364,7 +369,7 @@ class CompactCatalogBatchWithProfileResponse(StrictOutputModel):
     batch_complete: Literal[True]
 
 
-CATALOG_CONTRACT_VERSION = "catalog-v11-task-family-variations"
+CATALOG_CONTRACT_VERSION = "catalog-v13-numerical-givens-contract"
 CATALOG_BATCHING_VERSION = "parent-pairs-v1"
 
 
@@ -467,6 +472,10 @@ def _validate_completed_batch(
         evidence = set(map(str, task.get("evidence_chunk_ids") or []))
         if not evidence or not evidence.issubset(valid_chunk_ids):
             raise ValueError("task evidence IDs are outside this compiler batch")
+        for variation in task.get("allowed_variations") or []:
+            variation_evidence = set(map(str, variation.get("evidence_chunk_ids") or []))
+            if variation_evidence and not variation_evidence.issubset(valid_chunk_ids):
+                raise ValueError("variation evidence IDs are outside this compiler batch")
     for entry in normalized.get("fitb_bank") or []:
         if str(entry.get("evidence_chunk_id") or "") not in valid_chunk_ids:
             raise ValueError("FITB evidence ID is outside this compiler batch")
@@ -616,7 +625,7 @@ def apply_canonical_task_ids(item: dict[str, Any]) -> bool:
 
 
 def _normalize_variations(values: Any) -> list[dict[str, Any]]:
-    """Normalize, identify, and merge semantically identical assessment angles."""
+    """Normalize legacy/multi-type angles into grouped, type-specific variations."""
     normalized: dict[str, dict[str, Any]] = {}
     for value in values or []:
         if hasattr(value, "model_dump"):
@@ -627,33 +636,45 @@ def _normalize_variations(values: Any) -> list[dict[str, Any]]:
             variation = TaskVariation.model_validate(value).model_dump()
         except ValidationError:
             continue
-        variation_id = _stable_id(
-            "variation", variation.get("target"), variation.get("operation"),
+        question_types = list(dict.fromkeys(variation.get("question_types") or []))
+        supplied_group = str(variation.get("variation_group_id") or "")
+        group_id = (
+            supplied_group if supplied_group.startswith("variation_group_")
+            else _stable_id("variation_group", supplied_group) if supplied_group
+            else _stable_id(
+            "variation_group", variation.get("target"), variation.get("operation"),
             sorted(_normalized(value) for value in variation.get("givens") or []),
             variation.get("reasoning_mode") or "",
             variation.get("student_work_product") or "",
             variation.get("representation") or "", variation.get("application") or "",
             variation.get("numeric_values_may_change", False),
+            )
         )
-        variation["variation_id"] = variation_id
-        existing = normalized.get(variation_id)
-        if existing is None:
-            normalized[variation_id] = variation
-            continue
-        existing["question_types"] = list(dict.fromkeys([
-            *(existing.get("question_types") or []),
-            *(variation.get("question_types") or []),
-        ]))
-        evidence = list(dict.fromkeys([
-            *(existing.get("evidence_chunk_ids") or []),
-            *(variation.get("evidence_chunk_ids") or []),
-        ]))
-        existing["evidence_chunk_ids"] = evidence or None
+        # Persisted pre-v12 catalogs did not bind variations to a question
+        # type. Preserve those angles for display/migration, while excluding
+        # them from typed eligibility until a primary typed contract is built.
+        typed_question_types: list[str | None] = question_types or [None]
+        for question_type in typed_question_types:
+            typed = {**variation, "question_types": [question_type],
+                     "variation_group_id": group_id}
+            if question_type is None:
+                typed["question_types"] = []
+            variation_id = _stable_id("variation", group_id, question_type or "legacy")
+            typed["variation_id"] = variation_id
+            existing = normalized.get(variation_id)
+            if existing is None:
+                normalized[variation_id] = typed
+                continue
+            evidence = list(dict.fromkeys([
+                *(existing.get("evidence_chunk_ids") or []),
+                *(typed.get("evidence_chunk_ids") or []),
+            ]))
+            existing["evidence_chunk_ids"] = evidence or None
     return list(normalized.values())
 
 
-def _primary_variation(task: dict[str, Any]) -> dict[str, Any]:
-    """Expose the compatible primary angle as a selectable, stable variation."""
+def _primary_variations(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose one type-specific primary variation for every declared type."""
     primary = {
         "target": task.get("target"),
         "operation": task.get("task_operation"),
@@ -668,18 +689,74 @@ def _primary_variation(task: dict[str, Any]) -> dict[str, Any]:
     }
     normalized = _normalize_variations([primary])
     if normalized:
-        return normalized[0]
+        return normalized
     # Legacy/test plans may carry a free-form reasoning label from the pre-contract era.
     primary["reasoning_mode"] = None
     normalized = _normalize_variations([primary])
     if normalized:
-        return normalized[0]
+        return normalized
     primary["student_work_product"] = None
-    return _normalize_variations([primary])[0]
+    return _normalize_variations([primary])
+
+
+def _primary_variation(task: dict[str, Any]) -> dict[str, Any]:
+    """Compatibility helper for callers that need the first primary angle."""
+    return _primary_variations(task)[0]
+
+
+def _scope_variations(
+    task: dict[str, Any], variations: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Make group and type-specific IDs stable within their owning task."""
+    task_id = str(task.get("task_id") or "")
+    if not task_id:
+        return variations
+    scoped: list[dict[str, Any]] = []
+    for variation in variations:
+        qtypes = list(variation.get("question_types") or [])
+        if len(qtypes) > 1:
+            continue
+        # Recompute from semantic fields rather than wrapping a previously
+        # generated group ID. This makes scoping idempotent across cache load,
+        # allocation, repair, and resume while retaining cross-type grouping.
+        group_id = _stable_id(
+            "variation_group", task_id, variation.get("target"),
+            variation.get("operation"),
+            sorted(_normalized(value) for value in variation.get("givens") or []),
+            variation.get("reasoning_mode") or "",
+            variation.get("student_work_product") or "",
+            variation.get("representation") or "", variation.get("application") or "",
+            variation.get("numeric_values_may_change", False),
+        )
+        scoped.append({
+            **variation,
+            "variation_group_id": group_id,
+            "variation_id": _stable_id(
+                "variation", group_id, qtypes[0] if qtypes else "legacy"
+            ),
+        })
+    return scoped
 
 
 def permitted_task_variations(task: dict[str, Any], question_type: str | None = None) -> list[dict[str, Any]]:
-    variations = [_primary_variation(task), *_normalize_variations(task.get("allowed_variations"))]
+    scoped = _scope_variations(task, [
+        *_primary_variations(task), *_normalize_variations(task.get("allowed_variations"))
+    ])
+    # A finalized task may already contain its primary variation in
+    # allowed_variations.  Keep this operation idempotent across cache loads.
+    by_id: dict[str, dict[str, Any]] = {}
+    for variation in scoped:
+        variation_id = str(variation.get("variation_id") or "")
+        existing = by_id.get(variation_id)
+        if existing is None:
+            by_id[variation_id] = variation
+            continue
+        evidence = list(dict.fromkeys([
+            *(existing.get("evidence_chunk_ids") or []),
+            *(variation.get("evidence_chunk_ids") or []),
+        ]))
+        existing["evidence_chunk_ids"] = evidence or None
+    variations = list(by_id.values())
     if question_type:
         variations = [
             variation for variation in variations
@@ -688,11 +765,449 @@ def permitted_task_variations(task: dict[str, Any], question_type: str | None = 
     return variations
 
 
+def eligible_task_variations(
+    task: dict[str, Any], question_type: str, *,
+    variations: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Return the single shared eligibility contract for every planning path."""
+    if question_type not in (task.get("allowed_question_types") or []):
+        return []
+    if task.get("text_answerable") is False:
+        return []
+    parent_evidence = [str(value) for value in task.get("evidence_chunk_ids") or [] if value]
+    eligible: list[dict[str, Any]] = []
+    permitted = variations if variations is not None else permitted_task_variations(task)
+    for variation in permitted:
+        if question_type not in (variation.get("question_types") or []):
+            continue
+        operation = str(variation.get("operation") or task.get("task_operation") or "").strip()
+        target = str(variation.get("target") or task.get("target") or "").strip()
+        mode = str(variation.get("reasoning_mode") or task.get("reasoning_mode") or "")
+        givens = [str(value).strip() for value in variation.get("givens") or [] if str(value).strip()]
+        relationship = str(task.get("relationship") or "").strip()
+        evidence = variation.get("evidence_chunk_ids")
+        effective_evidence = parent_evidence if evidence is None else [
+            str(value) for value in evidence if value
+        ]
+        if not operation or not target or not effective_evidence:
+            continue
+        if mode in _RELATIONSHIP_VARIATION_MODES and not (relationship or givens):
+            continue
+        if _has_visual_dependency(_variation_idea(task, variation)) and not givens:
+            continue
+        eligible.append(variation)
+    return eligible
+
+
+PLANNER_SCORE_WEIGHTS = {
+    "task_reuse": 30, "difficulty": 15, "scenario_diversity": 20,
+    "target_diversity": 15, "variation_reuse": 20,
+}
+_TASK_REUSE_POINTS = (30, 20, 12, 6)
+_SCENARIO_REUSE_POINTS = (20, 12, 6)
+_TARGET_REUSE_POINTS = (15, 9, 4)
+_VARIATION_REUSE_POINTS = (20, 12, 5)
+_DIFFICULTY_ORDER = {"easy": 0, "medium": 1, "hard": 2}
+_ARABIC_DIACRITICS_RE = re.compile(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed]")
+
+
+def normalize_planner_diversity_text(value: Any) -> str:
+    """Conservatively normalize scenario/target labels for equality-only counts."""
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = _ARABIC_DIACRITICS_RE.sub("", text)
+    text = text.translate(str.maketrans({
+        "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي", "ـ": "",
+    }))
+    # Preserve arithmetic/comparison operators so normalization cannot merge
+    # mathematically different targets such as x + 1 and x - 1.
+    tokens = re.findall(r"[\w\u0600-\u06ff]+|[+\-*/=<>≤≥≠]", text, flags=re.UNICODE)
+    normalized: list[str] = []
+    for token in tokens:
+        # A bounded English inflection fold keeps this dependency-free and
+        # deliberately avoids semantic or fuzzy matching.
+        if token.isascii() and token.isalpha():
+            if token.endswith("ing") and len(token) > 5:
+                stem = token[:-3]
+                if len(stem) > 2 and stem[-1:] == stem[-2:-1]:
+                    stem = stem[:-1]
+                token = stem + ("e" if stem.endswith("v") else "")
+            elif token.endswith("ies") and len(token) > 4:
+                token = token[:-3] + "y"
+            elif token.endswith("s") and not token.endswith("ss") and len(token) > 3:
+                token = token[:-1]
+        normalized.append(token)
+    return " ".join(normalized)
+
+
+def _curve(points: tuple[int, ...], uses: int) -> int:
+    return points[uses] if 0 <= uses < len(points) else 0
+
+
+def score_task_variation_candidate(
+    task: dict[str, Any], variation: dict[str, Any], *, requested_difficulty: str,
+    task_uses: int = 0, scenario_uses: int = 0, target_uses: int = 0,
+    variation_group_uses: int = 0,
+) -> dict[str, Any]:
+    """Return the central, explainable 0-100 Planner preference score."""
+    native = str(_native_difficulty(task) or "medium")
+    requested = str(requested_difficulty or "mix")
+    difficulty_points = 0
+    if requested in _DIFFICULTY_ORDER and native in _DIFFICULTY_ORDER:
+        difficulty_points = {0: 15, 1: 8, 2: 2}[
+            abs(_DIFFICULTY_ORDER[requested] - _DIFFICULTY_ORDER[native])
+        ]
+    scenario = variation.get("application")
+    if scenario is None:
+        scenario = task.get("scenario_family")
+    target = variation.get("target") or task.get("target")
+    parts = {
+        "task_reuse": _curve(_TASK_REUSE_POINTS, int(task_uses)),
+        "difficulty": difficulty_points,
+        "scenario_diversity": (
+            _curve(_SCENARIO_REUSE_POINTS, int(scenario_uses))
+            if normalize_planner_diversity_text(scenario) else 10
+        ),
+        "target_diversity": (
+            _curve(_TARGET_REUSE_POINTS, int(target_uses))
+            if normalize_planner_diversity_text(target) else 7
+        ),
+        "variation_reuse": _curve(
+            _VARIATION_REUSE_POINTS, int(variation_group_uses)
+        ),
+    }
+    return {"score": sum(parts.values()), "components": parts}
+
+
+def eligible_task_variation_candidates(
+    task: dict[str, Any], question_type: str, *,
+    assessment_profile: dict[str, Any] | None = None,
+    valid_chunk_ids: set[str] | None = None,
+    variations: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Apply the shared hard filter and return materializable variations."""
+    if task.get("text_answerable") is not True:
+        return []
+    type_profile = (
+        ((assessment_profile or {}).get("question_types") or {}).get(question_type) or {}
+    )
+    allowed_operations = set(map(str, type_profile.get("task_operations") or []))
+    parent_evidence = [str(value) for value in task.get("evidence_chunk_ids") or [] if value]
+    candidates: list[dict[str, Any]] = []
+    for variation in eligible_task_variations(
+        task, question_type, variations=variations,
+    ):
+        operation = str(variation.get("operation") or task.get("task_operation") or "").strip()
+        target = str(variation.get("target") or task.get("target") or "").strip()
+        product = str(
+            variation.get("student_work_product") or task.get("student_work_product") or ""
+        ).strip()
+        mode = str(variation.get("reasoning_mode") or task.get("reasoning_mode") or "").strip()
+        evidence_value = variation.get("evidence_chunk_ids")
+        evidence = parent_evidence if evidence_value is None else [
+            str(value) for value in evidence_value if value
+        ]
+        if not all((operation, target, product, mode, evidence)):
+            continue
+        if allowed_operations and operation not in allowed_operations:
+            continue
+        if valid_chunk_ids is not None and any(value not in valid_chunk_ids for value in evidence):
+            continue
+        candidates.append(variation)
+    return candidates
+
+
 def selected_variation(task: dict[str, Any], variation_id: str, question_type: str) -> dict[str, Any] | None:
+    permitted = task.get("permitted_variations")
+    if isinstance(permitted, list) and permitted:
+        return next((
+            variation for variation in permitted
+            if variation.get("variation_id") == variation_id
+            and question_type in (variation.get("question_types") or [])
+        ), None)
     return next((
         variation for variation in permitted_task_variations(task, question_type)
         if variation.get("variation_id") == variation_id
     ), None)
+
+
+def _normalized_parameter(value: Any) -> str:
+    return " ".join(str(value or "").casefold().replace("%", " ").split())
+
+
+def catalog_numerical_contract_diagnostics(task: dict[str, Any]) -> list[dict[str, Any]]:
+    """Find deterministic cross-field contradictions without guessing semantics."""
+    required = [str(value) for value in task.get("required_givens") or []]
+    variables = [str(value) for value in task.get("variable_givens") or []]
+    numeric_required = [value for value in required if any(ch.isdigit() for ch in value)]
+    overlaps = [
+        value for value in numeric_required
+        if any(
+            _normalized_parameter(variable)
+            and _normalized_parameter(variable) in _normalized_parameter(value)
+            for variable in variables
+        )
+    ]
+    diagnostics: list[dict[str, Any]] = []
+    if overlaps:
+        diagnostics.append({
+            "code": "required_variable_numeric_overlap",
+            "fields": ["required_givens", "variable_givens"],
+            "values": overlaps,
+        })
+    variations = _normalize_variations(task.get("allowed_variations"))
+    numeric_freedom = any(value.get("numeric_values_may_change") for value in variations)
+    if task.get("exact_source_instance") is True and (overlaps or numeric_freedom):
+        diagnostics.append({
+            "code": "exact_instance_numeric_variation_conflict",
+            "fields": ["exact_source_instance", "variable_givens", "allowed_variations"],
+        })
+    return diagnostics
+
+
+def _repair_catalog_numerical_contract(task: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Repair only the mechanically provable overlap; quarantine all other contradictions."""
+    value = deepcopy(task)
+    diagnostics = catalog_numerical_contract_diagnostics(value)
+    overlap = next((item for item in diagnostics
+                    if item["code"] == "required_variable_numeric_overlap"), None)
+    if overlap:
+        moved = list(overlap.get("values") or [])
+        value["required_givens"] = [
+            item for item in value.get("required_givens") or [] if str(item) not in set(moved)
+        ]
+        value["source_example_givens"] = list(dict.fromkeys([
+            *(value.get("source_example_givens") or []), *moved,
+        ]))
+        # When every concrete numeric required given names an already-declared
+        # variable parameter, exactness is contradicted by the task's own data.
+        remaining_numeric = [
+            item for item in value.get("required_givens") or []
+            if any(ch.isdigit() for ch in str(item))
+        ]
+        if value.get("exact_source_instance") is True and not remaining_numeric:
+            value["exact_source_instance"] = False
+        diagnostics.append({
+            "code": "safe_numeric_parameter_normalization",
+            "disposition": "repaired",
+            "moved_to_source_example_givens": moved,
+        })
+    # Exact-instance tasks cannot authorize changed numbers. Disabling that
+    # permission is deterministic and preserves the exact source exercise.
+    if value.get("exact_source_instance") is True:
+        changed = False
+        normalized_variations = []
+        for variation in _normalize_variations(value.get("allowed_variations")):
+            variation = deepcopy(variation)
+            if variation.get("numeric_values_may_change"):
+                variation["numeric_values_may_change"] = False
+                changed = True
+            normalized_variations.append(variation)
+        if changed:
+            value["allowed_variations"] = normalized_variations
+            diagnostics.append({
+                "code": "exact_instance_numeric_variation_disabled",
+                "disposition": "repaired",
+            })
+    remaining = catalog_numerical_contract_diagnostics(value)
+    return value, [*diagnostics, *(
+        [{**item, "disposition": "quarantined"} for item in remaining]
+        if remaining else []
+    )]
+
+
+def validate_plan_catalog_bindings(
+    catalog: dict[str, Any], plans: list[dict[str, Any]],
+    valid_chunk_ids: set[str] | None = None,
+) -> list[str]:
+    """Validate that every current plan identity belongs to this exact v12 Catalog."""
+    errors: list[str] = []
+    if catalog.get("catalog_version") != config.ASSESSMENT_CATALOG_VERSION:
+        return ["Plan requires the current Assessment Catalog version."]
+    tasks = {str(task.get("task_id") or ""): task for task in catalog.get("tasks") or []}
+    fitb_ids = {
+        str(entry.get("fitb_entry_id") or "") for entry in catalog.get("fitb_bank") or []
+        if entry.get("fitb_entry_id") and not entry.get("alias_of_fitb_entry_id")
+    }
+    catalog_chunks = set(map(str, catalog.get("selected_chunk_ids") or []))
+    if valid_chunk_ids is not None and catalog_chunks != set(valid_chunk_ids):
+        errors.append("Assessment Catalog evidence IDs do not match the current retrieved evidence.")
+    for plan in plans:
+        for qtype, values in (plan.get("items") or {}).items():
+            for item in values or []:
+                sid = str(item.get("slot_id") or "unknown")
+                if qtype == "fill_in_the_blank":
+                    if str(item.get("fitb_entry_id") or "") not in fitb_ids:
+                        errors.append(f"Slot {sid} references a FITB entry outside the current Catalog.")
+                    continue
+                base_id = str(item.get("base_catalog_task_id") or item.get("task_id") or "")
+                task = tasks.get(base_id)
+                if task is None:
+                    errors.append(f"Slot {sid} references a task outside the current Catalog.")
+                    continue
+                variation_id = str(item.get("selected_variation_id") or "")
+                group_id = str(item.get("selected_variation_group_id") or "")
+                if not variation_id or not group_id or not item.get("permitted_variations"):
+                    errors.append(f"Slot {sid} is missing its required typed variation binding.")
+                    continue
+                variation = selected_variation(task, variation_id, qtype)
+                if variation is None:
+                    errors.append(f"Slot {sid} references a variation outside its Catalog task.")
+                    continue
+                if str(variation.get("variation_group_id") or "") != group_id:
+                    errors.append(f"Slot {sid} has an inconsistent variation-group identity.")
+                bound = next((
+                    candidate for candidate in item.get("permitted_variations") or []
+                    if str(candidate.get("variation_id") or "") == variation_id
+                ), None)
+                if bound is None:
+                    errors.append(f"Slot {sid} selected variation is absent from its bound variation set.")
+                elif any(
+                    bound.get(field) != variation.get(field)
+                    for field in (
+                        "variation_group_id", "question_types", "operation", "target",
+                        "givens", "reasoning_mode", "student_work_product",
+                        "evidence_chunk_ids",
+                    )
+                ):
+                    errors.append(f"Slot {sid} bound variation differs from its Catalog contract.")
+                operation = str(variation.get("operation") or task.get("task_operation") or "")
+                target = str(variation.get("target") or task.get("target") or "")
+                if str(item.get("task_operation") or "") != operation:
+                    errors.append(f"Slot {sid} operation differs from its selected Catalog variation.")
+                if str(item.get("target") or "") != target:
+                    errors.append(f"Slot {sid} target differs from its selected Catalog variation.")
+                evidence = {str(item.get("source_chunk_id") or ""), *map(
+                    str, item.get("support_chunk_ids") or []
+                )} - {""}
+                allowed_evidence = set(map(str,
+                    variation.get("evidence_chunk_ids")
+                    if variation.get("evidence_chunk_ids") is not None
+                    else task.get("evidence_chunk_ids") or []
+                ))
+                if not evidence or not evidence.issubset(allowed_evidence):
+                    errors.append(f"Slot {sid} evidence differs from its selected Catalog variation.")
+    return errors
+
+
+_RELATIONSHIP_VARIATION_MODES = {
+    "calculation",
+    "symbolic_manipulation",
+    "law_or_theorem_application",
+    "derivation_relationship",
+}
+_VISUAL_VARIATION_RE = re.compile(
+    r"\b(?:image|graph|table|diagram|figure|chart|visual)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_visual_dependency(text: str) -> bool:
+    """Reuse the planner's multilingual visual cue detector when available."""
+    try:
+        from app.online.planner import _VISUAL_DEPENDENCY_RE
+        return bool(_VISUAL_DEPENDENCY_RE.search(text))
+    except (ImportError, AttributeError):
+        return bool(_VISUAL_VARIATION_RE.search(text))
+
+
+def _variation_idea(task: dict[str, Any], variation: dict[str, Any]) -> str:
+    product = variation.get("student_work_product") or task.get("student_work_product")
+    target = variation.get("target") or task.get("target")
+    idea = f"{product}: {target}"
+    mode = variation.get("reasoning_mode") or task.get("reasoning_mode")
+    if mode == "derivation_relationship":
+        idea = f"Derive and establish the relationship: {idea}"
+    return idea
+
+
+def _variation_is_self_contained(
+    task: dict[str, Any], variation: dict[str, Any]
+) -> bool:
+    """Reject variations that would force the planner to invent missing data."""
+    givens = list(variation.get("givens") or [])
+    mode = variation.get("reasoning_mode") or task.get("reasoning_mode")
+    if mode in _RELATIONSHIP_VARIATION_MODES and not (
+        task.get("relationship") or givens
+    ):
+        return False
+    if _has_visual_dependency(_variation_idea(task, variation)) and not givens:
+        return False
+    return True
+
+
+def _effective_variation(
+    task: dict[str, Any],
+    question_type: str | None = None,
+    selected_variation_id: str | None = None,
+) -> dict[str, Any] | None:
+    """Choose one self-contained variation, preferring the task's primary angle."""
+    variations = (
+        eligible_task_variations(task, question_type)
+        if question_type else permitted_task_variations(task)
+    )
+    if not variations:
+        return None
+    if selected_variation_id:
+        explicit = next((
+            variation for variation in variations
+            if variation.get("variation_id") == selected_variation_id
+        ), None)
+        if explicit is not None:
+            return explicit
+    return next((
+        variation for variation in variations
+        if _variation_is_self_contained(task, variation)
+    ), variations[0])
+
+
+def _apply_effective_variation(
+    item: dict[str, Any], task: dict[str, Any], variation: dict[str, Any]
+) -> None:
+    """Bind the selected angle to the plan item without mutating the catalog task."""
+    operation = variation.get("operation") or task.get("task_operation")
+    target = variation.get("target") or task.get("target")
+    product = variation.get("student_work_product") or task.get("student_work_product")
+    mode = variation.get("reasoning_mode") or task.get("reasoning_mode")
+    evidence = variation.get("evidence_chunk_ids")
+    if evidence is None:
+        if task.get("evidence_chunk_ids") is not None:
+            evidence = task.get("evidence_chunk_ids") or []
+        else:
+            evidence = [
+                task.get("source_chunk_id"),
+                *(task.get("support_chunk_ids") or []),
+            ]
+    evidence = [str(value) for value in evidence if str(value)]
+    givens = [
+        str(value) for value in (variation.get("givens") or []) if str(value).strip()
+    ]
+    if not givens:
+        givens = [
+            str(value) for value in (task.get("required_givens") or [])
+            if str(value).strip()
+        ]
+    idea = _variation_idea(task, variation)
+    item.update({
+        "source_chunk_id": evidence[0] if evidence else item.get("source_chunk_id"),
+        "support_chunk_ids": list(dict.fromkeys(evidence[1:])),
+        "canonical_skill": operation,
+        "student_work_product": product,
+        "target": target,
+        "task_operation": operation,
+        "given_conditions": list(dict.fromkeys(givens)),
+        "scenario_family": (
+            variation.get("application")
+            if variation.get("application") is not None
+            else task.get("scenario_family")
+        ),
+        "reasoning_mode": mode,
+        "reasoning_requirements": [f"{operation}: {target}"],
+        "idea_to_test": idea,
+        "concept_to_test": idea,
+        "selected_variation_id": variation.get("variation_id"),
+        "selected_variation_group_id": variation.get("variation_group_id"),
+        "effective_givens": list(dict.fromkeys(givens)),
+    })
 
 
 _METHOD_RESTRICTION_RE = re.compile(
@@ -817,7 +1332,7 @@ def _read_cache(key: str) -> dict[str, Any] | None:
         payload["tasks_by_question_type"] = {
             qtype: [
                 str(task["task_id"]) for task in payload.get("tasks") or []
-                if qtype in (task.get("allowed_question_types") or [])
+                if eligible_task_variations(task, qtype)
             ]
             for qtype in (
                 "mcq", "true_false", "definition", "why", "equation",
@@ -829,6 +1344,32 @@ def _read_cache(key: str) -> dict[str, Any] | None:
             if entry.get("fitb_entry_id") and not entry.get("alias_of_fitb_entry_id")
         ]
     return payload
+
+
+def _cached_catalog_matches_evidence(
+    payload: dict[str, Any], processed_document_key: str, selected_chunk_ids: list[str],
+) -> bool:
+    """Fail closed when a cached catalog references another retrieval snapshot."""
+    selected = set(map(str, selected_chunk_ids))
+    if (
+        payload.get("processed_document_key") != processed_document_key
+        or set(map(str, payload.get("selected_chunk_ids") or [])) != selected
+    ):
+        return False
+    for task in payload.get("tasks") or []:
+        evidence = set(map(str, task.get("evidence_chunk_ids") or []))
+        if not evidence or not evidence.issubset(selected):
+            return False
+        for variation in task.get("allowed_variations") or []:
+            variation_evidence = variation.get("evidence_chunk_ids")
+            if variation_evidence is not None and not set(
+                map(str, variation_evidence)
+            ).issubset(evidence):
+                return False
+    return all(
+        str(entry.get("evidence_chunk_id") or "") in selected
+        for entry in payload.get("fitb_bank") or []
+    )
 
 
 def _cached_task_contract_valid(task: Any) -> bool:
@@ -849,6 +1390,7 @@ def _cached_task_contract_valid(task: Any) -> bool:
         == task.get("allowed_variations")
         and isinstance(prerequisites, list)
         and all(isinstance(value, str) and value.strip() for value in prerequisites)
+        and not catalog_numerical_contract_diagnostics(task)
     )
 
 
@@ -893,7 +1435,13 @@ def _write_compiler_cache(key: str, raw: dict[str, Any]) -> None:
 def _compatible_compiler_seed(
     processed_document_key: str, selected_chunk_ids: list[str]
 ) -> dict[str, Any] | None:
-    """Migrate a prior derived V1 catalog into the new two-layer cache."""
+    """Return a same-version, same-evidence Catalog without an LLM call.
+
+    Cache-key internals can change while the public Catalog contract remains
+    compatible. Re-finalizing that payload under the current deterministic
+    contract avoids needless recompilation. Incompatible contract changes must
+    bump ``ASSESSMENT_CATALOG_VERSION``.
+    """
     root = Path(config.ASSESSMENT_CATALOG_CACHE_DIR)
     selected = sorted(set(map(str, selected_chunk_ids)))
     for path in sorted(root.glob("[0-9a-f][0-9a-f]/*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
@@ -901,21 +1449,40 @@ def _compatible_compiler_seed(
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
             continue
+        source_version = str(payload.get("catalog_version") or "")
+        migratable_version = source_version in {
+            config.ASSESSMENT_CATALOG_VERSION,
+            "catalog-v12-grouped-type-variations",
+        }
+        migrated_tasks: list[dict[str, Any]] = []
+        migration_failed = False
+        for task in payload.get("tasks") or []:
+            migrated, diagnostics = _repair_catalog_numerical_contract(task)
+            if any(item.get("disposition") == "quarantined" for item in diagnostics):
+                migration_failed = True
+                break
+            migrated["catalog_contract_version"] = config.ASSESSMENT_CATALOG_VERSION
+            if diagnostics:
+                migrated["contract_diagnostics"] = diagnostics
+            migrated_tasks.append(migrated)
         if (
-            payload.get("catalog_version") == config.ASSESSMENT_CATALOG_VERSION
+            migratable_version
             and payload.get("processed_document_key") == processed_document_key
-            and payload.get("selected_chunk_ids") == selected
+            and sorted(set(map(str, payload.get("selected_chunk_ids") or []))) == selected
             and payload.get("assessment_profile")
             and payload["assessment_profile"].get("subject")
             and payload["assessment_profile"].get("domain") in {"STEM", "NON_STEM"}
             and bool(payload.get("tasks"))
             and isinstance(payload.get("fitb_bank"), list)
-            and all(_cached_task_contract_valid(task) for task in payload.get("tasks") or [])
+            and not migration_failed
+            and all(_cached_task_contract_valid(task) for task in migrated_tasks)
         ):
             return {
                 "assessment_profile": payload["assessment_profile"],
-                "tasks": payload["tasks"],
+                "tasks": migrated_tasks,
                 "fitb_bank": payload["fitb_bank"],
+                "catalog_compilation_complete": True,
+                "recovered_batch_count": int(payload.get("recovered_batch_count") or 0),
             }
     return None
 
@@ -1066,13 +1633,17 @@ For every task, use the variation fields as follows:
 - variable_givens describes illustrative quantities or parameters that a future question may choose
   and change while remaining valid (for example total matches, distance, speed, or elapsed time);
 - variations is an array of bounded objects. Each object names one exact source-supported target,
-  operation, givens, and question_types; optionally use reasoning_mode, student_work_product, form for
+  operation, givens, and exactly one question_types value; optionally use reasoning_mode, student_work_product, form for
   representation, context for application, and evidence_chunk_ids for a narrower evidence subset.
   Omit evidence_chunk_ids to inherit the task evidence. Never repeat the primary angle merely to fill
   the array. Set vary_numbers true only when the named givens are illustrative parameters and changing
   them preserves the relationship and constraints. Never emit broad labels such as different_target,
-  different_operation, or different_application. Set variation_id to null; deterministic code assigns
-  it after validation. Do not invent an angle absent from the source;
+  different_operation, or different_application. Emit one type-specific variation for every declared
+  allowed_question_types value. Variations that assess the same underlying concept, operation, and
+  result share one variation_group_id; different assessment angles use different groups. Set both
+  variation_group_id and variation_id to null; deterministic code assigns stable IDs after validation.
+  Never invent an angle or context absent from the source. If evidence cannot support a declared type,
+  remove that type rather than fabricating coverage;
 - complexity_boundaries lists concepts, methods, or difficulty increases that the selected evidence
   does not authorize. Use short source-specific restrictions, not generic permission codes;
 - exact_source_instance is true only when assessing the exact worked example is itself the task.
@@ -1090,7 +1661,9 @@ structure, a physical constant, an integrality/non-negativity constraint, or a f
 may remain required. Do not authorize a variation merely because it is generally true in the subject;
 it must be supported by the selected evidence and educational scope.
 Set answerable explicitly for every task. False tasks are filtered and must never be presented as
-usable merely because related evidence exists. Evidence IDs must come from the supplied list and every required numerical/symbolic given must
+usable merely because related evidence exists. Every task, variation, and FITB evidence ID must be
+copied exactly from the Valid source chunk IDs supplied for this compiler batch. Never cite a chunk
+from another batch, even if it belongs to the same document. Every required numerical/symbolic given must
 be present in those chunks. Equation tasks must ask for symbolic manipulation/derivation; word
 problems must ask for a contextual numerical solution. Use information-dense values: short noun
 phrases, compact formulas, canonical operation/mode identifiers, atomic givens/prereqs, and precise
@@ -1117,6 +1690,11 @@ def _finalize_catalog(
         if not isinstance(raw_task, dict):
             continue
         raw_task = _expand_compact_task(raw_task)
+        raw_task, contract_diagnostics = _repair_catalog_numerical_contract(raw_task)
+        if any(item.get("disposition") == "quarantined" for item in contract_diagnostics):
+            continue
+        if contract_diagnostics:
+            raw_task["contract_diagnostics"] = contract_diagnostics
         evidence = [
             str(value) for value in raw_task.get("evidence_chunk_ids") or []
             if str(value) in valid_ids
@@ -1154,20 +1732,34 @@ def _finalize_catalog(
                 existing[field] = list(dict.fromkeys([
                     *(existing.get(field) or []), *(raw_task.get(field) or []),
                 ]))
-            incoming_primary = _primary_variation({
+            incoming_primaries = _primary_variations({
                 **raw_task,
                 "evidence_chunk_ids": evidence,
                 "primary_question_types": list(raw_task.get("allowed_question_types") or []),
             })
-            existing_primary_id = _primary_variation(existing).get("variation_id")
+            existing_primary_ids = {
+                value.get("variation_id") for value in _primary_variations(existing)
+            }
             existing["allowed_variations"] = _normalize_variations([
                 *(existing.get("allowed_variations") or []),
-                *([incoming_primary] if incoming_primary.get("variation_id") != existing_primary_id else []),
+                *(value for value in incoming_primaries
+                  if value.get("variation_id") not in existing_primary_ids),
                 *(raw_task.get("allowed_variations") or []),
             ])
             existing["exact_source_instance"] = bool(
                 existing.get("exact_source_instance")
                 and raw_task.get("exact_source_instance")
+            )
+            existing["allowed_question_types"] = [
+                qtype for qtype in existing["allowed_question_types"]
+                if eligible_task_variations(existing, qtype)
+            ]
+            existing["primary_question_types"] = [
+                qtype for qtype in (existing.get("primary_question_types") or [])
+                if qtype in existing["allowed_question_types"]
+            ]
+            existing["allowed_variations"] = _scope_variations(
+                existing, existing.get("allowed_variations") or []
             )
             continue
         reasoning_mode = str(raw_task.get("reasoning_mode") or "")
@@ -1208,8 +1800,27 @@ def _finalize_catalog(
             "variable_givens": list(raw_task.get("variable_givens") or []),
             "complexity_boundaries": list(raw_task.get("complexity_boundaries") or []),
             "exact_source_instance": exact_source_instance,
+            "catalog_contract_version": config.ASSESSMENT_CATALOG_VERSION,
             "text_answerable": True,
         }
+        finalized_task["allowed_variations"] = _scope_variations(
+            finalized_task, finalized_task["allowed_variations"]
+        )
+        # The compiler may over-declare a representation. Keep only types with
+        # a complete, source-grounded type-specific variation.
+        finalized_variations = permitted_task_variations(finalized_task)
+        finalized_task["allowed_question_types"] = [
+            qtype for qtype in finalized_task["allowed_question_types"]
+            if eligible_task_variations(
+                finalized_task, qtype, variations=finalized_variations,
+            )
+        ]
+        finalized_task["primary_question_types"] = [
+            qtype for qtype in primary_allowed
+            if qtype in finalized_task["allowed_question_types"]
+        ]
+        if not finalized_task["allowed_question_types"]:
+            continue
         finalized.append(finalized_task)
         finalized_by_id[task_id] = finalized_task
     fitb_bank: list[dict[str, Any]] = []
@@ -1237,7 +1848,7 @@ def _finalize_catalog(
         for qtype, type_profile in type_profiles.items():
             if not isinstance(type_profile, dict):
                 continue
-            supporting = [task for task in finalized if qtype in task["allowed_question_types"]]
+            supporting = [task for task in finalized if eligible_task_variations(task, qtype)]
             if qtype == "fill_in_the_blank" and fitb_bank:
                 type_profile["support"] = "supported"
                 type_profile["task_operations"] = ["identify_term_from_text_clue"]
@@ -1249,7 +1860,9 @@ def _finalize_catalog(
             if supporting:
                 type_profile["support"] = "supported"
                 type_profile["task_operations"] = list(dict.fromkeys(
-                    str(task["task_operation"]) for task in supporting
+                    str(variation.get("operation") or task.get("task_operation"))
+                    for task in supporting
+                    for variation in eligible_task_variations(task, qtype)
                 ))
                 type_profile["evidence_chunk_ids"] = list(dict.fromkeys(
                     chunk_id for task in supporting for chunk_id in task["evidence_chunk_ids"]
@@ -1270,7 +1883,7 @@ def _finalize_catalog(
     tasks_by_question_type = {
         qtype: [
             str(task["task_id"]) for task in finalized
-            if qtype in (task.get("allowed_question_types") or [])
+            if eligible_task_variations(task, qtype)
         ]
         for qtype in (
             "mcq", "true_false", "definition", "why", "equation",
@@ -1341,9 +1954,29 @@ def _balanced_catalog_batches(
     Chunks without stored parent metadata are conservatively treated as their
     own parent so unrelated source records are never merged into one section.
     """
+    def source_order(indexed: tuple[int, dict[str, Any]]) -> tuple[Any, ...]:
+        index, chunk = indexed
+        child_order = chunk.get("child_order")
+        try:
+            numeric_order = int(child_order)
+        except (TypeError, ValueError):
+            numeric_order = None
+        return (
+            0 if numeric_order is not None else 1,
+            numeric_order if numeric_order is not None else index,
+            str(chunk.get("parent_id") or ""),
+            str(chunk.get("child_id") or ""),
+        )
+
+    # Retrieval preserves caller selection order, which differs between the UI,
+    # resumed jobs, and workers. Canonicalize before deriving batches and the
+    # cache identity so the same processed selection cannot trigger recompilation.
+    ordered_chunks = [
+        chunk for _index, chunk in sorted(enumerate(chunks), key=source_order)
+    ]
     parent_groups: dict[str, list[dict[str, Any]]] = {}
     parent_order: list[str] = []
-    for index, chunk in enumerate(chunks):
+    for index, chunk in enumerate(ordered_chunks):
         parent_id = str(chunk.get("parent_id") or "").strip()
         parent_key = parent_id or f"__child_parent__:{chunk.get('child_id') or index}"
         if parent_key not in parent_groups:
@@ -1449,6 +2082,13 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
     processed_key = str(state.get("processed_document_key") or state.get("document_id") or "")
     key = catalog_cache_key(processed_key, selected, compiler_identity)
     cached = _read_cache(key)
+    if cached is not None and not _cached_catalog_matches_evidence(
+        cached, processed_key, selected
+    ):
+        logger.warning(
+            "Assessment catalog cache rejected for retrieval mismatch | key=%s", key
+        )
+        cached = None
     if cached is not None:
         logger.info("Assessment catalog cache hit | key=%s | tasks=%d", key, len(cached["tasks"]))
         return {
@@ -1471,8 +2111,20 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
         # Leave the file untouched for diagnostics. It is not a reusable result.
         raw = None
     compiler_cache_hit = raw is not None
+    compatibility_cache_hit = False
+    if raw is None:
+        raw = _compatible_compiler_seed(processed_key, selected)
+        if raw is not None:
+            compatibility_cache_hit = True
+            compiler_cache_hit = True
+            logger.info(
+                "Assessment catalog compatible cache migrated | key=%s", key
+            )
     client = None
-    compiler_usage: dict[str, Any] = {}
+    compiler_usage: dict[str, Any] = (
+        {"source": "compatible_finalized_catalog", "provider_calls": 0}
+        if compatibility_cache_hit else {}
+    )
     if raw is None:
         from app.online.retrieval import build_planner_context
 
@@ -1641,12 +2293,18 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
             "assessment_catalog_failure_reason": "no_source_supported_assessment_tasks",
         }
     _write_cache(key, payload)
-    logger.info("Assessment catalog compiled | key=%s | tasks=%d", key, len(payload["tasks"]))
+    logger.info(
+        "Assessment catalog %s | key=%s | tasks=%d",
+        "migrated" if compatibility_cache_hit else "compiled",
+        key,
+        len(payload["tasks"]),
+    )
     return {
         "assessment_catalog": payload,
         "assessment_catalog_key": key,
-        "assessment_catalog_cache_hit": False,
+        "assessment_catalog_cache_hit": compatibility_cache_hit,
         "assessment_compiler_cache_hit": compiler_cache_hit,
+        "assessment_catalog_compatibility_cache_hit": compatibility_cache_hit,
         "planner_context": "",
     }
 
@@ -1681,13 +2339,28 @@ def _native_difficulty(task: dict[str, Any]) -> str | None:
     return None
 
 
-def materialize_plan_item(task: dict[str, Any], slot_id: str, difficulty: str) -> dict[str, Any]:
+def _slot_question_type(slot_id: str) -> str | None:
+    match = re.fullmatch(
+        r"m\d+_(mcq|true_false|fill_in_the_blank|definition|why|equation|"
+        r"word_problem|essay)_\d+",
+        slot_id,
+    )
+    return match.group(1) if match else None
+
+
+def materialize_plan_item(
+    task: dict[str, Any],
+    slot_id: str,
+    difficulty: str,
+    *,
+    selected_variation_id: str | None = None,
+) -> dict[str, Any]:
     evidence = list(task.get("evidence_chunk_ids") or [])
     relationship = task.get("relationship")
     idea = f"{task.get('student_work_product')}: {task.get('target')}"
     if task.get("reasoning_mode") == "derivation_relationship":
         idea = f"Derive and establish the relationship: {idea}"
-    return {
+    item = {
         "slot_id": slot_id,
         "task_id": task["task_id"],
         "task_family_id": task.get("task_family_id") or task["task_id"],
@@ -1739,6 +2412,12 @@ def materialize_plan_item(task: dict[str, Any], slot_id: str, difficulty: str) -
         "idea_to_test": idea,
         "concept_to_test": idea,
     }
+    variation = _effective_variation(
+        task, _slot_question_type(slot_id), selected_variation_id
+    )
+    if variation is not None:
+        _apply_effective_variation(item, task, variation)
+    return item
 
 
 def materialize_fitb_plan_item(
@@ -1805,6 +2484,9 @@ def allocate_catalog_plan(
     shortages: dict[str, int] = {}
     task_usage_count: dict[str, int] = {}
     coverage_usage_count: dict[str, int] = {}
+    scenario_usage_count: dict[str, int] = {}
+    target_usage_count: dict[str, int] = {}
+    variation_group_usage_count: dict[str, int] = {}
     fitb_usage_count: dict[str, int] = {}
     for model_number in range(1, num_models + 1):
         items: dict[str, list[dict[str, Any]]] = {qtype: [] for qtype, _ in tasks}
@@ -1813,29 +2495,45 @@ def allocate_catalog_plan(
             for qtype, count in tasks if qtype != "fill_in_the_blank"
             for index in range(1, count + 1)
         ]
-        compatible: dict[tuple[str, int], list[tuple[int, dict[str, Any], str]]] = {}
+        profile = catalog.get("assessment_profile") or {}
+        valid_chunks = set(map(str, catalog.get("selected_chunk_ids") or [])) or None
+        permitted_by_position = {
+            position: permitted_task_variations(candidate)
+            for position, candidate in enumerate(source_tasks)
+        }
+        compatible: dict[
+            tuple[str, int], list[tuple[int, dict[str, Any], str, dict[str, Any]]]
+        ] = {}
+        candidate_pool_by_type: dict[
+            str, list[tuple[int, dict[str, Any], str, dict[str, Any]]]
+        ] = {}
+        for qtype in {slot[0] for slot in slots}:
+            pool: list[tuple[int, dict[str, Any], str, dict[str, Any]]] = []
+            for position, candidate in enumerate(source_tasks):
+                variations = eligible_task_variation_candidates(
+                    candidate, qtype, assessment_profile=profile,
+                    valid_chunk_ids=valid_chunks,
+                    variations=permitted_by_position[position],
+                )
+                if not variations:
+                    continue
+                native_level = _native_difficulty(candidate)
+                selected_level = _difficulty_for(candidate, difficulty)
+                level = selected_level or (
+                    native_level if difficulty in {"easy", "medium", "hard"} else None
+                )
+                if level is not None:
+                    pool.extend(
+                        (position, candidate, level, variation)
+                        for variation in variations
+                    )
+            candidate_pool_by_type[qtype] = pool
         for slot in slots:
-            qtype, _index = slot
-            direct = [
-                (position, candidate, level)
-                for position, candidate in enumerate(source_tasks)
-                for level in [_difficulty_for(candidate, difficulty)]
-                if level is not None and qtype in (candidate.get("allowed_question_types") or [])
-            ]
-            if difficulty in {"easy", "medium", "hard"}:
-                fallback = [
-                    (position, candidate, native_level)
-                    for position, candidate in enumerate(source_tasks)
-                    for native_level in [_native_difficulty(candidate)]
-                    if qtype in (candidate.get("allowed_question_types") or [])
-                    and native_level is not None
-                    and native_level != difficulty
-                ]
-                compatible[slot] = direct + fallback
-            else:
-                compatible[slot] = direct
+            compatible[slot] = candidate_pool_by_type[slot[0]]
         ordered_slots = sorted(slots, key=lambda slot: (len(compatible[slot]), slot[0], slot[1]))
-        assignment: dict[tuple[str, int], tuple[dict[str, Any], str]] = {}
+        assignment: dict[
+            tuple[str, int], tuple[dict[str, Any], str, dict[str, Any]]
+        ] = {}
         resource_owner: dict[str, tuple[str, int]] = {}
         source_scenario_frequency = {
             scenario: sum(
@@ -1847,6 +2545,34 @@ def allocate_catalog_plan(
             }
         }
 
+        def candidate_sort_key(
+            entry: tuple[int, dict[str, Any], str, dict[str, Any]],
+        ) -> tuple[Any, ...]:
+            return (
+                -score_task_variation_candidate(
+                    entry[1], entry[3], requested_difficulty=difficulty,
+                    task_uses=task_usage_count.get(str(entry[1].get("task_id") or ""), 0),
+                    scenario_uses=scenario_usage_count.get(normalize_planner_diversity_text(
+                        entry[3].get("application") if entry[3].get("application") is not None
+                        else entry[1].get("scenario_family")
+                    ), 0),
+                    target_uses=target_usage_count.get(normalize_planner_diversity_text(
+                        entry[3].get("target") or entry[1].get("target")
+                    ), 0),
+                    variation_group_uses=variation_group_usage_count.get(
+                        str(entry[3].get("variation_group_id") or ""), 0
+                    ),
+                )["score"],
+                len(entry[1].get("allowed_question_types") or []),
+                source_scenario_frequency.get(_normalized(entry[1].get("scenario_family")), 0),
+                len(entry[1].get("evidence_chunk_ids") or []), entry[0],
+            )
+
+        for qtype, pool in candidate_pool_by_type.items():
+            candidate_pool_by_type[qtype] = sorted(pool, key=candidate_sort_key)
+        for slot in slots:
+            compatible[slot] = candidate_pool_by_type[slot[0]]
+
         def resource_id(candidate: dict[str, Any]) -> str:
             return str(
                 candidate.get("coverage_id")
@@ -1855,19 +2581,7 @@ def allocate_catalog_plan(
             )
 
         def match(slot: tuple[str, int], seen: set[str]) -> bool:
-            ranked = sorted(
-                compatible[slot],
-                key=lambda entry: (
-                    difficulty in {"easy", "medium", "hard"} and entry[2] != difficulty,
-                    coverage_usage_count.get(str(entry[1].get("coverage_id") or ""), 0) > 0,
-                    task_usage_count.get(str(entry[1].get("task_id") or ""), 0) > 0,
-                    len(entry[1].get("allowed_question_types") or []),
-                    source_scenario_frequency.get(_normalized(entry[1].get("scenario_family")), 0),
-                    len(entry[1].get("evidence_chunk_ids") or []),
-                    entry[0],
-                ),
-            )
-            for _position, candidate, level in ranked:
+            for _position, candidate, level, variation in compatible[slot]:
                 resource = resource_id(candidate)
                 if not resource or resource in seen:
                     continue
@@ -1876,7 +2590,7 @@ def allocate_catalog_plan(
                 if previous_slot is not None and not match(previous_slot, seen):
                     continue
                 resource_owner[resource] = slot
-                assignment[slot] = (candidate, level)
+                assignment[slot] = (candidate, level, variation)
                 return True
             return False
 
@@ -1888,10 +2602,11 @@ def allocate_catalog_plan(
         # artificial shortage while a compatible task exists. Fill remaining
         # slots from unused task IDs first, then enter explicit reuse mode.
         assigned_ids = {
-            str(task.get("task_id") or "") for task, _level in assignment.values()
+            str(task.get("task_id") or "") for task, _level, _variation in assignment.values()
         }
         assigned_coverage_ids = {
-            str(task.get("coverage_id") or "") for task, _level in assignment.values()
+            str(task.get("coverage_id") or "")
+            for task, _level, _variation in assignment.values()
             if task.get("coverage_id")
         }
         for slot in ordered_slots:
@@ -1910,19 +2625,95 @@ def allocate_catalog_plan(
                 and task_usage_count.get(str(entry[1].get("task_id") or ""), 0) == 0
             ]
             pool = unused_concept_tasks or unused_tasks or compatible[slot]
-            _position, chosen, level = min(
+            _position, chosen, level, variation = min(
                 pool,
                 key=lambda entry: (
-                    difficulty in {"easy", "medium", "hard"} and entry[2] != difficulty,
-                    coverage_usage_count.get(str(entry[1].get("coverage_id") or ""), 0),
-                    task_usage_count.get(str(entry[1].get("task_id") or ""), 0),
+                    -score_task_variation_candidate(
+                        entry[1], entry[3], requested_difficulty=difficulty,
+                        task_uses=task_usage_count.get(str(entry[1].get("task_id") or ""), 0),
+                        scenario_uses=scenario_usage_count.get(normalize_planner_diversity_text(
+                            entry[3].get("application") if entry[3].get("application") is not None
+                            else entry[1].get("scenario_family")
+                        ), 0),
+                        target_uses=target_usage_count.get(normalize_planner_diversity_text(
+                            entry[3].get("target") or entry[1].get("target")
+                        ), 0),
+                        variation_group_uses=variation_group_usage_count.get(
+                            str(entry[3].get("variation_group_id") or ""), 0
+                        ),
+                    )["score"],
                     str(entry[1].get("task_id") or ""),
                 ),
             )
-            assignment[slot] = (chosen, level)
+            assignment[slot] = (chosen, level, variation)
             assigned_ids.add(str(chosen.get("task_id") or ""))
             if chosen.get("coverage_id"):
                 assigned_coverage_ids.add(str(chosen["coverage_id"]))
+
+        # Re-rank the complete feasible assignment in constrained-slot order.
+        # Resources reserved for other slots remain protected, while each
+        # committed choice updates diversity counts for the next slot.
+        live_task_usage = dict(task_usage_count)
+        live_scenario_usage = dict(scenario_usage_count)
+        live_target_usage = dict(target_usage_count)
+        live_group_usage = dict(variation_group_usage_count)
+        resource_by_slot = {
+            slot: resource_id(value[0]) for slot, value in assignment.items()
+        }
+        for slot in ordered_slots:
+            current = assignment.get(slot)
+            if current is None:
+                continue
+            reserved_elsewhere = {
+                resource for other, resource in resource_by_slot.items()
+                if other != slot and resource
+            }
+            feasible = [
+                entry for entry in compatible[slot]
+                if resource_id(entry[1]) not in reserved_elsewhere
+            ] or [(0, current[0], current[1], current[2])]
+
+            def live_rank(entry):
+                task, variation = entry[1], entry[3]
+                scenario_key = normalize_planner_diversity_text(
+                    variation.get("application") if variation.get("application") is not None
+                    else task.get("scenario_family")
+                )
+                target_key = normalize_planner_diversity_text(
+                    variation.get("target") or task.get("target")
+                )
+                group_id = str(variation.get("variation_group_id") or "")
+                return (
+                    -score_task_variation_candidate(
+                        task, variation, requested_difficulty=difficulty,
+                        task_uses=live_task_usage.get(str(task.get("task_id") or ""), 0),
+                        scenario_uses=live_scenario_usage.get(scenario_key, 0),
+                        target_uses=live_target_usage.get(target_key, 0),
+                        variation_group_uses=live_group_usage.get(group_id, 0),
+                    )["score"],
+                    str(task.get("task_id") or ""),
+                    str(variation.get("variation_id") or ""),
+                )
+
+            _position, chosen, level, variation = min(feasible, key=live_rank)
+            assignment[slot] = (chosen, level, variation)
+            resource_by_slot[slot] = resource_id(chosen)
+            task_id = str(chosen.get("task_id") or "")
+            scenario_key = normalize_planner_diversity_text(
+                variation.get("application") if variation.get("application") is not None
+                else chosen.get("scenario_family")
+            )
+            target_key = normalize_planner_diversity_text(
+                variation.get("target") or chosen.get("target")
+            )
+            group_id = str(variation.get("variation_group_id") or "")
+            live_task_usage[task_id] = live_task_usage.get(task_id, 0) + 1
+            if scenario_key:
+                live_scenario_usage[scenario_key] = live_scenario_usage.get(scenario_key, 0) + 1
+            if target_key:
+                live_target_usage[target_key] = live_target_usage.get(target_key, 0) + 1
+            if group_id:
+                live_group_usage[group_id] = live_group_usage.get(group_id, 0) + 1
 
         for qtype, count in tasks:
             for index in range(1, count + 1):
@@ -2001,12 +2792,30 @@ def allocate_catalog_plan(
                 if selected is None:
                     shortages[qtype] = shortages.get(qtype, 0) + 1
                     continue
-                chosen, level = selected
+                chosen, level, variation = selected
                 task_id = str(chosen.get("task_id") or "")
                 reused = task_usage_count.get(task_id, 0) > 0
                 item = materialize_plan_item(
-                    chosen, f"m{model_number}_{qtype}_{index}", level
+                    chosen, f"m{model_number}_{qtype}_{index}", level,
+                    selected_variation_id=variation.get("variation_id"),
                 )
+                scenario_key = normalize_planner_diversity_text(
+                    variation.get("application") if variation.get("application") is not None
+                    else chosen.get("scenario_family")
+                )
+                target_key = normalize_planner_diversity_text(
+                    variation.get("target") or chosen.get("target")
+                )
+                group_id = str(variation.get("variation_group_id") or "")
+                ranking = score_task_variation_candidate(
+                    chosen, variation, requested_difficulty=difficulty,
+                    task_uses=task_usage_count.get(task_id, 0),
+                    scenario_uses=scenario_usage_count.get(scenario_key, 0),
+                    target_uses=target_usage_count.get(target_key, 0),
+                    variation_group_uses=variation_group_usage_count.get(group_id, 0),
+                )
+                item["planner_candidate_score"] = ranking["score"]
+                item["planner_candidate_score_components"] = ranking["components"]
                 item["requested_difficulty"] = difficulty
                 item["actual_difficulty"] = level
                 if difficulty in {"easy", "medium", "hard"} and level != difficulty:
@@ -2019,15 +2828,19 @@ def allocate_catalog_plan(
                         "failed_strategies": [],
                     }
                 task_usage_count[task_id] = task_usage_count.get(task_id, 0) + 1
+                if scenario_key:
+                    scenario_usage_count[scenario_key] = scenario_usage_count.get(scenario_key, 0) + 1
+                if target_key:
+                    target_usage_count[target_key] = target_usage_count.get(target_key, 0) + 1
+                if group_id:
+                    variation_group_usage_count[group_id] = variation_group_usage_count.get(group_id, 0) + 1
                 coverage_id = str(chosen.get("coverage_id") or "")
                 if coverage_id:
                     coverage_usage_count[coverage_id] = coverage_usage_count.get(coverage_id, 0) + 1
                 compatible_ids = {
-                    str(candidate.get("task_id") or "")
-                    for candidate in source_tasks
-                    if candidate.get("task_id")
-                    and qtype in (candidate.get("allowed_question_types") or [])
-                    and _native_difficulty(candidate) is not None
+                    str(entry[1].get("task_id") or "")
+                    for entry in candidate_pool_by_type.get(qtype, [])
+                    if entry[1].get("task_id")
                 }
                 used_compatible_ids = {
                     candidate_id for candidate_id in compatible_ids
@@ -2116,6 +2929,48 @@ def _replacement_representation_rank(
     )
 
 
+def replacement_candidate_score(
+    task: dict[str, Any], variation: dict[str, Any], plans: list[dict[str, Any]],
+    *, excluding_slot_id: str, requested_difficulty: str,
+) -> dict[str, Any]:
+    """Score a replacement from the latest active plan state."""
+    represented = [
+        item for plan in plans for values in (plan.get("items") or {}).values()
+        for item in values or []
+        if str(item.get("slot_id") or "") != excluding_slot_id
+    ]
+    task_id = str(task.get("task_id") or "")
+    scenario = variation.get("application")
+    if scenario is None:
+        scenario = task.get("scenario_family")
+    target = variation.get("target") or task.get("target")
+    scenario_key = normalize_planner_diversity_text(scenario)
+    target_key = normalize_planner_diversity_text(target)
+    group_id = str(variation.get("variation_group_id") or "")
+    return score_task_variation_candidate(
+        task, variation, requested_difficulty=requested_difficulty,
+        task_uses=sum(
+            str(item.get("base_catalog_task_id") or item.get("task_id") or "") == task_id
+            for item in represented
+        ),
+        scenario_uses=sum(
+            bool(scenario_key)
+            and normalize_planner_diversity_text(item.get("scenario_family")) == scenario_key
+            for item in represented
+        ),
+        target_uses=sum(
+            bool(target_key)
+            and normalize_planner_diversity_text(item.get("target")) == target_key
+            for item in represented
+        ),
+        variation_group_uses=sum(
+            bool(group_id)
+            and str(item.get("selected_variation_group_id") or "") == group_id
+            for item in represented
+        ),
+    )
+
+
 def unused_catalog_replacement(
     catalog: dict[str, Any], plans: list[dict[str, Any]], slot_id: str,
     qtype: str, requested_difficulty: str, *,
@@ -2160,23 +3015,32 @@ def unused_catalog_replacement(
         for value in (used_fitb_answer_keys or set())
         if normalize_fitb_answer_key(value)
     }
-    candidates: list[tuple[dict[str, Any], str]] = []
+    profile = catalog.get("assessment_profile") or {}
+    valid_chunks = set(map(str, catalog.get("selected_chunk_ids") or [])) or None
+    candidates: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     for task in catalog.get("tasks") or []:
         level = _difficulty_for(task, requested_difficulty)
+        variations = eligible_task_variation_candidates(
+            task, qtype, assessment_profile=profile, valid_chunk_ids=valid_chunks,
+        )
         if (
-            level and qtype in (task.get("allowed_question_types") or [])
+            level and variations
             and str(task.get("task_id") or "") not in excluded
             and str(task.get("task_id")) not in current_task_ids
             and str(task.get("task_family_id") or task.get("task_id")) not in current_family_ids
             and str(task.get("task_id")) not in used
             and str(task.get("task_family_id") or task.get("task_id")) not in used_families
         ):
-            candidates.append((task, level))
+            candidates.extend((task, level, variation) for variation in variations)
     if not candidates:
         return None
-    task, level = min(
+    task, level, variation = min(
         candidates,
         key=lambda entry: (
+            -replacement_candidate_score(
+                entry[0], entry[2], plans, excluding_slot_id=slot_id,
+                requested_difficulty=requested_difficulty,
+            )["score"],
             int(bool(
                 qtype == "fill_in_the_blank"
                 and fitb_answer_keys(entry[0]) & represented_fitb_answers
@@ -2186,7 +3050,10 @@ def unused_catalog_replacement(
             ),
         ),
     )
-    return materialize_plan_item(task, slot_id, level)
+    return materialize_plan_item(
+        task, slot_id, level,
+        selected_variation_id=str(variation.get("variation_id") or ""),
+    )
 
 
 def catalog_exhaustion_replacement(
@@ -2336,7 +3203,7 @@ def catalog_exhaustion_replacement(
         if qtype == "fill_in_the_blank"
         and str(task.get("task_id") or "") in used_task_ids_before_replacement
         and str(task.get("task_id") or "") not in excluded_ids
-        and qtype in (task.get("allowed_question_types") or [])
+        and eligible_task_variations(task, qtype)
         and _difficulty_for(task, requested_difficulty) is not None
         and not (fitb_answer_keys(task) & represented_fitb_answers)
     ]
@@ -2393,16 +3260,21 @@ def catalog_exhaustion_replacement(
         if str(item.get("slot_id") or "") != slot_id and item.get("task_id")
     }
 
-    compatible: list[tuple[dict[str, Any], str]] = []
+    profile = catalog.get("assessment_profile") or {}
+    valid_chunks = set(map(str, catalog.get("selected_chunk_ids") or [])) or None
+    compatible: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     for task in catalog.get("tasks") or []:
         level = _difficulty_for(task, requested_difficulty)
+        variations = eligible_task_variation_candidates(
+            task, qtype, assessment_profile=profile, valid_chunk_ids=valid_chunks,
+        )
         if (
-            level and qtype in (task.get("allowed_question_types") or [])
+            level and variations
             and str(task.get("task_id") or "") not in {
                 str(value) for value in (excluded_task_ids or set()) if str(value)
             }
         ):
-            compatible.append((task, level))
+            compatible.extend((task, level, variation) for variation in variations)
 
     represented_items = [
         item for item in all_items
@@ -2423,15 +3295,24 @@ def catalog_exhaustion_replacement(
     # Stage 2: retain exact task-ID uniqueness while relaxing only the broader
     # family/coverage uniqueness constraint.
     unused = [
-        (task, level) for task, level in compatible
+        (task, level, variation) for task, level, variation in compatible
         if str(task.get("task_id") or "") != current_task_id
         and str(task.get("task_id") or "") not in used_task_ids
     ]
     if unused and not prefer_used_fresh_fitb_answer:
-        task, level = min(
-            unused, key=lambda entry: coverage_rank(entry[0], include_task_usage=False)
+        task, level, variation = min(
+            unused, key=lambda entry: (
+                -replacement_candidate_score(
+                    entry[0], entry[2], plans, excluding_slot_id=slot_id,
+                    requested_difficulty=requested_difficulty,
+                )["score"],
+                *coverage_rank(entry[0], include_task_usage=False),
+            )
         )
-        replacement = materialize_plan_item(task, slot_id, level)
+        replacement = materialize_plan_item(
+            task, slot_id, level,
+            selected_variation_id=str(variation.get("variation_id") or ""),
+        )
         family_id = str(replacement.get("task_family_id") or "")
         coverage_id = str(replacement.get("coverage_id") or "")
         related_slots = [
@@ -2482,14 +3363,20 @@ def catalog_exhaustion_replacement(
         if task_id:
             usage_count[task_id] = usage_count.get(task_id, 0) + 1
     reused = [
-        (usage_count.get(str(task.get("task_id") or ""), 0), task, level)
-        for task, level in compatible
+        (usage_count.get(str(task.get("task_id") or ""), 0), task, level, variation)
+        for task, level, variation in compatible
         if usage_count.get(str(task.get("task_id") or ""), 0) > 0
         and str(task.get("task_id") or "") != current_task_id
     ]
     if reused:
-        _count, task, level = min(
-            reused, key=lambda value: coverage_rank(value[1], include_task_usage=True)
+        _count, task, level, variation = min(
+            reused, key=lambda value: (
+                -replacement_candidate_score(
+                    value[1], value[3], plans, excluding_slot_id=slot_id,
+                    requested_difficulty=requested_difficulty,
+                )["score"],
+                *coverage_rank(value[1], include_task_usage=True),
+            )
         )
         reused_task_id = str(task.get("task_id") or "")
         same_task_slots = [
@@ -2497,7 +3384,10 @@ def catalog_exhaustion_replacement(
             if str(item.get("slot_id") or "") != slot_id
             and str(item.get("task_id") or "") == reused_task_id
         ]
-        replacement = materialize_plan_item(task, slot_id, level)
+        replacement = materialize_plan_item(
+            task, slot_id, level,
+            selected_variation_id=str(variation.get("variation_id") or ""),
+        )
         replacement.update({
             "catalog_replacement_stage": "reused_task_after_catalog_exhaustion",
             "reused_due_to_catalog_exhaustion": True,
@@ -2546,14 +3436,17 @@ def catalog_exhaustion_replacement(
     # Stage 4: a duplicate generated question does not invalidate its catalog task.
     # Retry it only after no unused or alternative represented task remains.
     original = next((
-        (task, level) for task, level in compatible
+        (task, level, variation) for task, level, variation in compatible
         if str(task.get("task_id") or "") == current_task_id
         and current_task_id not in excluded
     ), None)
     if original is None:
         return None
-    task, level = original
-    replacement = materialize_plan_item(task, slot_id, level)
+    task, level, variation = original
+    replacement = materialize_plan_item(
+        task, slot_id, level,
+        selected_variation_id=str(variation.get("variation_id") or ""),
+    )
     replacement.update({
         "catalog_replacement_stage": "regenerated_original_task_after_duplicate",
         "reused_due_to_catalog_exhaustion": False,

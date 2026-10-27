@@ -91,7 +91,10 @@ def test_partial_exam_is_saved_with_shortage_and_same_id(monkeypatch):
         "difficulty": "easy",
         "metadata": {},
     }
-    job = {"document_id": DOCUMENT_ID, "session_id": SESSION_ID, "request_data": request}
+    job = {
+        "document_id": DOCUMENT_ID, "session_id": SESSION_ID,
+        "request_data": request, "claim_generation": 1, "checkpoint_revision": 0,
+    }
     document = {
         "id": DOCUMENT_ID,
         "active_index_job_id": "index-job",
@@ -102,8 +105,11 @@ def test_partial_exam_is_saved_with_shortage_and_same_id(monkeypatch):
     monkeypatch.setattr(task_module.repositories, "claim_job", lambda *_args: job)
     monkeypatch.setattr(task_module.repositories, "get_document", lambda *_args: document)
     monkeypatch.setattr(task_module.repositories, "get_exam_id_for_job", lambda *_args: EXAM_ID)
-    monkeypatch.setattr(task_module.repositories, "update_job_progress", lambda *_args: None)
-    monkeypatch.setattr(task_module.repositories, "job_is_cancelled", lambda *_args: False)
+    monkeypatch.setattr(task_module.repositories, "update_job_progress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        task_module.repositories, "load_generation_checkpoint", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(task_module.repositories, "job_is_cancelled", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(task_module.repositories, "complete_generation_job", lambda *args, **kwargs: saved.update(kwargs) or True)
     monkeypatch.setattr(
         task_module.repositories,
@@ -365,3 +371,34 @@ console.log(warning.textContent);
     assert process.returncode == 0, process.stderr
     assert "Missing: 2." in process.stdout
     assert "Missing: ." not in process.stdout
+@pytest.mark.skipif(NODE is None, reason="node not available")
+def test_complete_saved_exam_displays_persisted_duplicate_warning(tmp_path):
+    frontend = Path(__file__).parents[1] / "FrontEnd" / "js"
+    module = tmp_path / "exam-lifecycle.mjs"
+    module.write_text(
+        (frontend / "exam-lifecycle.js").read_text(encoding="utf-8")
+        .replace('./i18n.js', './i18n.mjs'), encoding="utf-8",
+    )
+    (tmp_path / "i18n.mjs").write_text(
+        (frontend / "i18n.js").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    script = """
+globalThis.localStorage = {getItem: () => 'en', setItem: () => {}};
+const warning = {hidden: true, textContent: ''};
+globalThis.document = {getElementById: () => warning};
+const lifecycle = await import(process.env.MODULE_URL);
+lifecycle.renderPartialExamWarning({
+  status: 'complete',
+  metadata: {duplicate_quality: {status: 'warning', unresolved_count: 2}}
+});
+console.log(JSON.stringify(warning));
+"""
+    process = subprocess.run(
+        [NODE, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", timeout=30,
+        env={**os.environ, "MODULE_URL": module.resolve().as_uri()},
+    )
+    assert process.returncode == 0, process.stderr
+    warning = json.loads(process.stdout)
+    assert warning["hidden"] is False
+    assert "2 possible duplicate" in warning["textContent"]

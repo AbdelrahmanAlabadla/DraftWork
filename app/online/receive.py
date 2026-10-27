@@ -34,19 +34,25 @@ def receive_request(state: ExamState) -> dict:
 
     if not tasks:
         return {"error": "At least one question type/count must be requested.", "questions": []}
+    normalized_tasks: list[tuple[str, int]] = []
     for qtype, count in tasks:
         if qtype not in VALID_TYPES:
             return {
                 "error": f"Unsupported question_type '{qtype}'. Supported: {sorted(VALID_TYPES)}",
                 "questions": [],
             }
-        if not isinstance(count, int) or count < 1 or count > MAX_PER_TYPE:
+        if type(count) is not int or count < 0 or count > MAX_PER_TYPE:
             return {
-                "error": f"question count must be an integer between 1 and {MAX_PER_TYPE}",
+                "error": f"question count must be an integer between 0 and {MAX_PER_TYPE}",
                 "questions": [],
             }
+        if count:
+            normalized_tasks.append((qtype, count))
 
-    if not isinstance(num_models, int) or not (
+    if not normalized_tasks:
+        return {"error": "At least one question count must be greater than zero.", "questions": []}
+
+    if type(num_models) is not int or not (
         _NUM_MODELS_MIN <= num_models <= _NUM_MODELS_MAX
     ):
         return {
@@ -69,4 +75,4 @@ def receive_request(state: ExamState) -> dict:
             "questions": [],
         }
 
-    return {}
+    return {"tasks": normalized_tasks}

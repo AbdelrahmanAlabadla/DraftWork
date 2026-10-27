@@ -91,7 +91,19 @@ def _validator_entries(prompt):
     block = prompt.split("## Questions to review\n", 1)[1].split(
         "\n\n## Verdict object format", 1
     )[0]
-    return json.loads(block)
+    entries = json.loads(block)
+    if "## Evidence registry\n" in prompt:
+        registry_block = prompt.split("## Evidence registry\n", 1)[1].split(
+            "\n\n## Questions to review", 1
+        )[0]
+        registry = json.loads(registry_block)
+        for entry in entries:
+            entry["assigned_sources"] = {
+                chunk_id: registry[chunk_id]
+                for chunk_id in entry.get("assigned_evidence_ids") or []
+                if chunk_id in registry
+            }
+    return entries
 
 
 class EchoValidatorClient:
@@ -531,8 +543,7 @@ def test_why_revalidation_uses_latest_authoritative_plan_task(monkeypatch):
     result = validate_generated_questions(state)
     entry = captured["entry"]
     assert result["validation_reports"][0]["verdicts"][0]["action"] == "PASS"
-    assert entry["plan"]["task_id"] == "task-current"
-    assert entry["expected_catalog_task"] == {
+    assert entry["task_contract"] == {
         "slot_id": slot_id, "task_id": "task-current",
         "task_family_id": "family-current", "coverage_id": "coverage-current",
         "concept_id": None, "relationship_id": None,
@@ -545,8 +556,10 @@ def test_why_revalidation_uses_latest_authoritative_plan_task(monkeypatch):
             "complexity_boundaries": [], "exact_source_instance": False,
             "difficulty": None,
             "assigned_evidence_ids": ["chunk-current", "chunk-support"],
-            "selected_variation_id": None, "selected_variation": None,
-            "effective_evidence_chunk_ids": ["chunk-current", "chunk-support"],
+                "selected_variation_id": None, "selected_variation": None,
+                "selected_variation_group_id": None,
+                "effective_instance_id": None, "effective_givens": [],
+                "effective_evidence_chunk_ids": ["chunk-current", "chunk-support"],
     }
     assert entry["assigned_sources"] == {
         "chunk-current": "E = hν",
@@ -656,6 +669,7 @@ def _quant_plan(slot_id="m1_equation_1"):
 # ---------------------------------------------------------------------------
 def test_assign_ids_unique_per_type():
     mcq1, mcq2 = _mcq("x1"), _mcq("x2")
+    mcq1["slot_id"], mcq2["slot_id"] = "m1_mcq_1", "m1_mcq_2"
     del mcq1["question_id"], mcq2["question_id"]
     eb._assign_ids(1, "mcq", [mcq1, mcq2])
     assert [q["question_id"] for q in (mcq1, mcq2)] == ["model1_mcq_1", "model1_mcq_2"]
@@ -663,8 +677,10 @@ def test_assign_ids_unique_per_type():
 
 def test_assign_ids_different_types_no_collision():
     mcq = _mcq("x")
+    mcq["slot_id"] = "m1_mcq_1"
     del mcq["question_id"]
     tf = _tf("x")
+    tf["slot_id"] = "m1_true_false_1"
     del tf["question_id"]
     eb._assign_ids(1, "mcq", [mcq])
     eb._assign_ids(1, "true_false", [tf])
@@ -674,6 +690,7 @@ def test_assign_ids_different_types_no_collision():
 
 def test_assign_ids_model_isolation():
     mcq1, mcq2 = _mcq("x"), _mcq("y")
+    mcq1["slot_id"], mcq2["slot_id"] = "m1_mcq_1", "m2_mcq_1"
     del mcq1["question_id"], mcq2["question_id"]
     eb._assign_ids(1, "mcq", [mcq1])
     eb._assign_ids(2, "mcq", [mcq2])
@@ -684,9 +701,11 @@ def test_assign_ids_model_isolation():
 
 def test_assign_ids_continues_sequence():
     q1 = _mcq("x")
+    q1["slot_id"] = "m1_mcq_1"
     del q1["question_id"]
     eb._assign_ids(1, "mcq", [q1])
     q2 = _mcq("y")
+    q2["slot_id"] = "m1_mcq_2"
     del q2["question_id"]
     eb._assign_ids(1, "mcq", [q1, q2])  # q2 has no id -> continues
     assert q1["question_id"] == "model1_mcq_1"
@@ -695,6 +714,7 @@ def test_assign_ids_continues_sequence():
 
 def test_assign_ids_fitb_items():
     item = _fitb_item("x")
+    item["slot_id"] = "m1_fill_in_the_blank_1"
     del item["question_id"]
     eb._assign_ids(1, "fill_in_the_blank", _fitb([item]))
     assert item["question_id"] == "model1_fill_in_the_blank_1"
@@ -1350,10 +1370,8 @@ def test_validator_receives_internal_plan_and_assigned_source_only():
     )
     assert report["all_pass"] is True
     entries = _validator_entries(fake.last_validator_prompt)
-    assert entries[0]["plan"]["reasoning_mode"] == "derivation_relationship"
-    assert entries[0]["assigned_sources"] == {
-        "chunk-kinematics": "v = u + at; s = (u + v)t/2"
-    }
+    assert entries[0]["task_contract"]["reasoning_mode"] == "derivation_relationship"
+    assert entries[0]["assigned_evidence_ids"] == ["chunk-kinematics"]
     assert "v = u + at; s = (u + v)t/2" in fake.last_validator_prompt
     assert "This content must not be sent" not in fake.last_validator_prompt
 
@@ -1942,7 +1960,7 @@ def test_general_validator_receives_task_contract_and_accepts_task_drift_code():
     )
     assert report["verdicts"][0]["failure_code"] == "task_drift"
     entry = _validator_entries(fake.last_validator_prompt)[0]
-    assert entry["expected_catalog_task"] == {
+    assert entry["task_contract"] == {
         "slot_id": "m1_why_1",
         "task_id": "task-region",
         "task_family_id": "family-region",
@@ -1962,8 +1980,10 @@ def test_general_validator_receives_task_contract_and_accepts_task_drift_code():
             "scenario_family": None,
         "difficulty": None,
             "assigned_evidence_ids": ["chunk-a"],
-            "selected_variation_id": None, "selected_variation": None,
-            "effective_evidence_chunk_ids": ["chunk-a"],
+                "selected_variation_id": None, "selected_variation": None,
+                "selected_variation_group_id": None,
+                "effective_instance_id": None, "effective_givens": [],
+                "effective_evidence_chunk_ids": ["chunk-a"],
         }
     assert "Being on the same broad topic is not enough" in val.VALIDATOR_SYSTEM_PROMPT
 
@@ -2490,10 +2510,9 @@ def test_validator_prompt_contains_main_and_support_sources():
         "_source_chunks": {"main": "first law", "support": "second law"},
     }])
     entries = _validator_entries(prompt)
-    assert entries[0]["assigned_sources"] == {
-        "main": "first law",
-        "support": "second law",
-    }
+    assert entries[0]["assigned_evidence_ids"] == ["main", "support"]
+    assert prompt.count('"main": "first law"') == 1
+    assert prompt.count('"support": "second law"') == 1
 
 
 def test_local_validator_rejects_commutative_duplicate_mcq_options():

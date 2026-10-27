@@ -16,10 +16,61 @@ from app.online.assessment_catalog import (
     compatible_task_inventory,
     fitb_answer_keys,
     is_authorized_catalog_exhaustion_reuse,
+    eligible_task_variations,
 )
 from app.online.duplicate_judge import review_duplicate_candidates
+from app.online.lifecycle import question_fingerprint
 
 logger = get_logger("DUPLICATE_PIPELINE")
+
+
+def _build_question_fingerprint_index(exam: dict[str, Any]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for section in (exam.get("questions") or {}).values():
+        values = section.get("items") if isinstance(section, dict) else section
+        for item in values or []:
+            qid = str(item.get("question_id") or "")
+            if qid:
+                result[qid] = question_fingerprint(item)
+    return result
+
+
+def _current_conflict_groups(
+    groups: list[dict[str, Any]], exams: dict[int, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop stale endpoints and edges; groups are derived from current fingerprints."""
+    current: list[dict[str, Any]] = []
+    for raw in groups:
+        group = deepcopy(raw)
+        model_number = int(group.get("model_number") or 1)
+        fingerprints = _build_question_fingerprint_index(exams.get(model_number) or {})
+        recorded = group.get("question_fingerprints") or {}
+        valid_ids = {
+            str(qid) for qid in group.get("question_ids") or []
+            if str(qid) in fingerprints
+            and (not recorded or recorded.get(str(qid)) == fingerprints[str(qid)])
+        }
+        edges = [
+            edge for edge in group.get("edges") or []
+            if str(edge.get("left") or "") in valid_ids
+            and str(edge.get("right") or "") in valid_ids
+        ]
+        connected_ids = {str(edge.get(side)) for edge in edges for side in ("left", "right")}
+        if len(connected_ids) < 2:
+            continue
+        group["edges"] = edges
+        group["question_ids"] = sorted(connected_ids)
+        group["keep_question_ids"] = [
+            qid for qid in group.get("keep_question_ids") or [] if qid in connected_ids
+        ]
+        group["replace_question_ids"] = [
+            qid for qid in group.get("replace_question_ids") or [] if qid in connected_ids
+        ]
+        group["question_fingerprints"] = {
+            qid: fingerprints[qid] for qid in connected_ids
+        }
+        current.append(group)
+    return current
 
 
 class ReplacementCandidateRejection(BaseModel):
@@ -76,13 +127,12 @@ def _attach_reuse_context(
         for item in values or []:
             plan = plan_by_slot.get(str(item.get("slot_id") or "")) or {}
             authorized = bool(
-                plan.get("plan_review_status") == "intentional_reuse"
-                or plan.get("reuse_mode") == "intentional_practice_variation"
+                plan.get("reuse_mode") == "intentional_practice_variation"
                 or is_authorized_catalog_exhaustion_reuse(plan)
             )
             if not authorized:
                 continue
-            item["plan_review_reuse_context"] = {
+            item["reuse_context"] = {
                 "status": "intentional_practice_variation",
                 "authorized": True,
                 "task_id": plan.get("task_id"),
@@ -355,6 +405,9 @@ def _complete_question_context(
         "idea_to_test": plan.get("idea_to_test"),
         "task_operation": plan.get("task_operation"),
         "target": plan.get("target"),
+        "selected_variation_group_id": plan.get("selected_variation_group_id"),
+        "effective_instance_id": plan.get("effective_instance_id"),
+        "effective_givens": deepcopy(plan.get("effective_givens") or []),
         "reasoning_requirements": deepcopy(plan.get("reasoning_requirements") or []),
         "student_work_product": plan.get("student_work_product"),
         "required_givens": deepcopy(plan.get("required_givens") or []),
@@ -485,7 +538,13 @@ def _select_replacement_candidate(
         declared = candidate.get("allowed_question_types")
         # Legacy persisted plans may predate this compiler field. Keep their
         # existing candidate behavior, but never accept an explicit mismatch.
-        return not declared or qtype in declared
+        if not declared:
+            return True
+        if qtype not in declared:
+            return False
+        if "text_answerable" not in candidate and "allowed_variations" not in candidate:
+            return True
+        return bool(eligible_task_variations(candidate, qtype))
 
     def authorized_reuse(candidate: dict[str, Any]) -> bool:
         return bool(
@@ -616,7 +675,7 @@ def _forced_catalog_reuse_pairs(
             or item.get("fitb_entry_reused") is True
             or replacement_stage.startswith("unused_task_")
             or replacement_stage == "unused_fitb_entry"
-            or replacement_stage == "plan_review_unused_task"
+            or replacement_stage == "deterministic_unused_task"
             or replacement_stage == "regenerated_original_task_after_duplicate"
             or replacement_stage == "regenerated_original_fitb_entry"
         ):
@@ -667,7 +726,9 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
         state.get("duplicate_verification_attempt") or repair_rounds + 1
     )
     if repair_rounds >= config.MAX_DUPLICATE_REPAIR_ROUNDS and not verification_pending:
-        unresolved = list(state.get("unresolved_duplicate_conflicts") or [])
+        unresolved = _current_conflict_groups(
+            state.get("unresolved_duplicate_conflicts") or [], _exam_by_model(state)
+        )
         unresolved.extend(deepcopy(state.get("pending_duplicate_groups") or []))
         if not unresolved and reports:
             unresolved.extend(deepcopy(reports[-1].get("duplicate_groups") or []))
@@ -735,6 +796,26 @@ def scan_exam_duplicates(state: dict[str, Any]) -> dict[str, Any]:
         )
         report = run_review(filtered_exam, forced_pairs)
         fact_cache = dict(report.pop("fact_cache", fact_cache))
+        by_id = _build_question_fingerprint_index(filtered_exam)
+        for pair in report.get("candidate_pairs") or []:
+            pair["left_question_fingerprint"] = by_id.get(
+                str((pair.get("left") or {}).get("question_id") or "")
+            )
+            pair["right_question_fingerprint"] = by_id.get(
+                str((pair.get("right") or {}).get("question_id") or "")
+            )
+            pair["screening_version"] = "duplicate-screen-v2-fingerprinted"
+        for verdict in report.get("pair_verdicts") or []:
+            pair = next((item for item in report.get("candidate_pairs") or []
+                         if item.get("pair_id") == verdict.get("pair_id")), {})
+            verdict["left_question_fingerprint"] = pair.get("left_question_fingerprint")
+            verdict["right_question_fingerprint"] = pair.get("right_question_fingerprint")
+            verdict["judge_version"] = "duplicate-judge-v2-fingerprinted"
+            verdict.setdefault("resolution_status", "active")
+        for group in report.get("duplicate_groups") or []:
+            group["question_fingerprints"] = {
+                str(qid): by_id.get(str(qid)) for qid in group.get("question_ids") or []
+            }
         report_record = {"model_number": model_number, "scan_index": scan_index, **report}
         reports.append(report_record)
         distributions.append({
@@ -1361,7 +1442,16 @@ def repair_duplicate_groups(state: dict[str, Any]) -> dict[str, Any]:
                             "evidence_justification": adjustment.get(
                                 "evidence_justification"
                             ),
+                            "base_variation_id": active_plan.get("selected_variation_id"),
+                            "effective_instance_id": adjustment.get("effective_instance_id"),
+                            "effective_givens": list(adjustment.get("effective_givens") or []),
                         }
+                        if adjustment.get("effective_instance_id"):
+                            active_plan["effective_instance_id"] = adjustment["effective_instance_id"]
+                            active_plan["derived_task_id"] = adjustment["effective_instance_id"]
+                            active_plan["effective_givens"] = list(
+                                adjustment.get("effective_givens") or []
+                            )
                     elif adjustment.get("status") == "failed":
                         active_plan["adjustment_failure_reason"] = adjustment.get("reason")
                         active_plan["difficulty_fallback_reason"] = adjustment.get("reason")

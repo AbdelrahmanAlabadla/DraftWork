@@ -162,14 +162,16 @@ def test_fitb_missing_regenerated_full(monkeypatch):
     stats = create_pipeline_eval([("fill_in_the_blank", 3)], 1)
 
     def _fake_fitb(count, planned, *a, **k):
-        captured["planned"] = planned
+        captured.setdefault("planned", []).extend(planned)
         captured["eval_stats"] = k.get("eval_stats")
         answers = ["alpha", "beta", "gamma"]
         distractors = [["delta", "epsilon"], ["zeta", "eta"], ["theta", "iota"]]
-        return {"word_bank": [*answers, *[v for pair in distractors for v in pair]], "items": [
-            {"question": f"The term is ________ for item {i}.", "answers": [answers[i]],
-             "distractors": distractors[i], "slot_id": planned[i]["slot_id"]}
-            for i in range(3)]}, []
+        index = int(planned[0]["slot_id"].rsplit("_", 1)[1]) - 1
+        return {"word_bank": [answers[index], *distractors[index]], "items": [{
+            "question": f"The term is ________ for item {index}.",
+            "answers": [answers[index]], "distractors": distractors[index],
+            "slot_id": planned[0]["slot_id"],
+        }]}, []
 
     monkeypatch.setattr(eb, "_generate_fitb_type", _fake_fitb)
     questions = {}

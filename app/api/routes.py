@@ -31,6 +31,7 @@ from app.metrics import (
     replace_gauges,
 )
 from app import config
+from app.file_validation import InvalidPdfError, validate_pdf
 
 logger = get_logger("API")
 
@@ -246,7 +247,11 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
             output.write(chunk)
 
     try:
+        validate_pdf(dest)
         summary = run_pipeline(dest, document_id)
+    except InvalidPdfError as exc:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc))
     except PipelineError as exc:
         logger.warning(
             "Upload indexing failed | document_id=%s | error=%s",

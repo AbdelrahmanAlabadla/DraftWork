@@ -45,12 +45,17 @@ REPAIR_ACTIONS = frozenset(
     {"FIX_QUESTION", "FIX_ANSWER", "FIX_OPTIONS", "FIX_QUESTION_AND_ANSWER"}
 )
 
-MAX_QUESTION_REPAIR_ATTEMPTS = 3
+MAX_QUESTION_REPAIR_ATTEMPTS = 6
+MAX_ASSIGNMENT_REPAIR_ATTEMPTS = 3
+MAX_CANDIDATE_GENERATION_FAILURES = 3
 
 VALIDATOR_TEMPERATURE = 0.1
 # Some served models (e.g. qwen/qwen3-8b) only support reasoning 'off'/'on'.
 # 'off' keeps the call fast and non-creative while still producing verdicts.
 VALIDATOR_REASONING = "on"
+GENERAL_VALIDATION_RULE_VERSION = "general-v2-compact-contract"
+STEM_VALIDATION_RULE_VERSION = "stem-v2-compact-contract"
+VALIDATION_SCHEMA_VERSION = "validator-verdict-v2"
 # DeepSeek can spend a large part of its response budget on hidden reasoning.
 # Give the general validator its final budget up front instead of paying for an
 # avoidable 12k -> 24k -> 32k output-limit retry chain.
@@ -1373,16 +1378,20 @@ def build_validator_prompt(
     rejection_reason: str = "",
 ) -> str:
     prompt_entries: List[Dict[str, Any]] = []
+    evidence_registry: Dict[str, str] = {}
     for entry in entries:
         cleaned = dict(entry)
         source_chunks = cleaned.pop("_source_chunks", {}) or {}
-        cleaned["assigned_sources"] = {
-            str(chunk_id): str(content)
-            for chunk_id, content in source_chunks.items()
-            if chunk_id and content
-        } if isinstance(source_chunks, dict) else {}
+        if isinstance(source_chunks, dict):
+            for chunk_id, content in source_chunks.items():
+                if chunk_id and content:
+                    evidence_registry.setdefault(str(chunk_id), str(content))
+        cleaned["assigned_evidence_ids"] = [
+            str(chunk_id) for chunk_id in source_chunks if chunk_id
+        ] if isinstance(source_chunks, dict) else []
         prompt_entries.append(cleaned)
-    payload = json.dumps(prompt_entries, ensure_ascii=False, indent=None)
+    evidence_payload = json.dumps(evidence_registry, ensure_ascii=False)
+    payload = json.dumps(prompt_entries, ensure_ascii=False)
     retry_context = (
         "\n\n## Corrective retry\n"
         "The previous structured response was rejected by code for this exact reason:\n"
@@ -1395,7 +1404,10 @@ def build_validator_prompt(
         "question (same number of results as entries).\n"
         "Use the exact question_ids you were given and never invent new ones. Each entry is an "
         "isolated evidence boundary. Use only that entry's assigned_sources; never use another "
-        "entry's evidence to validate or rescue it.\n\n"
+        "entry's evidence IDs to validate or rescue it. Source text is stored once in the "
+        "shared evidence_registry; an entry may use only its assigned_evidence_ids.\n\n"
+        "## Evidence registry\n"
+        f"{evidence_payload}\n\n"
         "## Questions to review\n"
         f"{payload}\n\n"
         "## Verdict object format (use exactly these field names)\n"
@@ -1457,6 +1469,11 @@ def _catalog_task_contract(
         "assigned_evidence_ids": _plan_source_ids(plan),
         "selected_variation_id": (question or {}).get("selected_variation_id"),
         "selected_variation": (question or {}).get("selected_variation"),
+        "selected_variation_group_id": plan.get("selected_variation_group_id"),
+        "effective_instance_id": plan.get("effective_instance_id"),
+        "effective_givens": list(
+            plan.get("effective_givens") or plan.get("given_conditions") or []
+        ),
         "effective_evidence_chunk_ids": list(
             (question or {}).get("effective_evidence_chunk_ids") or _plan_source_ids(plan)
         ),
@@ -1708,8 +1725,7 @@ def validate_exam(
             "question_id": str(qid),
             "question_type": qtype,
             "question": payload,
-            "plan": plan_item or {},
-            "expected_catalog_task": _catalog_task_contract(plan_item, item),
+            "task_contract": _catalog_task_contract(plan_item, item),
             "_source_chunks": _assigned_source_chunks(
                 plan_item, source_by_chunk,
                 list(item.get("effective_evidence_chunk_ids") or []) or None,
@@ -2188,8 +2204,8 @@ def _repair_fields_with_dependencies(
     if qtype == "mcq":
         if expanded & {"question", "options", "correct_answer"}:
             expanded.add("solution_certificate")
-            if "options" in expanded:
-                expanded.add("correct_answer")
+            if expanded & {"question", "options"}:
+                expanded.update({"options", "correct_answer"})
     elif qtype == "true_false" and expanded & {"statement", "answer"}:
         expanded.add("solution_certificate")
     elif qtype in {"equation", "word_problem"} and expanded & {
@@ -2309,6 +2325,7 @@ def repair_exam(
                 "rejected_distractors": rejected_distractors,
                 "required_repair": required_repair,
                 "previous_repair_rejection": v.get("previous_repair_rejection") or "",
+                "previous_attempts": list(v.get("repair_attempt_history") or [])[-3:],
                 "authorized_patch_fields": sorted(allowed),
                 "question": p,
                 "plan": plan_item or {},
@@ -2971,7 +2988,31 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Validation of isolated staged candidates is independent. Workers only
     # produce reports; commits below remain deterministic and transactional.
-    repair_candidates = list(state.get("repair_candidates") or [])
+    repair_candidates = []
+    stale_candidate_events: list[dict[str, Any]] = []
+    lifecycle = state.get("slot_lifecycle") or {}
+    for candidate in state.get("repair_candidates") or []:
+        slot_id = str(candidate.get("slot_id") or "")
+        current = lifecycle.get(slot_id) or {}
+        expected_assignment = candidate.get("expected_assignment_fingerprint")
+        expected_question = candidate.get("expected_question_fingerprint")
+        stale = bool(
+            (expected_assignment and expected_assignment != current.get("assignment_fingerprint"))
+            or (expected_question and expected_question != current.get("question_fingerprint"))
+        )
+        if stale:
+            stale_candidate_events.append({
+                "model_number": candidate.get("model_number"), "slot_id": slot_id,
+                "question_id": candidate.get("question_id"), "status": "stale_candidate_rejected",
+                "failure_code": "stale_slot_revision",
+                "expected_assignment_fingerprint": expected_assignment,
+                "current_assignment_fingerprint": current.get("assignment_fingerprint"),
+                "expected_question_fingerprint": expected_question,
+                "current_question_fingerprint": current.get("question_fingerprint"),
+            })
+            continue
+        repair_candidates.append(candidate)
+    validation_repair_history.extend(stale_candidate_events)
 
     def validate_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
         mn = int(candidate.get("model_number") or 1)
@@ -3051,8 +3092,10 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             "candidate_task_id": candidate.get("candidate_task_id"),
             "candidate_fitb_entry_id": candidate.get("candidate_fitb_entry_id"),
             "revalidation_result": "PASS" if passed else "FAIL",
+            "assignment_fingerprint": candidate.get("assignment_fingerprint"),
         }
         if passed:
+            event["progress"] = "PASSED"
             active_exam = next((e for e in generated if int(e.get("model_number") or 0) == mn), None)
             staged_entry = _build_by_id(staged_exam.get("questions") or {}).get(qid)
             if active_exam is not None and staged_entry is not None:
@@ -3078,6 +3121,13 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             new_code = str(failure.get("failure_code") or "candidate_revalidation_failed")
             new_reason = str(failure.get("reason") or failure.get("expected_fix") or
                              "Candidate did not pass revalidation.")
+            old_code = str(candidate.get("previous_failure_code") or "")
+            severe = {"unsupported_given", "evidence_mismatch", "task_drift", "wrong_task_identity"}
+            event["progress"] = (
+                "UNCHANGED" if new_code == old_code
+                else "REGRESSED" if new_code in severe and old_code not in severe
+                else "LATERAL"
+            )
             category, repair_type = _repair_classification(
                 new_code, validation_role=str(failure.get("validation_role") or "general")
             )
@@ -3141,6 +3191,13 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 payload = {
                     "question": item,
                     "plan": plan_by_slot.get(slot_id) or {},
+                    "source_hashes": {
+                        chunk_id: hashlib.sha256(text.encode("utf-8")).hexdigest()
+                        for chunk_id, text in _assigned_source_chunks(
+                            plan_by_slot.get(slot_id), source_by_chunk,
+                            list(item.get("effective_evidence_chunk_ids") or []) or None,
+                        ).items()
+                    },
                     "section_dependency": (
                         list(container.get("word_bank") or [])
                         if qtype == "fill_in_the_blank" and isinstance(container, dict)
@@ -3153,6 +3210,15 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             return result
 
         current_fingerprints = question_fingerprints()
+        general_identity = str(getattr(general_client, "model", "default-general"))
+        stem_identity = str(getattr(quantitative_client, "model", "default-stem"))
+        def role_fingerprint(common: str, role: str) -> str:
+            version = (STEM_VALIDATION_RULE_VERSION if role == "stem_quantitative"
+                       else GENERAL_VALIDATION_RULE_VERSION)
+            model = stem_identity if role == "stem_quantitative" else general_identity
+            return hashlib.sha256(
+                f"{common}|{role}|{version}|{VALIDATION_SCHEMA_VERSION}|{model}".encode("utf-8")
+            ).hexdigest()
         model_ledger = validation_ledger.setdefault(str(mn), {})
 
         def run_reviews(ids: Optional[Iterable[str]]) -> Dict[str, Any]:
@@ -3224,12 +3290,15 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             stale_ids = [
                 qid for qid, fingerprint in current_fingerprints.items()
                 if (
-                    (model_ledger.get(qid) or {}).get("fingerprint") != fingerprint
+                    ((model_ledger.get(qid) or {}).get("role_fingerprints") or {}).get("general")
+                    != role_fingerprint(fingerprint, "general")
                     or "general" not in ((model_ledger.get(qid) or {}).get("roles") or {})
                     or (
                         qid in quantitative_required_ids
-                        and "stem_quantitative" not in (
-                            (model_ledger.get(qid) or {}).get("roles") or {}
+                        and (
+                            "stem_quantitative" not in ((model_ledger.get(qid) or {}).get("roles") or {})
+                            or ((model_ledger.get(qid) or {}).get("role_fingerprints") or {}).get("stem_quantitative")
+                            != role_fingerprint(fingerprint, "stem_quantitative")
                         )
                     )
                 )
@@ -3265,7 +3334,11 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             roles = {"general": deepcopy(verdict)}
             if qid in quantitative_by_id:
                 roles["stem_quantitative"] = deepcopy(quantitative_by_id[qid])
-            model_ledger[qid] = {"fingerprint": fingerprint, "roles": roles}
+            model_ledger[qid] = {
+                "fingerprint": fingerprint,
+                "role_fingerprints": {role: role_fingerprint(fingerprint, role) for role in roles},
+                "roles": roles,
+            }
         present_slots = {
             str(item.get("slot_id") or "")
             for _qtype, _container, item in _iter_questions(exam.get("questions") or {})
@@ -3382,7 +3455,7 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
     exam_by_model = {int(exam.get("model_number") or 0): exam for exam in generated}
 
     for target in manifest:
-        if target.get("status") == "resolved":
+        if target.get("status") in {"resolved", "exhausted", "terminal_failure"}:
             continue
         slot_id = str(target.get("slot_id") or "")
         if not slot_id or (attempts.get(slot_id) or 0) >= MAX_QUESTION_REPAIR_ATTEMPTS:
@@ -3391,8 +3464,10 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
         active_exam = exam_by_model.get(mn)
         if active_exam is None:
             continue
+        # Consumed only after a viable candidate is ready for correctness
+        # evaluation; transport/schema/no-op failures have separate bounded
+        # provider retries and do not spend this correctness budget.
         attempt = (attempts.get(slot_id) or 0) + 1
-        attempts[slot_id] = attempt
         qtype = str(target.get("question_type") or _question_type_from_slot(slot_id))
         prefix = f"m{mn}_"
         qid = str(target.get("question_id") or f"model{mn}_{slot_id[len(prefix):] if slot_id.startswith(prefix) else slot_id}")
@@ -3410,8 +3485,18 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             "original_candidate_id": target.get("fitb_entry_id") or target.get("task_id"),
             "attempted_candidate_ids": [], "blacklisted_candidate_ids": [],
             "candidate_failures": [], "replacement_attempt_count": 0,
+            "assignment_validated_attempts": {},
         })
         repair_action = str(target.get("repair_type") or "repair_question")
+        prior_rejections = [
+            item for item in (target.get("history") or [])
+            if item.get("status") in {"rejected", "candidate_generation_failed"}
+            or item.get("revalidation_result") == "FAIL"
+        ]
+        if repair_action == "repair_question" and prior_rejections:
+            repair_action = "regenerate_missing_slot"
+        if repair_action == "regenerate_missing_slot" and len(prior_rejections) >= 2:
+            repair_action = "replace_assignment"
         use_replacement = repair_action == "replace_assignment" or (
             repair_action == "regenerate_missing_slot" and attempt > 1
         )
@@ -3471,7 +3556,11 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             )
             if replacement is None:
                 reason = "No unused or reusable grounded replacement remained for this slot."
-                target.update(failure_code="replacement_inventory_exhausted", failure_reason=reason)
+                target.update(
+                    status="exhausted",
+                    failure_code="replacement_inventory_exhausted",
+                    failure_reason=reason,
+                )
                 history.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
                                 "attempt": attempt, "repair_action": repair_action,
                                 "status": "candidate_generation_failed", "new_failure_reason": reason})
@@ -3536,6 +3625,13 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             verdict["fields_to_fix"] = list(
                 target.get("fields_to_fix") or verdict.get("fields_to_fix") or []
             )
+            verdict["repair_attempt_history"] = [
+                {key: item.get(key) for key in (
+                    "attempt", "repair_action", "status", "new_failure_code",
+                    "new_failure_reason", "progress",
+                ) if item.get(key) is not None}
+                for item in (target.get("history") or [])[-3:]
+            ]
             prior_rejection = next((
                 str(item.get("new_failure_reason") or item.get("failure_reason") or "")
                 for item in reversed(target.get("history") or [])
@@ -3567,11 +3663,21 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
         warnings.extend(outcome_warnings)
         if not generated_ok:
             reason = "; ".join(outcome_warnings) or "Repairer did not produce a candidate."
+            operational_failures = int(memory.get("candidate_generation_failures") or 0) + 1
+            memory["candidate_generation_failures"] = operational_failures
             if selected_id:
                 memory["blacklisted_candidate_ids"].append(selected_id)
                 memory["candidate_failures"].append({"candidate_id": selected_id,
                                                       "reason": reason, "attempt": attempt})
-            target.update(failure_code="candidate_generation_failed", failure_reason=reason)
+            target.update(
+                status=("exhausted" if operational_failures >= MAX_CANDIDATE_GENERATION_FAILURES else "invalid"),
+                failure_code=(
+                    "candidate_generation_budget_exhausted"
+                    if operational_failures >= MAX_CANDIDATE_GENERATION_FAILURES
+                    else "candidate_generation_failed"
+                ),
+                failure_reason=reason,
+            )
             target.setdefault("history", []).append({"attempt": attempt,
                 "repair_action": repair_action, "repair_role": target.get("repair_role"),
                 "requested_fields": list(target.get("fields_to_fix") or []),
@@ -3582,6 +3688,26 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
                             "status": "candidate_generation_failed", "new_failure_reason": reason})
             continue
         candidate_plan = plan_by_slot.get(slot_id) or {}
+        assignment_payload = {
+            "task_id": candidate_plan.get("task_id"),
+            "fitb_entry_id": candidate_plan.get("fitb_entry_id"),
+            "variation_id": candidate_plan.get("selected_variation_id"),
+            "effective_instance_id": candidate_plan.get("effective_instance_id"),
+            "evidence_ids": _plan_source_ids(candidate_plan),
+        }
+        assignment_fingerprint = hashlib.sha256(json.dumps(
+            assignment_payload, ensure_ascii=False, sort_keys=True, default=str,
+        ).encode("utf-8")).hexdigest()
+        assignment_attempts = memory.setdefault("assignment_validated_attempts", {})
+        if int(assignment_attempts.get(assignment_fingerprint) or 0) >= MAX_ASSIGNMENT_REPAIR_ATTEMPTS:
+            target.update(failure_code="assignment_repair_budget_exhausted",
+                          failure_reason="Assignment exhausted its validated-candidate budget.",
+                          repair_type="replace_assignment")
+            continue
+        attempts[slot_id] = attempt
+        assignment_attempts[assignment_fingerprint] = int(
+            assignment_attempts.get(assignment_fingerprint) or 0
+        ) + 1
         candidates.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
             "question_type": qtype, "attempt": attempt, "repair_action": repair_action,
             "repair_role": selected_repair_role,
@@ -3590,6 +3716,11 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             "previous_failure_reason": target.get("failure_reason"),
             "candidate_task_id": candidate_plan.get("task_id"),
             "candidate_fitb_entry_id": candidate_plan.get("fitb_entry_id"),
+            "assignment_fingerprint": assignment_fingerprint,
+            "expected_assignment_revision": ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get("assignment_revision"),
+            "expected_assignment_fingerprint": ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get("assignment_fingerprint"),
+            "expected_question_revision": ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get("question_revision"),
+            "expected_question_fingerprint": ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get("question_fingerprint"),
             "exam": staged_exam, "plans": staged_plans})
         if mn in validated_models:
             validated_models.remove(mn)
@@ -3687,6 +3818,68 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         warnings.extend(result.get("warnings") or [])
         history.extend(result.get("validation_repair_history") or [])
         validated.intersection_update(result.get("validated_models") or [])
+
+    # One coordinator owns assignment/content reservations. Parallel workers may
+    # propose independently, but identical realized instances never proceed to
+    # paid revalidation or overwrite an active sibling.
+    from app.online.lifecycle import assessment_instance_fingerprint
+    active_instances: dict[str, str] = {}
+    plan_by_model = {
+        int(plan.get("model_number") or 1): {
+            str(item.get("slot_id") or ""): item
+            for values in (plan.get("items") or {}).values() for item in values or []
+        } for plan in state.get("plans") or []
+    }
+    for exam in state.get("generated_exams") or []:
+        mn = int(exam.get("model_number") or 1)
+        for section in (exam.get("questions") or {}).values():
+            values = section.get("items") if isinstance(section, dict) else section
+            for question in values or []:
+                sid = str(question.get("slot_id") or "")
+                if sid:
+                    active_instances[sid] = assessment_instance_fingerprint(
+                        (plan_by_model.get(mn) or {}).get(sid) or {}, question
+                    )
+    accepted_candidates: list[Dict[str, Any]] = []
+    reserved: dict[str, str] = {}
+    for candidate in candidates:
+        mn = int(candidate.get("model_number") or 1)
+        sid = str(candidate.get("slot_id") or "")
+        qid = str(candidate.get("question_id") or "")
+        staged_plan, _ = _plan_context_for_model(
+            {**state, "plans": candidate.get("plans") or []}, mn
+        )
+        entry = _build_by_id((candidate.get("exam") or {}).get("questions") or {}).get(qid)
+        if entry is None or not staged_plan.get(sid):
+            # Compatibility for legacy checkpoints and narrow test doubles that
+            # predate staged assignment/question payloads.
+            accepted_candidates.append(candidate)
+            continue
+        fingerprint = assessment_instance_fingerprint(
+            staged_plan.get(sid) or {}, entry[2] if entry else {}
+        )
+        conflict_slot = next((
+            other_sid for other_sid, other_fp in {**active_instances, **reserved}.items()
+            if other_sid != sid and other_fp == fingerprint
+        ), None)
+        if conflict_slot:
+            target = manifest_by_key.get((mn, sid))
+            if target is not None:
+                target["status"] = "invalid"
+                target["failure_code"] = "assessment_instance_reservation_conflict"
+                target["failure_reason"] = f"Candidate duplicates reserved/active slot {conflict_slot}."
+            history.append({
+                "model_number": mn, "slot_id": sid, "question_id": qid,
+                "status": "candidate_reservation_rejected",
+                "failure_code": "assessment_instance_reservation_conflict",
+                "conflict_slot_id": conflict_slot,
+                "assessment_instance_fingerprint": fingerprint,
+            })
+            continue
+        reserved[sid] = fingerprint
+        candidate["assessment_instance_fingerprint"] = fingerprint
+        accepted_candidates.append(candidate)
+    candidates = accepted_candidates
 
     ordered_manifest = [
         manifest_by_key[(int(item.get("model_number") or 0), str(item.get("slot_id") or ""))]

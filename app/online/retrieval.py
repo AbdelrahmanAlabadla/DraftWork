@@ -89,7 +89,9 @@ def retrieve_selected(
         # Preserve the public pipeline contract for local callers and tests.
         children = store.get_by_child_ids(document_id, selected_child_ids)
 
-    if not children and processed_document_key:
+    returned_ids = {str(child.get("child_id") or "") for child in children}
+    missing_ids = [value for value in selected_child_ids if value not in returned_ids]
+    if missing_ids and processed_document_key:
         cached = load_processed_document_by_key(processed_document_key)
         if cached:
             cached_structure = cached["structure"]
@@ -106,21 +108,33 @@ def retrieve_selected(
                 if cached_document_ids == {document_id}
                 else materialize_for_document(cached_structure, document_id)
             )
-            store.replace_document(
-                structure, document_id=document_id, session_id=session_id,
-                job_id=job_id, processed_document_key=processed_document_key,
-                processing_versions=cached.get("processing_versions") or {},
-            )
-            children = store.get_by_child_ids(
-                document_id, selected_child_ids, session_id=session_id, job_id=job_id,
-            )
-            logger.info("Backfilled cached document chunks into PostgreSQL | document_id=%s", document_id)
+            cached_by_id = {
+                str(child.get("child_id") or ""): child
+                for child in structure.get("children") or [] if child.get("child_id")
+            }
+            recoverable = [cached_by_id[value] for value in missing_ids if value in cached_by_id]
+            if recoverable:
+                store.replace_document(
+                    structure, document_id=document_id, session_id=session_id,
+                    job_id=job_id, processed_document_key=processed_document_key,
+                    processing_versions=cached.get("processing_versions") or {},
+                )
+                children = store.get_by_child_ids(
+                    document_id, selected_child_ids, session_id=session_id, job_id=job_id,
+                )
+                logger.info(
+                    "Backfilled current cached document chunks into PostgreSQL | "
+                    "document_id=%s | recovered=%d", document_id, len(recoverable),
+                )
 
-    if not children:
+    by_id = {str(child.get("child_id") or ""): child for child in children}
+    children = [by_id[value] for value in selected_child_ids if value in by_id]
+    missing_ids = [value for value in selected_child_ids if value not in by_id]
+
+    if missing_ids:
         logger.warning(
-            "Selection retrieval returned 0 chunks | document_id=%s | selected=%d",
-            document_id,
-            len(selected_child_ids),
+            "Selection retrieval incomplete | document_id=%s | selected=%d | missing=%s",
+            document_id, len(selected_child_ids), missing_ids,
         )
         return {
             "retrieved_chunks": [],
@@ -128,8 +142,8 @@ def retrieve_selected(
             "planner_context": "",
             "document_language": "en",
             "error": (
-                f"No stored content found for the selected sections of document "
-                f"{document_id}. Upload and index it first."
+                "Selected source evidence is incomplete for the current processed document. "
+                f"Missing chunk IDs: {', '.join(missing_ids)}. Re-index the document before generating."
             ),
         }
 

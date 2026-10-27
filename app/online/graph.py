@@ -12,6 +12,10 @@ from app.online.eval_stats import PipelineEvalStats
 class ExamState(TypedDict):
     # --- Request -------------------------------------------------------
     document_id: str
+    job_id: str
+    immutable_request: dict[str, Any]
+    request_fingerprint: str
+    plan_schema_version: str
     tasks: list[tuple[str, int]]  # [(question_type, count), ...]
     num_models: int
     selected_child_ids: Optional[list[str]]
@@ -30,25 +34,17 @@ class ExamState(TypedDict):
     assessment_catalog_key: str
     assessment_catalog_cache_hit: bool
     assessment_compiler_cache_hit: bool
+    assessment_catalog_compatibility_cache_hit: bool
     # --- Planning -------------------------------------------------------
     plans: list[dict[str, Any]]  # one plan per model
     assessment_profile: dict[str, Any]  # one compact analysis shared by all models
     planning_issues: list[dict[str, Any]]  # unsupported requested forms/counts
     plan_errors: list[str]  # validation failures from the last attempt
     plan_attempts: int
+    plan_failed_candidate_ids: list[str]
     unrepairable_plan_slots: list[dict[str, Any]]  # omitted slots with repair reasons
-    plan_review_history: list[dict[str, Any]]
-    plan_review_attempts: int
-    plan_review_retry_required: bool
-    plan_review_rechecks: int
     plan_duplicate_repair_attempts: dict[str, int]
-    plan_review_candidate_blacklist: dict[str, list[str]]
     unresolved_plan_duplicate_conflicts: list[dict[str, Any]]
-    plan_review_pair_verdicts: dict[str, dict[str, Any]]
-    plan_review_difficulty_verdicts: dict[str, dict[str, Any]]
-    plan_review_slot_fingerprints: dict[str, dict[str, str]]
-    plan_review_issues: list[dict[str, Any]]
-    plan_review_telemetry: list[dict[str, Any]]
     difficulty_adjustment_history: list[dict[str, Any]]
     difficulty_adjustment_attempts: dict[str, int]
     difficulty_verification_slot_ids: list[str]
@@ -100,11 +96,11 @@ class ExamState(TypedDict):
 
 
 _AUDIT_NODE_EVENTS = {
+    "retrieve_context": ("retrieval", "retrieval_completed"),
     "prepare_assessment_catalog": ("planning", "assessment_catalog_compiled"),
     "plan_exams": ("planning", "plan_completed"),
     "repair_plan": ("planning", "plan_repaired"),
     "adjust_plan_difficulty": ("difficulty_adjustment", "difficulty_adjustment_completed"),
-    "review_plan": ("plan_review", "plan_review_completed"),
     "generate_exams_node": ("generation", "questions_generated"),
     "validate_generated_questions": ("general_validation", "validation_completed"),
     "repair_invalid_questions": ("repair", "repair_completed"),
@@ -123,11 +119,21 @@ def _audit_node_output(
     if not callback or not event:
         return
     stage, event_type = event
-    payload: dict[str, Any] = {"node_output": result}
+    durable_output = deepcopy(result)
+    for key in (
+        "job_id", "immutable_request", "request_fingerprint", "plan_schema_version",
+        "document_id", "processed_document_key", "selected_child_ids", "tasks",
+        "num_models", "difficulty", "domain_type", "subject", "document_language",
+        "assessment_catalog_key", "assessment_catalog", "assessment_profile",
+        "retrieved_chunks",
+    ):
+        if key not in durable_output and key in state:
+            durable_output[key] = deepcopy(state.get(key))
+    payload: dict[str, Any] = {"node_output": durable_output}
     if before:
         payload["stage_input"] = before
     if node_name in {
-        "review_plan", "generate_exams_node", "validate_generated_questions",
+        "generate_exams_node", "validate_generated_questions",
         "repair_invalid_questions", "scan_exam_duplicates",
         "repair_duplicate_groups", "assemble_exams_node",
     }:
@@ -168,7 +174,11 @@ def _with_progress(node, stage: str, progress: int, *, after_repair: bool = Fals
         if callback:
             current_stage = stage
             current_progress = progress
-            if after_repair and state.get("pending_revalidation_ids"):
+            if after_repair and (
+                state.get("pending_revalidation_ids")
+                or state.get("repair_candidates")
+                or state.get("duplicate_numeric_fallback_pending_validation")
+            ):
                 current_stage = "validating_updates"
                 current_progress = 95
             callback(current_stage, current_progress)
@@ -216,7 +226,6 @@ def build_exam_graph() -> StateGraph:
     from app.online.retrieval import retrieve_context
     from app.online.assessment_catalog import prepare_assessment_catalog
     from app.online.planner import plan_exams, repair_plan
-    from app.online.plan_review import review_plan
     from app.online.difficulty_adjustment import adjust_plan_difficulty
     from app.online.exam_builder import generate_exams_node, assemble_exams_node
     from app.online.receive import receive_request
@@ -228,7 +237,14 @@ def build_exam_graph() -> StateGraph:
 
     builder = StateGraph(ExamState)
 
+    def stop_with_error(state: ExamState) -> dict[str, Any]:
+        errors = list(state.get("plan_errors") or [])
+        return {"error": state.get("error") or (
+            "Planner could not produce a fully valid exam plan: " + "; ".join(errors)
+        )}
+
     builder.add_node("receive_request", _with_progress(receive_request, "analyzing_request", 5))
+    builder.add_node("stop_with_error", stop_with_error)
     builder.add_node("retrieve_context", retrieve_context)
     builder.add_node(
         "prepare_assessment_catalog",
@@ -239,7 +255,6 @@ def build_exam_graph() -> StateGraph:
     builder.add_node("adjust_plan_difficulty", _with_progress(
         adjust_plan_difficulty, "adjusting_difficulty", 30
     ))
-    builder.add_node("review_plan", _with_progress(review_plan, "reviewing_plan", 35))
     builder.add_node("generate_exams", _with_progress(generate_exams_node, "generating_exam", 50))
     builder.add_node(
         "validate_generated_questions",
@@ -269,34 +284,51 @@ def build_exam_graph() -> StateGraph:
         "retrieve_context_progress",
         _with_progress(retrieve_context, "retrieving_context", 10),
     )
-    builder.add_edge("receive_request", "retrieve_context_progress")
-    builder.add_edge("retrieve_context_progress", "prepare_assessment_catalog")
+    builder.add_conditional_edges(
+        "receive_request",
+        _route_after_receive,
+        {
+            "retrieve_context_progress": "retrieve_context_progress",
+            "prepare_assessment_catalog": "prepare_assessment_catalog",
+            "plan_exams": "plan_exams",
+            "repair_plan": "repair_plan",
+            "adjust_plan_difficulty": "adjust_plan_difficulty",
+            "generate_exams": "generate_exams",
+            "validate_generated_questions": "validate_generated_questions",
+            "stop_with_error": "stop_with_error",
+        },
+    )
+    builder.add_conditional_edges(
+        "retrieve_context_progress",
+        _route_after_retrieval,
+        {
+            "prepare_assessment_catalog": "prepare_assessment_catalog",
+            "repair_plan": "repair_plan",
+            "adjust_plan_difficulty": "adjust_plan_difficulty",
+            "generate_exams": "generate_exams",
+            "validate_generated_questions": "validate_generated_questions",
+            "stop_with_error": "stop_with_error",
+        },
+    )
     builder.add_edge("prepare_assessment_catalog", "plan_exams")
     builder.add_conditional_edges(
         "plan_exams",
         _route_after_plan,
-        {"repair_plan": "repair_plan", "adjust_plan_difficulty": "adjust_plan_difficulty", "review_plan": "review_plan"},
+        {"repair_plan": "repair_plan", "adjust_plan_difficulty": "adjust_plan_difficulty", "generate_exams": "generate_exams", "stop_with_error": "stop_with_error"},
     )
     builder.add_conditional_edges(
         "repair_plan",
         _route_after_plan,
-        {"repair_plan": "repair_plan", "adjust_plan_difficulty": "adjust_plan_difficulty", "review_plan": "review_plan"},
+        {"repair_plan": "repair_plan", "adjust_plan_difficulty": "adjust_plan_difficulty", "generate_exams": "generate_exams", "stop_with_error": "stop_with_error"},
     )
     builder.add_conditional_edges(
         "adjust_plan_difficulty",
         _route_after_difficulty_adjustment,
         {
             "adjust_plan_difficulty": "adjust_plan_difficulty",
-            "review_plan": "review_plan",
-        },
-    )
-    builder.add_conditional_edges(
-        "review_plan",
-        _route_after_plan_review,
-        {
-            "adjust_plan_difficulty": "adjust_plan_difficulty",
-            "review_plan": "review_plan",
             "generate_exams": "generate_exams",
+            "repair_plan": "repair_plan",
+            "stop_with_error": "stop_with_error",
         },
     )
     builder.add_edge("generate_exams", "validate_generated_questions")
@@ -320,29 +352,69 @@ def build_exam_graph() -> StateGraph:
     )
     builder.add_edge("repair_duplicate_groups", "validate_generated_questions")
     builder.add_edge("assemble_exams", END)
+    builder.add_edge("stop_with_error", END)
 
     return builder.compile()
+
+
+def _route_after_receive(state: ExamState) -> str:
+    """Resume from the latest complete job-scoped checkpoint."""
+    if state.get("error"):
+        return "stop_with_error"
+    plans = state.get("plans") or []
+    generated = state.get("generated_exams") or []
+    planned_slots = {
+        str(item.get("slot_id") or "")
+        for plan in plans
+        for values in (plan.get("items") or {}).values()
+        for item in values or [] if item.get("slot_id")
+    }
+    generated_slots = {
+        str(item.get("slot_id") or "")
+        for exam in generated
+        for section in (exam.get("questions") or {}).values()
+        for item in (
+            section.get("items") if isinstance(section, dict) else section
+        ) or [] if item.get("slot_id")
+    }
+    if plans and not state.get("retrieved_chunks"):
+        # Older job checkpoints may contain a durable plan but predate the
+        # retrieval checkpoint event. Reload that same job's selected evidence,
+        # then continue from the plan without compiling or allocating again.
+        return "retrieve_context_progress"
+    if plans and planned_slots and planned_slots.issubset(generated_slots):
+        return "validate_generated_questions"
+    if plans:
+        # A resumed plan is revalidated in place before any pending difficulty
+        # work or generation. repair_plan preserves valid slots/checkpoints.
+        return "repair_plan"
+    if state.get("assessment_catalog"):
+        return "plan_exams"
+    if state.get("retrieved_chunks"):
+        return "prepare_assessment_catalog"
+    return "retrieve_context_progress"
+
+
+def _route_after_retrieval(state: ExamState) -> str:
+    """Restore evidence for an older checkpoint without rebuilding its plan."""
+    if state.get("error"):
+        return "stop_with_error"
+    if state.get("plans"):
+        return _route_after_receive(state)
+    return "prepare_assessment_catalog"
 
 
 def _route_after_plan(state: ExamState) -> str:
     """Cycle to repair while a plan is invalid within the bounded attempt budget."""
     from app.online.planner import MAX_PLAN_ATTEMPTS
 
-    if (
-        state.get("plan_errors")
-        and not state.get("planning_issues")
-        and (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
-    ):
-        return "repair_plan"
-    # Difficulty mismatches are first verified and collected by Plan Review.
-    # The reviewer then routes only confirmed pending slots to the adjuster.
-    return "review_plan"
-
-
-def _route_after_plan_review(state: ExamState) -> str:
-    """Send reviewer-confirmed difficulty mismatches to the dedicated adjuster."""
-    if state.get("plan_review_retry_required"):
-        return "review_plan"
+    if state.get("error"):
+        return "stop_with_error"
+    if state.get("plan_errors"):
+        return (
+            "repair_plan" if (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
+            else "stop_with_error"
+        )
     if any(
         (item.get("difficulty_adaptation") or {}).get("status") == "pending"
         for plan in state.get("plans") or []
@@ -354,20 +426,28 @@ def _route_after_plan_review(state: ExamState) -> str:
 
 
 def _route_after_difficulty_adjustment(state: ExamState) -> str:
-    """Finish bounded adjustment attempts before one targeted Plan Review."""
+    """Finish bounded adjustment attempts before generation."""
+    from app.online.planner import MAX_PLAN_ATTEMPTS
+    if state.get("error"):
+        return "stop_with_error"
+    if state.get("plan_errors"):
+        return (
+            "repair_plan" if (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
+            else "stop_with_error"
+        )
     return "adjust_plan_difficulty" if any(
         (item.get("difficulty_adaptation") or {}).get("status") == "pending"
         for plan in state.get("plans") or []
         for values in (plan.get("items") or {}).values()
         for item in values or []
-    ) else "review_plan"
+    ) else "generate_exams"
 
 
 def _route_after_validation(state: ExamState) -> str:
     """Route unresolved requested slots through their own bounded budgets."""
     attempts = state.get("question_repair_attempts") or {}
     for target in state.get("repair_manifest") or []:
-        if target.get("status") == "resolved":
+        if target.get("status") in {"resolved", "exhausted", "terminal_failure"}:
             continue
         slot_id = str(target.get("slot_id") or "")
         if slot_id and (attempts.get(slot_id) or 0) < MAX_QUESTION_REPAIR_ATTEMPTS:
@@ -379,7 +459,9 @@ def _route_after_validation(state: ExamState) -> str:
         for report in state.get("validation_reports") or []:
             if any(v.get("action") in REPAIR_ACTIONS for v in report.get("verdicts") or []):
                 return "repair_invalid_questions"
-    if state.get("duplicate_repair_finalization_pending"):
+    if state.get("duplicate_repair_finalization_pending") and not state.get(
+        "duplicate_verification_pending"
+    ):
         return "assemble_exams"
     return "scan_exam_duplicates"
 

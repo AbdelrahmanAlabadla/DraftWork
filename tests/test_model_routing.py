@@ -8,7 +8,6 @@ from app.llm.factory import (
     create_assessment_compiler_client,
     create_duplicate_replacement_client,
     create_llm_client,
-    create_plan_review_client,
     create_review_client,
     reset_online_assessment_domain,
     set_online_assessment_domain,
@@ -17,7 +16,7 @@ from app.llm.openai_client import OpenAIClient
 
 
 STEM_GENERAL_STAGES = [
-    "planner", "plan_reviewer", "mcq_generator", "true_false_generator",
+    "planner", "mcq_generator", "true_false_generator",
     "fill_in_the_blank_generator", "definition_generator", "why_generator",
     "equation_generator", "word_problem_generator", "essay_generator",
     "correctness_validator", "general_validator", "general_repairer",
@@ -71,7 +70,7 @@ def test_context_routes_shared_online_factories_to_stem(monkeypatch):
     token = set_online_assessment_domain("STEM")
     try:
         for client in (
-            create_llm_client(), create_plan_review_client(),
+            create_llm_client(),
             create_duplicate_replacement_client(),
         ):
             _assert_luna_medium(client)
@@ -96,13 +95,9 @@ def test_non_stem_context_preserves_specialized_factories(monkeypatch):
     monkeypatch.setattr(deepseek, "DEEPSEEK_API_KEY", "test-key")
     token = set_online_assessment_domain("NON_STEM")
     try:
-        reviewer = create_plan_review_client()
         selector = create_duplicate_replacement_client()
     finally:
         reset_online_assessment_domain(token)
-    assert type(reviewer) is DeepSeekClient
-    assert reviewer.model == "deepseek-flash"
-    assert reviewer._reasoning_effort("plan_reviewer") == "low"
     assert type(selector) is DeepSeekClient
     assert selector.model == "deepseek-flash"
 

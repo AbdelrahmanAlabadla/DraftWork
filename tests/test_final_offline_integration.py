@@ -6,7 +6,7 @@ import time
 import tracemalloc
 
 from app.llm import scheduler
-from app.online import assessment_catalog, duplicate_pipeline, plan_review, validator
+from app.online import assessment_catalog, duplicate_pipeline, validator
 
 
 def _raw_task(index: int) -> dict:
@@ -36,6 +36,7 @@ def _raw_task(index: int) -> dict:
                           "solve_for_speed" if index % 4 == 2 else "verify_solution"),
             "givens": ["distance", "speed", "time"], "representation": None,
             "application": "constant-speed scenario", "numeric_values_may_change": True,
+            "question_types": [qtype],
         }],
         "variable_givens": ["distance", "speed", "time"],
         "complexity_boundaries": ["do not introduce acceleration"],
@@ -79,17 +80,7 @@ def test_large_catalogs_finalize_allocate_and_stay_bounded(monkeypatch):
         assert all(item["complexity_boundaries"] == ["do not introduce acceleration"]
                    for item in catalog["tasks"])
         assert all(item["evidence_chunk_ids"] for item in catalog["tasks"])
-        plan_review._PLAN_EMBEDDING_CACHE.clear()
-        monkeypatch.setattr(
-            plan_review, "embed_dense",
-            lambda *_args, **_kwargs: [[float(index), 1.0] for index in range(len(items))],
-        )
-        review_started = time.perf_counter()
-        pairs, review_stats = plan_review._shortlist_plan_pairs(plans[0])
-        review_elapsed = time.perf_counter() - review_started
-        assert review_stats["possible_pair_count"] == 253
-        assert len(pairs) <= review_stats["possible_pair_count"]
-        metrics.append((count, elapsed, review_elapsed, peak, len(json.dumps(catalog))))
+        metrics.append((count, elapsed, peak, len(json.dumps(catalog))))
     assert metrics[-1][1] < 5
     assert metrics[-1][2] < 32 * 1024 * 1024
     print("catalog_metrics", metrics)

@@ -52,6 +52,7 @@ class TaskVariation(StrictOutputModel):
     representation: NonEmptyString | None = Field(default=None, alias="form")
     application: NonEmptyString | None = Field(default=None, alias="context")
     numeric_values_may_change: StrictBool = Field(default=False, alias="vary_numbers")
+    variation_group_id: str | None = None
     variation_id: str | None = None
 
 
@@ -99,7 +100,7 @@ def strict_json_schema(model: type[BaseModel]) -> dict:
 
 
 class DifficultyAdaptation(StrictOutputModel):
-    status: Literal["pending", "adapted", "failed"]
+    status: Literal["pending", "adapted", "failed", "fallback", "retained"]
     from_difficulty: Literal["easy", "medium", "hard"]
     to_difficulty: Literal["easy", "medium", "hard"]
     base_task_id: str = Field(min_length=1)
@@ -108,6 +109,9 @@ class DifficultyAdaptation(StrictOutputModel):
     changed_reasoning_requirements: list[NonEmptyString] = Field(default_factory=list)
     evidence_support: list[NonEmptyString] = Field(default_factory=list)
     evidence_justification: str | None = None
+    base_variation_id: str | None = None
+    effective_instance_id: str | None = None
+    effective_givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
 
 
 class ReasoningProfile(StrictOutputModel):
@@ -134,6 +138,8 @@ class PlanItem(StrictOutputModel):
     required_givens: list[NonEmptyString] = Field(max_length=12)
     allowed_variations: list[TaskVariation] = Field(default_factory=list)
     permitted_variations: list[TaskVariation] = Field(default_factory=list)
+    selected_variation_id: str | None = None
+    selected_variation_group_id: str | None = None
     primary_question_types: list[QuestionType] = Field(default_factory=list)
     variable_givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
     complexity_boundaries: list[NonEmptyString] = Field(default_factory=list, max_length=8)
@@ -152,6 +158,8 @@ class PlanItem(StrictOutputModel):
     reasoning_requirements: list[str] = Field(default_factory=list)
     prerequisites: list[str] = Field(default_factory=list)
     derived_task_id: str | None = None
+    effective_instance_id: str | None = None
+    effective_givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
     selected_replacement_task_id: str | None = None
     task_was_previously_used: bool = False
     adjustment_attempts: int = 0

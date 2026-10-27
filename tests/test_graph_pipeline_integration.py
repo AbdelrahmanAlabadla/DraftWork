@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from pathlib import Path
+import subprocess
+
+import pytest
 
 from app.online import graph
 from app.online.lifecycle import initialize_slot_lifecycle
@@ -40,7 +45,6 @@ def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch
     lifecycle reconciliation, and every graph transition are production code.
     """
     calls: list[str] = []
-    review_inputs: list[dict] = []
     generated_plan: list[dict] = []
     audit_events: list[tuple[str, str, dict]] = []
     validation_calls = 0
@@ -87,45 +91,6 @@ def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch
             "difficulty_adjustment_history": [{"status": "accepted", "slot_id": "m1_mcq_1"}],
         }
 
-    def review_plan(state):
-        attempt = len(review_inputs) + 1
-        calls.append(f"review-{attempt}")
-        items = deepcopy(state["plans"][0]["items"]["mcq"])
-        review_inputs.append({"items": deepcopy(items), "attempt": attempt})
-        repaired = items[1]
-        repaired.update({
-            "plan_duplicate_repair_attempt": min(attempt, 3),
-            "plan_duplicate_conflict_with": "m1_mcq_1",
-            "plan_duplicate_conflict_reason": "same operation and scenario",
-        })
-        if attempt <= 2:
-            repaired.update({
-                "plan_duplicate_repair_mode": "targeted_semantic_repair",
-                "idea_to_test": f"distinct supported strategy {attempt}",
-            })
-            retry = True
-            unresolved = []
-        elif attempt == 3:
-            repaired.update({
-                "plan_duplicate_repair_mode": "controlled_diversification",
-                "idea_to_test": "different supported equation representation",
-            })
-            retry = True
-            unresolved = []
-        else:
-            repaired["plan_duplicate_unresolved"] = True
-            retry = False
-            unresolved = [{
-                "slot_id": "m1_mcq_2", "conflict_with": "m1_mcq_1",
-                "reason": "same operation and scenario", "status": "plan_duplicate_unresolved_kept",
-            }]
-        return {
-            "plans": [{"model_number": 1, "items": {"mcq": items}}],
-            "plan_review_retry_required": retry,
-            "plan_duplicate_repair_attempts": {"m1_mcq_2": min(attempt, 3)},
-            "unresolved_plan_duplicate_conflicts": unresolved,
-        }
-
     def generate_exams_node(state):
         calls.append("generate")
         generated_plan.extend(deepcopy(state["plans"]))
@@ -134,7 +99,6 @@ def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch
         assert second["task_family_id"] == "linear-equations"
         assert second["source_chunk_id"] == "chunk-1"
         assert second["derived_task_id"] == "derived:task-two:easy"
-        assert second["plan_duplicate_unresolved"] is True
         return {"generated_exams": [{"model_number": 1, "questions": {"mcq": {"items": [
             {"slot_id": "m1_mcq_1", "question_id": "q-1", "question": "Solve x + 2 = 5."},
             {"slot_id": "m1_mcq_2", "question_id": "q-2", "question": "Solve x - 4 = 3."},
@@ -203,7 +167,6 @@ def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch
         "app.online.planner.plan_exams": plan_exams,
         "app.online.planner.repair_plan": repair_plan,
         "app.online.difficulty_adjustment.adjust_plan_difficulty": adjust_plan_difficulty,
-        "app.online.plan_review.review_plan": review_plan,
         "app.online.exam_builder.generate_exams_node": generate_exams_node,
         "app.online.exam_builder.assemble_exams_node": assemble_exams_node,
         "app.online.validator.validate_generated_questions": validate_generated_questions,
@@ -224,14 +187,12 @@ def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch
 
     assert calls == [
         "receive", "retrieve", "catalog", "plan",
-        "review-1", "review-2", "review-3", "review-4", "adjust", "review-5", "generate",
+        "adjust", "generate",
         "validate-1", "question-repair", "validate-2", "duplicate-scan-1",
         "duplicate-repair", "validate-3", "duplicate-scan-2", "assemble",
     ]
     assert validation_calls == 3
     assert duplicate_scan_calls == 2
-    assert len(review_inputs) == 5
-    assert all(len(entry["items"]) == 2 for entry in review_inputs)
     assert result["warnings"] == ["controlled assembly completed with two valid questions"]
     finalization = next(payload for stage, event, payload in audit_events if event == "exam_assembled")
     final_slots = finalization["node_output"]["slot_lifecycle"]
@@ -245,3 +206,219 @@ def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch
     assert final_second["reasoning_requirements"] == ["Use one inverse operation."]
     assert finalization["generated_exams_after_stage"][0]["questions"]["mcq"]["items"][1]["question_id"] == "q-2"
     assert generated_plan[0]["items"]["mcq"][0]["base_catalog_task_id"] == "task-one"
+def test_resume_router_keeps_durable_plan_and_partial_questions():
+    plans = [{"model_number": 1, "items": {"mcq": [
+        {"slot_id": "m1_mcq_1"}, {"slot_id": "m1_mcq_2"},
+    ]}}]
+    partial = [{"model_number": 1, "questions": {"mcq": [
+        {"slot_id": "m1_mcq_1", "question_id": "q1"},
+    ]}}]
+    assert graph._route_after_receive({
+        "plans": plans, "generated_exams": partial,
+        "retrieved_chunks": [{"child_id": "c1"}],
+    }) == "repair_plan"
+    complete = deepcopy(partial)
+    complete[0]["questions"]["mcq"].append(
+        {"slot_id": "m1_mcq_2", "question_id": "q2"}
+    )
+    assert graph._route_after_receive({
+        "plans": plans, "generated_exams": complete,
+        "retrieved_chunks": [{"child_id": "c1"}],
+    }) == "validate_generated_questions"
+
+
+def test_new_job_without_checkpoint_always_enters_fresh_retrieval_and_planning():
+    assert graph._route_after_receive({
+        "plans": [], "assessment_catalog": {}, "retrieved_chunks": [],
+    }) == "retrieve_context_progress"
+    assert graph._route_after_retrieval({
+        "plans": [], "retrieved_chunks": [{"child_id": "current-c1"}],
+    }) == "prepare_assessment_catalog"
+
+
+def test_resume_with_unresolved_plan_errors_routes_to_repair_before_generation():
+    state = {
+        "plans": [{"model_number": 1, "items": {"true_false": [{
+            "slot_id": "m1_true_false_1",
+        }]}}],
+        "plan_errors": [
+            "Slot m1_true_false_1 uses an operation outside the profile."
+        ],
+        "retrieved_chunks": [{"child_id": "c1"}],
+    }
+    assert graph._route_after_receive(state) == "repair_plan"
+
+
+def test_legacy_same_job_checkpoint_retrieves_evidence_without_replanning():
+    plans = [{"model_number": 1, "items": {"mcq": [
+        {"slot_id": "m1_mcq_1", "selected_variation_id": "variation-1"},
+    ]}}]
+    assert graph._route_after_receive({"plans": plans}) == "retrieve_context_progress"
+    assert graph._route_after_retrieval({
+        "plans": plans, "retrieved_chunks": [{"child_id": "c1"}],
+    }) == "repair_plan"
+
+
+def test_saved_103_chunk_catalog_mocked_graph_reaches_final_assembly(
+    monkeypatch, tmp_path,
+):
+    """Run the production graph and planner with every paid call mocked."""
+    root = Path(__file__).parents[1]
+    source_catalog = root / "data" / "assessment_catalogs" / "33" / (
+        "339d652657343eec2e1a6f5af7dcee91b9523cdd66d9e86f95bceb47171ae3e7.json"
+    )
+    # The saved live artifact is intentionally optional for clean CI clones.
+    if not source_catalog.exists():
+        pytest.skip("saved 103-chunk mathematics Catalog is unavailable")
+    processed_key = "772d2717699ca1dc2b015371744fb5d9df8f50751dc7a80b8eb63d716697f84e"
+    # The filesystem copy under data/processed_documents predates the current
+    # Docker index and has different chunk IDs despite sharing this legacy key.
+    # Read the authoritative, persisted child rows used by the saved Catalog.
+    query = """
+        SELECT json_agg(metadata ORDER BY chunk_order)::text
+          FROM document_chunks
+         WHERE document_id = '175ef217-a754-4e58-8bae-2bbb4841f824'
+           AND chunk_type = 'child'
+    """
+    try:
+        docker_result = subprocess.run(
+            [
+                "docker", "exec", "genexam-postgres", "psql", "-U", "postgres",
+                "-d", "draftwork", "-At", "-c", query,
+            ],
+            check=True,
+            capture_output=True,
+            encoding="utf-8",
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        # Inside the production worker there is intentionally no Docker socket.
+        # Read the same authoritative PostgreSQL rows through its configured
+        # connection instead of skipping the deployment-level verification.
+        from app import db
+        with db.connection() as connection:
+            row = connection.execute(query).fetchone()
+        direct_value = (row or [None])[0]
+        children = list(
+            json.loads(direct_value) if isinstance(direct_value, str) else (direct_value or [])
+        )
+    else:
+        children = list(json.loads(docker_result.stdout.strip() or "[]"))
+    assert len(children) == 103
+    catalog_payload = json.loads(source_catalog.read_text(encoding="utf-8"))
+    assert {str(row["child_id"]) for row in children} == set(
+        catalog_payload["selected_chunk_ids"]
+    )
+
+    cache_copy = tmp_path / "33" / source_catalog.name
+    cache_copy.parent.mkdir(parents=True)
+    cache_copy.write_bytes(source_catalog.read_bytes())
+    calls: list[str] = []
+
+    from app.online import assessment_catalog, difficulty_adjustment
+    monkeypatch.setattr(
+        assessment_catalog.config, "ASSESSMENT_CATALOG_CACHE_DIR", str(tmp_path)
+    )
+    monkeypatch.setattr(
+        assessment_catalog, "request_structured",
+        lambda *_args, **_kwargs: pytest.fail("Catalog cache reuse called a provider"),
+    )
+    monkeypatch.setattr(
+        difficulty_adjustment, "create_difficulty_adjustment_client",
+        lambda **_kwargs: object(),
+    )
+
+    def decline_adjustment(_client, prompt, **_kwargs):
+        payload = json.loads(prompt)
+        results = []
+        for row in payload["tasks"]:
+            task = row["task"]
+            results.append({
+                "slot_id": task["immutable_identifiers"]["slot_id"],
+                "adjustment_succeeded": False,
+                "achieved_difficulty": task["requested_difficulty"],
+                "adjusted_fields": None,
+                "evidence_support": [],
+                "evidence_justification": "Mocked decline; deterministic fallback required.",
+                "reason": "Mocked model cannot safely change the source task.",
+            })
+        return {"results": results}
+
+    monkeypatch.setattr(difficulty_adjustment, "request_structured", decline_adjustment)
+    monkeypatch.setattr(
+        "app.online.receive.receive_request", lambda _state: calls.append("receive") or {}
+    )
+    monkeypatch.setattr(
+        "app.online.retrieval.retrieve_context",
+        lambda _state: calls.append("retrieve") or {
+            "retrieved_chunks": children,
+            "context": "",
+            "planner_context": "",
+        },
+    )
+
+    original_prepare = assessment_catalog.prepare_assessment_catalog
+    monkeypatch.setattr(
+        "app.online.assessment_catalog.prepare_assessment_catalog",
+        lambda state: calls.append("catalog") or original_prepare(state),
+    )
+
+    def generate(state):
+        calls.append("generate")
+        sections = {}
+        for qtype, values in state["plans"][0]["items"].items():
+            sections[qtype] = [{
+                "slot_id": item["slot_id"],
+                "question_id": f"q_{item['slot_id']}",
+                "question": f"Mocked grounded {qtype} question for {item['slot_id']}",
+            } for item in values]
+        assert sum(map(len, sections.values())) == 23
+        return {"generated_exams": [{"model_number": 1, "questions": sections}]}
+
+    def validate(state):
+        calls.append("validate")
+        verdicts = [{
+            "question_id": item["question_id"], "action": "PASS",
+        } for section in state["generated_exams"][0]["questions"].values()
+          for item in section]
+        return {"validation_reports": [{"verdicts": verdicts}], "repair_manifest": []}
+
+    monkeypatch.setattr("app.online.exam_builder.generate_exams_node", generate)
+    monkeypatch.setattr("app.online.validator.validate_generated_questions", validate)
+    monkeypatch.setattr(
+        "app.online.validator.repair_invalid_questions",
+        lambda _state: pytest.fail("all mocked questions pass validation"),
+    )
+    monkeypatch.setattr(
+        "app.online.duplicate_pipeline.scan_exam_duplicates",
+        lambda _state: calls.append("duplicates") or {"pending_duplicate_groups": []},
+    )
+    monkeypatch.setattr(
+        "app.online.duplicate_pipeline.repair_duplicate_groups",
+        lambda _state: pytest.fail("mocked exam has no duplicate group"),
+    )
+    monkeypatch.setattr(
+        "app.online.exam_builder.assemble_exams_node",
+        lambda state: calls.append("assemble") or {
+            "complete": True,
+            "warnings": ["mocked final assembly persisted 23 of 23 questions"],
+        },
+    )
+
+    tasks = [("mcq", 10), ("true_false", 5), ("equation", 4), ("word_problem", 4)]
+    result = graph.build_exam_graph().invoke({
+        "document_id": "saved-math-document", "processed_document_key": processed_key,
+        "tasks": tasks, "num_models": 1, "difficulty": "easy",
+        "selected_child_ids": [str(row["child_id"]) for row in reversed(children)],
+        "domain_type": "stem", "subject": "mathematics", "document_language": "ar",
+        "slot_lifecycle": initialize_slot_lifecycle(tasks, 1),
+    }, {"recursion_limit": 60})
+
+    assert result["assessment_catalog_cache_hit"] is True
+    assert result["assessment_catalog_compatibility_cache_hit"] is True
+    assert result["plan_errors"] == []
+    assert result["warnings"] == ["mocked final assembly persisted 23 of 23 questions"]
+    assert sum(
+        len(section)
+        for section in result["generated_exams"][0]["questions"].values()
+    ) == 23
+    assert calls[-4:] == ["generate", "validate", "duplicates", "assemble"]

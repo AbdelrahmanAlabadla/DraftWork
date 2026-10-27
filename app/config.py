@@ -61,7 +61,7 @@ DEEPSEEK_MODEL: str = _env("DEEPSEEK_MODEL", "deepseek-flash") or "deepseek-flas
 if LLM_PROVIDER == "deepseek" and DEEPSEEK_MODEL not in {"deepseek-flash", "deepseek-v4-pro"}:
     raise ValueError("DEEPSEEK_MODEL must be 'deepseek-flash' or 'deepseek-v4-pro'")
 DEEPSEEK_CONCURRENCY_LIMIT: int = max(
-    1, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "10") or "10")
+    1, min(50, int(_env("DEEPSEEK_CONCURRENCY_LIMIT", "50") or "50"))
 )
 DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: int = max(
     1, min(3, int(_env("DEEPSEEK_MAX_STRUCTURED_ATTEMPTS", "3") or "3"))
@@ -103,7 +103,7 @@ VALIDATOR_BATCH_SIZE: int = max(
     1, int(_env("VALIDATOR_BATCH_SIZE", "8") or "8")
 )
 MAX_PARALLEL_GENERATION_CALLS: int = max(
-    1, min(10, int(_env("MAX_PARALLEL_GENERATION_CALLS", "10") or "10"))
+    1, min(50, int(_env("MAX_PARALLEL_GENERATION_CALLS", "50") or "50"))
 )
 MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: int = max(
     1, min(10, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "10") or "10"))
@@ -121,7 +121,7 @@ DUPLICATE_JUDGE_BATCH_SIZE: int = max(
     1, int(_env("DUPLICATE_JUDGE_BATCH_SIZE", "8") or "8")
 )
 LLM_JOB_CONCURRENCY_LIMIT: int = max(
-    1, min(64, int(_env("LLM_JOB_CONCURRENCY_LIMIT", "10") or "10"))
+    1, min(64, int(_env("LLM_JOB_CONCURRENCY_LIMIT", "50") or "50"))
 )
 TITLE_MODEL: str = _env("TITLE_MODEL", "mistralai/mistral-7b-instruct-v0.3") or "mistralai/mistral-7b-instruct-v0.3"
 # Base URL used ONLY by the title-generation client (section/subsection
@@ -145,12 +145,21 @@ EMBEDDING_BATCH_SIZE: int = max(
 PARSER_PIPELINE_VERSION: str = _env("PARSER_PIPELINE_VERSION", "llamaparse-v2-canonical-items") or "llamaparse-v2-canonical-items"
 CHUNKER_PIPELINE_VERSION: str = _env("CHUNKER_PIPELINE_VERSION", "semantic-v5-restored-integrity") or "semantic-v5-restored-integrity"
 EMBEDDING_PIPELINE_VERSION: str = _env("EMBEDDING_PIPELINE_VERSION", "dense-sparse-v1") or "dense-sparse-v1"
+GENERATION_PIPELINE_VERSION: str = _env(
+    "GENERATION_PIPELINE_VERSION", "slot-generation-v2"
+) or "slot-generation-v2"
+VALIDATION_PIPELINE_VERSION: str = _env(
+    "VALIDATION_PIPELINE_VERSION", "selective-validation-v2"
+) or "selective-validation-v2"
+DUPLICATE_PIPELINE_VERSION: str = _env(
+    "DUPLICATE_PIPELINE_VERSION", "semantic-facts-v5-practice-variation"
+) or "semantic-facts-v5-practice-variation"
 ASSESSMENT_CATALOG_VERSION: str = _env(
-    "ASSESSMENT_CATALOG_VERSION", "catalog-v11-task-family-variations"
-) or "catalog-v11-task-family-variations"
+    "ASSESSMENT_CATALOG_VERSION", "catalog-v13-numerical-givens-contract"
+) or "catalog-v13-numerical-givens-contract"
 ASSESSMENT_COMPILER_VERSION: str = (
-    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v4-parallel-atomic-task-ontology")
-    or "compiler-v4-parallel-atomic-task-ontology"
+    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v5-grouped-type-variations")
+    or "compiler-v5-grouped-type-variations"
 )
 PROCESSED_DOCUMENT_CACHE_DIR: str = (
     _env("PROCESSED_DOCUMENT_CACHE_DIR", "data/processed_documents")
