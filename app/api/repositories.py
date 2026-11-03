@@ -531,6 +531,129 @@ def create_generation_job(
     return result
 
 
+def create_generation_replay_job(*, source_job_id: str) -> dict[str, Any]:
+    """Create one new job that may restore a failed job through generation only.
+
+    The source job is never claimed, updated, or copied into the new job's audit
+    stream until the new worker has its own claim fence.  The worker validates
+    and writes the actual replay checkpoint after claiming the target job.
+    """
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT id, session_id, document_id, status, type, request_data
+                     FROM jobs WHERE id = %s FOR SHARE""",
+                (source_job_id,),
+            )
+            source = cursor.fetchone()
+    if source is None:
+        raise ResourceNotFound("Replay source job not found")
+    if source["type"] != "exam_generation" or source["status"] != "failed":
+        raise InvalidState("Replay source must be a failed exam-generation job")
+    request_data = dict(source.get("request_data") or {})
+    if not request_data.get("tasks") or not request_data.get("child_ids"):
+        raise InvalidState("Replay source does not contain a complete generation request")
+    metadata = dict(request_data.get("metadata") or {})
+    metadata["checkpoint_replay_source_job_id"] = str(source_job_id)
+    request_data.update({
+        "metadata": metadata,
+        "replay_source_job_id": str(source_job_id),
+        "replay_mode": "validation_continuation",
+    })
+    return create_generation_job(
+        session_id=str(source["session_id"]),
+        document_id=str(source["document_id"]),
+        request_data=request_data,
+    )
+
+
+def load_generation_replay_checkpoint(
+    *, source_job_id: str, target_job_id: str,
+    target_immutable_request: dict[str, Any],
+    target_request_fingerprint: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load only the source state available immediately after generation.
+
+    Source validation, repair, duplicate, and assembly events are deliberately
+    excluded.  The returned state carries the target job identity, so it can be
+    persisted under the target claim fence and resumed after a worker restart.
+    """
+    state: dict[str, Any] = {}
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT id, status, request_fingerprint, checkpoint_revision
+                     FROM jobs WHERE id = %s AND type = 'exam_generation' FOR SHARE""",
+                (source_job_id,),
+            )
+            source = cursor.fetchone()
+            if source is None or source["status"] != "failed":
+                raise InvalidState("Replay source is not a failed exam-generation job")
+            cursor.execute(
+                """SELECT e.payload, e.checkpoint_revision, e.event_type
+                     FROM exam_audit_events e
+                     JOIN exams x ON x.id = e.exam_id
+                    WHERE x.job_id = %s AND e.job_id = %s
+                      AND e.checkpoint_revision IS NOT NULL
+                      AND e.checkpoint_revision <= 5
+                      AND e.event_type IN (
+                          'retrieval_completed', 'assessment_catalog_compiled',
+                          'plan_completed', 'plan_repaired',
+                          'difficulty_adjustment_completed', 'generation_checkpoint',
+                          'questions_generated'
+                      )
+                    ORDER BY e.checkpoint_revision, e.id""",
+                (source_job_id, source_job_id),
+            )
+            events = cursor.fetchall()
+    last_revision = 0
+    for event in events:
+        revision = int(event.get("checkpoint_revision") or 0)
+        if revision <= last_revision:
+            continue
+        payload = dict(event.get("payload") or {})
+        output = payload.get("node_output") or payload.get("checkpoint_state")
+        if isinstance(output, dict):
+            state.update(output)
+            last_revision = revision
+    if not state.get("generated_exams") or not state.get("plans"):
+        raise InvalidState("Replay source has no complete generated-question checkpoint")
+    source_request = dict(state.get("immutable_request") or {})
+    comparable = dict(source_request)
+    comparable["job_id"] = str(target_job_id)
+    if comparable != target_immutable_request:
+        raise InvalidState("Replay source immutable request is incompatible with target job")
+    state.update({
+        "job_id": str(target_job_id),
+        "immutable_request": target_immutable_request,
+        "request_fingerprint": target_request_fingerprint,
+        "checkpoint_revision": 0,
+        "validation_reports": [],
+        "validated_models": [],
+        "validation_ledger": {},
+        "validation_call_logs": [],
+        "repair_call_logs": [],
+        "repair_manifest": [],
+        "repair_candidates": [],
+        "repair_retry_seeds": {},
+        "repair_replacement_memory": {},
+        "pending_revalidation_ids": {},
+        "duplicate_reports": [],
+        "duplicate_fact_cache": {},
+        "duplicate_repair_history": [],
+        "duplicate_replacement_failures": {},
+        "unresolved_duplicate_conflicts": [],
+        "error": None,
+    })
+    provenance = {
+        "source_job_id": str(source_job_id),
+        "source_checkpoint_revision": last_revision,
+        "source_job_checkpoint_revision": int(source["checkpoint_revision"] or 0),
+        "replay_mode": "validation_continuation",
+    }
+    return state, provenance
+
+
 def get_job_for_session(
     job_id: str, session_id: str, user_id: str | None = None
 ) -> dict[str, Any]:
@@ -1342,6 +1465,46 @@ def record_llm_usage(
                     job_id, provider, model, operation, input_tokens,
                     output_tokens, cached_tokens, reasoning_tokens,
                     estimated_cost_usd, duration_ms,
+                ),
+            )
+        conn.commit()
+
+
+def record_llm_request_event(
+    *, job_id: str | None, provider: str, model: str, operation: str,
+    status: str, agent_role: str | None = None, request_id: str | None = None,
+    provider_request_id: str | None = None, error_category: str | None = None,
+    provider_error_code: str | None = None,
+    sanitized_error_message: str | None = None, retry_count: int = 0,
+    retry_after_seconds: float | None = None, usage_available: bool = False,
+    input_tokens: int | None = None, output_tokens: int | None = None,
+    reasoning_tokens: int | None = None, estimated_cost_usd: float | None = None,
+    duration_ms: int | None = None, metadata: dict[str, Any] | None = None,
+) -> None:
+    """Persist one compact request outcome without prompt or credential data."""
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO llm_request_events (
+                       job_id, provider, model, operation, agent_role, request_id,
+                       provider_request_id, status, error_category,
+                       provider_error_code, sanitized_error_message, retry_count,
+                       retry_after_seconds, usage_available, input_tokens,
+                       output_tokens, reasoning_tokens, estimated_cost_usd,
+                       duration_ms, metadata
+                   ) VALUES (
+                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                       %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                   )""",
+                (
+                    job_id, provider, model, operation, agent_role, request_id,
+                    provider_request_id, status, error_category,
+                    provider_error_code,
+                    str(sanitized_error_message or "")[:1000] or None,
+                    max(0, int(retry_count)), retry_after_seconds,
+                    bool(usage_available), input_tokens, output_tokens,
+                    reasoning_tokens, estimated_cost_usd, duration_ms,
+                    _jsonb(metadata or {}),
                 ),
             )
         conn.commit()

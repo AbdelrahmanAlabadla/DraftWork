@@ -300,7 +300,7 @@ def test_old_full_task_contract_shapes_are_rejected_with_exact_schema_error(
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
     assert item["actual_difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "retained"
+    assert item["difficulty_adaptation"]["status"] == "accepted_source_constraint"
     assert "structured_response_invalid" in item["adjustment_failure_reason"]
     assert "adjusted_task" in audit["reason"]
     assert audit["model_decision"] == "invalid_response"
@@ -328,7 +328,7 @@ def test_invalid_identity_evidence_and_difficulty_retain_original(
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
     assert item["actual_difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "retained"
+    assert item["difficulty_adaptation"]["status"] == "accepted_source_constraint"
     combined = " ".join([
         item["adjustment_failure_reason"], audit["reason"],
         *audit["rejection_reasons"],
@@ -536,7 +536,7 @@ def test_catalog_fallback_prefers_unused_nearby_level_over_used_exact_level():
     replacement = plans[0]["items"]["equation"][1]
     assert replacement["base_catalog_task_id"] == "task_medium_unused"
     assert replacement["actual_difficulty"] == "medium"
-    assert replacement["difficulty_adaptation"]["status"] == "fallback"
+    assert replacement["difficulty_adaptation"]["status"] == "accepted_source_constraint"
     assert replacement["difficulty_fallback_reason"]
 
 

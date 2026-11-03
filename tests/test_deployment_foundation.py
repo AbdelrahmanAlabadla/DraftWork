@@ -102,9 +102,9 @@ def test_online_generation_parallelism_has_fifty_call_ceiling():
     assert config.MAX_PARALLEL_GENERATION_CALLS == 50
     assert config.LLM_JOB_CONCURRENCY_LIMIT == 50
     assert config.MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS == 10
-    assert config.MAX_PARALLEL_VALIDATOR_CALLS == 10
+    assert config.MAX_PARALLEL_VALIDATOR_CALLS == 50
     assert config.MAX_PARALLEL_CATALOG_CALLS == 50
-    assert config.MAX_PARALLEL_DUPLICATE_JUDGE_CALLS == 10
+    assert config.MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS == 50
     assert config.LLM_JOB_CONCURRENCY_LIMIT == 50
     assert config.DEEPSEEK_CONCURRENCY_LIMIT == 50
 

@@ -6,6 +6,10 @@ from typing import Any, Callable, Optional, TypedDict
 from langgraph.graph import StateGraph, END
 
 from app.online.validator import MAX_QUESTION_REPAIR_ATTEMPTS, REPAIR_ACTIONS
+from app.config import (
+    MAX_CONTENT_REPAIR_CALLS_PER_SLOT,
+    MAX_COMPLETION_ATTEMPTS_PER_SLOT,
+)
 from app.online.eval_stats import PipelineEvalStats
 
 
@@ -55,10 +59,18 @@ class ExamState(TypedDict):
     # --- Post-generation validation / repair ----------------------------
     validation_reports: list[dict[str, Any]]  # one report per validated model
     validation_ledger: dict[str, dict[str, Any]]
+    validation_call_logs: list[dict[str, Any]]
+    repair_call_logs: list[dict[str, Any]]
     validated_models: list[int]  # models that fully passed (skip re-validation)
     question_repair_attempts: dict[str, int]  # per-slot repair budget already used
+    question_repair_calls: dict[str, int]  # every content Repair-agent call
+    question_repair_failures: dict[str, int]  # rejected/no-progress/revalidation failures
+    slot_completion_attempts: dict[str, int]  # assignment replacements after repair exhaustion
+    repair_working_candidates: dict[str, dict[str, Any]]  # durable accepted revisions
     repair_manifest: list[dict[str, Any]]
     repair_candidates: list[dict[str, Any]]
+    revalidation_progress: dict[str, dict[str, Any]]
+    blocked_revalidation_candidates: list[dict[str, Any]]
     repair_retry_seeds: dict[str, dict[str, Any]]
     repair_replacement_memory: dict[str, dict[str, Any]]
     fitb_recovery_history: list[dict[str, Any]]
@@ -84,6 +96,7 @@ class ExamState(TypedDict):
     unresolved_duplicate_conflicts: list[dict[str, Any]]
     duplicate_scan_count: int
     duplicate_fact_cache: dict[str, dict[str, str]]  # content-keyed Luna facts for unchanged pairs
+    duplicate_screen_fingerprints: dict[str, dict[str, str]]
     slot_lifecycle: dict[str, dict[str, Any]]
     developer_diagnostics: list[dict[str, Any]]
     eval_stats: PipelineEvalStats  # JSON-safe V1 pipeline telemetry
@@ -104,8 +117,6 @@ _AUDIT_NODE_EVENTS = {
     "generate_exams_node": ("generation", "questions_generated"),
     "validate_generated_questions": ("general_validation", "validation_completed"),
     "repair_invalid_questions": ("repair", "repair_completed"),
-    "scan_exam_duplicates": ("duplicate_scan", "duplicate_scan_completed"),
-    "repair_duplicate_groups": ("duplicate_replacement", "duplicate_replacement_completed"),
     "assemble_exams_node": ("finalization", "exam_assembled"),
 }
 
@@ -134,8 +145,7 @@ def _audit_node_output(
         payload["stage_input"] = before
     if node_name in {
         "generate_exams_node", "validate_generated_questions",
-        "repair_invalid_questions", "scan_exam_duplicates",
-        "repair_duplicate_groups", "assemble_exams_node",
+        "repair_invalid_questions", "assemble_exams_node",
     }:
         payload["plans_after_stage"] = deepcopy(
             result.get("plans", state.get("plans") or [])
@@ -233,7 +243,6 @@ def build_exam_graph() -> StateGraph:
         validate_generated_questions,
         repair_invalid_questions,
     )
-    from app.online.duplicate_pipeline import scan_exam_duplicates, repair_duplicate_groups
 
     builder = StateGraph(ExamState)
 
@@ -265,14 +274,6 @@ def build_exam_graph() -> StateGraph:
     builder.add_node(
         "repair_invalid_questions",
         _with_progress(repair_invalid_questions, "repairing_exam", 90),
-    )
-    builder.add_node(
-        "scan_exam_duplicates",
-        _with_progress(scan_exam_duplicates, "checking_duplicates", 96),
-    )
-    builder.add_node(
-        "repair_duplicate_groups",
-        _with_progress(repair_duplicate_groups, "repairing_duplicates", 97),
     )
     builder.add_node(
         "assemble_exams",
@@ -336,21 +337,12 @@ def build_exam_graph() -> StateGraph:
         "validate_generated_questions",
         _route_after_validation,
         {
+            "validate_generated_questions": "validate_generated_questions",
             "repair_invalid_questions": "repair_invalid_questions",
-            "scan_exam_duplicates": "scan_exam_duplicates",
             "assemble_exams": "assemble_exams",
         },
     )
     builder.add_edge("repair_invalid_questions", "validate_generated_questions")
-    builder.add_conditional_edges(
-        "scan_exam_duplicates",
-        _route_after_duplicate_scan,
-        {
-            "repair_duplicate_groups": "repair_duplicate_groups",
-            "assemble_exams": "assemble_exams",
-        },
-    )
-    builder.add_edge("repair_duplicate_groups", "validate_generated_questions")
     builder.add_edge("assemble_exams", END)
     builder.add_edge("stop_with_error", END)
 
@@ -445,30 +437,69 @@ def _route_after_difficulty_adjustment(state: ExamState) -> str:
 
 def _route_after_validation(state: ExamState) -> str:
     """Route unresolved requested slots through their own bounded budgets."""
-    attempts = state.get("question_repair_attempts") or {}
+    if state.get("repair_candidates"):
+        return "validate_generated_questions"
+    failures = (
+        state.get("question_repair_failures")
+        or state.get("question_repair_attempts") or {}
+    )
+    calls = state.get("question_repair_calls") or {}
+    completion = state.get("slot_completion_attempts") or {}
+    completion_enabled = "slot_completion_attempts" in state
     for target in state.get("repair_manifest") or []:
-        if target.get("status") in {"resolved", "exhausted", "terminal_failure"}:
+        target_status = str(target.get("status") or "")
+        if target_status == "resolved":
+            continue
+        # Persisted states created before slot completion existed used these as
+        # final statuses.  Do not reopen them merely because their newer split
+        # call/failure counters are absent.  New states explicitly carry the
+        # completion counter and may route the slot into bounded replacement.
+        if (
+            target_status in {"exhausted", "terminal_failure", "failed_to_repair"}
+            and not completion_enabled
+        ):
             continue
         slot_id = str(target.get("slot_id") or "")
-        if slot_id and (attempts.get(slot_id) or 0) < MAX_QUESTION_REPAIR_ATTEMPTS:
+        if target_status == "validation_blocked":
+            if (
+                slot_id and completion_enabled
+                and int(completion.get(slot_id) or 0) < MAX_COMPLETION_ATTEMPTS_PER_SLOT
+            ):
+                return "repair_invalid_questions"
+            continue
+        if slot_id and (
+            (
+                int(failures.get(slot_id) or 0) < MAX_QUESTION_REPAIR_ATTEMPTS
+                and int(calls.get(slot_id) or 0) < MAX_CONTENT_REPAIR_CALLS_PER_SLOT
+            )
+            or (
+                completion_enabled
+                and int(completion.get(slot_id) or 0) < MAX_COMPLETION_ATTEMPTS_PER_SLOT
+            )
+        ):
             return "repair_invalid_questions"
     # Compatibility for an in-flight/pre-manifest state. New validations always
     # populate the manifest; this prevents persisted older jobs from skipping a
     # repair solely because their state predates the contract.
     if not state.get("repair_manifest"):
         for report in state.get("validation_reports") or []:
-            if any(v.get("action") in REPAIR_ACTIONS for v in report.get("verdicts") or []):
+            if any(
+                v.get("action") in REPAIR_ACTIONS
+                or (
+                    v.get("action") == "UNVALIDATED"
+                    and v.get("validation_status") == "VALIDATION_BLOCKED"
+                )
+                for v in report.get("verdicts") or []
+            ):
                 return "repair_invalid_questions"
     if state.get("duplicate_repair_finalization_pending") and not state.get(
         "duplicate_verification_pending"
     ):
+        from app.online.multi_validator import clear_job_validation_cache
+        clear_job_validation_cache(str(state.get("job_id") or ""))
         return "assemble_exams"
-    return "scan_exam_duplicates"
-
-
-def _route_after_duplicate_scan(state: ExamState) -> str:
-    if state.get("pending_duplicate_groups"):
-        return "repair_duplicate_groups"
+    from app.online.multi_validator import clear_job_validation_cache
+    clear_job_validation_cache(str(state.get("job_id") or ""))
     return "assemble_exams"
 
 

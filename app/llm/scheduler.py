@@ -25,6 +25,7 @@ class _JobGate:
 
 _gates_lock = threading.Lock()
 _gates: dict[tuple[str, str], _JobGate] = {}
+_provider_cooldowns: dict[str, float] = {}
 _last_request_metrics: ContextVar[dict[str, float] | None] = ContextVar(
     "llm_last_request_metrics", default=None
 )
@@ -55,8 +56,21 @@ def _gate(key: str, *, agent: str = "") -> _JobGate:
         return gate
 
 
+def register_provider_cooldown(provider: str, seconds: float) -> None:
+    """Delay future process-local requests using verified provider guidance."""
+    if seconds <= 0:
+        return
+    with _gates_lock:
+        _provider_cooldowns[str(provider).lower()] = max(
+            _provider_cooldowns.get(str(provider).lower(), 0.0),
+            time.monotonic() + min(60.0, seconds),
+        )
+
+
 @contextmanager
-def llm_request_slot(*, agent: str, operation: str) -> Iterator[None]:
+def llm_request_slot(
+    *, agent: str, operation: str, provider: str = "",
+) -> Iterator[None]:
     """Enforce one shared LLM request ceiling for the current exam job."""
     key = _job_key()
     gate = _gate(key, agent=agent)
@@ -66,6 +80,13 @@ def llm_request_slot(*, agent: str, operation: str) -> Iterator[None]:
         else config.LLM_JOB_CONCURRENCY_LIMIT
     )
     queued_at = time.perf_counter()
+    provider_key = str(provider).lower()
+    if provider_key:
+        with _gates_lock:
+            cooldown_until = _provider_cooldowns.get(provider_key, 0.0)
+        remaining = cooldown_until - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(60.0, remaining))
     with gate.lock:
         gate.waiting += 1
     gate.semaphore.acquire()
@@ -130,4 +151,5 @@ def last_request_metrics() -> dict[str, float]:
 def reset_scheduler_for_tests() -> None:
     with _gates_lock:
         _gates.clear()
+        _provider_cooldowns.clear()
     _last_request_metrics.set(None)

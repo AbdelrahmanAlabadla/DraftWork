@@ -85,7 +85,7 @@ def test_terminal_repair_failure_does_not_reenter_repair():
         }],
         "question_repair_attempts": {},
     }
-    assert graph._route_after_validation(state) == "scan_exam_duplicates"
+    assert graph._route_after_validation(state) == "assemble_exams"
 
 
 def test_jsonb_sanitizer_replaces_only_nul_recursively():

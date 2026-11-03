@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
-import math
 import re
 import unicodedata
 from collections import defaultdict
@@ -16,15 +15,14 @@ from pydantic import Field, create_model
 
 from app import config
 from app.llm.client import request_structured
-from app.config import DUPLICATE_JUDGE_BATCH_SIZE, MAX_PARALLEL_DUPLICATE_JUDGE_CALLS
+from app.config import DUPLICATE_VALIDATOR_BATCH_SIZE, MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS
 from app.llm.factory import create_llm_client
 from app.llm.schemas import StrictOutputModel
-from app.offline.embeddings import cosine_sim, embed_dense
 from app.online.semantic_keys import formula_semantic_key
 
-logger = logging.getLogger("DUPLICATE_JUDGE")
+logger = logging.getLogger("DUPLICATE_VALIDATOR")
 
-DUPLICATE_JUDGE_PROMPT_VERSION = "semantic-facts-v5-practice-variation"
+DUPLICATE_VALIDATOR_PROMPT_VERSION = "semantic-facts-v6-metadata-candidates"
 SEMANTIC_FACT_FIELDS = (
     "same_core_knowledge",
     "same_student_operation_or_method",
@@ -41,6 +39,50 @@ class DuplicatePairVerdict(StrictOutputModel):
     same_target_or_result: Literal["yes", "no"]
     genuinely_new_reasoning: Literal["yes", "no"]
     one_answer_substantially_gives_away_other: Literal["yes", "no"]
+
+
+class DuplicateValidatorResponseError(ValueError):
+    """A pair-review response cannot safely establish duplicate-free content."""
+
+
+def _validated_batch_verdicts(
+    verdicts: list[dict[str, Any]], expected_pair_ids: list[str],
+) -> list[dict[str, Any]]:
+    """Require one well-typed semantic-fact row for every requested pair.
+
+    Provider schema validation normally enforces this boundary.  Keeping the
+    check here protects direct/mock provider adapters as well: omitting an
+    uncertain pair must block validation, never silently mean acceptable reuse.
+    """
+    expected = set(expected_pair_ids)
+    received: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for value in verdicts:
+        if not isinstance(value, dict):
+            raise DuplicateValidatorResponseError("Duplicate Validator returned a non-object verdict row.")
+        pair_id = value.get("pair_id")
+        if not isinstance(pair_id, str) or pair_id not in expected:
+            raise DuplicateValidatorResponseError(
+                f"Duplicate Validator returned unknown pair_id={pair_id!r}."
+            )
+        if pair_id in received:
+            raise DuplicateValidatorResponseError(
+                f"Duplicate Validator returned duplicate pair_id={pair_id!r}."
+            )
+        invalid = [field for field in SEMANTIC_FACT_FIELDS
+                   if value.get(field) not in {"yes", "no"}]
+        if invalid:
+            raise DuplicateValidatorResponseError(
+                f"Duplicate Validator returned invalid semantic facts for {pair_id}: {', '.join(invalid)}."
+            )
+        received.add(pair_id)
+        normalized.append(value)
+    missing = sorted(expected - received)
+    if missing:
+        raise DuplicateValidatorResponseError(
+            "Duplicate Validator omitted verdicts for " + ", ".join(missing) + "."
+        )
+    return normalized
 
 
 def _literal(values: list[str]):
@@ -91,7 +133,10 @@ def _answer(qtype: str, item: dict[str, Any]) -> str:
         base = f"{label}: {option}".strip(": ")
         return "\n".join(value for value in (base, certificate_text) if value)
     if qtype == "true_false":
-        return str(item.get("answer") or "")
+        value = item.get("answer")
+        if isinstance(value, bool):
+            return "True" if value else "False"
+        return str(value) if value is not None else ""
     if qtype == "fill_in_the_blank":
         return " | ".join(
             str(value).strip() for value in item.get("answers") or []
@@ -110,7 +155,10 @@ def _answer(qtype: str, item: dict[str, Any]) -> str:
     return "\n".join(value for value in (base, certificate_text) if value)
 
 
-def actual_question_registry(exam: dict[str, Any]) -> list[dict[str, Any]]:
+def actual_question_registry(
+    exam: dict[str, Any], plan_by_slot: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    plan_by_slot = plan_by_slot or {}
     registry: list[dict[str, Any]] = []
     for qtype, section in (exam.get("questions") or {}).items():
         for item in _section_items(section):
@@ -119,13 +167,22 @@ def actual_question_registry(exam: dict[str, Any]) -> list[dict[str, Any]]:
                 continue
             stem = _stem(qtype, item)
             answer = _answer(qtype, item)
+            plan = plan_by_slot.get(str(item.get("slot_id") or "")) or {}
             registry.append({
                 "question_id": qid, "slot_id": str(item.get("slot_id") or ""),
                 "question_type": qtype, "stem": stem, "answer": answer,
-                "reuse_context": item.get("reuse_context"),
-                "selected_variation_group_id": item.get("selected_variation_group_id"),
+                "reuse_context": item.get("reuse_context") or plan.get("reuse_context"),
+                "task_id": plan.get("task_id") or item.get("task_id"),
+                "selected_variation_id": plan.get("selected_variation_id") or item.get("selected_variation_id"),
+                "selected_variation_group_id": plan.get("selected_variation_group_id") or item.get("selected_variation_group_id"),
                 "effective_instance_id": item.get("effective_instance_id"),
-                "embedding_text": f"Question:\n{stem}\n\nCorrect answer and solution:\n{answer}".strip(),
+                "concept": plan.get("concept") or plan.get("concept_to_test"),
+                "idea_to_test": plan.get("idea_to_test") or plan.get("concept_to_test"),
+                "task_operation": plan.get("task_operation") or plan.get("canonical_skill"),
+                "target": plan.get("target"),
+                "student_work_product": plan.get("student_work_product") or plan.get("expected_work_product"),
+                "reasoning_mode": plan.get("reasoning_mode"),
+                "effective_givens": list(plan.get("effective_givens") or plan.get("required_givens") or []),
             })
     return registry
 
@@ -189,54 +246,62 @@ def _same_meaningful_result(left: Any, right: Any) -> bool:
     return left_core not in generic and len(left_core) >= 2
 
 
-def _distribution(values: list[float]) -> dict[str, Any]:
-    if not values:
-        return {"count": 0}
-    ordered = sorted(values)
-    def percentile(fraction: float) -> float:
-        index = min(len(ordered) - 1, max(0, math.ceil(fraction * len(ordered)) - 1))
-        return round(ordered[index], 4)
-    return {
-        "count": len(values), "min": round(ordered[0], 4), "max": round(ordered[-1], 4),
-        "mean": round(sum(ordered) / len(ordered), 4), "p50": percentile(0.50),
-        "p75": percentile(0.75), "p90": percentile(0.90), "p95": percentile(0.95),
-        "at_or_above_threshold": sum(value >= config.DUPLICATE_EMBEDDING_THRESHOLD for value in ordered),
-    }
-
-
 def shortlist_duplicate_pairs(
     exam: dict[str, Any],
     forced_question_pairs: set[frozenset[str]] | None = None,
+    plan_by_slot: dict[str, dict[str, Any]] | None = None,
+    changed_question_ids: set[str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    items = actual_question_registry(exam)
+    """Shortlist pairs without loading an embedding model or calling a provider."""
+    items = actual_question_registry(exam, plan_by_slot)
     if len(items) < 2:
-        return [], {"question_count": len(items), "pair_count": 0, "combined": {"count": 0}}
-    combined_vectors = embed_dense([item["embedding_text"] for item in items], max_length=1024)
-    stem_vectors = embed_dense([item["stem"] for item in items], max_length=768)
-    answer_vectors = embed_dense([item["answer"] for item in items], max_length=768)
+        return [], {"question_count": len(items), "possible_pair_count": 0,
+                    "candidate_count": 0, "embedding_calls": 0}
     pair_rows: list[dict[str, Any]] = []
-    neighbours: dict[int, list[tuple[float, int]]] = defaultdict(list)
+    evaluated = 0
     for left_index, right_index in combinations(range(len(items)), 2):
         left, right = items[left_index], items[right_index]
-        combined = cosine_sim(combined_vectors[left_index], combined_vectors[right_index])
-        stem_score = cosine_sim(stem_vectors[left_index], stem_vectors[right_index])
-        answer_score = cosine_sim(answer_vectors[left_index], answer_vectors[right_index])
-        discovery = max(combined, stem_score, answer_score)
-        neighbours[left_index].append((discovery, right_index))
-        neighbours[right_index].append((discovery, left_index))
+        if changed_question_ids is not None and not (
+            {left["question_id"], right["question_id"]} & changed_question_ids
+        ):
+            continue
+        evaluated += 1
         signals = []
         if frozenset((left["question_id"], right["question_id"])) in (
             forced_question_pairs or set()
         ):
             signals.append("forced_catalog_reuse")
+        if left.get("task_id") and left.get("task_id") == right.get("task_id"):
+            signals.append("shared_task_id")
+        if (left.get("selected_variation_id") and
+                left.get("selected_variation_id") == right.get("selected_variation_id")):
+            signals.append("shared_variation_id")
         if (
             left.get("selected_variation_group_id")
             and left.get("selected_variation_group_id")
             == right.get("selected_variation_group_id")
         ):
             signals.append("shared_variation_group")
-        if discovery >= config.DUPLICATE_EMBEDDING_THRESHOLD:
-            signals.append("embedding_threshold")
+        operation_match = bool(
+            _normalized(left.get("task_operation"))
+            and _normalized(left.get("task_operation")) == _normalized(right.get("task_operation"))
+        )
+        target_match = bool(
+            _normalized(left.get("target")) and (
+                _normalized(left.get("target")) == _normalized(right.get("target"))
+                or _jaccard(left.get("target"), right.get("target")) >= 0.72
+            )
+        )
+        product_match = bool(
+            _normalized(left.get("student_work_product"))
+            and _normalized(left.get("student_work_product"))
+            == _normalized(right.get("student_work_product"))
+        )
+        if operation_match and (target_match or product_match):
+            signals.append("matching_operation_and_target")
+        if (operation_match and _normalized(left.get("concept"))
+                and _normalized(left.get("concept")) == _normalized(right.get("concept"))):
+            signals.append("matching_concept_and_operation")
         if _formula_keys(f"{left['stem']}\n{left['answer']}") & _formula_keys(f"{right['stem']}\n{right['answer']}"):
             signals.append("same_normalized_formula")
         equation_overlap = _equation_signatures(left["stem"]) & _equation_signatures(right["stem"])
@@ -259,34 +324,22 @@ def shortlist_duplicate_pairs(
             shared_numbers = left_numbers & right_numbers
             if len(shared_numbers) >= 3 and len(shared_numbers) / max(1, min(len(left_numbers), len(right_numbers))) >= 0.75:
                 signals.append("important_repeated_numbers")
-        pair_rows.append({
-            "pair_id": f"pair_{left_index + 1}_{right_index + 1}", "left": left, "right": right,
-            "combined_similarity": round(combined, 4), "stem_similarity": round(stem_score, 4),
-            "answer_similarity": round(answer_score, 4), "discovery_similarity": round(discovery, 4),
-            "signals": signals, "_indices": (left_index, right_index),
-        })
-    forced: set[tuple[int, int]] = set()
-    for index in range(len(items)):
-        for _score, other in sorted(neighbours[index], reverse=True)[: config.DUPLICATE_TOP_NEIGHBOURS]:
-            forced.add(tuple(sorted((index, other))))
-    candidates = []
-    for row in pair_rows:
-        if row["_indices"] in forced:
-            row["signals"].append("top_neighbour")
-        if row["signals"]:
-            row.pop("_indices", None)
-            candidates.append(row)
-    candidates.sort(key=lambda row: (-row["discovery_similarity"], row["pair_id"]))
+        if signals:
+            qids = sorted((left["question_id"], right["question_id"]))
+            pair_rows.append({
+                "pair_id": f"{qids[0]}::{qids[1]}", "left": left, "right": right,
+                "signals": sorted(set(signals)),
+            })
+    candidates = sorted(pair_rows, key=lambda row: row["pair_id"])
     scores = {
-        "question_count": len(items), "pair_count": len(pair_rows),
-        "threshold": config.DUPLICATE_EMBEDDING_THRESHOLD,
-        "top_neighbours": config.DUPLICATE_TOP_NEIGHBOURS, "candidate_count": len(candidates),
-        "combined": _distribution([row["combined_similarity"] for row in pair_rows]),
-        "stem": _distribution([row["stem_similarity"] for row in pair_rows]),
-        "answer": _distribution([row["answer_similarity"] for row in pair_rows]),
-        "discovery": _distribution([row["discovery_similarity"] for row in pair_rows]),
+        "question_count": len(items),
+        "possible_pair_count": len(items) * (len(items) - 1) // 2,
+        "evaluated_pair_count": evaluated,
+        "candidate_count": len(candidates),
+        "screening_policy": "metadata-and-deterministic-v2",
+        "embedding_calls": 0,
     }
-    logger.info("Duplicate similarity distribution | %s", json.dumps(scores, sort_keys=True))
+    logger.info("Duplicate candidate screening | %s", json.dumps(scores, sort_keys=True))
     return candidates, scores
 
 
@@ -300,8 +353,15 @@ def _prompt(candidates: list[dict[str, Any]]) -> str:
                 "question_type": item["question_type"], "stem": item["stem"],
                 "complete_correct_answer_and_solution": item["answer"],
                 "reuse_context": item.get("reuse_context"),
+                "task_id": item.get("task_id"),
+                "selected_variation_id": item.get("selected_variation_id"),
                 "selected_variation_group_id": item.get("selected_variation_group_id"),
                 "effective_instance_id": item.get("effective_instance_id"),
+                "concept": item.get("concept"), "idea_to_test": item.get("idea_to_test"),
+                "task_operation": item.get("task_operation"), "target": item.get("target"),
+                "student_work_product": item.get("student_work_product"),
+                "reasoning_mode": item.get("reasoning_mode"),
+                "effective_givens": item.get("effective_givens") or [],
             }
         pairs.append({
             "pair_id": pair["pair_id"], "left_question_id": pair["left"]["question_id"],
@@ -394,6 +454,16 @@ def _fact_cache_key(pair: dict[str, Any], client: Any) -> str:
             "stem": content(item.get("stem")),
             "answer": content(item.get("answer")),
             "reuse_context": item.get("reuse_context"),
+            "task_id": item.get("task_id"),
+            "selected_variation_id": item.get("selected_variation_id"),
+            "selected_variation_group_id": item.get("selected_variation_group_id"),
+            "concept": content(item.get("concept")),
+            "idea_to_test": content(item.get("idea_to_test")),
+            "task_operation": content(item.get("task_operation")),
+            "target": content(item.get("target")),
+            "student_work_product": content(item.get("student_work_product")),
+            "reasoning_mode": item.get("reasoning_mode"),
+            "effective_givens": item.get("effective_givens") or [],
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
     model = str(
         getattr(client, "model", None)
@@ -401,9 +471,9 @@ def _fact_cache_key(pair: dict[str, Any], client: Any) -> str:
         or type(client).__name__
     )
     material = "\n".join([
-        DUPLICATE_JUDGE_PROMPT_VERSION,
-        "duplicate-screen-v2-bge-m3",
-        "pair-ledger-v2",
+        DUPLICATE_VALIDATOR_PROMPT_VERSION,
+        "duplicate-screen-v3-metadata-deterministic",
+        "pair-ledger-v3-job-local",
         model,
         *sorted(contents),
     ])
@@ -460,13 +530,28 @@ def build_duplicate_groups(candidates: list[dict[str, Any]], verdicts: list[dict
                 continue
             component.add(node); visited.add(node); stack.extend(adjacency[node] - component)
         component_edges = [edge for edge in edges if edge["left"] in component and edge["right"] in component]
-        nodes, covers = sorted(component), []
-        for size in range(1, len(nodes) + 1):
-            covers = [subset for subset in combinations(nodes, size)
-                      if all(edge["left"] in subset or edge["right"] in subset for edge in component_edges)]
-            if covers:
-                break
-        replacements = min(covers, key=lambda subset: sum(_question_value(item_by_id[qid]) for qid in subset))
+        nodes = sorted(component)
+        if len(nodes) <= 12:
+            covers = []
+            for size in range(1, len(nodes) + 1):
+                covers = [subset for subset in combinations(nodes, size)
+                          if all(edge["left"] in subset or edge["right"] in subset for edge in component_edges)]
+                if covers:
+                    break
+            replacements = min(
+                covers,
+                key=lambda subset: sum(_question_value(item_by_id[qid]) for qid in subset),
+            )
+        else:
+            # Bounded deterministic 2-approximation for pathological groups.
+            uncovered = {(edge["left"], edge["right"]) for edge in component_edges}
+            selected: set[str] = set()
+            while uncovered:
+                left, right = min(uncovered)
+                preferred = min((left, right), key=lambda qid: (_question_value(item_by_id[qid]), qid))
+                selected.add(preferred)
+                uncovered = {edge for edge in uncovered if preferred not in edge}
+            replacements = tuple(sorted(selected))
         groups.append({
             "group_id": f"group_{len(groups) + 1}", "question_ids": nodes,
             "edges": component_edges,
@@ -477,19 +562,23 @@ def build_duplicate_groups(candidates: list[dict[str, Any]], verdicts: list[dict
 
 
 def review_duplicate_candidates(
-    exam: dict[str, Any], _ignored_plan_metadata: Any | None = None,
+    exam: dict[str, Any], plan_by_slot: dict[str, dict[str, Any]] | None = None,
     client: Any | None = None,
     fact_cache: dict[str, dict[str, str]] | None = None,
     forced_question_pairs: set[frozenset[str]] | None = None,
+    changed_question_ids: set[str] | None = None,
+    client_factory: Any | None = None,
 ) -> dict[str, Any]:
-    candidates, distribution = shortlist_duplicate_pairs(exam, forced_question_pairs)
+    candidates, distribution = shortlist_duplicate_pairs(
+        exam, forced_question_pairs, plan_by_slot, changed_question_ids,
+    )
     cache = dict(fact_cache or {})
     if not candidates:
         return {"candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
                 "similarity_distribution": distribution, "usage": {},
                 "fact_cache": cache, "fact_cache_hits": 0, "fact_cache_misses": 0}
     explicit_client = client
-    client = client or create_llm_client()
+    client = client or (client_factory() if client_factory else create_llm_client())
     cached_by_pair: dict[str, dict[str, Any]] = {}
     uncached: list[dict[str, Any]] = []
     cache_key_by_pair: dict[str, str] = {}
@@ -511,19 +600,21 @@ def review_duplicate_candidates(
         # conflict grouping remain deterministic after all batches are merged,
         # so splitting here cannot remove cross-pair reasoning.
         batches = [
-            uncached[index:index + DUPLICATE_JUDGE_BATCH_SIZE]
-            for index in range(0, len(uncached), DUPLICATE_JUDGE_BATCH_SIZE)
+            uncached[index:index + DUPLICATE_VALIDATOR_BATCH_SIZE]
+            for index in range(0, len(uncached), DUPLICATE_VALIDATOR_BATCH_SIZE)
         ]
 
         def review_batch(batch_index: int, batch: list[dict[str, Any]]):
             batch_ids = [pair["pair_id"] for pair in batch]
-            batch_client = explicit_client or create_llm_client()
+            batch_client = explicit_client or (
+                client_factory() if client_factory else create_llm_client()
+            )
             raw = request_structured(
                 batch_client, _prompt(batch),
                 response_model=duplicate_response_model(batch_ids),
                 schema_name="actual_question_duplicate_judgment",
-                agent="duplicate_judge",
-                operation="actual_question_duplicate_judgment",
+                agent="duplicate_validator",
+                operation="duplicate_validation",
                 item_count=len(batch), expected_ids=batch_ids,
                 expected_id_field="pair_id",
                 system_prompt=(
@@ -532,12 +623,15 @@ def review_duplicate_candidates(
                 ), temperature=0.0,
                 max_tokens=min(16000, max(4096, len(batch) * 260)),
             )
-            return batch_index, list((raw or {}).get("verdicts") or []), (
+            verdicts = _validated_batch_verdicts(
+                list((raw or {}).get("verdicts") or []), batch_ids,
+            )
+            return batch_index, verdicts, (
                 getattr(batch_client, "last_usage", None) or {}
             )
 
         completed: dict[int, tuple[list[dict[str, Any]], dict[str, Any]]] = {}
-        workers = min(MAX_PARALLEL_DUPLICATE_JUDGE_CALLS, len(batches))
+        workers = min(MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS, 50, len(batches))
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
                 executor.submit(copy_context().run, review_batch, index, batch): index

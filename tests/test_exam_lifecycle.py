@@ -79,6 +79,24 @@ def _questions(qtype: str, count: int):
     ]
 
 
+def test_zero_accepted_question_count_drives_empty_exam_guard():
+    assert task_module._accepted_question_count({
+        "quality_summary": {
+            "requested": 23, "generated": 23, "accepted": 0,
+            "valid": 0, "failed": 23,
+        },
+    }) == 0
+
+
+def test_twenty_one_of_twenty_three_preserves_partial_count():
+    assert task_module._accepted_question_count({
+        "quality_summary": {
+            "requested": 23, "generated": 23, "accepted": 21,
+            "valid": 21, "failed": 2,
+        },
+    }) == 21
+
+
 def test_partial_exam_is_saved_with_shortage_and_same_id(monkeypatch):
     request = {
         "exam_id": EXAM_ID,
@@ -195,6 +213,69 @@ def test_partial_exam_is_saved_with_shortage_and_same_id(monkeypatch):
     assert generated_event["payload"]["generated_exams"][0]["questions"]["mcq"]
 
 
+def test_replay_job_restores_generated_checkpoint_before_validation_only(monkeypatch):
+    request = {
+        "exam_id": EXAM_ID,
+        "tasks": [["mcq", 1]], "num_models": 1, "child_ids": ["c1"],
+        "difficulty": "mix", "metadata": {}, "replay_source_job_id": "source-job",
+    }
+    job = {
+        "document_id": DOCUMENT_ID, "session_id": SESSION_ID,
+        "request_data": request, "claim_generation": 1, "checkpoint_revision": 0,
+    }
+    document = {
+        "id": DOCUMENT_ID, "active_index_job_id": "index-job",
+        "stats": {"processed_document_key": "cache", "domain_type": "stem", "subject": "math"},
+    }
+    events = []
+    source_state = {
+        "plans": [{"model_number": 1, "items": {"mcq": [{"slot_id": "m1_mcq_1"}]}}],
+        "generated_exams": [{"model_number": 1, "questions": {"mcq": [
+            {"question_id": "model1_mcq_1", "slot_id": "m1_mcq_1"},
+        ]}}],
+        "retrieved_chunks": [{"child_id": "c1"}], "assessment_catalog": {"cache_key": "catalog"},
+        "assessment_catalog_key": "catalog",
+    }
+    monkeypatch.setattr(task_module.repositories, "claim_job", lambda *_args: job)
+    monkeypatch.setattr(task_module.repositories, "get_document", lambda *_args: document)
+    monkeypatch.setattr(task_module.repositories, "get_exam_id_for_job", lambda *_args: EXAM_ID)
+    monkeypatch.setattr(task_module.repositories, "update_job_progress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        task_module.repositories, "load_generation_replay_checkpoint",
+        lambda **_kwargs: (source_state, {"source_job_id": "source-job", "source_checkpoint_revision": 5}),
+    )
+    monkeypatch.setattr(task_module.repositories, "job_is_cancelled", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(task_module.repositories, "complete_generation_job", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        task_module.repositories, "append_exam_audit_event",
+        lambda exam_id, **kwargs: events.append({"exam_id": exam_id, **kwargs}),
+    )
+    monkeypatch.setattr(task_module.evaluation_store, "save_evaluation", lambda **_kwargs: None)
+    monkeypatch.setattr(task_module, "_heartbeat", lambda *_args: nullcontext())
+    monkeypatch.setattr(
+        "app.online.assessment_catalog.validate_plan_catalog_bindings", lambda *_args: [],
+    )
+    monkeypatch.setattr("app.online.multi_validator.clear_job_validation_cache", lambda *_args: None)
+
+    def validate_only(*_args, **kwargs):
+        restored = kwargs["resume_state"]
+        assert restored["generated_exams"] == source_state["generated_exams"]
+        assert restored["plans"] == source_state["plans"]
+        return {
+            "exams": restored["generated_exams"], "warnings": [], "planning_issues": [],
+            "assessment_profile": {}, "quality_summary": {"requested": 1, "valid": 1},
+            "document_language": "ar", "complete": True, "status": "completed", "eval": {},
+        }
+
+    monkeypatch.setattr(task_module, "generate_exams", validate_only)
+    response = task_module.generate_exam.run(JOB_ID)
+
+    assert response["exam_status"] == "complete"
+    assert events[0]["stage"] == "replay"
+    assert events[0]["event_type"] == "questions_generated"
+    assert events[0]["payload"]["replay_provenance"]["source_job_id"] == "source-job"
+
+
 def test_lifecycle_migration_keeps_failed_exam_and_audit_rows():
     migration = (
         Path(__file__).parents[1]
@@ -215,6 +296,56 @@ def test_completed_full_exam_has_no_shortage_warning():
         "complete": True,
     }
     assert task_module._question_shortage_warnings(result, [("mcq", 2)], 1) == []
+
+
+def test_persistence_integrity_rejects_nonfinal_question_in_payload():
+    result = {
+        "exams": [{
+            "model_number": 1,
+            "questions": {"mcq": [
+                {"slot_id": "m1_mcq_1", "question_id": "model1_mcq_1"},
+                {"slot_id": "m1_mcq_2", "question_id": "model1_mcq_2"},
+            ]},
+        }],
+        "slot_lifecycle": {
+            "m1_mcq_1": {
+                "validated": True, "finalized": True,
+                "terminal_status": "finalized", "failure_code": None,
+            },
+            "m1_mcq_2": {
+                "validated": True, "finalized": False,
+                "terminal_status": "repair_failed",
+                "failure_code": "repair_exhausted",
+            },
+        },
+    }
+
+    with pytest.raises(RuntimeError, match="persistence integrity failure"):
+        task_module._assert_persisted_exam_integrity(result)
+
+
+def test_persistence_integrity_accepts_exact_authoritative_set():
+    result = {
+        "exams": [{
+            "model_number": 1,
+            "questions": {"mcq": [
+                {"slot_id": "m1_mcq_1", "question_id": "model1_mcq_1"},
+            ]},
+        }],
+        "slot_lifecycle": {
+            "m1_mcq_1": {
+                "validated": True, "finalized": True,
+                "terminal_status": "finalized", "failure_code": None,
+            },
+            "m1_mcq_2": {
+                "validated": False, "finalized": False,
+                "terminal_status": "validation_failed",
+                "failure_code": "validation_blocked",
+            },
+        },
+    }
+
+    task_module._assert_persisted_exam_integrity(result)
 
 
 def test_difficulty_warning_never_recalculates_requested_total_from_survivors():

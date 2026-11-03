@@ -116,14 +116,17 @@ export function splitEquationContent(source) {
     start = display.lastIndex;
   }
   const tail = text.slice(start).trim();
-  if (tail) parts.push({ type: parts.length ? "text" : "math", value: tail });
+  if (tail) {
+    const displayEnvironment = /\\begin\{(?:aligned|array|cases|matrix|bmatrix|pmatrix)\}/.test(tail);
+    parts.push({ type: displayEnvironment || !parts.length ? "math" : "text", value: tail });
+  }
   return parts;
 }
 
 export function renderMixedMath(target, source, language = "en") {
   const text = String(source ?? "");
   const parts = splitEquationContent(text);
-  const hasDelimitedMath = /\$\$|\\\[|\\\(|(?<!\$)\$[^$\n]+?\$(?!\$)/.test(text);
+  const hasDelimitedMath = /\$\$|\\\[|\\\(|(?<!\$)\$[^$\n]+?\$(?!\$)|\\begin\{(?:aligned|array|cases|matrix|bmatrix|pmatrix)\}/.test(text);
   target.replaceChildren();
   if (!hasDelimitedMath) {
     target.textContent = text;

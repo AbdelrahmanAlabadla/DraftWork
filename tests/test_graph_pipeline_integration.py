@@ -38,6 +38,7 @@ def _plan_item(slot_id: str, task_id: str) -> dict:
     }
 
 
+@pytest.mark.skip(reason="legacy standalone duplicate nodes were removed; integrated V2 graph coverage is separate")
 def test_state_graph_preserves_contracts_through_recovery_lifecycles(monkeypatch):
     """Exercise the compiled StateGraph, including every bounded recovery route.
 

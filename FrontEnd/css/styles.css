@@ -867,9 +867,32 @@
     }
 
     .preview-option {
+      display: grid;
+      grid-template-columns: 1.6rem minmax(0, 1fr);
+      align-items: start;
+      gap: 0.25rem;
       min-width: 0;
       font-size: 13px;
       line-height: 1.35;
+      break-inside: avoid;
+    }
+
+    .preview-option-marker {
+      direction: ltr;
+      unicode-bidi: isolate;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .preview-option-content {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .preview-option-content .katex-display {
+      margin: 0.15rem 0;
+      overflow-x: auto;
+      overflow-y: hidden;
     }
 
     .preview-word-bank {
@@ -1533,6 +1556,8 @@ html[dir="rtl"] input[type="date"] {
 
 .math-inline {
   margin-inline: 0.2em;
+  max-width: 100%;
+  vertical-align: baseline;
 }
 
 .math-display {

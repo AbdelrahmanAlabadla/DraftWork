@@ -20,7 +20,7 @@ STEM_GENERAL_STAGES = [
     "fill_in_the_blank_generator", "definition_generator", "why_generator",
     "equation_generator", "word_problem_generator", "essay_generator",
     "correctness_validator", "general_validator", "general_repairer",
-    "duplicate_judge", "duplicate_replacement",
+    "duplicate_validator", "duplicate_replacement",
 ]
 
 

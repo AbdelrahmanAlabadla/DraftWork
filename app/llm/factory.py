@@ -31,7 +31,9 @@ def _domain(domain: str | None = None) -> str:
 def _stem_reasoning_effort(stage: str) -> str:
     from app import config
 
-    if stage in {"stem_quantitative_validator", "stem_quantitative_repairer"}:
+    if stage in {
+        "stem_quantitative_validator", "stem_quantitative_repairer", "solution_repairer",
+    }:
         return config.STEM_QUANTITATIVE_REASONING_EFFORT
     return config.STEM_REVIEW_REASONING_EFFORT
 
@@ -85,7 +87,11 @@ def create_review_client(*, domain: str, stage: str):
     normalized_domain = str(domain or "").strip().upper()
     if stage not in {
         "correctness_validator", "general_validator", "stem_quantitative_validator",
-        "stem_quantitative_repairer", "duplicate_judge",
+        "stem_quantitative_repairer", "grounding_validator",
+        "task_alignment_validator", "answer_correctness_validator",
+        "difficulty_validator", "quantitative_validator", "duplicate_validator",
+        "answer_repairer", "question_repairer", "options_repairer", "duplicate_repairer",
+        "solution_repairer", "task_alignment_repairer", "difficulty_repairer",
     }:
         raise ValueError(f"Unsupported review stage: {stage}")
     if normalized_domain not in {"STEM", "NON_STEM"}:

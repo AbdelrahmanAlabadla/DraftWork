@@ -76,9 +76,9 @@ def test_missing_whole_section_creates_one_target_per_expected_slot(monkeypatch)
     assert out["validation_reports"][0]["missing_sections"] == ["true_false"]
 
 
-def test_unsupported_given_routes_to_assignment_replacement():
+def test_unsupported_given_routes_to_task_alignment_content_repair_first():
     assert val._repair_classification("unsupported_given") == (
-        "task_or_evidence_invalid", "replace_assignment"
+        "question_repairable", "repair_question"
     )
     assert val._repair_classification("invalid_structure") == (
         "structure_invalid", "repair_question"

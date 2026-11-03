@@ -9,8 +9,7 @@ def test_generation_progress_has_real_stage_labels_in_english_and_arabic():
     for key in (
         "retrieving_context", "compiling_assessment_catalog", "planning_exam",
         "adjusting_difficulty", "generating_exam",
-        "validating_exam", "repairing_exam", "checking_duplicates",
-        "repairing_duplicates", "finalizing_exam", "completed",
+        "validating_exam", "repairing_exam", "finalizing_exam", "completed",
     ):
         assert source.count(f'"exam_stage.{key}"') == 2
     assert 'return normalized.replaceAll("_", " ");' in source

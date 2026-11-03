@@ -732,7 +732,7 @@ def test_id_survives_repair():
     repair_exam(exam, verdicts, client=fake)
     q = exam["questions"]["true_false"][0]
     assert q["question_id"] == "model1_true_false_1"
-    assert q["answer"] == "True"
+    assert q["answer"] is True
 
 
 def test_display_numbering_independent_of_id():
@@ -884,7 +884,7 @@ def test_tf_wrong_answer_repaired_answer_only():
     verdicts = validate_exam(exam, client=fake)["verdicts"]
     repair_exam(exam, verdicts, client=fake)
     q = exam["questions"]["true_false"][0]
-    assert q["answer"] == "True"
+    assert q["answer"] is True
     assert q["statement"] == "Cyanobacteria released oxygen through photosynthesis."
     assert q["question_id"] == "model1_true_false_2"
 
@@ -1812,7 +1812,7 @@ def test_unvalidated_only_report_does_not_enter_repair_node(monkeypatch):
 
     out = repair_invalid_questions(state)
     assert out["question_repair_attempts"] == {}
-    assert _route_after_validation(state) == "scan_exam_duplicates"
+    assert _route_after_validation(state) == "assemble_exams"
 
 
 def test_real_content_failure_still_routes_to_repair():
@@ -2190,7 +2190,7 @@ def test_repair_normalizes_before_write_back():
         {"question_id": "model1_true_false_1", "patch": {"answer": "true"}}
     ])
     repair_exam(exam, [_verdict("model1_true_false_1", "FIX_ANSWER", av=False, fields=["answer"])], client=fake)
-    assert exam["questions"]["true_false"][0]["answer"] == "True"  # normalized via normalizer
+    assert exam["questions"]["true_false"][0]["answer"] is True
 
 
 def test_valid_questions_not_touched_when_sibling_repairs():
@@ -2279,9 +2279,7 @@ def test_selective_revalidation_merges_untouched_passes(monkeypatch):
     state = {**state, **validate_generated_questions(state)}
 
     assert validation_scopes[0] is None
-    assert {tuple(scope) for scope in validation_scopes[1:]} == {
-        (qid,) for qid in invalid_ids
-    }
+    assert {tuple(sorted(scope)) for scope in validation_scopes[1:]} == {tuple(sorted(invalid_ids))}
     report = state["validation_reports"][0]
     assert report["all_pass"]
     assert len(report["verdicts"]) == 10
@@ -2342,9 +2340,9 @@ def test_mcq_balance_expands_revalidation_to_every_modified_item(monkeypatch):
     state = {**state, **validate_generated_questions(state)}
 
     assert scopes[0] is None
-    assert {tuple(scope) for scope in scopes[1:] if scope is not None} == {
-        (qid,) for qid in qids
-    }
+    selective = [scope for scope in scopes[1:] if scope is not None]
+    assert set().union(*(set(scope) for scope in selective)) == set(qids)
+    assert all(set(scope).issubset(qids) for scope in selective)
     assert repair_round["value"] == 2
     assert state["validation_reports"][0]["all_pass"]
 

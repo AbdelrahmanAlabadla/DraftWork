@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -98,6 +99,53 @@ def test_mcq_answer_positions_are_balanced_and_keep_correct_content():
     snapshot = [dict(item["options"]) for item in questions["mcq"]]
     exam_builder.balance_mcq_answer_positions(questions)
     assert [item["options"] for item in questions["mcq"]] == snapshot
+
+
+def test_mcq_balance_atomically_updates_english_and_arabic_certificate_labels():
+    questions = {"mcq": [
+        {
+            "question_id": f"q{index}",
+            "options": {"A": "-10", "B": "-2", "C": "2", "D": "-6"},
+            "correct_answer": "A",
+            "solution_certificate": {
+                "matching_correct_option": "A",
+                "verification_method": (
+                    "The correct answer is option A (-10)."
+                    if index == 0 else "الإجابة الصحيحة هي الخيار A وقيمتها -10."
+                ),
+            },
+        }
+        for index in range(2)
+    ]}
+
+    changed = exam_builder.balance_mcq_answer_positions(questions)
+
+    assert changed == ["q0"]
+    moved = questions["mcq"][0]
+    assert moved["correct_answer"] == "B"
+    assert moved["options"]["B"] == "-10"
+    assert moved["solution_certificate"]["matching_correct_option"] == "B"
+    assert "option B" in moved["solution_certificate"]["verification_method"]
+    assert "option A" not in moved["solution_certificate"]["verification_method"]
+
+
+def test_mcq_balance_skips_unsafe_multi_label_certificate():
+    questions = {"mcq": [
+        {
+            "question_id": f"q{index}",
+            "options": {"A": "10", "B": "20", "C": "30", "D": "40"},
+            "correct_answer": "A",
+            "solution_certificate": {
+                "matching_correct_option": "A",
+                "verification_method": "Option A is correct; option B is a distractor.",
+            },
+        }
+        for index in range(2)
+    ]}
+    snapshot = deepcopy(questions)
+
+    assert exam_builder.balance_mcq_answer_positions(questions) == []
+    assert questions == snapshot
 
 
 def test_mcq_balance_triggers_at_fifty_percent_and_moves_toward_least_used():
@@ -852,6 +900,66 @@ def test_assembly_excludes_non_pass_questions_from_student_output():
     assert result["invalid_questions"][0]["slot_id"] == "m1_mcq_2"
 
 
+def test_assembly_excludes_pass_verdict_with_nonfinal_lifecycle_status():
+    accepted = _mcq("Accepted question")
+    blocked = _mcq("Operationally blocked question")
+    accepted.update({"question_id": "model1_mcq_1", "slot_id": "m1_mcq_1"})
+    blocked.update({"question_id": "model1_mcq_2", "slot_id": "m1_mcq_2"})
+    state = {
+        "document_language": "en",
+        "generated_exams": [{
+            "model_number": 1,
+            "questions": {"mcq": [accepted, blocked]},
+        }],
+        "validation_reports": [{
+            "model_number": 1,
+            "verdicts": [
+                {"question_id": "model1_mcq_1", "action": "PASS"},
+                {"question_id": "model1_mcq_2", "action": "PASS"},
+            ],
+        }],
+        "repair_manifest": [{
+            "slot_id": "m1_mcq_2",
+            "status": "exhausted",
+            "failure_code": "validation_blocked",
+        }],
+        "slot_lifecycle": {
+            "m1_mcq_1": {
+                "slot_id": "m1_mcq_1", "model_number": 1,
+                "question_type": "mcq", "planned": True, "generated": True,
+                "validated": True, "finalized": False,
+                "terminal_status": None, "failure_code": None,
+                "repair_attempts": [], "developer_diagnostics": [],
+                "validation": {}, "history": [],
+            },
+            "m1_mcq_2": {
+                "slot_id": "m1_mcq_2", "model_number": 1,
+                "question_type": "mcq", "planned": True, "generated": True,
+                "validated": False, "finalized": False,
+                "terminal_status": "repair_failed",
+                "failure_code": "validation_blocked",
+                "repair_attempts": [], "developer_diagnostics": [],
+                "validation": {}, "history": [],
+            },
+        },
+        "eval_stats": None,
+    }
+
+    result = exam_builder.assemble_exams_node(state)
+
+    public = result["generated_exams"][0]["questions"]["mcq"]
+    assert [item["slot_id"] for item in public] == ["m1_mcq_1"]
+    assert result["accepted_slot_ids"] == ["m1_mcq_1"]
+    assert result["slot_lifecycle"]["m1_mcq_1"]["terminal_status"] == "finalized"
+    assert result["slot_lifecycle"]["m1_mcq_2"]["terminal_status"] == "repair_failed"
+    rejected = next(
+        item for item in result["invalid_questions"]
+        if item["slot_id"] == "m1_mcq_2"
+    )
+    assert rejected["failure_code"] == "validation_blocked"
+    assert "Operationally blocked question" not in result["generated_exams"][0]["markdown"]
+
+
 def test_assembly_preserves_four_valid_fitb_when_one_slot_fails():
     items = []
     verdicts = []
@@ -927,7 +1035,8 @@ def test_generation_reports_separate_quality_status_and_counts(monkeypatch):
     assert result["workflow_status"] == "completed"
     assert result["quality_status"] == "incomplete"
     assert result["quality_summary"] == {
-        "requested": 3, "valid": 1, "missing": 1, "invalid": 1,
+        "requested": 3, "generated": 2, "accepted": 1, "valid": 1,
+        "missing": 1, "failed": 1, "invalid": 1,
         "status": "incomplete",
     }
     identity = result["semantic_identities"][0]

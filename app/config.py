@@ -100,7 +100,7 @@ ACTIVE_LLM_MODEL: str = DEEPSEEK_MODEL if LLM_PROVIDER == "deepseek" else LMS_MO
 # Keep validator requests small enough that local models reliably return one
 # verdict per question.  Missing IDs are retried once in an even smaller request.
 VALIDATOR_BATCH_SIZE: int = max(
-    1, int(_env("VALIDATOR_BATCH_SIZE", "8") or "8")
+    1, min(4, int(_env("VALIDATOR_BATCH_SIZE", "4") or "4"))
 )
 MAX_PARALLEL_GENERATION_CALLS: int = max(
     1, min(50, int(_env("MAX_PARALLEL_GENERATION_CALLS", "50") or "50"))
@@ -109,16 +109,80 @@ MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: int = max(
     1, min(10, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "10") or "10"))
 )
 MAX_PARALLEL_VALIDATOR_CALLS: int = max(
-    1, min(10, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "10") or "10"))
+    1, min(50, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "50") or "50"))
+)
+REVALIDATION_OPERATIONAL_RETRIES: int = max(
+    0, min(5, int(_env("REVALIDATION_OPERATIONAL_RETRIES", "2") or "2"))
+)
+REPAIR_BATCH_SIZE: int = max(
+    1, min(4, int(_env("REPAIR_BATCH_SIZE", "4") or "4"))
+)
+MAX_PARALLEL_REPAIR_CALLS: int = max(
+    1, min(50, int(_env("MAX_PARALLEL_REPAIR_CALLS", "50") or "50"))
+)
+REPAIR_PROVIDER_RPM: int = max(
+    0, int(_env("REPAIR_PROVIDER_RPM", "0") or "0")
+)
+REPAIR_PROVIDER_TPM: int = max(
+    0, int(_env("REPAIR_PROVIDER_TPM", "0") or "0")
+)
+REPAIR_REQUEST_TIMEOUT_SECONDS: int = max(
+    1, int(_env("REPAIR_REQUEST_TIMEOUT_SECONDS", "600") or "600")
+)
+REPAIR_TRACE_MAX_ATTEMPTS: int = max(
+    10, int(_env("REPAIR_TRACE_MAX_ATTEMPTS", "500") or "500")
+)
+ANSWER_REPAIR_MAX_TOKENS: int = max(256, int(_env("ANSWER_REPAIR_MAX_TOKENS", "6000") or "6000"))
+QUESTION_REPAIR_MAX_TOKENS: int = max(256, int(_env("QUESTION_REPAIR_MAX_TOKENS", "6000") or "6000"))
+OPTIONS_REPAIR_MAX_TOKENS: int = max(256, int(_env("OPTIONS_REPAIR_MAX_TOKENS", "6000") or "6000"))
+SOLUTION_REPAIR_MAX_TOKENS: int = max(256, int(_env("SOLUTION_REPAIR_MAX_TOKENS", "10000") or "10000"))
+TASK_ALIGNMENT_REPAIR_MAX_TOKENS: int = max(256, int(_env("TASK_ALIGNMENT_REPAIR_MAX_TOKENS", "8000") or "8000"))
+DIFFICULTY_REPAIR_MAX_TOKENS: int = max(256, int(_env("DIFFICULTY_REPAIR_MAX_TOKENS", "8000") or "8000"))
+DUPLICATE_REPAIR_MAX_TOKENS: int = max(256, int(_env("DUPLICATE_REPAIR_MAX_TOKENS", "8000") or "8000"))
+VALIDATOR_PROVIDER_RPM: int = max(
+    0, int(_env("VALIDATOR_PROVIDER_RPM", "0") or "0")
+)
+VALIDATOR_PROVIDER_TPM: int = max(
+    0, int(_env("VALIDATOR_PROVIDER_TPM", "0") or "0")
+)
+VALIDATOR_REQUEST_TIMEOUT_SECONDS: int = max(
+    1, int(_env("VALIDATOR_REQUEST_TIMEOUT_SECONDS", "600") or "600")
+)
+VALIDATOR_INPUT_MAX_CHARS: int = max(
+    10_000, int(_env("VALIDATOR_INPUT_MAX_CHARS", "120000") or "120000")
+)
+VALIDATOR_TRACE_MAX_CHARS: int = max(
+    1_000, int(_env("VALIDATOR_TRACE_MAX_CHARS", "50000") or "50000")
+)
+VALIDATOR_LOG_CONTENT: bool = (_env("VALIDATOR_LOG_CONTENT", "false") or "false").lower() in {
+    "1", "true", "yes", "on",
+}
+VALIDATOR_TRACE_MAX_ATTEMPTS: int = max(
+    10, int(_env("VALIDATOR_TRACE_MAX_ATTEMPTS", "500") or "500")
+)
+GROUNDING_VALIDATOR_MAX_TOKENS: int = max(
+    256, int(_env("GROUNDING_VALIDATOR_MAX_TOKENS", "6000") or "6000")
+)
+TASK_ALIGNMENT_VALIDATOR_MAX_TOKENS: int = max(
+    256, int(_env("TASK_ALIGNMENT_VALIDATOR_MAX_TOKENS", "6000") or "6000")
+)
+ANSWER_CORRECTNESS_VALIDATOR_MAX_TOKENS: int = max(
+    256, int(_env("ANSWER_CORRECTNESS_VALIDATOR_MAX_TOKENS", "6000") or "6000")
+)
+DIFFICULTY_VALIDATOR_MAX_TOKENS: int = max(
+    256, int(_env("DIFFICULTY_VALIDATOR_MAX_TOKENS", "6000") or "6000")
+)
+QUANTITATIVE_VALIDATOR_MAX_TOKENS: int = max(
+    256, int(_env("QUANTITATIVE_VALIDATOR_MAX_TOKENS", "10000") or "10000")
 )
 MAX_PARALLEL_CATALOG_CALLS: int = max(
     1, min(50, int(_env("MAX_PARALLEL_CATALOG_CALLS", "50") or "50"))
 )
-MAX_PARALLEL_DUPLICATE_JUDGE_CALLS: int = max(
-    1, min(10, int(_env("MAX_PARALLEL_DUPLICATE_JUDGE_CALLS", "10") or "10"))
+MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS: int = max(
+    1, min(50, int(_env("MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS", "50") or "50"))
 )
-DUPLICATE_JUDGE_BATCH_SIZE: int = max(
-    1, int(_env("DUPLICATE_JUDGE_BATCH_SIZE", "8") or "8")
+DUPLICATE_VALIDATOR_BATCH_SIZE: int = max(
+    1, min(4, int(_env("DUPLICATE_VALIDATOR_BATCH_SIZE", "4") or "4"))
 )
 LLM_JOB_CONCURRENCY_LIMIT: int = max(
     1, min(64, int(_env("LLM_JOB_CONCURRENCY_LIMIT", "50") or "50"))
@@ -152,8 +216,8 @@ VALIDATION_PIPELINE_VERSION: str = _env(
     "VALIDATION_PIPELINE_VERSION", "selective-validation-v2"
 ) or "selective-validation-v2"
 DUPLICATE_PIPELINE_VERSION: str = _env(
-    "DUPLICATE_PIPELINE_VERSION", "semantic-facts-v5-practice-variation"
-) or "semantic-facts-v5-practice-variation"
+    "DUPLICATE_PIPELINE_VERSION", "integrated-duplicate-validation-v2"
+) or "integrated-duplicate-validation-v2"
 ASSESSMENT_CATALOG_VERSION: str = _env(
     "ASSESSMENT_CATALOG_VERSION", "catalog-v13-numerical-givens-contract"
 ) or "catalog-v13-numerical-givens-contract"
@@ -170,12 +234,6 @@ ASSESSMENT_CATALOG_CACHE_DIR: str = (
     or "data/assessment_catalogs"
 )
 CATALOG_MAX_TASKS: int = max(16, int(_env("CATALOG_MAX_TASKS", "48") or "48"))
-DUPLICATE_EMBEDDING_THRESHOLD: float = float(
-    _env("DUPLICATE_EMBEDDING_THRESHOLD", "0.80") or "0.80"
-)
-DUPLICATE_TOP_NEIGHBOURS: int = max(
-    1, int(_env("DUPLICATE_TOP_NEIGHBOURS", "2") or "2")
-)
 MAX_DUPLICATE_REPAIR_ROUNDS: int = max(
     1, min(3, int(_env("MAX_DUPLICATE_REPAIR_ROUNDS", "3") or "3"))
 )
@@ -237,13 +295,13 @@ MAX_ACTIVE_GENERATION_JOBS_PER_SESSION: int = max(
     1, int(_env("MAX_ACTIVE_GENERATION_JOBS_PER_SESSION", "2") or "2")
 )
 DEEPSEEK_INPUT_COST_PER_MTOK: float = max(
-    0.0, float(_env("DEEPSEEK_INPUT_COST_PER_MTOK", "0") or "0")
+    0.0, float(_env("DEEPSEEK_INPUT_COST_PER_MTOK", "0.30") or "0.30")
 )
 DEEPSEEK_CACHED_INPUT_COST_PER_MTOK: float = max(
-    0.0, float(_env("DEEPSEEK_CACHED_INPUT_COST_PER_MTOK", "0") or "0")
+    0.0, float(_env("DEEPSEEK_CACHED_INPUT_COST_PER_MTOK", "0.006") or "0.006")
 )
 DEEPSEEK_OUTPUT_COST_PER_MTOK: float = max(
-    0.0, float(_env("DEEPSEEK_OUTPUT_COST_PER_MTOK", "0") or "0")
+    0.0, float(_env("DEEPSEEK_OUTPUT_COST_PER_MTOK", "1.20") or "1.20")
 )
 OPENAI_INPUT_COST_PER_MTOK: float = max(
     0.0, float(_env("OPENAI_INPUT_COST_PER_MTOK", "0.10") or "0.10")
@@ -275,6 +333,15 @@ PARSING_TIMEOUT_SECONDS: int = max(
 )
 GENERATION_TIMEOUT_SECONDS: int = max(
     1, int(_env("GENERATION_TIMEOUT_SECONDS", "1300") or "1300")
+)
+MAX_CONTENT_REPAIR_CALLS_PER_SLOT: int = max(
+    1, int(_env("MAX_CONTENT_REPAIR_CALLS_PER_SLOT", "8") or "8")
+)
+MAX_FAILED_REPAIR_ATTEMPTS_PER_SLOT: int = max(
+    1, int(_env("MAX_FAILED_REPAIR_ATTEMPTS_PER_SLOT", "3") or "3")
+)
+MAX_COMPLETION_ATTEMPTS_PER_SLOT: int = max(
+    1, int(_env("MAX_COMPLETION_ATTEMPTS_PER_SLOT", "3") or "3")
 )
 JOB_HEARTBEAT_SECONDS: int = max(5, int(_env("JOB_HEARTBEAT_SECONDS", "30") or "30"))
 JOB_STALE_AFTER_SECONDS: int = max(

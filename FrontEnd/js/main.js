@@ -62,8 +62,6 @@ function initGenerate() {
     { id: "generation", stages: ["generating_exam"] },
     { id: "validation", stages: ["validating_exam", "validating_updates"] },
     { id: "repair", stages: ["repairing_exam"] },
-    { id: "duplicates", stages: ["checking_duplicates"] },
-    { id: "duplicate_repair", stages: ["repairing_duplicates"] },
     { id: "final", stages: ["finalizing_exam"] },
     { id: "completed", stages: ["completed"] },
   ];

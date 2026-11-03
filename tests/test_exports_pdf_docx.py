@@ -17,6 +17,8 @@ from app.exports.common import (
 )
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
 from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
+from app.exports.common import split_equation_content
+from app.exports.math_renderer import latex_to_plain_text, render_math
 
 
 def _stored_record() -> dict:
@@ -256,6 +258,22 @@ def test_docx_uses_a4_half_inch_margins_and_grouped_sections():
         "Solve the word problems and show your steps.", "Essay",
     ):
         assert heading in document_xml
+
+
+def test_inline_latex_stays_editable_and_complex_system_renders():
+    assert latex_to_plain_text(r"x+y\leq 25") == "x+y≤ 25"
+    assert latex_to_plain_text(r"\frac{925}{96}") == "(925/96)"
+    assert latex_to_plain_text(r"\begin{aligned}x+y&=3\\x-y&=1\end{aligned}") is None
+    rendered = render_math(r"\begin{aligned}x+y&=3\\x-y&=1\end{aligned}")
+    assert rendered is not None
+    assert rendered.width_px > 0 and rendered.height_px > 0
+
+
+def test_undelimited_display_environment_is_not_exported_as_prose():
+    parts = split_equation_content(
+        r"\begin{cases}x+y=3\\x-y=1\end{cases}", undelimited_as_math=False,
+    )
+    assert parts == [("math", r"\begin{cases}x+y=3\\x-y=1\end{cases}")]
 
 
 def test_docx_has_page_number_only_and_visible_open_answer_lines():

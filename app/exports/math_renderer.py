@@ -135,11 +135,60 @@ def to_mathtext(source: object) -> str:
     return r"\quad ".join(filter(None, (_normalize_clause(part) for part in clauses)))
 
 
+def latex_to_plain_text(source: object) -> str | None:
+    """Convert simple inline TeX to editable Unicode; defer complex displays."""
+    value = str(source or "").strip()
+    for left, right in (("$$", "$$"), (r"\[", r"\]"), (r"\(", r"\)"), ("$", "$")):
+        if value.startswith(left) and value.endswith(right):
+            value = value[len(left):-len(right)].strip()
+            break
+    if re.search(r"\\begin\{|\\end\{", value):
+        return None
+    previous = None
+    while previous != value:
+        previous = value
+        value = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1/\2)", value)
+    value = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", value)
+    value = re.sub(r"\\(?:mathrm|text)\{([^{}]+)\}", r"\1", value)
+    value = re.sub(r"\^\{([^{}]+)\}", r"^(\1)", value)
+    value = re.sub(r"_\{([^{}]+)\}", r"_(\1)", value)
+    for command, symbol in {
+        r"\times": "×", r"\div": "÷", r"\cdot": "·", r"\leq": "≤",
+        r"\le": "≤", r"\geq": "≥", r"\ge": "≥", r"\ne": "≠",
+        r"\to": "→", r"\infty": "∞", r"\pi": "π",
+    }.items():
+        value = value.replace(command, symbol)
+    value = re.sub(r"\\[,;!]", " ", value)
+    if re.search(r"\\[A-Za-z]+|[{}]", value):
+        return None
+    return re.sub(r"\s+", " ", value).strip() or None
+
+
 def render_math(source: object, *, font_size: float = 13.0, dpi: int = 220) -> RenderedMath | None:
     """Render equation text to a tightly cropped transparent PNG."""
     mathtext = to_mathtext(source)
     if not mathtext:
         return None
+    aligned = re.fullmatch(
+        r"\\begin\{(?:aligned|array)\}(?:\{[^{}]*\})?([\s\S]+?)"
+        r"\\end\{(?:aligned|array)\}", mathtext.strip()
+    )
+    if aligned:
+        rows = [row.strip().replace("&", "") for row in re.split(r"\\\\", aligned.group(1)) if row.strip()]
+        rendered_rows = [render_math(row, font_size=font_size, dpi=dpi) for row in rows]
+        if rows and all(rendered_rows):
+            images = [Image.open(io.BytesIO(row.png)).convert("RGBA") for row in rendered_rows]
+            gap = max(5, int(dpi / 50))
+            width = max(image.width for image in images)
+            height = sum(image.height for image in images) + gap * (len(images) - 1)
+            canvas = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+            y = 0
+            for image in images:
+                canvas.alpha_composite(image, ((width - image.width) // 2, y))
+                y += image.height + gap
+            output = io.BytesIO()
+            canvas.save(output, format="PNG")
+            return RenderedMath(output.getvalue(), width, height)
     matrix = re.fullmatch(
         r"(.*?)\\begin\{(?:bmatrix|pmatrix|matrix)\}([\s\S]+?)"
         r"\\end\{(?:bmatrix|pmatrix|matrix)\}", mathtext.strip()

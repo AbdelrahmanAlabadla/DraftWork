@@ -28,7 +28,7 @@ from app.exports.common import (
     response_line_count,
 )
 from app.language import detect_language
-from app.exports.math_renderer import render_math
+from app.exports.math_renderer import latex_to_plain_text, render_math
 
 PAGE_MARGIN_IN = 0.5
 CONTENT_WIDTH_IN = 7.27  # A4 width (8.27in) minus two 0.5in margins
@@ -436,6 +436,12 @@ def _add_mixed_math_runs(
             run = paragraph.add_run(value)
             _set_run_font(run, size=size, bold=bold)
             continue
+        plain = latex_to_plain_text(value)
+        if plain is not None:
+            run = paragraph.add_run(plain)
+            _set_run_font(run, size=size, bold=bold)
+            run.font.rtl = False
+            continue
         rendered = render_math(value)
         if rendered:
             stream = io.BytesIO(rendered.png)
@@ -599,6 +605,16 @@ def _add_equation(doc: Document, item: dict[str, Any], rtl: bool = False) -> Non
     _set_run_font(run, bold=True)
     equation_text = _clean(item.get("text"), "(missing equation)")
     parts = split_equation_content(equation_text)
+    if (parts and any(kind == "text" for kind, _ in parts)
+            and not re.search(r"\$\$|\\\[", equation_text)
+            and all(kind == "text" or latex_to_plain_text(value) is not None
+                    for kind, value in parts)):
+        equation = equation_cell.paragraphs[0]
+        equation.paragraph_format.space_after = Pt(2)
+        _set_content_direction(equation, equation_text, rtl)
+        _add_mixed_math_runs(equation, equation_text, bold=True)
+        _add_answer_lines(doc, response_line_count("equation"), rtl=rtl)
+        return
     for part_index, (kind, value) in enumerate(parts):
         equation = equation_cell.paragraphs[0] if part_index == 0 else equation_cell.add_paragraph()
         equation.paragraph_format.space_after = Pt(2)
@@ -746,16 +762,8 @@ def _render_answer_key(
                 ]
                 for value in values:
                     line = doc.add_paragraph()
-                    line.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    rendered = render_math(value)
-                    if rendered:
-                        stream = io.BytesIO(rendered.png)
-                        stream.name = "answer-equation.png"
-                        width = min(CONTENT_WIDTH_IN - 0.9, max(0.35, rendered.width_px / 220))
-                        line.add_run().add_picture(stream, width=Inches(width))
-                    else:
-                        run = line.add_run(value)
-                        _set_run_font(run, size=9.5)
+                    _set_content_direction(line, value, rtl)
+                    _add_mixed_math_runs(line, value, size=9.5)
             else:
                 _add_mixed_math_runs(p, answer, size=9.5)
 

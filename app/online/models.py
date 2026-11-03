@@ -45,9 +45,10 @@ def type_label(question_type: str, language: str = "en") -> str:
     return TYPE_LABELS_BY_LANG.get(language, TYPE_LABELS).get(question_type, question_type)
 
 
-def tf_answer_label(answer: str, language: str = "en") -> str:
+def tf_answer_label(answer: Any, language: str = "en") -> str:
     true_label, false_label = TRUE_FALSE_ANSWER_LABELS.get(language, ("True", "False"))
-    return true_label if str(answer).lower() == "true" else false_label
+    normalized = normalize_true_false_answer(answer)
+    return true_label if normalized is True else false_label
 
 TYPE_ORDER = [
     "mcq",
@@ -78,15 +79,60 @@ FORBIDDEN_PHRASES = (
     "according to the context",
 )
 
+ARABIC_FORBIDDEN_PHRASES = (
+    "كما ورد في النص",
+    "كما جاء في النص",
+    "بالاعتماد على المعلومات السابقة",
+    "اعتمادا على المعلومات السابقة",
+    "اعتمادًا على المعلومات السابقة",
+)
+
+ARABIC_CONDITIONAL_CONTEXT_PHRASES = (
+    "وفق القيود",
+    "حسب القيود",
+    "حسب المعطيات",
+    "وفق المعطيات",
+)
+
+
+def _arabic_context_is_explicit(text: str, phrase_end: int) -> bool:
+    """Allow a context phrase only when its referenced data follows inline."""
+    remainder = text[phrase_end:].lstrip(" \t\n\r،,:؛-")
+    introduced = False
+    for lead_in in ("التالية", "الآتية", "الاتية", "التالي", "الآتي", "الاتي"):
+        if remainder.startswith(lead_in):
+            introduced = True
+            remainder = remainder[len(lead_in):].lstrip(" \t\n\r،,:؛-")
+            break
+    if not remainder:
+        return False
+    has_relational_math = any(
+        symbol in remainder for symbol in ("≤", "≥", "=", "<", ">")
+    )
+    has_introduced_givens = (
+        introduced and any(char.isdigit() for char in remainder)
+        and len(remainder.split()) >= 3
+    )
+    return has_relational_math or has_introduced_givens
+
 def contains_forbidden_phrase(text: str, language: str | None = None) -> bool:
-    """Check for source-referencing phrases. The phrase list is English-only;
-    skip the check entirely for non-English documents."""
+    """Detect obvious references to source/context absent from the question."""
     if language is None:
         language = detect_language(text)
-    if language != "en":
-        return False
     lowered = str(text).lower()
-    return any(phrase in lowered for phrase in FORBIDDEN_PHRASES)
+    if language == "en":
+        return any(phrase in lowered for phrase in FORBIDDEN_PHRASES)
+    if language == "ar":
+        if any(phrase in lowered for phrase in ARABIC_FORBIDDEN_PHRASES):
+            return True
+        for phrase in ARABIC_CONDITIONAL_CONTEXT_PHRASES:
+            start = lowered.find(phrase)
+            while start >= 0:
+                end = start + len(phrase)
+                if not _arabic_context_is_explicit(lowered, end):
+                    return True
+                start = lowered.find(phrase, end)
+    return False
 
 
 def _questions_from(raw: object) -> list[dict[str, Any]]:
@@ -110,6 +156,9 @@ def _keep_slot_id(normalized: dict[str, Any], item: dict[str, Any]) -> dict[str,
     fitb_entry_id = _clean_str(item.get("fitb_entry_id"))
     if fitb_entry_id:
         normalized["fitb_entry_id"] = fitb_entry_id
+    selected_variation_id = _clean_str(item.get("selected_variation_id"))
+    if selected_variation_id:
+        normalized["selected_variation_id"] = selected_variation_id
     certificate = item.get("solution_certificate")
     if isinstance(certificate, dict):
         method = _clean_str(certificate.get("method"))
@@ -161,18 +210,28 @@ def _normalize_mcq(item: dict[str, Any]) -> dict[str, Any] | None:
     )
 
 
+def normalize_true_false_answer(value: Any) -> bool | None:
+    """Return the canonical boolean for an unambiguous True/False value."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    return None
+
+
 def _normalize_true_false(item: dict[str, Any]) -> dict[str, Any] | None:
     statement = _clean_str(item.get("statement"))
     if not statement:
         return None
-    answer = item.get("answer")
-    if isinstance(answer, bool):
-        answer = "True" if answer else "False"
-    answer = _clean_str(answer)
-    if answer.lower() not in {"true", "false"}:
+    answer = normalize_true_false_answer(item.get("answer"))
+    if answer is None:
         return None
     return _keep_slot_id(
-        {"statement": statement, "answer": "True" if answer.lower() == "true" else "False"},
+        {"statement": statement, "answer": answer},
         item,
     )
 

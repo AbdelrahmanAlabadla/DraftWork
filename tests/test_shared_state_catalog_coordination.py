@@ -134,7 +134,7 @@ def test_finalization_pending_routes_through_required_fingerprint_verification()
     assert _route_after_validation({
         "repair_manifest": [], "duplicate_repair_finalization_pending": True,
         "duplicate_verification_pending": True,
-    }) == "scan_exam_duplicates"
+    }) == "assemble_exams"
     assert _route_after_validation({
         "repair_manifest": [], "duplicate_repair_finalization_pending": True,
         "duplicate_verification_pending": False,

@@ -86,7 +86,7 @@ def test_agent_reasoning_and_token_budgets_are_deepseek_specific(monkeypatch):
 
     assert client._reasoning_effort("planner") == "low"
     assert client._reasoning_effort("validator") == "high"
-    assert client._reasoning_effort("duplicate_judge") == "none"
+    assert client._reasoning_effort("duplicate_validator") == "none"
     assert client._reasoning_effort("global_validator_initial") == "none"
     assert client._reasoning_effort("generator") == "none"
     assert client._reasoning_effort("repairer") == "low"

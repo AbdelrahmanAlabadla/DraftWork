@@ -418,7 +418,7 @@ def _metrics(outcome: ModelOutcome, calls: list[dict[str, Any]], quality: dict[s
         "outer_retry_attempts": max(0, len(rows) - len(outcome.batches)),
         "input_tokens": numbers("input_tokens"), "cached_input_tokens": numbers("cached_input_tokens"),
         "output_tokens": numbers("output_tokens"), "reasoning_tokens": numbers("reasoning_tokens"),
-        "total_tokens": numbers("total_tokens"), "cost_usd_estimated_peak": round(sum(costs), 6),
+        "total_tokens": numbers("total_tokens"), "cost_usd_estimated_peak": sum(costs),
         "average_successful_batch_seconds": round(sum(durations) / max(1, sum(row.status == "complete" for row in outcome.batches)), 3),
         "median_call_seconds": round(sorted(durations)[len(durations) // 2], 3) if durations else None,
         "maximum_call_seconds": round(max(durations), 3) if durations else None,
@@ -446,7 +446,7 @@ def _report(config_data: dict[str, Any], outcomes: list[ModelOutcome], metrics: 
         ("outer_retry_attempts", "Outer retries"), ("input_tokens", "Input tokens"),
         ("cached_input_tokens", "Cached input tokens"), ("output_tokens", "Output tokens"),
         ("reasoning_tokens", "Reasoning tokens"), ("total_tokens", "Total tokens"),
-        ("cost_usd_estimated_peak", "Estimated peak-rate cost (USD)"),
+        ("cost_usd_estimated_peak", "Estimated peak-rate cost (USD, 8 decimal places)"),
         ("raw_tasks", "Raw tasks"), ("accepted_tasks", "Accepted tasks"),
         ("distinct_concepts", "Distinct normalized concepts"), ("distinct_evidence_chunks", "Evidence chunks cited"),
         ("evidence_coverage_pct", "Evidence chunk coverage (%)"), ("word_problem_tasks", "Word-problem-compatible tasks"),
@@ -498,7 +498,7 @@ def main() -> int:
     }
     (output_dir / "experiment_config.json").write_text(json.dumps(config_data, ensure_ascii=False, indent=2), encoding="utf-8")
     if not args.no_budget_cap and reservation["total"] > BUDGET_USD:
-        (output_dir / "errors_and_retries.md").write_text(f"# Blocked\n\nReserved worst-case ${reservation['total']:.6f} exceeds ${BUDGET_USD:.2f}; no API requests were launched.\n", encoding="utf-8")
+        (output_dir / "errors_and_retries.md").write_text(f"# Blocked\n\nReserved worst-case ${reservation['total']:.8f} exceeds ${BUDGET_USD:.8f}; no API requests were launched.\n", encoding="utf-8")
         return 2
     if not config.DEEPSEEK_API_KEY or not config.OPENAI_API_KEY:
         (output_dir / "errors_and_retries.md").write_text("# Blocked\n\nA required provider key is absent; no API requests were launched.\n", encoding="utf-8")

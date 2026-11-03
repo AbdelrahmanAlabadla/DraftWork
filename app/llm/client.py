@@ -253,7 +253,10 @@ def request_structured(
     """Use provider structured output while preserving the local call behavior."""
     from app.llm.scheduler import llm_request_slot
 
-    with llm_request_slot(agent=agent, operation=operation):
+    with llm_request_slot(
+        agent=agent, operation=operation,
+        provider=str(getattr(client, "provider_name", "")),
+    ):
         return _request_structured_unlimited(
             client, prompt, json_schema=json_schema, response_model=response_model,
             schema_name=schema_name, agent=agent, item_count=item_count,
