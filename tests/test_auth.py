@@ -108,6 +108,6 @@ def test_generation_ui_stops_polling_state_after_a_missing_or_failed_job():
     assert "generationFailed" in main_js
     assert "if (!(generationCompleted || generationFailed))" in main_js
     assert ".gen-status.failed .gen-spinner" in styles
-    assert '"exam_stage.checking_duplicates"' in open(
+    assert '"exam_stage.validating_exam"' in open(
         "FrontEnd/js/i18n.js", encoding="utf-8"
     ).read()

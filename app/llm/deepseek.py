@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Awaitable, TypeVar
 
@@ -56,6 +58,10 @@ class DeepSeekRateLimitError(DeepSeekError):
     pass
 
 
+class DeepSeekQuotaError(DeepSeekError):
+    pass
+
+
 class DeepSeekTimeoutError(DeepSeekError):
     pass
 
@@ -102,10 +108,24 @@ class DeepSeekClient:
     supports_agent_structured_output = True
     supports_temperature = True
     provider_name = "deepseek"
+    provider_label = "DeepSeek"
+    error_type = DeepSeekError
+    configuration_error_type = DeepSeekConfigurationError
+    authentication_error_type = DeepSeekAuthenticationError
+    rate_limit_error_type = DeepSeekRateLimitError
+    quota_error_type = DeepSeekQuotaError
+    timeout_error_type = DeepSeekTimeoutError
+    network_error_type = DeepSeekNetworkError
+    server_error_type = DeepSeekServerError
+    schema_error_type = DeepSeekSchemaError
+    validation_error_type = DeepSeekValidationError
+    incomplete_error_type = DeepSeekIncompleteError
     _concurrency = threading.BoundedSemaphore(DEEPSEEK_CONCURRENCY_LIMIT)
     _catalog_concurrency = threading.BoundedSemaphore(
         config.MAX_PARALLEL_CATALOG_CALLS
     )
+    _quota_lock = threading.Lock()
+    _quota_blocked_accounts: set[str] = set()
 
     def __init__(self, *, model: str | None = None) -> None:
         if not DEEPSEEK_API_KEY:
@@ -118,6 +138,73 @@ class DeepSeekClient:
         self.last_usage: dict[str, int | str] | None = None
         self.last_transient_retries = 0
         self.last_structured_attempts = 0
+        self.last_structured_attempt_details: list[dict[str, Any]] = []
+
+    def _account_scope(self) -> str:
+        digest = hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()[:16]
+        return f"{self.provider_name}:{digest}"
+
+    def _record_request_event(self, **values: Any) -> None:
+        try:
+            from app.api import repositories
+            repositories.record_llm_request_event(
+                job_id=current_job_id(), provider=self.provider_name,
+                model=self.model, **values,
+            )
+        except Exception as exc:
+            logger.warning(
+                "LLM request-event persistence failed | error=%s",
+                type(exc).__name__,
+            )
+
+    @staticmethod
+    def _provider_error_details(exc: Exception) -> dict[str, Any]:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", {}) or {}
+        body = getattr(exc, "body", None)
+        error = body.get("error") if isinstance(body, dict) else None
+        error = error if isinstance(error, dict) else (body if isinstance(body, dict) else {})
+        message = str(error.get("message") or exc)
+        code = str(error.get("code") or error.get("type") or "")
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        request_id = (
+            headers.get("x-request-id") or headers.get("X-Request-Id")
+            or getattr(exc, "request_id", None)
+        )
+        selected_headers = {
+            str(key).lower(): str(value)
+            for key, value in headers.items()
+            if str(key).lower() in {
+                "retry-after", "x-request-id", "x-ratelimit-limit-requests",
+                "x-ratelimit-remaining-requests", "x-ratelimit-reset-requests",
+                "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
+                "x-ratelimit-reset-tokens",
+            }
+        }
+        return {
+            "message": message[:1000], "code": code[:200],
+            "retry_after": retry_after, "request_id": request_id,
+            "headers": selected_headers,
+            "status_code": getattr(response, "status_code", 429),
+        }
+
+    @staticmethod
+    def _is_insufficient_quota(details: dict[str, Any]) -> bool:
+        text = f"{details.get('code', '')} {details.get('message', '')}".lower()
+        return any(marker in text for marker in (
+            "insufficient_quota", "insufficient quota", "no credits remaining",
+            "credit balance", "exceeded your current quota", "quota exhausted",
+        ))
+
+    @staticmethod
+    def _attach_error_details(error: Exception, details: dict[str, Any], category: str) -> Exception:
+        error.normalized_category = category  # type: ignore[attr-defined]
+        error.provider_code = details.get("code")  # type: ignore[attr-defined]
+        error.provider_request_id = details.get("request_id")  # type: ignore[attr-defined]
+        error.retry_after = details.get("retry_after")  # type: ignore[attr-defined]
+        error.rate_limit_headers = details.get("headers")  # type: ignore[attr-defined]
+        error.status_code = details.get("status_code")  # type: ignore[attr-defined]
+        return error
 
     async def _sdk_request(self, *, timeout: int, agent: str = "", **kwargs):
         concurrency = (
@@ -141,38 +228,109 @@ class DeepSeekClient:
         self, *, timeout: int, agent: str = "", **kwargs
     ):
         self.last_transient_retries = 0
+        account_scope = self._account_scope()
+        with self._quota_lock:
+            quota_blocked = account_scope in self._quota_blocked_accounts
+        if quota_blocked:
+            raise self._attach_error_details(
+                self.quota_error_type(
+                    f"{self.provider_label} account has confirmed insufficient quota"
+                ), {}, "INSUFFICIENT_QUOTA",
+            )
         for transient_attempt in range(DEEPSEEK_MAX_TRANSIENT_RETRIES + 1):
+            request_event_id = str(uuid.uuid4())
+            request_started = time.perf_counter()
             try:
                 return await self._sdk_request(
                     timeout=timeout, agent=agent, **kwargs
                 )
             except AuthenticationError as exc:
-                raise DeepSeekAuthenticationError(
-                    "DeepSeek rejected DEEPSEEK_API_KEY"
+                raise self.authentication_error_type(
+                    f"{self.provider_label} rejected its configured API key"
                 ) from exc
             except RateLimitError as exc:
+                details = self._provider_error_details(exc)
+                if self._is_insufficient_quota(details):
+                    with self._quota_lock:
+                        self._quota_blocked_accounts.add(account_scope)
+                    mapped_quota = self._attach_error_details(
+                        self.quota_error_type(
+                            f"{self.provider_label} reported insufficient quota"
+                        ), details, "INSUFFICIENT_QUOTA",
+                    )
+                    self._record_request_event(
+                        operation=agent or "provider_request", agent_role=agent,
+                        request_id=request_event_id,
+                        provider_request_id=details.get("request_id"),
+                        status="failed", error_category="INSUFFICIENT_QUOTA",
+                        provider_error_code=details.get("code"),
+                        sanitized_error_message=details.get("message"),
+                        retry_count=transient_attempt,
+                        usage_available=False,
+                        duration_ms=int((time.perf_counter() - request_started) * 1000),
+                        metadata={"rate_limit_headers": details.get("headers") or {}},
+                    )
+                    raise mapped_quota from exc
                 cause = exc
-                mapped: DeepSeekError = DeepSeekRateLimitError(
-                    "DeepSeek rate limit exceeded"
+                mapped: Exception = self._attach_error_details(
+                    self.rate_limit_error_type(
+                        f"{self.provider_label} rate limit exceeded"
+                    ), details, "RATE_LIMITED",
                 )
+                try:
+                    from app.llm.scheduler import register_provider_cooldown
+                    register_provider_cooldown(
+                        self.provider_name, float(details.get("retry_after") or 0)
+                    )
+                except (TypeError, ValueError):
+                    pass
             except APITimeoutError as exc:
                 cause = exc
-                mapped = DeepSeekTimeoutError("DeepSeek request timed out")
+                mapped = self._attach_error_details(
+                    self.timeout_error_type(f"{self.provider_label} request timed out"),
+                    {}, "PROVIDER_UNAVAILABLE",
+                )
             except APIConnectionError as exc:
                 cause = exc
-                mapped = DeepSeekNetworkError("DeepSeek network connection failed")
+                mapped = self._attach_error_details(
+                    self.network_error_type(
+                        f"{self.provider_label} network connection failed"
+                    ), {}, "PROVIDER_UNAVAILABLE",
+                )
             except BadRequestError:
                 raise
             except APIStatusError as exc:
                 if exc.status_code < 500:
-                    raise DeepSeekError(
-                        f"DeepSeek API rejected the request with status {exc.status_code}"
+                    raise self.error_type(
+                        f"{self.provider_label} API rejected the request with status {exc.status_code}"
                     ) from exc
                 cause = exc
-                mapped = DeepSeekServerError(
-                    f"DeepSeek server error ({exc.status_code})"
+                mapped = self._attach_error_details(
+                    self.server_error_type(
+                        f"{self.provider_label} server error ({exc.status_code})"
+                    ), {"status_code": exc.status_code}, "PROVIDER_UNAVAILABLE",
                 )
 
+            self._record_request_event(
+                operation=agent or "provider_request", agent_role=agent,
+                request_id=request_event_id,
+                provider_request_id=getattr(mapped, "provider_request_id", None),
+                status="failed",
+                error_category=getattr(mapped, "normalized_category", type(mapped).__name__),
+                provider_error_code=getattr(mapped, "provider_code", None),
+                sanitized_error_message=str(mapped),
+                retry_count=transient_attempt,
+                retry_after_seconds=(
+                    float(getattr(mapped, "retry_after"))
+                    if str(getattr(mapped, "retry_after", "")).replace(".", "", 1).isdigit()
+                    else None
+                ),
+                usage_available=False,
+                duration_ms=int((time.perf_counter() - request_started) * 1000),
+                metadata={
+                    "rate_limit_headers": getattr(mapped, "rate_limit_headers", {}) or {},
+                },
+            )
             if transient_attempt >= DEEPSEEK_MAX_TRANSIENT_RETRIES:
                 raise mapped from cause
             self.last_transient_retries = transient_attempt + 1
@@ -186,7 +344,8 @@ class DeepSeekClient:
                 except (TypeError, ValueError):
                     pass
             logger.warning(
-                "DeepSeek transient failure | type=%s | retry=%d/%d | delay=%.2fs",
+                "%s transient failure | type=%s | retry=%d/%d | delay=%.2fs",
+                self.provider_label,
                 type(mapped).__name__,
                 transient_attempt + 1,
                 DEEPSEEK_MAX_TRANSIENT_RETRIES,
@@ -227,11 +386,12 @@ class DeepSeekClient:
         return min(8000, max(2048, count * 320)), 8000
 
     def _capture_usage(
-        self, response: Any, agent: str, *, duration_ms: int | None = None
-    ) -> None:
+        self, response: Any, agent: str, *, duration_ms: int | None = None,
+        record_request_event: bool = True,
+    ) -> dict[str, Any] | None:
         usage = getattr(response, "usage", None)
         if usage is None:
-            return
+            return None
         input_details = getattr(usage, "input_tokens_details", None)
         output_details = getattr(usage, "output_tokens_details", None)
         values: dict[str, int | str] = {
@@ -251,6 +411,7 @@ class DeepSeekClient:
             + int(values["cached_tokens"]) * DEEPSEEK_CACHED_INPUT_COST_PER_MTOK
             + int(values["output_tokens"]) * DEEPSEEK_OUTPUT_COST_PER_MTOK
         ) / 1_000_000
+        values["estimated_cost_usd"] = estimated_cost
         increment(
             "genexam_llm_tokens",
             value=int(values["input_tokens"]),
@@ -286,6 +447,18 @@ class DeepSeekClient:
                 estimated_cost_usd=estimated_cost,
                 duration_ms=duration_ms,
             )
+            if record_request_event:
+                repositories.record_llm_request_event(
+                    job_id=current_job_id(), provider=self.provider_name,
+                    model=self.model, operation=agent, agent_role=agent,
+                    provider_request_id=str(getattr(response, "id", "") or "") or None,
+                    status="success", usage_available=True,
+                    input_tokens=int(values["input_tokens"]),
+                    output_tokens=int(values["output_tokens"]),
+                    reasoning_tokens=int(values["reasoning_tokens"]),
+                    estimated_cost_usd=estimated_cost, duration_ms=duration_ms,
+                    metadata={"cached_tokens": int(values["cached_tokens"])},
+                )
         except Exception as exc:
             logger.warning("LLM usage persistence failed | error=%s", type(exc).__name__)
         logger.info(
@@ -307,14 +480,80 @@ class DeepSeekClient:
                 "duration_ms": duration_ms,
             },
         )
+        return dict(values)
+
+    @staticmethod
+    def _bounded_response_diagnostic(value: str) -> dict[str, Any]:
+        text = " ".join(str(value or "").split())
+        # Provider output should not contain credentials, but redact common
+        # bearer/key forms before retaining a bounded debugging excerpt.
+        text = re.sub(
+            r"(?i)(bearer\s+|api[_ -]?key\s*[:=]\s*)[^\s,;]+",
+            r"\1[REDACTED]",
+            text,
+        )
+        return {
+            "raw_response_excerpt": text[:2000],
+            "raw_response_length": len(text),
+            "raw_response_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            "raw_response_truncated": len(text) > 2000,
+        }
+
+    def _record_structured_attempt(
+        self, *, operation: str, agent: str, request_id: str, attempt: int,
+        schema_name: str, duration_ms: int, status: str,
+        response: Any | None = None, response_status: str | None = None,
+        provider_request_id: str | None = None,
+        error_category: str | None = None, error_message: str | None = None,
+        provider_error_code: str | None = None,
+        usage: dict[str, Any] | None = None, raw_output: str = "",
+    ) -> None:
+        metadata: dict[str, Any] = {
+            "event_kind": "structured_output_attempt",
+            "attempt_number": attempt,
+            "schema_name": schema_name,
+            "response_status": response_status,
+            "cached_tokens": int(usage["cached_tokens"]) if usage else None,
+            **self._bounded_response_diagnostic(raw_output),
+        }
+        detail = {
+            "provider": self.provider_name, "model": self.model,
+            "request_id": request_id,
+            "provider_request_id": (
+                provider_request_id
+                or str(getattr(response, "id", "") or "")
+                or None
+            ),
+            "attempt_number": attempt, "status": status,
+            "failure_classification": error_category,
+            "error": str(error_message or "")[:1000] or None,
+            "duration_ms": duration_ms, "usage_available": usage is not None,
+            "input_tokens": int(usage["input_tokens"]) if usage else None,
+            "output_tokens": int(usage["output_tokens"]) if usage else None,
+            "cached_tokens": int(usage["cached_tokens"]) if usage else None,
+            "reasoning_tokens": int(usage["reasoning_tokens"]) if usage else None,
+            "estimated_cost_usd": float(usage["estimated_cost_usd"]) if usage else None,
+            **metadata,
+        }
+        self.last_structured_attempt_details.append(detail)
+        self._record_request_event(
+            operation=operation, agent_role=agent, request_id=request_id,
+            provider_request_id=detail["provider_request_id"], status=status,
+            error_category=error_category, provider_error_code=provider_error_code,
+            sanitized_error_message=error_message, retry_count=attempt - 1,
+            usage_available=usage is not None,
+            input_tokens=detail["input_tokens"], output_tokens=detail["output_tokens"],
+            reasoning_tokens=detail["reasoning_tokens"],
+            estimated_cost_usd=detail["estimated_cost_usd"], duration_ms=duration_ms,
+            metadata=metadata,
+        )
 
     @staticmethod
     def _output_text(response: Any) -> str:
         return str(getattr(response, "output_text", "") or "").strip()
 
-    @staticmethod
     def _validate_expected_ids(
-        value: Any, expected_ids: list[str] | None, id_field: str | None
+        self, value: Any, expected_ids: list[str] | None, id_field: str | None
     ) -> None:
         if not expected_ids or not id_field:
             return
@@ -332,7 +571,7 @@ class DeepSeekClient:
 
         collect(value)
         if sorted(found) != sorted(str(item) for item in expected_ids):
-            raise DeepSeekValidationError(
+            raise self.validation_error_type(
                 f"{id_field} values must be exactly {expected_ids}; received {found}"
             )
 
@@ -383,7 +622,7 @@ class DeepSeekClient:
         try:
             schema = strict_json_schema(response_model)
         except ValueError as exc:
-            raise DeepSeekSchemaError(str(exc)) from exc
+            raise self.schema_error_type(str(exc)) from exc
         safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", schema_name)[:64] or "response"
         default_tokens, token_ceiling = self._token_budget(agent, item_count, operation)
         max_tokens = max(1, int(max_tokens or default_tokens))
@@ -391,16 +630,18 @@ class DeepSeekClient:
         reasoning_effort = self._reasoning_effort(agent)
         previous_output = ""
         failure_reason = ""
+        self.last_structured_attempt_details = []
 
         attempt_limit = (
             1 if (
                 (agent == "planner" and operation == "initial_planner")
-                or agent in {"assessment_compiler", "duplicate_judge"}
+                or agent in {"assessment_compiler", "duplicate_validator"}
             )
             else DEEPSEEK_MAX_STRUCTURED_ATTEMPTS
         )
         for attempt in range(1, attempt_limit + 1):
             self.last_structured_attempts = attempt
+            attempt_request_id = str(uuid.uuid4())
             current_input = (
                 prompt
                 if attempt == 1
@@ -409,8 +650,9 @@ class DeepSeekClient:
                 )
             )
             logger.info(
-                "DeepSeek structured call | agent=%s | model=%s | schema=%s | "
+                "%s structured call | agent=%s | model=%s | schema=%s | "
                 "reasoning=%s | attempt=%d/%d | max_output_tokens=%d",
+                self.provider_label,
                 agent,
                 self.model,
                 safe_name,
@@ -454,16 +696,46 @@ class DeepSeekClient:
                 )
             except BadRequestError as exc:
                 message = str(exc)
-                if "schema" in message.lower() or "text.format" in message.lower():
-                    raise DeepSeekSchemaError(
-                        "DeepSeek rejected the normalized JSON Schema"
+                details = self._provider_error_details(exc)
+                schema_rejected = "schema" in message.lower() or "text.format" in message.lower()
+                self._record_structured_attempt(
+                    operation=operation, agent=agent, request_id=attempt_request_id,
+                    attempt=attempt, schema_name=safe_name,
+                    duration_ms=int((time.perf_counter() - request_started) * 1000),
+                    status="failed", response_status="request_rejected",
+                    provider_request_id=details.get("request_id"),
+                    error_category=("SCHEMA_REJECTED" if schema_rejected else "REQUEST_REJECTED"),
+                    provider_error_code=details.get("code"),
+                    error_message=details.get("message") or message,
+                )
+                if schema_rejected:
+                    raise self.schema_error_type(
+                        f"{self.provider_label} rejected the normalized JSON Schema"
                     ) from exc
-                raise DeepSeekError("DeepSeek rejected the structured request") from exc
+                raise self.error_type(
+                    f"{self.provider_label} rejected the structured request"
+                ) from exc
+            except Exception as exc:
+                self._record_structured_attempt(
+                    operation=operation, agent=agent, request_id=attempt_request_id,
+                    attempt=attempt, schema_name=safe_name,
+                    duration_ms=int((time.perf_counter() - request_started) * 1000),
+                    status="failed", response_status="transport_error",
+                    provider_request_id=getattr(exc, "provider_request_id", None),
+                    error_category=str(
+                        getattr(exc, "normalized_category", "PROVIDER_ERROR")
+                    ),
+                    provider_error_code=getattr(exc, "provider_code", None),
+                    error_message=str(exc),
+                )
+                raise
 
-            self._capture_usage(
+            duration_ms = int((time.perf_counter() - request_started) * 1000)
+            usage_values = self._capture_usage(
                 response,
                 agent,
-                duration_ms=int((time.perf_counter() - request_started) * 1000),
+                duration_ms=duration_ms,
+                record_request_event=False,
             )
             previous_output = self._output_text(response)
             status = str(getattr(response, "status", "") or "")
@@ -471,10 +743,17 @@ class DeepSeekClient:
                 details = getattr(response, "incomplete_details", None)
                 reason = str(getattr(details, "reason", "unknown") or "unknown")
                 failure_reason = f"response incomplete: {reason}"
+                self._record_structured_attempt(
+                    operation=operation, agent=agent, request_id=attempt_request_id,
+                    attempt=attempt, schema_name=safe_name, duration_ms=duration_ms,
+                    status="failed", response=response, response_status=status,
+                    error_category="INCOMPLETE_RESPONSE", error_message=failure_reason,
+                    usage=usage_values, raw_output=previous_output,
+                )
                 if reason == "max_output_tokens":
                     max_tokens = min(token_ceiling, max_tokens * 2)
                 if attempt == attempt_limit:
-                    raise DeepSeekIncompleteError(
+                    raise self.incomplete_error_type(
                         failure_reason,
                         partial_output=previous_output,
                         reason=reason,
@@ -484,13 +763,29 @@ class DeepSeekClient:
                 error = getattr(response, "error", None)
                 code = str(getattr(error, "code", "unknown") or "unknown")
                 failure_reason = f"response failed: {code}"
+                self._record_structured_attempt(
+                    operation=operation, agent=agent, request_id=attempt_request_id,
+                    attempt=attempt, schema_name=safe_name, duration_ms=duration_ms,
+                    status="failed", response=response, response_status=status,
+                    error_category="PROVIDER_RESPONSE_FAILED", provider_error_code=code,
+                    error_message=failure_reason, usage=usage_values,
+                    raw_output=previous_output,
+                )
                 if attempt == attempt_limit:
-                    raise DeepSeekError(failure_reason)
+                    raise self.error_type(failure_reason)
                 continue
             if status and status != "completed":
                 failure_reason = f"unexpected response status: {status}"
+                self._record_structured_attempt(
+                    operation=operation, agent=agent, request_id=attempt_request_id,
+                    attempt=attempt, schema_name=safe_name, duration_ms=duration_ms,
+                    status="failed", response=response, response_status=status,
+                    error_category="UNEXPECTED_RESPONSE_STATUS",
+                    error_message=failure_reason, usage=usage_values,
+                    raw_output=previous_output,
+                )
                 if attempt == attempt_limit:
-                    raise DeepSeekIncompleteError(
+                    raise self.incomplete_error_type(
                         failure_reason,
                         partial_output=previous_output,
                         reason=status,
@@ -501,18 +796,48 @@ class DeepSeekClient:
                 validated = response_model.model_validate_json(previous_output)
                 value = validated.model_dump()
                 self._validate_expected_ids(value, expected_ids, expected_id_field)
+                self._record_structured_attempt(
+                    operation=operation, agent=agent, request_id=attempt_request_id,
+                    attempt=attempt, schema_name=safe_name, duration_ms=duration_ms,
+                    status="success", response=response,
+                    response_status=status or "completed", usage=usage_values,
+                    raw_output=previous_output,
+                )
                 return value
-            except (ValidationError, json.JSONDecodeError, DeepSeekValidationError) as exc:
+            except (ValidationError, json.JSONDecodeError, self.validation_error_type) as exc:
                 failure_reason = str(exc)
+                classification = (
+                    "INVALID_JSON" if (
+                        isinstance(exc, json.JSONDecodeError)
+                        or (
+                            isinstance(exc, ValidationError)
+                            and any(
+                                error.get("type") == "json_invalid"
+                                for error in exc.errors()
+                            )
+                        )
+                    )
+                    else "SCHEMA_VALIDATION_FAILED"
+                )
+                self._record_structured_attempt(
+                    operation=operation, agent=agent, request_id=attempt_request_id,
+                    attempt=attempt, schema_name=safe_name, duration_ms=duration_ms,
+                    status="failed", response=response,
+                    response_status=status or "completed",
+                    error_category=classification, error_message=failure_reason,
+                    usage=usage_values, raw_output=previous_output,
+                )
                 if attempt == attempt_limit:
-                    raise DeepSeekValidationError(
-                        "DeepSeek structured output failed local Pydantic validation "
+                    raise self.validation_error_type(
+                        f"{self.provider_label} structured output failed local Pydantic validation "
                         f"after {attempt_limit} attempts: {failure_reason}",
                         partial_output=previous_output,
                         reason="schema_validation",
                     ) from exc
 
-        raise DeepSeekValidationError("DeepSeek structured output failed")
+        raise self.validation_error_type(
+            f"{self.provider_label} structured output failed"
+        )
 
     def chat_structured(
         self,
@@ -575,11 +900,14 @@ class DeepSeekClient:
         status = str(getattr(response, "status", "") or "")
         if status == "incomplete":
             details = getattr(response, "incomplete_details", None)
-            raise DeepSeekIncompleteError(
-                f"DeepSeek text response incomplete: {getattr(details, 'reason', 'unknown')}"
+            raise self.incomplete_error_type(
+                f"{self.provider_label} text response incomplete: "
+                f"{getattr(details, 'reason', 'unknown')}"
             )
         if status != "completed":
-            raise DeepSeekError(f"DeepSeek text response status was {status or 'unknown'}")
+            raise self.error_type(
+                f"{self.provider_label} text response status was {status or 'unknown'}"
+            )
         return self._output_text(response)
 
     def chat(
@@ -601,8 +929,9 @@ class DeepSeekClient:
         )
 
     def chat_json(self, *args, **kwargs) -> object:
-        raise DeepSeekConfigurationError(
-            "DeepSeek JSON operations require chat_structured with a Pydantic schema"
+        raise self.configuration_error_type(
+            f"{self.provider_label} JSON operations require chat_structured "
+            "with a Pydantic schema"
         )
 
     async def ahealth(self, timeout: int = 3) -> None:
@@ -616,8 +945,8 @@ class DeepSeekClient:
             ) as client:
                 await client.models.list()
         except AuthenticationError as exc:
-            raise DeepSeekAuthenticationError(
-                "DeepSeek rejected DEEPSEEK_API_KEY"
+            raise self.authentication_error_type(
+                f"{self.provider_label} rejected its configured API key"
             ) from exc
         finally:
             self._concurrency.release()

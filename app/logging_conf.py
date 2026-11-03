@@ -65,7 +65,10 @@ class JsonFormatter(logging.Formatter):
             payload["document_id"] = document_id
         for key in (
             "stage", "duration_ms", "provider", "model", "input_tokens",
-            "output_tokens", "total_tokens", "status_code",
+            "output_tokens", "total_tokens", "status_code", "operation",
+            "agent_role", "provider_request_id", "retry_count",
+            "error_category", "provider_error_code", "retry_after_seconds",
+            "candidate_count", "context_component_chars", "approx_prompt_tokens",
         ):
             value = getattr(record, key, None)
             if value is not None:

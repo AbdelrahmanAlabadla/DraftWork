@@ -1,25 +1,90 @@
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from app import config
-from app.llm.deepseek import DeepSeekClient, DeepSeekConfigurationError
+from app.llm.deepseek import DeepSeekClient
 from app.logging_conf import current_job_id, get_logger
 from app.metrics import increment
 
 logger = get_logger("LLM")
 
 
+class OpenAIError(RuntimeError):
+    """Base error for the OpenAI provider."""
+
+
+class OpenAIConfigurationError(OpenAIError):
+    pass
+
+
+class OpenAIAuthenticationError(OpenAIError):
+    pass
+
+
+class OpenAIRateLimitError(OpenAIError):
+    pass
+
+
+class OpenAIQuotaError(OpenAIError):
+    pass
+
+
+class OpenAITimeoutError(OpenAIError):
+    pass
+
+
+class OpenAINetworkError(OpenAIError):
+    pass
+
+
+class OpenAIServerError(OpenAIError):
+    pass
+
+
+class OpenAISchemaError(OpenAIError):
+    pass
+
+
+class OpenAIValidationError(OpenAIError):
+    def __init__(self, message: str, *, partial_output: str = "", reason: str = ""):
+        super().__init__(message)
+        self.partial_output = partial_output
+        self.reason = reason
+
+
+class OpenAIIncompleteError(OpenAIError):
+    def __init__(self, message: str, *, partial_output: str = "", reason: str = ""):
+        super().__init__(message)
+        self.partial_output = partial_output
+        self.reason = reason
+
+
 class OpenAIClient(DeepSeekClient):
     """OpenAI Responses client for the two routed STEM review stages."""
 
     provider_name = "openai"
+    provider_label = "OpenAI"
     supports_temperature = False
+    error_type = OpenAIError
+    configuration_error_type = OpenAIConfigurationError
+    authentication_error_type = OpenAIAuthenticationError
+    rate_limit_error_type = OpenAIRateLimitError
+    quota_error_type = OpenAIQuotaError
+    timeout_error_type = OpenAITimeoutError
+    network_error_type = OpenAINetworkError
+    server_error_type = OpenAIServerError
+    schema_error_type = OpenAISchemaError
+    validation_error_type = OpenAIValidationError
+    incomplete_error_type = OpenAIIncompleteError
+    _concurrency = threading.BoundedSemaphore(config.LLM_JOB_CONCURRENCY_LIMIT)
+    _catalog_concurrency = threading.BoundedSemaphore(config.MAX_PARALLEL_CATALOG_CALLS)
 
     def __init__(self, *, model: str = "gpt-6-luna", reasoning_effort: str = "medium") -> None:
         api_key = str(config.OPENAI_API_KEY or "").strip()
         if not api_key:
-            raise DeepSeekConfigurationError(
+            raise OpenAIConfigurationError(
                 "OPENAI_API_KEY is required for OpenAI model routing"
             )
         self.url = config.OPENAI_BASE_URL.rstrip("/")
@@ -30,16 +95,18 @@ class OpenAIClient(DeepSeekClient):
         self.usage_history: list[dict[str, int | str]] = []
         self.last_transient_retries = 0
         self.last_structured_attempts = 0
+        self.last_structured_attempt_details: list[dict[str, Any]] = []
 
     def _reasoning_effort(self, agent: str) -> str:
         return self.reasoning_effort
 
     def _capture_usage(
-        self, response: Any, agent: str, *, duration_ms: int | None = None
-    ) -> None:
+        self, response: Any, agent: str, *, duration_ms: int | None = None,
+        record_request_event: bool = True,
+    ) -> dict[str, Any] | None:
         usage = getattr(response, "usage", None)
         if usage is None:
-            return
+            return None
         input_details = getattr(usage, "input_tokens_details", None)
         output_details = getattr(usage, "output_tokens_details", None)
         values: dict[str, int | str | float] = {
@@ -81,7 +148,21 @@ class OpenAIClient(DeepSeekClient):
                 estimated_cost_usd=float(values["estimated_cost_usd"]),
                 duration_ms=duration_ms,
             )
+            if record_request_event:
+                repositories.record_llm_request_event(
+                    job_id=current_job_id(), provider=self.provider_name,
+                    model=self.model, operation=agent, agent_role=agent,
+                    provider_request_id=str(getattr(response, "id", "") or "") or None,
+                    status="success", usage_available=True,
+                    input_tokens=int(values["input_tokens"]),
+                    output_tokens=int(values["output_tokens"]),
+                    reasoning_tokens=int(values["reasoning_tokens"]),
+                    estimated_cost_usd=float(values["estimated_cost_usd"]),
+                    duration_ms=duration_ms,
+                    metadata={"cached_tokens": int(values["cached_tokens"])},
+                )
         except Exception as exc:
             logger.warning("LLM usage persistence failed | error=%s", type(exc).__name__)
         if self.last_usage:
             self.usage_history.append(dict(self.last_usage))
+        return dict(values)

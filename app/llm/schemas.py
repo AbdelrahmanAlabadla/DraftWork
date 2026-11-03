@@ -146,6 +146,7 @@ class PlanItem(StrictOutputModel):
     exact_source_instance: bool = False
     text_answerable: bool
     reasoning_mode: ReasoningMode
+    requires_quantitative_validation: StrictBool = False
     difficulty: Literal["easy", "medium", "hard"]
     idea_to_test: str = Field(min_length=1)
     requested_difficulty: Literal["easy", "medium", "hard", "mix"] | None = None
@@ -234,7 +235,9 @@ class TrueFalseQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     selected_variation_id: str | None = None
     statement: str = Field(min_length=1)
-    answer: Literal["True", "False"]
+    # Providers historically emitted string literals. The generation boundary
+    # normalizes either form to the canonical internal boolean.
+    answer: Union[StrictBool, Literal["True", "False"]]
     solution_certificate: SolutionCertificate | None = None
 
 
@@ -339,6 +342,72 @@ class QuantitativeValidatorVerdict(ValidatorVerdict):
     certificate_valid: bool
 
 
+class ValidationIssue(StrictOutputModel):
+    failure_code: str = Field(min_length=1, max_length=80)
+    fields_to_fix: list[str] = Field(default_factory=list, max_length=12)
+    reason: str = Field(min_length=1, max_length=2000)
+    expected_fix: str = Field(default="", max_length=2000)
+    category: Literal[
+        "missing_given",
+        "missing_constraint",
+        "missing_formula",
+        "missing_definition",
+        "missing_context",
+        "missing_variable_definition",
+    ] | None = None
+    missing_information: list[NonEmptyString] = Field(default_factory=list, max_length=20)
+    source_evidence_ids: list[NonEmptyString] = Field(default_factory=list, max_length=20)
+
+
+class OriginalIssueCheck(StrictOutputModel):
+    """A validator's explicit assessment of one issue it originally reported."""
+
+    issue_id: str = Field(min_length=1, max_length=160)
+    resolved: bool
+    reason: str = Field(min_length=1, max_length=2000)
+    remaining_defect: str = Field(default="", max_length=2000)
+
+
+class SpecializedValidatorVerdict(StrictOutputModel):
+    question_id: str = Field(min_length=1)
+    status: Literal["PASS", "FAIL"]
+    issues: list[ValidationIssue] = Field(default_factory=list, max_length=12)
+    grounding_outcome: Literal[
+        "SUPPORTED", "CONTRADICTED", "UNSUPPORTED", "INSUFFICIENT_EVIDENCE"
+    ] | None = None
+    observed_difficulty: Literal["easy", "medium", "hard"] | None = None
+    requested_difficulty: Literal["easy", "medium", "hard"] | None = None
+    declared_difficulty: Literal["easy", "medium", "hard"] | None = None
+    calculation_evidence: list[str] = Field(default_factory=list, max_length=12)
+    original_issue_checks: list[OriginalIssueCheck] = Field(default_factory=list, max_length=24)
+
+
+class SpecializedValidatorRawVerdict(StrictOutputModel):
+    """Strict provider row; Python also applies role-specific semantic checks."""
+
+    question_id: str = Field(min_length=1)
+    status: Literal["PASS", "FAIL"]
+    issues: list[ValidationIssue] = Field(default_factory=list, max_length=12)
+    grounding_outcome: Literal[
+        "SUPPORTED", "CONTRADICTED", "UNSUPPORTED", "INSUFFICIENT_EVIDENCE"
+    ] | None = None
+    observed_difficulty: Literal["easy", "medium", "hard"] | None = None
+    requested_difficulty: Literal["easy", "medium", "hard"] | None = None
+    declared_difficulty: Literal["easy", "medium", "hard"] | None = None
+    calculation_evidence: list[str] = Field(default_factory=list, max_length=12)
+    original_issue_checks: list[OriginalIssueCheck] = Field(default_factory=list, max_length=24)
+
+
+class SpecializedValidatorResponse(StrictOutputModel):
+    validator: Literal[
+        "grounding", "task_alignment", "answer_correctness", "difficulty", "quantitative", "duplicate"
+    ]
+    # The provider contract must itself be valid for strict structured output.
+    # Rows receive additional role-specific semantic validation before they can
+    # affect pipeline state.
+    verdicts: list[SpecializedValidatorRawVerdict] = Field(max_length=4)
+
+
 class GlobalExamVerdict(StrictOutputModel):
     """Compact exam-level verdict; PASS rows intentionally carry no explanation."""
 
@@ -405,7 +474,7 @@ class RepairMCQQuestion(StrictOutputModel):
 
 class RepairTrueFalseQuestion(StrictOutputModel):
     statement: str = Field(min_length=1)
-    answer: Literal["True", "False"]
+    answer: Union[StrictBool, Literal["True", "False"]]
     solution_certificate: SolutionCertificate | None = None
 
 
@@ -477,7 +546,8 @@ _REPAIR_PATCH_FIELDS: dict[str, dict[str, object]] = {
         "solution_certificate": SolutionCertificate,
     },
     "true_false": {
-        "statement": NonEmptyString, "answer": Literal["True", "False"],
+        "statement": NonEmptyString,
+        "answer": Union[StrictBool, Literal["True", "False"]],
         "solution_certificate": SolutionCertificate,
     },
     "fill_in_the_blank": {
@@ -658,7 +728,22 @@ def global_exam_review_response_model(question_ids: list[str]):
     )
 
 
-def repair_response_model(items: list[tuple[str, str, list[str]]]):
+class RepairChange(StrictOutputModel):
+    field: str = Field(min_length=1)
+    previous_value: str
+    new_value: str
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class RepairMetadata(StrictOutputModel):
+    modified_fields: list[str] = Field(min_length=1, max_length=12)
+    changes: list[RepairChange] = Field(min_length=1, max_length=12)
+    targeted_failure_codes: list[str] = Field(min_length=1, max_length=12)
+
+
+def repair_response_model(
+    items: list[tuple[str, str, list[str]]], *, include_metadata: bool = False,
+):
     """Build an exact, per-question patch contract from authorized fields."""
     repair_models = []
     for index, (question_id, qtype, fields) in enumerate(items, start=1):
@@ -673,14 +758,15 @@ def repair_response_model(items: list[tuple[str, str, list[str]]]):
         patch_model = create_model(
             f"RepairPatch{index}", __base__=StrictOutputModel, **patch_fields,
         )
-        repair_models.append(
-            create_model(
-                f"RepairItem{index}",
-                __base__=StrictOutputModel,
-                question_id=(_literal([question_id]), ...),
-                patch=(patch_model, ...),
-            )
-        )
+        item_fields = {
+            "question_id": (_literal([question_id]), ...),
+            "patch": (patch_model, ...),
+        }
+        if include_metadata:
+            item_fields["repair_metadata"] = (RepairMetadata, ...)
+        repair_models.append(create_model(
+            f"RepairItem{index}", __base__=StrictOutputModel, **item_fields,
+        ))
     item_type = Union[tuple(repair_models)] if len(repair_models) > 1 else repair_models[0]
     return create_model(
         "QuestionRepairResponse",
