@@ -93,6 +93,39 @@ def _question_shortage_warnings(
     return warnings
 
 
+def _assert_persisted_exam_integrity(result: dict[str, Any]) -> None:
+    """Refuse to persist a payload that disagrees with finalized lifecycle state."""
+    lifecycle = result.get("slot_lifecycle") or {}
+    if not lifecycle:
+        # Saved legacy jobs may predate lifecycle state. Their existing payload
+        # contract remains readable; all current graph runs provide lifecycle.
+        return
+    from app.online.lifecycle import accepted_slot_ids
+
+    authoritative = accepted_slot_ids(lifecycle)
+    public = {
+        str(item.get("slot_id") or "")
+        for exam in result.get("exams") or []
+        for section in (exam.get("questions") or {}).values()
+        for item in (
+            section.get("items") if isinstance(section, dict) else section
+        ) or []
+        if item.get("slot_id")
+    }
+    if public != authoritative:
+        raise RuntimeError(
+            "Exam persistence integrity failure: payload question slots do not "
+            "match authoritative finalized slots "
+            f"(payload_only={sorted(public - authoritative)}, "
+            f"finalized_only={sorted(authoritative - public)})."
+        )
+
+
+def _accepted_question_count(result: dict[str, Any]) -> int:
+    quality = result.get("quality_summary") or {}
+    return int(quality.get("accepted") or quality.get("valid") or 0)
+
+
 def _difficulty_fallback_warnings(result: dict[str, Any]) -> list[dict[str, Any]]:
     identities = result.get("semantic_identities") or []
     lifecycle = result.get("slot_lifecycle") or {}
@@ -428,15 +461,42 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             ) or None,
         )
         fingerprint = request_fingerprint(immutable_request)
-        checkpoint_state = repositories.load_generation_checkpoint(
-            job_id, claim_generation=claim_generation,
-            request_fingerprint=fingerprint,
-        )
         checkpoint_writer = _CheckpointWriter(
             job_id=job_id, exam_id=exam_id, claim_generation=claim_generation,
             request_fingerprint_value=fingerprint,
             revision=int(job.get("checkpoint_revision") or 0),
         )
+        replay_source_job_id = str(request_data.get("replay_source_job_id") or "")
+        if replay_source_job_id:
+            checkpoint_state, provenance = repositories.load_generation_replay_checkpoint(
+                source_job_id=replay_source_job_id,
+                target_job_id=job_id,
+                target_immutable_request=immutable_request,
+                target_request_fingerprint=fingerprint,
+            )
+            from app.online.assessment_catalog import validate_plan_catalog_bindings
+            from app.online.multi_validator import clear_job_validation_cache
+
+            chunk_ids = {
+                str(chunk.get("child_id")) for chunk in checkpoint_state.get("retrieved_chunks") or []
+                if chunk.get("child_id")
+            }
+            binding_errors = validate_plan_catalog_bindings(
+                checkpoint_state.get("assessment_catalog") or {},
+                checkpoint_state.get("plans") or [], chunk_ids or None,
+            )
+            if binding_errors:
+                raise RuntimeError("Replay checkpoint catalog binding failure: " + "; ".join(binding_errors))
+            clear_job_validation_cache(job_id)
+            checkpoint_writer.append(
+                "replay", "questions_generated",
+                {"node_output": checkpoint_state, "replay_provenance": provenance},
+            )
+        else:
+            checkpoint_state = repositories.load_generation_checkpoint(
+                job_id, claim_generation=claim_generation,
+                request_fingerprint=fingerprint,
+            )
         with _heartbeat(job_id, claim_generation):
             with deadline(config.GENERATION_TIMEOUT_SECONDS, "Exam generation"):
                 result = generate_exams(
@@ -473,8 +533,12 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             increment("genexam_jobs", type="exam_generation", status="cancelled")
             return {"job_id": job_id, "status": "cancelled"}
         exams = result.get("exams") or []
-        if not any(exam.get("questions") for exam in exams):
-            raise RuntimeError("; ".join(result.get("warnings") or []) or "No questions generated")
+        accepted_count = _accepted_question_count(result)
+        if accepted_count == 0:
+            raise RuntimeError(
+                "; ".join(str(value) for value in result.get("warnings") or [])
+                or "No validated questions were accepted; refusing to save an empty exam."
+            )
 
         shortage_warnings = _question_shortage_warnings(
             result, tasks, int(request_data["num_models"])
@@ -549,6 +613,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                 "assessment_catalog_compatibility_cache_hit"
             ),
             "assessment_catalog_usage": result.get("assessment_catalog_usage") or {},
+            "accepted_slot_ids": list(result.get("accepted_slot_ids") or []),
             "slot_lifecycle": dict(result.get("slot_lifecycle") or {}),
             "developer_diagnostics": list(result.get("developer_diagnostics") or []),
             "mcq_task_reassignments": list(result.get("mcq_task_reassignments") or []),
@@ -563,6 +628,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                 "Plan slot omitted from public exam | slot_id=%s | failure_code=%s | reason=%s",
                 missing.get("slot_id"), missing.get("failure_code"), missing.get("reason"),
             )
+        _assert_persisted_exam_integrity(result)
         status = "partial" if shortage_warnings or not result.get("complete") else "complete"
         completed = _complete_generation_with_transient_retry(
             job_id,

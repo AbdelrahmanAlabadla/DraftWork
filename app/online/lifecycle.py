@@ -12,6 +12,11 @@ TERMINAL_STATUSES = {
     "repair_failed", "duplicate_failed", "finalization_failed",
 }
 
+CURRENT_QUESTION_STATUSES = {
+    "PASS", "FAIL", "REPAIRING", "REVALIDATING",
+    "FAILED_TO_REPAIR", "VALIDATION_BLOCKED",
+}
+
 
 ASSIGNMENT_FIELDS = (
     "task_id", "fitb_entry_id", "base_catalog_task_id", "base_task_family_id",
@@ -240,6 +245,8 @@ def reconcile_slot_lifecycle(
             }
             record.update({
                 "validated": passed,
+                "finalized": False,
+                "terminal_status": None,
                 "failure_code": None if passed else verdict.get("failure_code"),
                 "failure_stage": None if passed else "validation",
                 "fields_to_fix": list(verdict.get("fields_to_fix") or []),
@@ -268,13 +275,18 @@ def reconcile_slot_lifecycle(
         result[slot_id]["repair_manifest_history"] = deepcopy(target.get("history") or [])
         if target.get("status") == "resolved":
             result[slot_id].update({
-                "validated": True, "failure_code": None, "failure_stage": None,
+                "validated": True, "finalized": False,
+                "terminal_status": None,
+                "failure_code": None, "failure_stage": None,
             })
         else:
             result[slot_id].update({
+                "finalized": False,
                 "failure_code": target.get("failure_code") or result[slot_id].get("failure_code"),
                 "failure_stage": "repair",
             })
+            if target.get("status") in {"exhausted", "terminal_failure"}:
+                result[slot_id]["terminal_status"] = "repair_failed"
 
     for event in state.get("fitb_recovery_history") or []:
         slot_id = str(event.get("slot_id") or "")
@@ -359,7 +371,18 @@ def reconcile_slot_lifecycle(
             if record["generated"] and record["validated"] and not record.get("failure_code"):
                 record.update({"finalized": True, "terminal_status": "finalized"})
             elif record["terminal_status"] is None:
-                if not record["planned"]:
+                failure_stage = str(record.get("failure_stage") or "")
+                terminal_by_stage = {
+                    "planning": "planning_failed",
+                    "generation": "generation_failed",
+                    "validation": "validation_failed",
+                    "repair": "repair_failed",
+                    "duplicate": "duplicate_failed",
+                    "finalization": "finalization_failed",
+                }
+                if failure_stage in terminal_by_stage:
+                    status = terminal_by_stage[failure_stage]
+                elif not record["planned"]:
                     status = "planning_failed"
                 elif not record["generated"]:
                     status = "generation_failed"
@@ -369,6 +392,56 @@ def reconcile_slot_lifecycle(
                     status = "finalization_failed"
                 record["terminal_status"] = status
                 record["failure_stage"] = record.get("failure_stage") or status.removesuffix("_failed")
+
+    candidate_slots = {
+        str(candidate.get("slot_id") or "")
+        for candidate in state.get("repair_candidates") or []
+        if candidate.get("slot_id")
+    }
+    pending_ids = {
+        str(question_or_slot_id)
+        for values in (state.get("pending_revalidation_ids") or {}).values()
+        for question_or_slot_id in values or []
+    }
+    pending_slots = {
+        slot_id for slot_id, record in result.items()
+        if slot_id in pending_ids or str(record.get("question_id") or "") in pending_ids
+    }
+    for slot_id, record in result.items():
+        manifest_status = str(record.get("repair_manifest_status") or "")
+        verdict = record.get("validator_verdict") or {}
+        validation_status = str(verdict.get("validation_status") or "")
+        failure_code = str(record.get("failure_code") or "")
+        operational = (
+            validation_status in {"VALIDATION_BLOCKED", "PENDING_RETRY"}
+            or manifest_status == "validation_blocked"
+            or manifest_status == "operational_retry_pending"
+            or "operational" in failure_code
+            or failure_code in {"validation_blocked", "provider_unavailable"}
+        )
+        if slot_id in candidate_slots or slot_id in pending_slots or manifest_status == "validation_pending":
+            current_status = "REVALIDATING"
+        elif operational:
+            current_status = "VALIDATION_BLOCKED"
+        elif manifest_status in {"exhausted", "terminal_failure"} or record.get("terminal_status") == "repair_failed":
+            current_status = "FAILED_TO_REPAIR"
+        elif manifest_status in {"repairing", "in_progress"}:
+            current_status = "REPAIRING"
+        elif record.get("validated") and not record.get("failure_code"):
+            current_status = "PASS"
+        else:
+            current_status = "FAIL"
+        previous_status = record.get("current_status")
+        record["current_status"] = current_status
+        if previous_status and previous_status != current_status:
+            event = {
+                "stage": stage,
+                "event": "current_status_changed",
+                "previous_status": previous_status,
+                "current_status": current_status,
+            }
+            if not record.setdefault("history", []) or record["history"][-1] != event:
+                record["history"].append(event)
     return result
 
 
@@ -381,4 +454,23 @@ def slot_counts(records: dict[str, dict[str, Any]]) -> dict[str, int]:
         "validated": sum(bool(item.get("validated")) for item in values),
         "repaired": sum(bool(item.get("repaired")) for item in values),
         "finalized": sum(bool(item.get("finalized")) for item in values),
+    }
+
+
+def accepted_slot_ids(records: dict[str, dict[str, Any]]) -> set[str]:
+    """Return the single authoritative set allowed in a public exam.
+
+    A Validator PASS alone is insufficient: repair, duplicate, or finalization
+    state may still block the slot. Finalization reconciliation owns that
+    decision and records it with both the finalized flag and terminal status.
+    Requiring both fields prevents temporary or stale state from being accepted.
+    """
+    return {
+        str(slot_id)
+        for slot_id, record in records.items()
+        if record.get("terminal_status") == "finalized"
+        and bool(record.get("finalized"))
+        and bool(record.get("validated"))
+        and record.get("current_status") in {None, "PASS"}
+        and not record.get("failure_code")
     }

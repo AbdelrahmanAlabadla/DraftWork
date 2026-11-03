@@ -106,7 +106,10 @@ def test_docx_renders_inline_arabic_math_and_matrix_without_raw_latex():
         assert "$" not in xml
         assert r"\begin" not in xml and r"\frac" not in xml
         media = [name for name in archive.namelist() if name.startswith("word/media/")]
-        assert len(media) >= len(expressions)
+        # Simple inline mathematics remains editable text; complex matrices use
+        # the documented rendered-image fallback.
+        assert len(media) >= 2
+        assert "x+y+z=3" in xml
 
 
 def test_pdf_renders_inline_arabic_math_without_raw_latex_text():
@@ -221,7 +224,7 @@ def test_exhausted_hard_adaptation_records_honest_medium_fallback(monkeypatch):
     assert result["plan_errors"] == []
     assert item["requested_difficulty"] == "hard"
     assert item["actual_difficulty"] == item["difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "retained"
+    assert item["difficulty_adaptation"]["status"] == "accepted_source_constraint"
     assert item["adjustment_attempts"] == 3
     assert item["difficulty_fallback_reason"]
 

@@ -382,6 +382,15 @@ def _bind_selected_variation(
     question["effective_evidence_chunk_ids"] = list(dict.fromkeys(map(
         str, effective_ids if effective_ids is not None else inherited
     )))
+    # Catalog identity is code-owned. Never trust (or require) the model to
+    # reproduce these fields; attach authoritative values after binding.
+    for key in (
+        "task_id", "task_family_id", "concept_id", "coverage_id",
+        "relationship_id", "task_operation", "target", "reasoning_mode",
+        "difficulty", "required_givens", "variable_givens",
+    ):
+        if key in plan_item:
+            question[key] = deepcopy(plan_item.get(key))
     return True
 
 
@@ -393,6 +402,89 @@ def _section_items(section: Any) -> list[dict[str, Any]]:
 
 
 _MCQ_POSITION_SEQUENCE = ("B", "D", "A", "C", "C", "A", "D", "B")
+
+_OPTION_REFERENCE_RE = re.compile(
+    r"(?ix)"
+    r"(?P<prefix>\b(?:option|choice|answer)\s*(?:label\s*)?[:#-]?\s*|"
+    r"(?:الخيار|الاختيار|الإجابة)\s*(?:رقم\s*)?[:#-]?\s*)"
+    r"(?P<open>[\(\[]?)(?P<label>[ABCD])(?P<close>[\)\]]?)(?![A-Za-z0-9_])"
+)
+
+
+def _certificate_option_references(value: Any) -> set[str]:
+    """Return explicit prose option labels without treating variables as labels."""
+    if isinstance(value, str):
+        return {
+            match.group("label").upper()
+            for match in _OPTION_REFERENCE_RE.finditer(value)
+        }
+    if isinstance(value, dict):
+        return set().union(*(
+            _certificate_option_references(item) for item in value.values()
+        ), set())
+    if isinstance(value, list):
+        return set().union(*(
+            _certificate_option_references(item) for item in value
+        ), set())
+    return set()
+
+
+def _remap_certificate_option_reference(value: Any, source: str, target: str) -> Any:
+    """Remap only explicit English/Arabic option-label phrases recursively."""
+    if isinstance(value, str):
+        def replace(match: re.Match[str]) -> str:
+            label = match.group("label").upper()
+            replacement = target if label == source else label
+            return (
+                f"{match.group('prefix')}{match.group('open')}"
+                f"{replacement}{match.group('close')}"
+            )
+        return _OPTION_REFERENCE_RE.sub(replace, value)
+    if isinstance(value, dict):
+        return {
+            key: _remap_certificate_option_reference(item, source, target)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            _remap_certificate_option_reference(item, source, target)
+            for item in value
+        ]
+    return deepcopy(value)
+
+
+def _balanced_mcq_candidate(
+    item: dict[str, Any], source: str, target: str,
+) -> dict[str, Any] | None:
+    """Build and verify one atomic MCQ label swap, or decline it safely."""
+    candidate = deepcopy(item)
+    options = candidate.get("options")
+    if not isinstance(options, dict) or source not in options or target not in options:
+        return None
+    correct_content = deepcopy(options[source])
+    certificate = candidate.get("solution_certificate")
+    if isinstance(certificate, dict):
+        # A certificate discussing multiple answer labels cannot be remapped
+        # safely without understanding the prose. Leave this MCQ untouched.
+        references = _certificate_option_references(certificate)
+        if references - {source}:
+            return None
+        certificate = _remap_certificate_option_reference(
+            certificate, source, target,
+        )
+        certificate["matching_correct_option"] = target
+        if source in _certificate_option_references(certificate):
+            return None
+        candidate["solution_certificate"] = certificate
+    options[source], options[target] = options[target], options[source]
+    candidate["correct_answer"] = target
+    if options.get(target) != correct_content:
+        return None
+    if isinstance(candidate.get("solution_certificate"), dict) and (
+        candidate["solution_certificate"].get("matching_correct_option") != target
+    ):
+        return None
+    return candidate
 
 
 def balance_mcq_answer_positions(
@@ -433,15 +525,21 @@ def balance_mcq_answer_positions(
             if item.get("correct_answer") == source
             and _MCQ_POSITION_SEQUENCE[(index + offset) % len(_MCQ_POSITION_SEQUENCE)] == target
         ]
-        index, item = (matching or [
+        candidates = matching or [
             pair for pair in eligible if pair[1].get("correct_answer") == source
-        ])[0]
-        options = item["options"]
-        options[source], options[target] = options[target], options[source]
-        item["correct_answer"] = target
-        certificate = item.get("solution_certificate")
-        if isinstance(certificate, dict):
-            certificate["matching_correct_option"] = target
+        ]
+        if not candidates:
+            break
+        index, item = candidates[0]
+        balanced = _balanced_mcq_candidate(item, source, target)
+        if balanced is None:
+            # Correctness is more important than answer-position balance.
+            eligible = [pair for pair in eligible if pair[1] is not item]
+            if not eligible:
+                break
+            continue
+        item.clear()
+        item.update(balanced)
         if item.get("question_id"):
             changed_ids.append(str(item["question_id"]))
         counts[source] -= 1
@@ -1247,6 +1345,26 @@ def _generate_obj_bundle(
     def incomplete() -> bool:
         return any(pending[qtype] for qtype in ("mcq", "true_false"))
 
+    def polarity_feedback(attempt_number: int) -> str:
+        rows = [
+            f"- slot_id={sid}: required_answer_polarity="
+            f"{item.get('required_answer_polarity')}"
+            for sid, item in pending["true_false"].items()
+            if item.get("required_answer_polarity") in {"True", "False"}
+        ]
+        if not rows:
+            return ""
+        retry = (
+            "A previous candidate was rejected because its actual/declared polarity did not "
+            "match this requirement. Construct new mathematics and verify it; do not merely "
+            "change the answer label.\n"
+            if attempt_number > 1 else ""
+        )
+        return (
+            "\n## Required True/False polarity\n"
+            + retry + "\n".join(rows) + "\n"
+        )
+
     attempt = 0
     while incomplete() and attempt < _MAX_ATTEMPTS:
         attempt += 1
@@ -1262,6 +1380,7 @@ def _generate_obj_bundle(
             within_model,
             [],
         )
+        feedback += polarity_feedback(attempt)
         system_prompt, user_prompt = build_obj_bundled_prompt(
             rem_planned, context, difficulty=difficulty,
             model_number=model_number, feedback=feedback, language=language,
@@ -1356,13 +1475,30 @@ def _generate_obj_bundle(
                         f"obj bundle {qtype} attempt {attempt}: unknown slot_id {sid!r}"
                     )
                     continue
+                if not _bind_selected_variation(q, pending[qtype][sid], qtype):
+                    warnings.append(
+                        f"obj bundle {qtype} attempt {attempt}: invalid or incompatible "
+                        f"selected variation for slot {sid}"
+                    )
+                    record_generation_rejection(
+                        eval_stats, model_number, qtype, "invalid_variation", slot_id=sid,
+                    )
+                    continue
                 if qtype == "true_false":
                     required = str(pending[qtype][sid].get("required_answer_polarity") or "")
-                    actual = str(q.get("answer") or "")
+                    actual_value = q.get("answer")
+                    actual = (
+                        "True" if actual_value is True else
+                        "False" if actual_value is False else str(actual_value or "")
+                    )
                     if required and actual.casefold() != required.casefold():
                         warnings.append(
                             f"obj bundle true_false attempt {attempt}: slot {sid} "
                             f"returned {actual!r}; required deterministic polarity {required}"
+                        )
+                        record_generation_rejection(
+                            eval_stats, model_number, qtype,
+                            "required_polarity_mismatch", slot_id=sid,
                         )
                         continue
                 already_accepted = [
@@ -1389,8 +1525,8 @@ def _generate_obj_bundle(
 
         tf_total = len(normalized["true_false"])
         if not pending["true_false"] and tf_total >= 4:
-            true_ids = [sid for sid, item in accepted["true_false"].items() if item.get("answer") == "True"]
-            false_ids = [sid for sid, item in accepted["true_false"].items() if item.get("answer") == "False"]
+            true_ids = [sid for sid, item in accepted["true_false"].items() if item.get("answer") is True]
+            false_ids = [sid for sid, item in accepted["true_false"].items() if item.get("answer") is False]
             minimum_each = 2
             minority_ids, majority_ids = (
                 (true_ids, false_ids) if len(true_ids) < len(false_ids) else (false_ids, true_ids)
@@ -2278,9 +2414,9 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
-    """Finalize audit data, then expose only validator-PASS questions."""
+    """Finalize audit data, then expose only authoritative accepted slots."""
     language = state.get("document_language") or "en"
-    generated_exams = state.get("generated_exams") or []
+    generated_exams = deepcopy(state.get("generated_exams") or [])
     reports = state.get("validation_reports") or []
     eval_stats = state.get("eval_stats")
     if eval_stats is not None:
@@ -2289,6 +2425,15 @@ def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     report_by_model = {
         int(report.get("model_number") or 0): report for report in reports
     }
+    lifecycle = deepcopy(state.get("slot_lifecycle") or {})
+    accepted_slots: set[str] | None = None
+    if lifecycle:
+        from app.online.lifecycle import accepted_slot_ids, reconcile_slot_lifecycle
+        lifecycle = reconcile_slot_lifecycle(
+            lifecycle, {**state, "generated_exams": generated_exams},
+            stage="finalization",
+        )
+        accepted_slots = accepted_slot_ids(lifecycle)
     invalid_questions: list[dict[str, Any]] = list(state.get("invalid_questions") or [])
     repair_history_by_question: dict[str, list[dict[str, Any]]] = {}
     for event in state.get("validation_repair_history") or []:
@@ -2306,19 +2451,30 @@ def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
             kept: list[dict[str, Any]] = []
             for item in _section_items(section):
                 qid = str(item.get("question_id") or "")
+                slot_id = str(item.get("slot_id") or "")
                 verdict = verdict_by_id.get(qid) or {}
-                if verdict.get("action") == "PASS":
+                accepted = (
+                    slot_id in accepted_slots
+                    if accepted_slots is not None
+                    else verdict.get("action") == "PASS"
+                )
+                if accepted:
                     kept.append(item)
                 else:
                     repair_events = repair_history_by_question.get(qid) or []
+                    lifecycle_record = lifecycle.get(slot_id) or {}
                     invalid_questions.append({
                         "model_number": model_number,
                         "question_type": qtype,
                         "slot_id": item.get("slot_id"),
                         "question_id": qid,
-                        "failure_code": verdict.get("failure_code") or "unvalidated",
-                        "failure_stage": "repair" if repair_events else "validation",
-                        "reason": verdict.get("reason") or "Question did not receive a PASS verdict.",
+                        "failure_code": lifecycle_record.get("failure_code")
+                        or verdict.get("failure_code") or "unvalidated",
+                        "failure_stage": lifecycle_record.get("failure_stage")
+                        or ("repair" if repair_events else "validation"),
+                        "reason": lifecycle_record.get("failure_reason")
+                        or verdict.get("reason")
+                        or "Question did not reach authoritative finalized status.",
                         "question": deepcopy(item),
                     })
             if qtype == "fill_in_the_blank":
@@ -2356,6 +2512,8 @@ def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "generated_exams": generated_exams,
         "invalid_questions": invalid_questions,
+        "slot_lifecycle": lifecycle,
+        "accepted_slot_ids": sorted(accepted_slots or []),
         "eval_stats": eval_stats,
     }
 
@@ -2461,6 +2619,10 @@ def generate_exams(
         "validation_reports": [],
         "validated_models": [],
         "question_repair_attempts": {},
+        "question_repair_calls": {},
+        "question_repair_failures": {},
+        "slot_completion_attempts": {},
+        "repair_working_candidates": {},
         "repair_manifest": [],
         "repair_candidates": [],
         "repair_retry_seeds": {},
@@ -2487,6 +2649,7 @@ def generate_exams(
         "unresolved_duplicate_conflicts": [],
         "duplicate_scan_count": 0,
         "duplicate_fact_cache": {},
+        "duplicate_screen_fingerprints": {},
         "slot_lifecycle": initialize_slot_lifecycle(tasks, num_models),
         "developer_diagnostics": [],
         "eval_stats": create_pipeline_eval(tasks, num_models),
@@ -2585,11 +2748,11 @@ def generate_exams(
                 for item in _section_items(section):
                     slot_id = str(item.get("slot_id") or "")
                     if slot_id in slot_lifecycle and slot_id not in invalid_ids:
-                        slot_lifecycle[slot_id].update({
-                            "generated": True, "validated": True, "finalized": True,
-                            "terminal_status": "finalized", "failure_code": None,
-                            "failure_stage": None,
-                        })
+                            slot_lifecycle[slot_id].update({
+                                "generated": True, "validated": True, "finalized": True,
+                                "terminal_status": "finalized", "failure_code": None,
+                                "failure_stage": None, "current_status": "PASS",
+                            })
     unrepairable_plan_slots = result.get("unrepairable_plan_slots") or []
     invalid_slot_ids = sorted(
         slot_id for slot_id, record in slot_lifecycle.items()
@@ -2603,6 +2766,23 @@ def generate_exams(
         1 for exam in exams for section in (exam.get("questions") or {}).values()
         for _item in _section_items(section)
     )
+    if slot_lifecycle:
+        from app.online.lifecycle import accepted_slot_ids
+        authoritative_ids = accepted_slot_ids(slot_lifecycle)
+        public_ids = {
+            str(item.get("slot_id") or "")
+            for exam in exams
+            for section in (exam.get("questions") or {}).values()
+            for item in _section_items(section)
+            if item.get("slot_id")
+        }
+        if public_ids != authoritative_ids:
+            raise RuntimeError(
+                "Final assembly integrity failure: public question slots do not "
+                "match authoritative finalized slots "
+                f"(public_only={sorted(public_ids - authoritative_ids)}, "
+                f"finalized_only={sorted(authoritative_ids - public_ids)})."
+            )
     deficit = max(0, requested_count - final_question_count)
     quality_status = "complete" if deficit == 0 else "incomplete"
     complete = quality_status == "complete"
@@ -2614,8 +2794,11 @@ def generate_exams(
         ]
     quality_summary = {
         "requested": requested_count,
+        "generated": max(0, requested_count - len(missing_slot_ids)),
+        "accepted": final_question_count,
         "valid": final_question_count,
         "missing": len(missing_slot_ids),
+        "failed": len(invalid_slot_ids),
         "invalid": len(invalid_slot_ids),
         "status": quality_status,
     }
@@ -2743,6 +2926,12 @@ def generate_exams(
         "missing_slot_ids": missing_slot_ids,
         "invalid_slot_ids": invalid_slot_ids,
         "invalid_questions": invalid_questions,
+        "accepted_slot_ids": sorted(
+            str(slot_id) for slot_id, record in slot_lifecycle.items()
+            if record.get("terminal_status") == "finalized"
+            and record.get("finalized") and record.get("validated")
+            and not record.get("failure_code")
+        ),
         "slot_lifecycle": slot_lifecycle,
         "developer_diagnostics": list(result.get("developer_diagnostics") or []),
         "mcq_task_reassignments": list(result.get("mcq_task_reassignments") or []),

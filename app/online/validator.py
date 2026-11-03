@@ -11,6 +11,13 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from app.config import (
     MAX_PARALLEL_VALIDATOR_CALLS,
     VALIDATOR_BATCH_SIZE,
+    VALIDATOR_TRACE_MAX_ATTEMPTS,
+    REVALIDATION_OPERATIONAL_RETRIES,
+    MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT,
+    ASSESSMENT_CATALOG_VERSION,
+    MAX_CONTENT_REPAIR_CALLS_PER_SLOT,
+    MAX_FAILED_REPAIR_ATTEMPTS_PER_SLOT,
+    MAX_COMPLETION_ATTEMPTS_PER_SLOT,
 )
 from app.llm.client import request_structured
 from app.llm.factory import create_llm_client
@@ -44,8 +51,14 @@ ACTIONS = frozenset(
 REPAIR_ACTIONS = frozenset(
     {"FIX_QUESTION", "FIX_ANSWER", "FIX_OPTIONS", "FIX_QUESTION_AND_ANSWER"}
 )
+# Recovery also owns questions whose validation could not complete after the
+# Validator's bounded role-specific retries.  They bypass content Repair and
+# enter the existing bounded slot-completion/replacement path.
+RECOVERY_ACTIONS = REPAIR_ACTIONS | {"UNVALIDATED"}
 
-MAX_QUESTION_REPAIR_ATTEMPTS = 6
+# Compatibility alias for callers/tests.  This now means failed content
+# strategies, not total Repair-agent calls.
+MAX_QUESTION_REPAIR_ATTEMPTS = MAX_FAILED_REPAIR_ATTEMPTS_PER_SLOT
 MAX_ASSIGNMENT_REPAIR_ATTEMPTS = 3
 MAX_CANDIDATE_GENERATION_FAILURES = 3
 
@@ -73,10 +86,12 @@ REPAIR_REASONING = "off"
 REPAIR_MAX_TOKENS = 12000
 
 TASK_REPLACEMENT_FAILURES: frozenset[str] = frozenset({
-    "task_drift", "question_type_operation_mismatch", "visual_dependency",
-    "mcq_task_unsuitable", "unsupported_given", "evidence_mismatch",
-    "bad_evidence_assignment", "wrong_task_identity",
-    "bad_fitb_answer_evidence",
+    # These defects cannot be corrected while preserving the current assigned
+    # task/evidence identity. Content-level alignment defects are attempted by
+    # the specialized Task Alignment Repair Agent first.
+    "visual_dependency", "mcq_task_unsuitable", "evidence_mismatch",
+    "bad_evidence_assignment", "wrong_task_identity", "bad_fitb_answer_evidence",
+    "duplicate_question", "excessive_overlap",
 })
 
 STRUCTURE_FAILURES: frozenset[str] = frozenset({
@@ -386,7 +401,9 @@ def _canonical_values(qtype: str, q: Dict[str, Any]) -> Dict[str, Any]:
             "solution_certificate": q.get("solution_certificate"),
         }
     if qtype == "true_false":
-        return {"statement": q.get("statement"), "answer": q.get("answer"),
+        from app.online.models import normalize_true_false_answer
+        return {"statement": q.get("statement"),
+                "answer": normalize_true_false_answer(q.get("answer")),
                 "solution_certificate": q.get("solution_certificate")}
     if qtype == "fill_in_the_blank":
         return {
@@ -427,6 +444,29 @@ def _canonical_values(qtype: str, q: Dict[str, Any]) -> Dict[str, Any]:
             "solution_certificate": q.get("solution_certificate"),
         }
     return {}
+
+
+def _canonical_changes(
+        qtype: str, before: Dict[str, Any], after: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Return changes to Repair-owned content, excluding orchestrator metadata.
+
+    Generated questions are enriched between graph nodes with assignment
+    fingerprints, revisions, evidence bindings, and catalog metadata.  Those
+    fields are verified by the assignment/lifecycle checks and are not part of
+    a Repair agent's patch contract.
+    """
+    old = _canonical_values(qtype, before)
+    new = _canonical_values(qtype, after)
+    return [
+        {
+            "field": field,
+            "previous_value": deepcopy(old.get(field)),
+            "new_value": deepcopy(new.get(field)),
+        }
+        for field in sorted(set(old) | set(new))
+        if old.get(field) != new.get(field)
+    ]
 
 
 def _allowed_canonical(
@@ -861,15 +901,16 @@ def _local_verdict(qtype: str, item: Dict[str, Any], section: Any) -> Optional[D
                 "Use plausible same-topic misconceptions, reversed relationships, or incomplete reasoning.",
             )
     elif qtype == "true_false":
+        from app.online.models import normalize_true_false_answer
         statement = str(item.get("statement") or "").strip()
         if not statement:
             return _verdict(False, False, "FIX_QUESTION", ["statement"],
                             "True/False statement is empty.",
                             "Write a complete, single, unambiguous statement.")
-        if str(item.get("answer") or "").strip().lower() not in {"true", "false"}:
+        if normalize_true_false_answer(item.get("answer")) is None:
             return _verdict(True, False, "FIX_ANSWER", ["answer"],
-                            "True/False answer is not 'True' or 'False'.",
-                            "Set the answer to exactly 'True' or 'False'.")
+                            "True/False answer is not an unambiguous boolean value.",
+                            "Set the answer to the boolean true or false.")
     elif qtype == "fill_in_the_blank":
         question = str(item.get("question") or "").strip()
         if not is_pure_text_fitb_value(question, allow_blank=True):
@@ -1061,6 +1102,8 @@ def _global_review_entry(
         "slot_id": str(item.get("slot_id") or ""),
         "question_type": qtype,
         "difficulty": plan.get("difficulty"),
+        "difficulty_status": plan.get("difficulty_status"),
+        "difficulty_fallback_reason": plan.get("difficulty_fallback_reason"),
         "question": question,
         "correct_option_text": correct_text,
         "reference_or_final_answer": _question_result_text(qtype, item),
@@ -1421,10 +1464,10 @@ def build_validator_prompt(
 def _plan_source_ids(plan_item: Optional[Dict[str, Any]]) -> List[str]:
     if not plan_item:
         return []
-    values = [
+    values = list(plan_item.get("source_evidence_ids") or [
         plan_item.get("source_chunk_id"),
         *(plan_item.get("support_chunk_ids") or []),
-    ]
+    ])
     return list(dict.fromkeys(str(value) for value in values if value))
 
 
@@ -1438,6 +1481,40 @@ def _assigned_source_chunks(
         for chunk_id in (evidence_ids if evidence_ids is not None else _plan_source_ids(plan_item))
         if sources.get(chunk_id)
     }
+
+
+def _plan_evidence_consistency_error(
+    plan_item: Optional[Dict[str, Any]], source_by_chunk: Optional[Dict[str, str]],
+) -> str | None:
+    """Validate the materialized assignment before generation or repair calls."""
+    if not plan_item:
+        return "replacement plan item is missing"
+    assigned = _plan_source_ids(plan_item)
+    if not assigned:
+        return "replacement plan has no assigned evidence"
+    selected_id = str(plan_item.get("selected_variation_id") or "")
+    variations = [
+        *(plan_item.get("permitted_variations") or []),
+        *(plan_item.get("allowed_variations") or []),
+    ]
+    selected = next((
+        value for value in variations
+        if selected_id and str(value.get("variation_id") or "") == selected_id
+    ), None)
+    variation_evidence = (
+        list(dict.fromkeys(map(str, selected.get("evidence_chunk_ids") or [])))
+        if selected is not None and selected.get("evidence_chunk_ids") is not None
+        else assigned
+    )
+    if variation_evidence != assigned:
+        return (
+            "selected variation evidence does not match the materialized assignment: "
+            f"variation={variation_evidence}, assigned={assigned}"
+        )
+    unavailable = [value for value in assigned if value not in (source_by_chunk or {})]
+    if unavailable:
+        return f"assigned replacement evidence is unavailable: {unavailable}"
+    return None
 
 
 def _catalog_task_contract(
@@ -1549,16 +1626,25 @@ REPAIR_SYSTEM_PROMPT = (
     "- Return one root JSON object with a `repairs` array containing one repair patch per "
     "input item, in any order. Each object is "
     '{"question_id":"...","patch":{only the exact fields_to_fix}}. '
-    "Never return the complete question and never add another field.\n"
+    "Never return the complete question. When the response schema requests repair_metadata, include it and no other field.\n"
     "- Return ONLY valid JSON. No fences, no extra text."
 )
 
 STEM_QUANTITATIVE_REPAIR_SYSTEM_PROMPT = """You are a quantitative STEM question repairer using medium reasoning. Repair every authorized field listed in fields_to_fix. Quantitative fields include numbers, equations, calculations, units, missing numerical or symbolic givens, solution_steps, final_answer, and numerical or symbolic MCQ options or correct_answer. When required_fixes also contains a General Validator finding, address its authorized wording, option, or structure field in the same coherent patch; do not discard either validator's finding. Also replace the internal solution_certificate so it exactly documents the repaired mathematics. Preserve the catalog task and every field not authorized by fields_to_fix. Add only premises and givens needed by the assigned operation; never add the final relationship, completed equation, governing rule, reasoning step, or result when producing or selecting it is the student work being assessed. Keep Equation items equation-centered and in valid LaTeX, with concise instructions separated from display equations and no narrative Word Problem conversion.
 Independently solve the repaired problem from scratch. Treat expected_results and expected_fix as diagnostic hypotheses, not authority. Verify by a second method when practical, such as substitution, reverse calculation, constraint testing, conservation, dimensional analysis, or independent recomputation. For optimization, use only feasible candidates. For MCQ, verify exactly one option is correct and put its label in solution_certificate.matching_correct_option. Keep solution_steps, final_answer, options, stored answer, and solution_certificate consistent. Never edit Planner metadata or address wording, difficulty, duplication, or coverage.
-Return one root JSON object with a `repairs` array. Each item must be {"question_id":"...","patch":{only the exact fields_to_fix}}. Never return the complete question or an unrequested field. Return only valid JSON."""
+Return one root JSON object with a `repairs` array. Each item must include question_id and patch; when the response schema requests repair_metadata, include it with modified_fields, changes, and targeted_failure_codes. Never return the complete question or any other unrequested field. Return only valid JSON."""
 
-def build_repair_prompt(payload: List[Dict[str, Any]]) -> str:
+def build_repair_prompt(
+    payload: List[Dict[str, Any]], *, include_metadata: bool = False,
+) -> str:
     block = json.dumps(payload, ensure_ascii=False, indent=None)
+    metadata = (
+        ',"repair_metadata":{"modified_fields":["field"],"changes":'
+        '[{"field":"field","previous_value":"JSON value before",'
+        '"new_value":"JSON value after","reason":"why this fixes the finding"}],'
+        '"targeted_failure_codes":["code"]}'
+        if include_metadata else ""
+    )
     return (
         "Repair the following questions. Each item tells you exactly what is broken "
         "and what to fix. Change only the listed fields and preserve the intended assessment task. Always keep "
@@ -1567,7 +1653,8 @@ def build_repair_prompt(payload: List[Dict[str, Any]]) -> str:
         f"{block}\n\n"
         "## Repair object format\n"
         '{"repairs":[{"question_id":"the unchanged ID","patch":'
-        "{exactly every field in fields_to_fix and no other fields}}]}\n\n"
+        "{exactly every field in fields_to_fix and no other fields}"
+        f"{metadata}" + "}]}\n\n"
         "Return ONLY one JSON object with a `repairs` array. No text before or after, "
         "no fences, and never return a bare root array."
     )
@@ -1651,7 +1738,7 @@ def _reconcile_simple_expected_answer(
             for value in expected
         )
     elif qtype == "true_false":
-        stored_raw = str(item.get("answer") or "").strip().casefold()
+        stored_raw = str(item.get("answer")).strip().casefold()
         truth_map = {
             "true": True, "false": False, "صح": True, "صحيح": True,
             "صواب": True, "خطأ": False, "خطا": False,
@@ -2168,6 +2255,15 @@ def _merge_validation_report(
         *(previous.get("coverage") or []),
         *(update.get("coverage") or []),
     ]
+    for key in ("role_results", "role_fingerprints", "input_protection"):
+        combined = deepcopy(previous.get(key) or {})
+        combined.update(deepcopy(update.get(key) or {}))
+        if combined:
+            merged[key] = combined
+    merged["validation_call_logs"] = [
+        *(previous.get("validation_call_logs") or []),
+        *(update.get("validation_call_logs") or []),
+    ][-VALIDATOR_TRACE_MAX_ATTEMPTS:]
     return merged
 
 
@@ -2255,6 +2351,7 @@ def repair_exam(
     ``{"warnings", "repaired_ids", "failed_ids"}`` and mutates the exam in place.
     """
     warnings: List[str] = []
+    repair_metadata_by_id: Dict[str, Dict[str, Any]] = {}
     questions = exam.get("questions") or {}
     invalid = [v for v in verdicts if v.get("action") in REPAIR_ACTIONS]
     if not invalid:
@@ -2347,7 +2444,11 @@ def repair_exam(
         local_reasoning=REPAIR_REASONING,
         deepseek_model="deepseek-flash",
     )
-    user_prompt = build_repair_prompt(payload)
+    require_repair_metadata = all(
+        str(verdict_by_id.get(item["question_id"], {}).get("validation_status") or "") == "FAIL"
+        for item in payload
+    )
+    user_prompt = build_repair_prompt(payload, include_metadata=require_repair_metadata)
     try:
         repair_model_items = [
             (
@@ -2359,7 +2460,9 @@ def repair_exam(
         raw = request_structured(
             llm,
             user_prompt,
-            response_model=repair_response_model(repair_model_items),
+            response_model=repair_response_model(
+                repair_model_items, include_metadata=require_repair_metadata,
+            ),
             schema_name="question_repairs",
             agent="repairer",
             item_count=len(payload),
@@ -2415,6 +2518,10 @@ def repair_exam(
         patch = r.get("patch")
         if not isinstance(patch, dict):
             warnings.append(f"repair: {qid} returned no patch payload; rejected")
+            continue
+        reported_metadata = r.get("repair_metadata")
+        if require_repair_metadata and not isinstance(reported_metadata, dict):
+            warnings.append(f"repair: {qid} omitted repair_metadata; rejected")
             continue
 
         verdict = verdict_by_id.get(qid) or {}
@@ -2500,6 +2607,59 @@ def repair_exam(
             )
             continue
 
+        original_values = _canonical_values(qtype, item)
+        repaired_values = _canonical_values(qtype, normalized)
+        actual_changes = {
+            field: {
+                "previous_value": deepcopy(original_values.get(field)),
+                "new_value": deepcopy(repaired_values.get(field)),
+            }
+            for field in allowed
+            if original_values.get(field) != repaired_values.get(field)
+        }
+        if require_repair_metadata:
+            reported_fields = set(map(str, reported_metadata.get("modified_fields") or []))
+            change_fields = {
+                str(change.get("field") or "")
+                for change in (reported_metadata.get("changes") or [])
+                if isinstance(change, dict)
+            }
+            if reported_fields != set(actual_changes) or change_fields != set(actual_changes):
+                warnings.append(
+                    f"repair: {qid} repair_metadata did not match actual changes; rejected"
+                )
+                continue
+            reported_by_field = {
+                str(change.get("field") or ""): change
+                for change in (reported_metadata.get("changes") or [])
+                if isinstance(change, dict)
+            }
+            values_match = all(
+                str(reported_by_field[field].get(key))
+                in {
+                    str(values[key]),
+                    json.dumps(values[key], ensure_ascii=False, sort_keys=True, default=str),
+                }
+                for field, values in actual_changes.items()
+                for key in ("previous_value", "new_value")
+            )
+            if not values_match:
+                warnings.append(
+                    f"repair: {qid} repair_metadata values did not match the actual diff; rejected"
+                )
+                continue
+            targeted = set(map(str, reported_metadata.get("targeted_failure_codes") or []))
+            expected_codes = {
+                str(finding.get("failure_code") or "")
+                for finding in verdict.get("required_fixes") or []
+                if finding.get("failure_code")
+            } or {str(verdict.get("failure_code") or "")}
+            if not expected_codes.issubset(targeted):
+                warnings.append(
+                    f"repair: {qid} repair_metadata omitted targeted failure codes; rejected"
+                )
+                continue
+
         # A repair that leaves every canonical field identical does not fix
         # anything; do not count it as repaired so the loop keeps trying. A FITB
         if (
@@ -2516,6 +2676,26 @@ def repair_exam(
         if fitb_bank_changed and isinstance(container, dict):
             container["word_bank"] = proposed_fitb_bank
         accepted.add(qid)
+        repair_metadata_by_id[qid] = {
+            "modified_fields": sorted(actual_changes),
+            "changes": [
+                {
+                    "field": field,
+                    **values,
+                    "reason": next((
+                        str(change.get("reason") or "")
+                        for change in (reported_metadata or {}).get("changes") or []
+                        if isinstance(change, dict)
+                        and str(change.get("field") or "") == field
+                    ), "repair patch changed this field"),
+                }
+                for field, values in actual_changes.items()
+            ],
+            "targeted_failure_codes": list(
+                (reported_metadata or {}).get("targeted_failure_codes")
+                or [verdict.get("failure_code")]
+            ),
+        }
         logger.info("Question repaired | id=%s | action=%s", qid, verdict.get("action"))
 
     fitb_section = questions.get("fill_in_the_blank")
@@ -2545,6 +2725,7 @@ def repair_exam(
         "sent_ids": sent_ids,
         "repaired_ids": sorted(revalidate_ids),
         "failed_ids": failed,
+        "repair_metadata": repair_metadata_by_id,
     }
 
 
@@ -2786,6 +2967,8 @@ def _repair_classification(
 ) -> tuple[str, str]:
     """Map a diagnosis to a mutation strategy without weakening validation."""
     code = str(failure_code or "validation_failure")
+    if code in {"difficulty_mismatch", "reasoning_complexity_mismatch"}:
+        return "difficulty_assignment_mismatch", "adjust_difficulty"
     if code == "missing_requested_slot":
         return "missing_slot", "regenerate_missing_slot"
     if code in TASK_REPLACEMENT_FAILURES:
@@ -2807,7 +2990,10 @@ def _manifest_from_report(
     targets: list[Dict[str, Any]] = []
     by_id = _build_by_id(exam.get("questions") or {})
     for verdict in report.get("verdicts") or []:
-        if verdict.get("action") == "PASS":
+        if verdict.get("action") not in RECOVERY_ACTIONS or (
+            verdict.get("action") == "UNVALIDATED"
+            and verdict.get("validation_status") != "VALIDATION_BLOCKED"
+        ):
             continue
         qid = str(verdict.get("question_id") or "")
         entry = by_id.get(qid)
@@ -2820,7 +3006,29 @@ def _manifest_from_report(
             str(verdict.get("failure_code") or ""),
             validation_role=str(verdict.get("validation_role") or "general"),
         )
+        if verdict.get("validation_status") == "VALIDATION_BLOCKED":
+            block_category = str(verdict.get("block_category") or "operational")
+            category = f"{block_category}_validation_block"
+            repair_type = "replace_assignment"
         required_fixes = deepcopy(verdict.get("required_fixes") or [])
+        seen_issue_bases: Dict[str, int] = {}
+        required_fixes.sort(key=lambda issue: (
+            str(issue.get("validator") or ""), str(issue.get("failure_code") or ""),
+            tuple(sorted(map(str, issue.get("fields_to_fix") or []))),
+            str(issue.get("reason") or ""),
+        ))
+        for issue in required_fixes:
+            if issue.get("issue_id"):
+                continue
+            base = "|".join((
+                qid, str(issue.get("validator") or "deterministic"),
+                str(issue.get("failure_code") or "other"),
+                ",".join(sorted(map(str, issue.get("fields_to_fix") or []))),
+            ))
+            seen_issue_bases[base] = seen_issue_bases.get(base, 0) + 1
+            digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:12]
+            issue["issue_id"] = f"{qid}-I-{digest}-{seen_issue_bases[base]}"
+        verdict["required_fixes"] = deepcopy(required_fixes)
         if str(verdict.get("failure_code") or "") in {
             "missing_required_given", "missing_required_givens", "invalid_required_givens",
         }:
@@ -2853,6 +3061,12 @@ def _manifest_from_report(
             "validation_role": verdict.get("validation_role") or "general",
             "fields_to_fix": list(verdict.get("fields_to_fix") or []),
             "required_fixes": required_fixes,
+            "repair_instruction_conflicts": deepcopy(
+                verdict.get("repair_instruction_conflicts") or []
+            ),
+            "role_statuses": deepcopy(verdict.get("role_statuses") or {}),
+            "block_category": verdict.get("block_category"),
+            "blocked_roles": deepcopy(verdict.get("blocked_roles") or []),
             "verdict": deepcopy(verdict),
         })
     for missing in report.get("missing_slots") or []:
@@ -2896,6 +3110,21 @@ def _merge_repair_manifest(
         if key in fresh_by_key:
             current = fresh_by_key[key]
             previous = old_by_key.get(key) or {}
+            previous_status = str(previous.get("status") or "")
+            if previous_status in {
+                "validation_pending", "validation_blocked", "exhausted",
+                "terminal_failure",
+            }:
+                # Fresh Validator findings are audit evidence, not authority to
+                # reopen a slot whose persisted lifecycle is pending or terminal.
+                current["status"] = previous_status
+                current["validation_candidate_id"] = previous.get("validation_candidate_id")
+                for field in (
+                    "failure_code", "failure_reason", "repair_category",
+                    "repair_type", "verdict", "repair_conflict",
+                ):
+                    if field in previous:
+                        current[field] = deepcopy(previous[field])
             current["history"] = list(previous.get("history") or [])
             if current["history"] and current["history"][-1].get("new_failure_reason"):
                 current["failure_code"] = previous.get("failure_code", current.get("failure_code"))
@@ -2955,22 +3184,175 @@ def _put_question(exam: Dict[str, Any], qtype: str, item: Dict[str, Any]) -> Non
         _rebuild_fitb_word_bank(section)
 
 
+def _integrate_duplicate_validation(
+    state: Dict[str, Any], generated: list[Dict[str, Any]], plans: list[Dict[str, Any]],
+    reports_by_model: Dict[Any, Dict[str, Any]], repair_manifest: list[Dict[str, Any]],
+    validated: list[int], warnings: list[str],
+) -> tuple[list[Dict[str, Any]], list[int], list[str], Dict[str, Any]]:
+    """Convert pair findings into stable normal validation/repair issues."""
+    from app.online.duplicate_pipeline import scan_exam_duplicates
+
+    try:
+        result = scan_exam_duplicates({
+            **state, "generated_exams": generated, "plans": plans,
+            "validation_reports": list(reports_by_model.values()),
+            "repair_manifest": repair_manifest, "validated_models": validated,
+            "warnings": warnings,
+        })
+    except Exception as exc:
+        # Duplicate review is a required cross-question validation.  Treat an
+        # operational failure exactly like an unavailable ordinary validator:
+        # retain the accepted questions and plans, but prevent the model from
+        # being represented as fully validated or assembled as complete.
+        reason = f"Duplicate Validator operational failure: {type(exc).__name__}: {exc}"
+        blocked: list[Dict[str, Any]] = []
+        exams = {int(exam.get("model_number") or 0): exam for exam in generated}
+        for mn, exam in exams.items():
+            report = reports_by_model.get(mn)
+            if report is None:
+                continue
+            plan_by_slot, _sources = _plan_context_for_model({**state, "plans": plans}, mn)
+            for qid, (qtype, _container, item) in _build_by_id(exam.get("questions") or {}).items():
+                slot_id = str(item.get("slot_id") or "")
+                issue_id = f"{qid}-I-duplicate-operational-1"
+                issue = {
+                    "issue_id": issue_id, "validator": "duplicate",
+                    "validation_status": "VALIDATION_BLOCKED",
+                    "failure_code": "duplicate_validation_operational_error",
+                    "fields_to_fix": [], "reason": reason,
+                    "expected_fix": "Retry the Duplicate Validator; do not alter content.",
+                }
+                verdict = {
+                    "question_id": qid, "action": "UNVALIDATED",
+                    "validation_status": "VALIDATION_BLOCKED",
+                    "validation_role": "duplicate",
+                    "failure_code": issue["failure_code"], "fields_to_fix": [],
+                    "reason": reason, "expected_fix": issue["expected_fix"],
+                    "required_fixes": [issue], "role_statuses": {"duplicate": "ERROR"},
+                }
+                previous = next((value for value in report.get("verdicts") or []
+                                 if str(value.get("question_id") or "") == qid), None)
+                if previous is not None:
+                    verdict["role_statuses"] = {
+                        **deepcopy(previous.get("role_statuses") or {}), "duplicate": "ERROR",
+                    }
+                    report["verdicts"].remove(previous)
+                report.setdefault("verdicts", []).append(verdict)
+                plan_item = plan_by_slot.get(slot_id) or {}
+                blocked.append({
+                    "model_number": mn, "slot_id": slot_id, "question_id": qid,
+                    "question_type": qtype, "status": "validation_blocked",
+                    "task_id": plan_item.get("task_id"),
+                    "fitb_entry_id": plan_item.get("fitb_entry_id"),
+                    "evidence_ids": _plan_source_ids(plan_item),
+                    "failure_code": issue["failure_code"], "failure_reason": reason,
+                    "repair_category": "operational", "repair_type": "none",
+                    "validation_role": "duplicate", "fields_to_fix": [],
+                    "required_fixes": [issue], "verdict": verdict,
+                })
+            report["all_pass"] = False
+            if mn in validated:
+                validated.remove(mn)
+        warnings.append(reason)
+        return _merge_repair_manifest(repair_manifest, blocked), validated, warnings, {
+            "operational_error": reason, "pending_duplicate_groups": [],
+            "duplicate_reports": list(state.get("duplicate_reports") or []),
+        }
+    targets: list[Dict[str, Any]] = []
+    exams = {int(exam.get("model_number") or 0): exam for exam in generated}
+    for group in result.get("pending_duplicate_groups") or []:
+        mn = int(group.get("model_number") or 1)
+        exam, report = exams.get(mn) or {}, reports_by_model.get(mn)
+        if report is None:
+            continue
+        plan_by_slot, _sources = _plan_context_for_model({**state, "plans": plans}, mn)
+        for qid in group.get("replace_question_ids") or []:
+            entry = _build_by_id(exam.get("questions") or {}).get(str(qid))
+            if entry is None:
+                continue
+            qtype, _container, item = entry
+            slot_id = str(item.get("slot_id") or "")
+            conflicts = sorted(str(value) for value in group.get("question_ids") or []
+                               if str(value) and str(value) != str(qid))
+            pair_ids = sorted(
+                f"{min(str(edge.get('left')), str(edge.get('right')))}::{max(str(edge.get('left')), str(edge.get('right')))}"
+                for edge in group.get("edges") or []
+                if str(qid) in {str(edge.get("left")), str(edge.get("right"))}
+            )
+            issue_id = f"{qid}-I-{hashlib.sha256((str(qid) + '|duplicate|' + '|'.join(pair_ids)).encode()).hexdigest()[:12]}-1"
+            issue = {
+                "issue_id": issue_id, "validator": "duplicate",
+                "validation_status": "FAIL", "failure_code": "duplicate_question",
+                "fields_to_fix": [],
+                "reason": "The question duplicates or excessively overlaps another validated question.",
+                "expected_fix": "Select an authorized distinct variation or catalog task and regenerate transactionally.",
+                "conflicting_question_ids": conflicts, "duplicate_pair_ids": pair_ids,
+                "duplicate_group_id": group.get("group_id"),
+            }
+            verdict = {
+                "question_id": str(qid), "action": "FIX_QUESTION_AND_ANSWER",
+                "validation_status": "FAIL", "validation_role": "duplicate",
+                "failure_code": "duplicate_question", "fields_to_fix": [],
+                "reason": issue["reason"], "expected_fix": issue["expected_fix"],
+                "required_fixes": [issue], "conflicting_question_ids": conflicts,
+                "duplicate_pair_ids": pair_ids, "role_statuses": {"duplicate": "FAIL"},
+            }
+            previous = next((value for value in report.get("verdicts") or []
+                             if str(value.get("question_id") or "") == str(qid)), None)
+            if previous is not None:
+                verdict["role_statuses"] = {
+                    **deepcopy(previous.get("role_statuses") or {}), "duplicate": "FAIL",
+                }
+                report["verdicts"].remove(previous)
+            report.setdefault("verdicts", []).append(verdict)
+            report["all_pass"] = False
+            plan_item = plan_by_slot.get(slot_id) or {}
+            targets.append({
+                "model_number": mn, "slot_id": slot_id, "question_id": str(qid),
+                "question_type": qtype, "status": "invalid",
+                "task_id": plan_item.get("task_id"),
+                "fitb_entry_id": plan_item.get("fitb_entry_id"),
+                "evidence_ids": _plan_source_ids(plan_item),
+                "failure_code": "duplicate_question", "failure_reason": issue["reason"],
+                "repair_category": "duplicate_conflict", "repair_type": "replace_assignment",
+                "preferred_recovery": "different authorized variation, then catalog replacement",
+                "validation_role": "duplicate", "fields_to_fix": [],
+                "required_fixes": [issue], "verdict": verdict,
+                "conflicting_question_ids": conflicts, "duplicate_pair_ids": pair_ids,
+                "duplicate_group_id": group.get("group_id"),
+            })
+            if mn in validated:
+                validated.remove(mn)
+    if targets:
+        repair_manifest = _merge_repair_manifest(repair_manifest, targets)
+    return repair_manifest, validated, list(result.get("warnings") or warnings), result
+
+
 def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate correctness only; semantic duplication is a later graph stage."""
+    """Run all six validators and transactionally revalidate staged candidates."""
     generated = deepcopy(state.get("generated_exams") or [])
     plans = deepcopy(state.get("plans") or [])
     validated = list(state.get("validated_models") or [])
-    attempts = state.get("question_repair_attempts") or {}
+    legacy_attempts = dict(state.get("question_repair_attempts") or {})
+    failures = dict(
+        state.get("question_repair_failures")
+        or state.get("question_repair_attempts") or {}
+    )
+    attempts = failures  # compatibility name used by manifest diagnostics
+    repair_calls = dict(state.get("question_repair_calls") or {})
+    completion_attempts = dict(state.get("slot_completion_attempts") or {})
+    completion_enabled = "slot_completion_attempts" in state
+    working_candidates = deepcopy(state.get("repair_working_candidates") or {})
     pending_revalidation = dict(state.get("pending_revalidation_ids") or {})
     warnings = list(state.get("warnings") or [])
     stored_domain = str((state.get("assessment_profile") or {}).get("domain") or "")
     general_client = None
     quantitative_client = None
     if stored_domain:
-        from app.llm.factory import create_review_client
-        general_client = create_review_client(domain=stored_domain, stage="general_validator")
-        if stored_domain.upper() == "STEM":
-            quantitative_client = create_review_client(domain=stored_domain, stage="stem_quantitative_validator")
+        # Specialized clients are created per concurrent request by the new
+        # orchestrator; sharing mutable provider clients across threads can
+        # corrupt usage and response telemetry.
+        general_client = quantitative_client = None
     # Preserve one latest report per model. Earlier passing models are skipped
     # by validation but their reports remain available for final telemetry.
     reports_by_model: Dict[Any, Dict[str, Any]] = {
@@ -2982,17 +3364,159 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     replacement_memory = deepcopy(state.get("repair_replacement_memory") or {})
     retry_seeds = deepcopy(state.get("repair_retry_seeds") or {})
     validation_repair_history = list(state.get("validation_repair_history") or [])
+    repair_call_logs = list(state.get("repair_call_logs") or [])
     validation_ledger = deepcopy(state.get("validation_ledger") or {})
     candidate_updates_by_model: Dict[int, Dict[str, Any]] = {}
     balanced_candidate_ids_by_model: Dict[int, list[str]] = {}
+    revalidation_progress = deepcopy(state.get("revalidation_progress") or {})
+    pending_candidates: list[Dict[str, Any]] = []
+    blocked_candidates = deepcopy(state.get("blocked_revalidation_candidates") or [])
+
+    def accept_source_constrained_difficulty(
+        report: Dict[str, Any], plan_by_slot: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Accept only an explicitly recorded, source-forced difficulty deviation.
+
+        This is intentionally narrow: every non-difficulty role must pass and
+        every issue must be a difficulty mismatch. Mathematical, grounding,
+        task, and answer defects remain failures.
+        """
+        result = deepcopy(report)
+        for verdict in result.get("verdicts") or []:
+            qid = str(verdict.get("question_id") or "")
+            entry = _build_by_id(
+                next((
+                    exam.get("questions") or {} for exam in generated
+                    if int(exam.get("model_number") or 0)
+                    == int(result.get("model_number") or 0)
+                ), {})
+            ).get(qid)
+            slot_id = str((entry or (None, None, {}))[2].get("slot_id") or "")
+            plan_item = plan_by_slot.get(slot_id) or {}
+            if plan_item.get("difficulty_status") != "accepted_source_constraint":
+                continue
+            issues = list(verdict.get("required_fixes") or [])
+            if not issues or any(
+                str(issue.get("failure_code") or "") not in {
+                    "difficulty_mismatch", "reasoning_complexity_mismatch",
+                }
+                for issue in issues
+            ):
+                continue
+            role_statuses = dict(verdict.get("role_statuses") or {})
+            if any(
+                status != "PASS" for role, status in role_statuses.items()
+                if role != "difficulty"
+            ):
+                continue
+            verdict.update({
+                "action": "PASS", "validation_status": "PASS",
+                "question_valid": True, "answer_valid": True,
+                "failure_code": "pass", "fields_to_fix": [],
+                "required_fixes": [], "expected_fix": "",
+                "reason": "",
+                "difficulty_deviation": {
+                    "status": "accepted_source_constraint",
+                    "requested_difficulty": plan_item.get("requested_difficulty"),
+                    "actual_difficulty": plan_item.get("actual_difficulty"),
+                    "reason": plan_item.get("difficulty_fallback_reason"),
+                },
+            })
+            role_statuses["difficulty"] = "PASS"
+            verdict["role_statuses"] = role_statuses
+        result["all_pass"] = all(
+            value.get("action") == "PASS" for value in result.get("verdicts") or []
+        )
+        return result
+
+    def item_fingerprint(item: Dict[str, Any]) -> str:
+        return hashlib.sha256(json.dumps(
+            item, ensure_ascii=False, sort_keys=True, default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def final_integrity_error(
+        candidate: Dict[str, Any], report: Dict[str, Any],
+        active_exam: Dict[str, Any] | None, staged_entry: Any,
+    ) -> str | None:
+        if active_exam is None or staged_entry is None:
+            return "active or staged question is missing"
+        qid = str(candidate.get("question_id") or "")
+        active_entry = _build_by_id(active_exam.get("questions") or {}).get(qid)
+        if active_entry is None and candidate.get("had_original"):
+            return "active original question is missing"
+        expected_original = candidate.get("original_question") or {}
+        if expected_original and active_entry is not None and item_fingerprint(active_entry[2]) != item_fingerprint(expected_original):
+            return "active original question changed after candidate creation"
+        staged_fingerprint = item_fingerprint(staged_entry[2])
+        expected_candidate = str(candidate.get("candidate_fingerprint") or staged_fingerprint)
+        if staged_fingerprint != expected_candidate:
+            return "staged candidate changed after candidate creation"
+        if str(report.get("validated_candidate_fingerprint") or staged_fingerprint) != staged_fingerprint:
+            return "candidate selected for commit differs from validated candidate"
+        current_lifecycle = (state.get("slot_lifecycle") or {}).get(str(candidate.get("slot_id") or "")) or {}
+        expected_assignment = candidate.get("expected_assignment_fingerprint")
+        expected_question = candidate.get("expected_question_fingerprint")
+        if expected_assignment and current_lifecycle.get("assignment_fingerprint") != expected_assignment:
+            return "assignment changed after revalidation"
+        if expected_question and current_lifecycle.get("question_fingerprint") != expected_question:
+            return "active question revision changed after revalidation"
+        metadata = candidate.get("repair_metadata") or {}
+        if candidate.get("repair_action") == "repair_question":
+            actual = {
+                change["field"] for change in _canonical_changes(
+                    str(candidate.get("question_type") or staged_entry[0]),
+                    expected_original,
+                    staged_entry[2],
+                )
+            }
+            def root(path: object) -> str:
+                return str(path or "").split(".", 1)[0].split("[", 1)[0]
+            # Specialized Repair metadata is Python-generated and records
+            # recursive leaf paths. The graph integrity layer compares their
+            # canonical roots with its independent top-level diff.
+            reported = {root(path) for path in metadata.get("modified_fields") or []}
+            if actual != reported:
+                return f"repair metadata fields differ from final candidate: actual={sorted(actual)}, reported={sorted(reported)}"
+            step_fields = {
+                root(change.get("field"))
+                for step in metadata.get("steps") or []
+                for change in step.get("changes") or []
+            }
+            if step_fields and not actual.issubset(step_fields):
+                return "combined repair history does not account for every modified field"
+        return None
+
+    def run_specialized_reviews(
+        target_exam: Dict[str, Any], ids: Optional[Iterable[str]],
+        plan_context: Dict[str, Dict[str, Any]], sources: Dict[str, str],
+        *, cached: Optional[Dict[str, Dict[str, Dict[str, Any]]]] = None,
+        revalidation: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        from app.online.multi_validator import validate_exam_multi
+        return validate_exam_multi(
+            target_exam, plan_by_slot=plan_context, source_by_chunk=sources,
+            domain=stored_domain, question_ids=ids, cached_roles=cached,
+            revalidation_context=revalidation,
+            cache_scope=str(state.get("job_id") or ""),
+        )
 
     # Validation of isolated staged candidates is independent. Workers only
     # produce reports; commits below remain deterministic and transactional.
     repair_candidates = []
     stale_candidate_events: list[dict[str, Any]] = []
     lifecycle = state.get("slot_lifecycle") or {}
+    terminal_manifest_slots = {
+        str(item.get("slot_id") or "")
+        for item in repair_manifest
+        if item.get("status") in {
+            "exhausted", "terminal_failure", "validation_blocked",
+        }
+    }
     for candidate in state.get("repair_candidates") or []:
         slot_id = str(candidate.get("slot_id") or "")
+        if slot_id in terminal_manifest_slots:
+            continue
         current = lifecycle.get(slot_id) or {}
         expected_assignment = candidate.get("expected_assignment_fingerprint")
         expected_question = candidate.get("expected_question_fingerprint")
@@ -3014,57 +3538,110 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         repair_candidates.append(candidate)
     validation_repair_history.extend(stale_candidate_events)
 
-    def validate_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
-        mn = int(candidate.get("model_number") or 1)
+    def blocked_report(candidate: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
         qid = str(candidate.get("question_id") or "")
-        staged_exam = candidate.get("exam") or {}
-        candidate_state = {**state, "plans": candidate.get("plans") or plans}
-        candidate_plan, candidate_sources = _plan_context_for_model(candidate_state, mn)
-        args = (staged_exam, [qid], candidate_plan, candidate_sources)
-        quantitative_ids = set(_quantitative_question_ids(staged_exam, candidate_plan))
-        if quantitative_client is not None and qid in quantitative_ids:
-            from app.llm.factory import create_review_client
-            fresh_quantitative_client = create_review_client(
-                domain="STEM", stage="stem_quantitative_validator"
+        return {"model_number": candidate.get("model_number"), "all_pass": False,
+                "verdicts": [{"question_id": qid, "action": "UNVALIDATED",
+                    "validation_status": "VALIDATION_BLOCKED",
+                    "failure_code": "validation_blocked", "fields_to_fix": [],
+                    "required_fixes": [], "role_statuses": {"system": "ERROR"},
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "expected_fix": "Retry candidate validation."}],
+                "role_results": {qid: {"system": {"status": "ERROR",
+                    "operational_error": f"{type(exc).__name__}: {exc}"}}},
+                "role_fingerprints": {}, "validation_call_logs": []}
+
+    def validate_candidate_group(indexes: list[int]) -> dict[int, Dict[str, Any]]:
+        first = repair_candidates[indexes[0]]
+        mn = int(first.get("model_number") or 1)
+        combined_exam: Dict[str, Any] = {"model_number": mn, "questions": {}}
+        combined_plan: Dict[str, Dict[str, Any]] = {}
+        combined_sources: Dict[str, str] = {}
+        ids: list[str] = []
+        contexts: Dict[str, Dict[str, Any]] = {}
+        for index in indexes:
+            candidate = repair_candidates[index]
+            qid = str(candidate.get("question_id") or "")
+            entry = _build_by_id((candidate.get("exam") or {}).get("questions") or {}).get(qid)
+            if entry is None:
+                raise ValueError(f"staged candidate question missing: {qid}")
+            _put_question(combined_exam, entry[0], deepcopy(entry[2]))
+            candidate_state = {**state, "plans": candidate.get("plans") or plans}
+            local_plan, local_sources = _plan_context_for_model(candidate_state, mn)
+            staged_assignment = local_plan.get(str(candidate.get("slot_id") or ""))
+            if staged_assignment is None and local_plan:
+                raise ValueError(f"staged candidate plan missing: {candidate.get('slot_id')}")
+            if staged_assignment is not None:
+                combined_plan[str(candidate.get("slot_id") or "")] = staged_assignment
+                combined_sources.update(_assigned_source_chunks(
+                    staged_assignment, local_sources,
+                ))
+            ids.append(qid)
+            contexts[qid] = {
+                "original_question": deepcopy(candidate.get("original_question") or {}),
+                "original_failure_findings": deepcopy(candidate.get("original_failure_findings") or []),
+                "repair_metadata": deepcopy(candidate.get("repair_metadata") or {}),
+                "previous_rejections": deepcopy(candidate.get("previous_rejections") or []),
+                "candidate_id": candidate.get("candidate_id"),
+                "candidate_fingerprint": candidate.get("candidate_fingerprint"),
+                "force_full_revalidation": str(
+                    candidate.get("candidate_id")
+                    or candidate.get("candidate_fingerprint")
+                    or ""
+                ) not in revalidation_progress,
+            }
+        if stored_domain:
+            from app.online.multi_validator import validate_exam_multi
+            shared = validate_exam_multi(
+                combined_exam, plan_by_slot=combined_plan, source_by_chunk=combined_sources,
+                domain=stored_domain, question_ids=ids,
+                revalidation_context=contexts,
+                cache_scope=str(state.get("job_id") or ""),
             )
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                general_future = executor.submit(
-                    copy_context().run, _validate_with_context, *args,
-                    general_client, "general",
-                )
-                quantitative_future = executor.submit(
-                    copy_context().run, _validate_with_context,
-                    staged_exam, [qid], candidate_plan, candidate_sources,
-                    fresh_quantitative_client, "stem_quantitative",
-                )
-                general = general_future.result()
-                quantitative = quantitative_future.result()
-            return _merge_role_reports(general, quantitative)
-        return (
-                _validate_with_context(*args, general_client, "general")
-                if general_client is not None else _validate_with_context(*args)
-            )
+        else:
+            shared = _validate_with_context(combined_exam, ids, combined_plan, combined_sources)
+        by_verdict = {str(value.get("question_id") or ""): value for value in shared.get("verdicts") or []}
+        result: dict[int, Dict[str, Any]] = {}
+        for index in indexes:
+            qid = str(repair_candidates[index].get("question_id") or "")
+            candidate_entry = _build_by_id(
+                (repair_candidates[index].get("exam") or {}).get("questions") or {}
+            ).get(qid)
+            verdict = deepcopy(by_verdict.get(qid))
+            if verdict is None:
+                verdict = blocked_report(repair_candidates[index], RuntimeError("missing batched verdict"))["verdicts"][0]
+            result[index] = {"model_number": mn, "verdicts": [verdict],
+                "all_pass": verdict.get("action") == "PASS",
+                "role_results": {qid: deepcopy((shared.get("role_results") or {}).get(qid) or {})},
+                "role_fingerprints": {qid: deepcopy((shared.get("role_fingerprints") or {}).get(qid) or {})},
+                "validation_call_logs": [deepcopy(trace) for trace in shared.get("validation_call_logs") or []
+                    if qid in set(map(str, trace.get("question_ids") or []))],
+                "input_protection": {qid: deepcopy((shared.get("input_protection") or {}).get(qid) or {})},
+                "validated_candidate_fingerprint": item_fingerprint((candidate_entry or (None, None, {}))[2])}
+        return result
 
     candidate_reports: dict[int, Dict[str, Any]] = {}
-    parallel = [
-        (index, candidate) for index, candidate in enumerate(repair_candidates)
-        if str(candidate.get("question_type") or "") != "fill_in_the_blank"
-    ]
-    serial = [
-        (index, candidate) for index, candidate in enumerate(repair_candidates)
-        if str(candidate.get("question_type") or "") == "fill_in_the_blank"
-    ]
-    if parallel:
-        workers = min(MAX_PARALLEL_VALIDATOR_CALLS, len(parallel), 10)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(copy_context().run, validate_candidate, candidate): index
-                for index, candidate in parallel
-            }
+    groups: list[list[int]] = []
+    grouped: Dict[tuple[int, str], list[int]] = {}
+    for index, candidate in enumerate(repair_candidates):
+        qtype = str(candidate.get("question_type") or "")
+        # FITB candidates retain serial section-level word-bank safety.
+        key = (int(candidate.get("model_number") or 1), qtype if qtype == "fill_in_the_blank" else "parallel")
+        grouped.setdefault(key, []).append(index)
+    for (_mn, kind), indexes in grouped.items():
+        size = 1 if kind == "fill_in_the_blank" else VALIDATOR_BATCH_SIZE
+        groups.extend(indexes[start:start + size] for start in range(0, len(indexes), size))
+    if groups:
+        workers = min(MAX_PARALLEL_VALIDATOR_CALLS, len(groups), 10)
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+            futures = {executor.submit(copy_context().run, validate_candidate_group, group): group for group in groups}
             for future in as_completed(futures):
-                candidate_reports[futures[future]] = future.result()
-    for index, candidate in serial:
-        candidate_reports[index] = validate_candidate(candidate)
+                group = futures[future]
+                try:
+                    candidate_reports.update(future.result())
+                except Exception as exc:
+                    for index in group:
+                        candidate_reports[index] = blocked_report(repair_candidates[index], exc)
 
     # Repair writes are transactional: mutate the active exam/plan only after
     # every required validator for that candidate passes.
@@ -3078,6 +3655,13 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         candidate_report = candidate_reports[index]
         verdicts = list(candidate_report.get("verdicts") or [])
         passed = bool(verdicts) and all(v.get("action") == "PASS" for v in verdicts)
+        failure = next((v for v in verdicts if v.get("action") != "PASS"), {})
+        operational = str(failure.get("validation_status") or "") in {
+            "VALIDATION_BLOCKED", "PENDING_RETRY",
+        }
+        candidate_id = str(candidate.get("candidate_id") or
+                           candidate.get("candidate_fingerprint") or
+                           f"{mn}:{slot_id}:{candidate.get('attempt')}")
         target = next((
             item for item in repair_manifest
             if int(item.get("model_number") or 0) == mn
@@ -3089,15 +3673,28 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             "question_id": qid,
             "attempt": candidate.get("attempt"),
             "repair_action": candidate.get("repair_action"),
+            "repair_strategy": candidate.get("repair_strategy"),
             "candidate_task_id": candidate.get("candidate_task_id"),
             "candidate_fitb_entry_id": candidate.get("candidate_fitb_entry_id"),
             "revalidation_result": "PASS" if passed else "FAIL",
             "assignment_fingerprint": candidate.get("assignment_fingerprint"),
         }
+        active_exam = next((e for e in generated if int(e.get("model_number") or 0) == mn), None)
+        staged_entry = _build_by_id(staged_exam.get("questions") or {}).get(qid)
+        integrity_error = final_integrity_error(candidate, candidate_report, active_exam, staged_entry) if passed else None
+        if integrity_error:
+            passed = False
+            operational = True
+            failure = {
+                "question_id": qid, "action": "UNVALIDATED",
+                "validation_status": "VALIDATION_BLOCKED",
+                "failure_code": "candidate_integrity_error", "role_statuses": {"integrity": "ERROR"},
+                "reason": integrity_error, "expected_fix": "Discard or reconstruct the staged candidate.",
+                "required_fixes": [], "fields_to_fix": [],
+            }
+            verdicts = [failure]
         if passed:
             event["progress"] = "PASSED"
-            active_exam = next((e for e in generated if int(e.get("model_number") or 0) == mn), None)
-            staged_entry = _build_by_id(staged_exam.get("questions") or {}).get(qid)
             if active_exam is not None and staged_entry is not None:
                 _put_question(active_exam, staged_entry[0], staged_entry[2])
                 if mn in candidate_updates_by_model:
@@ -3113,11 +3710,62 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 if target is not None:
                     target["status"] = "resolved"
                     target["resolved_by_attempt"] = candidate.get("attempt")
+                    target["resolved_candidate_fingerprint"] = candidate.get(
+                        "candidate_fingerprint"
+                    )
                     target["superseded_failure_code"] = target.get("failure_code")
                 event["status"] = "accepted"
                 retry_seeds.pop(slot_id, None)
+                revalidation_progress.pop(candidate_id, None)
+                slot_memory = replacement_memory.get(slot_id) or {}
+                if slot_memory.get("strategy_history"):
+                    slot_memory["strategy_history"][-1].update(
+                        outcome="PASS", candidate_fingerprint=candidate.get("candidate_fingerprint"),
+                    )
+        elif operational:
+            role_statuses = deepcopy(failure.get("role_statuses") or {})
+            pending_roles = sorted(
+                role for role, status in role_statuses.items()
+                if status in {"ERROR", "VALIDATION_BLOCKED", "PENDING_RETRY"}
+            ) or ["system"]
+            progress = revalidation_progress.setdefault(candidate_id, {
+                "candidate_id": candidate_id, "question_id": qid,
+                "candidate_fingerprint": candidate.get("candidate_fingerprint"),
+                "role_statuses": {}, "operational_retry_counts": {},
+            })
+            for role, result in ((candidate_report.get("role_results") or {}).get(qid) or {}).items():
+                status = str(result.get("status") or "ERROR")
+                progress["role_statuses"][role] = status
+            for role in pending_roles:
+                progress["operational_retry_counts"][role] = int(
+                    progress["operational_retry_counts"].get(role) or 0
+                ) + 1
+            exhausted = integrity_error is not None or any(
+                progress["operational_retry_counts"].get(role, 0) > REVALIDATION_OPERATIONAL_RETRIES
+                for role in pending_roles
+            )
+            progress.update(
+                candidate_status="VALIDATION_BLOCKED" if exhausted else "PENDING_RETRY",
+                pending_roles=[] if exhausted else pending_roles,
+                last_operational_error=failure.get("reason") or failure.get("expected_fix") or "",
+            )
+            if target is not None:
+                target["status"] = "validation_blocked" if exhausted else "validation_pending"
+                target["validation_candidate_id"] = candidate_id
+            event.update(
+                status="validation_blocked" if exhausted else "pending_validation_retry",
+                progress="BLOCKED" if exhausted else "PENDING_RETRY",
+                revalidation_result="VALIDATION_BLOCKED" if exhausted else "PENDING_RETRY",
+                operational=True,
+            )
+            if exhausted:
+                blocked_candidates.append(deepcopy(candidate) | {
+                    "candidate_status": "VALIDATION_BLOCKED",
+                    "validation_error": progress["last_operational_error"],
+                })
+            else:
+                pending_candidates.append(deepcopy(candidate))
         else:
-            failure = next((v for v in verdicts if v.get("action") != "PASS"), {})
             new_code = str(failure.get("failure_code") or "candidate_revalidation_failed")
             new_reason = str(failure.get("reason") or failure.get("expected_fix") or
                              "Candidate did not pass revalidation.")
@@ -3128,12 +3776,37 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 else "REGRESSED" if new_code in severe and old_code not in severe
                 else "LATERAL"
             )
+            slot_memory = replacement_memory.setdefault(slot_id, {})
+            if slot_memory.get("strategy_history"):
+                slot_memory["strategy_history"][-1].update(
+                    outcome="REVALIDATION_FAIL",
+                    failure_code=new_code,
+                    failure_reason=new_reason,
+                    candidate_fingerprint=candidate.get("candidate_fingerprint"),
+                    progress=event["progress"],
+                )
             category, repair_type = _repair_classification(
                 new_code, validation_role=str(failure.get("validation_role") or "general")
             )
+            # A content candidate that fails full Revalidation spends one
+            # failed strategy. A separately-budgeted replacement does not.
+            if candidate.get("repair_action") == "repair_question":
+                failures[slot_id] = min(
+                    MAX_QUESTION_REPAIR_ATTEMPTS,
+                    int(failures.get(slot_id) or 0) + 1,
+                )
             if target is not None:
                 target.update(
-                    status="invalid" if candidate.get("had_original") else "missing",
+                    status=(
+                        "terminal_failure"
+                        if (
+                            int(failures.get(slot_id) or 0)
+                            >= MAX_QUESTION_REPAIR_ATTEMPTS
+                            and int(completion_attempts.get(slot_id) or 0)
+                            >= MAX_COMPLETION_ATTEMPTS_PER_SLOT
+                        )
+                        else ("invalid" if candidate.get("had_original") else "missing")
+                    ),
                     failure_code=new_code,
                     failure_reason=new_reason,
                     repair_category=category,
@@ -3156,10 +3829,26 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                     "candidate_id": candidate_id, "attempt": candidate.get("attempt"),
                     "reason": new_reason, "failure_code": new_code,
                 })
+                fingerprint = str(candidate.get("candidate_fingerprint") or "")
+                if fingerprint and fingerprint not in memory.setdefault("rejected_candidate_fingerprints", []):
+                    memory["rejected_candidate_fingerprints"].append(fingerprint)
             event.update(status="rejected", new_failure_code=new_code,
-                         new_failure_reason=new_reason)
+                         new_failure_reason=new_reason,
+                         candidate_fingerprint=candidate.get("candidate_fingerprint"),
+                         changed_fields=list((candidate.get("repair_metadata") or {}).get("modified_fields") or []))
             retry_seeds[slot_id] = deepcopy(candidate)
+            revalidation_progress.pop(candidate_id, None)
         validation_repair_history.append(event)
+        repair_call_logs.append({
+            "job_id": None,
+            "question_id": qid,
+            "slot_id": slot_id,
+            "repair_route": deepcopy(candidate.get("repair_route") or []),
+            "attempt": candidate.get("attempt"),
+            "phase": "revalidation",
+            "revalidation_outcome": event.get("revalidation_result"),
+            "failure_code": None if passed else event.get("new_failure_code"),
+        })
     # Candidates are consumed exactly once, whether accepted or rejected.
     if candidate_updates_by_model:
         from app.online.exam_builder import balance_mcq_answer_positions
@@ -3181,12 +3870,20 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         plan_by_slot, source_by_chunk = _plan_context_for_model(
             {**state, "plans": plans}, int(mn or 1)
         )
+        terminal_slots_for_model = {
+            str(entry.get("slot_id") or "")
+            for entry in repair_manifest
+            if int(entry.get("model_number") or 0) == int(mn or 0)
+            and entry.get("status") in {
+                "exhausted", "terminal_failure", "validation_blocked",
+            }
+        }
         def question_fingerprints() -> dict[str, str]:
             result: dict[str, str] = {}
             for qtype, container, item in _iter_questions(exam.get("questions") or {}):
                 qid = str(item.get("question_id") or "")
                 slot_id = str(item.get("slot_id") or "")
-                if not qid:
+                if not qid or slot_id in terminal_slots_for_model:
                     continue
                 payload = {
                     "question": item,
@@ -3222,6 +3919,18 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         model_ledger = validation_ledger.setdefault(str(mn), {})
 
         def run_reviews(ids: Optional[Iterable[str]]) -> Dict[str, Any]:
+            if ids is not None:
+                ids = list(ids)
+            elif terminal_slots_for_model:
+                ids = sorted(current_fingerprints)
+            if stored_domain:
+                cached = {
+                    qid: deepcopy((entry or {}).get("specialized_roles") or {})
+                    for qid, entry in model_ledger.items()
+                }
+                return run_specialized_reviews(
+                    exam, ids, plan_by_slot, source_by_chunk, cached=cached,
+                )
             args = (exam, ids, plan_by_slot, source_by_chunk)
             if quantitative_client is None:
                 return (_validate_with_context(*args, general_client, "general")
@@ -3282,6 +3991,12 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 report = previous
             else:
                 report = run_reviews(None)
+        elif stored_domain:
+            # The specialized orchestrator performs dependency-aware reuse per
+            # role, so all current questions may be submitted here without
+            # repeating unchanged calls.
+            update = run_reviews(None)
+            report = _merge_validation_report(previous, update) if previous is not None else update
         else:
             quantitative_required_ids = set(
                 _quantitative_question_ids(exam, plan_by_slot)
@@ -3338,7 +4053,16 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 "fingerprint": fingerprint,
                 "role_fingerprints": {role: role_fingerprint(fingerprint, role) for role in roles},
                 "roles": roles,
+                "specialized_roles": {
+                    role: {
+                        "fingerprint": ((report.get("role_fingerprints") or {}).get(qid) or {}).get(role),
+                        "verdict": deepcopy(verdict_value),
+                    }
+                    for role, verdict_value in ((report.get("role_results") or {}).get(qid) or {}).items()
+                    if ((report.get("role_fingerprints") or {}).get(qid) or {}).get(role)
+                },
             }
+        report = accept_source_constrained_difficulty(report, plan_by_slot)
         present_slots = {
             str(item.get("slot_id") or "")
             for _qtype, _container, item in _iter_questions(exam.get("questions") or {})
@@ -3387,9 +4111,66 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             report["all_pass"] = False
         fresh_manifest = _manifest_from_report(report, exam, plan_by_slot)
         # Resolved staged candidates are absent from fresh problems. Preserve
-        # unresolved targets from other slots, but retire explicitly resolved ones.
-        unresolved_old = [item for item in repair_manifest if item.get("status") != "resolved"]
-        repair_manifest = _merge_repair_manifest(unresolved_old, fresh_manifest)
+        # their authoritative closure while the exact accepted candidate is
+        # unchanged.  Other slots may keep the graph alive for several rounds;
+        # that must not resurrect superseded findings for this slot.  A later
+        # content change produces a different fingerprint and invalidates the
+        # closure normally.
+        resolved_old = [
+            item for item in repair_manifest if item.get("status") == "resolved"
+        ]
+        resolved_fingerprints = {
+            (int(item.get("model_number") or 0), str(item.get("slot_id") or "")):
+            str(item.get("resolved_candidate_fingerprint") or "")
+            for item in resolved_old
+        }
+        current_by_slot = {
+            str(item.get("slot_id") or ""): hashlib.sha256(json.dumps(
+                item, ensure_ascii=False, sort_keys=True, default=str,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            for _qtype, _container, item in _iter_questions(exam.get("questions") or {})
+            if item.get("slot_id")
+        }
+        passing_ids = {
+            str(verdict.get("question_id") or "")
+            for verdict in report.get("verdicts") or []
+            if verdict.get("action") == "PASS"
+        }
+        for item in resolved_old:
+            if (
+                int(item.get("model_number") or 0) == int(mn or 0)
+                and str(item.get("question_id") or "") in passing_ids
+            ):
+                current_fingerprint = current_by_slot.get(
+                    str(item.get("slot_id") or "")
+                )
+                if current_fingerprint:
+                    item["resolved_candidate_fingerprint"] = current_fingerprint
+                    resolved_fingerprints[(
+                        int(item.get("model_number") or 0),
+                        str(item.get("slot_id") or ""),
+                    )] = current_fingerprint
+        protected_resolved_keys = {
+            key for key, fingerprint in resolved_fingerprints.items()
+            if fingerprint and current_by_slot.get(key[1]) == fingerprint
+        }
+        fresh_manifest = [
+            item for item in fresh_manifest
+            if (int(item.get("model_number") or 0), str(item.get("slot_id") or ""))
+            not in protected_resolved_keys
+        ]
+        unresolved_old = [
+            item for item in repair_manifest if item.get("status") != "resolved"
+        ]
+        protected_resolved = [
+            item for item in resolved_old
+            if (int(item.get("model_number") or 0), str(item.get("slot_id") or ""))
+            in protected_resolved_keys
+        ]
+        repair_manifest = _merge_repair_manifest(
+            [*unresolved_old, *protected_resolved], fresh_manifest,
+        )
         unresolved_for_model = [
             item for item in repair_manifest
             if int(item.get("model_number") or 0) == int(mn or 0)
@@ -3420,12 +4201,36 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 "keeping best-effort questions."
             )
 
+    if stored_domain:
+        repair_manifest, validated, warnings, duplicate_result = _integrate_duplicate_validation(
+            state, generated, plans, reports_by_model, repair_manifest, validated, warnings,
+        )
+    else:
+        duplicate_result = {
+            "duplicate_reports": list(state.get("duplicate_reports") or []),
+            "duplicate_similarity_distributions": list(
+                state.get("duplicate_similarity_distributions") or []
+            ),
+            "duplicate_fact_cache": dict(state.get("duplicate_fact_cache") or {}),
+            "duplicate_scan_count": int(state.get("duplicate_scan_count") or 0),
+            "unresolved_duplicate_conflicts": list(
+                state.get("unresolved_duplicate_conflicts") or []
+            ),
+        }
+
     return {
         "generated_exams": generated,
         "plans": plans,
         "validation_reports": list(reports_by_model.values()),
         "repair_manifest": repair_manifest,
-        "repair_candidates": [],
+        "repair_candidates": pending_candidates,
+        "question_repair_attempts": legacy_attempts,
+        "question_repair_calls": repair_calls,
+        "question_repair_failures": failures,
+        "slot_completion_attempts": completion_attempts,
+        "repair_working_candidates": working_candidates,
+        "revalidation_progress": revalidation_progress,
+        "blocked_revalidation_candidates": blocked_candidates,
         "repair_replacement_memory": replacement_memory,
         "repair_retry_seeds": retry_seeds,
         "validated_models": validated,
@@ -3437,6 +4242,21 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         "exam_quality_findings": list(state.get("exam_quality_findings") or []),
         "validation_repair_history": validation_repair_history,
         "validation_ledger": validation_ledger,
+        "validation_call_logs": [
+            trace
+            for report in reports_by_model.values()
+            for trace in (report.get("validation_call_logs") or [])
+        ],
+        "repair_call_logs": repair_call_logs[-VALIDATOR_TRACE_MAX_ATTEMPTS:],
+        "duplicate_reports": duplicate_result.get("duplicate_reports") or [],
+        "duplicate_similarity_distributions": duplicate_result.get("duplicate_similarity_distributions") or [],
+        "duplicate_fact_cache": duplicate_result.get("duplicate_fact_cache") or {},
+        "duplicate_scan_count": duplicate_result.get("duplicate_scan_count") or 0,
+        "pending_duplicate_groups": [],
+        "unresolved_duplicate_conflicts": duplicate_result.get("unresolved_duplicate_conflicts") or [],
+        "duplicate_candidate_blacklist": duplicate_result.get("duplicate_candidate_blacklist") or {},
+        "duplicate_replacement_failures": duplicate_result.get("duplicate_replacement_failures") or {},
+        "duplicate_repair_history": duplicate_result.get("duplicate_repair_history") or [],
     }
 
 
@@ -3445,9 +4265,20 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
     generated = state.get("generated_exams") or []
     plans = deepcopy(state.get("plans") or [])
     manifest = deepcopy(state.get("repair_manifest") or [])
-    attempts = dict(state.get("question_repair_attempts") or {})
+    # Legacy checkpoints stored one counter. Treat it as failed strategies;
+    # new checkpoints persist calls and failures independently.
+    legacy_attempts = dict(state.get("question_repair_attempts") or {})
+    failures = dict(
+        state.get("question_repair_failures")
+        or state.get("question_repair_attempts") or {}
+    )
+    repair_calls = dict(state.get("question_repair_calls") or {})
+    completion_attempts = dict(state.get("slot_completion_attempts") or {})
+    completion_enabled = "slot_completion_attempts" in state
+    working_candidates = deepcopy(state.get("repair_working_candidates") or {})
     memory_by_slot = deepcopy(state.get("repair_replacement_memory") or {})
     history = list(state.get("validation_repair_history") or [])
+    repair_call_logs = list(state.get("repair_call_logs") or [])
     warnings = list(state.get("warnings") or [])
     candidates: list[Dict[str, Any]] = []
     retry_seeds = deepcopy(state.get("repair_retry_seeds") or {})
@@ -3455,32 +4286,72 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
     exam_by_model = {int(exam.get("model_number") or 0): exam for exam in generated}
 
     for target in manifest:
-        if target.get("status") in {"resolved", "exhausted", "terminal_failure"}:
+        if target.get("status") in {"resolved", "validation_pending"}:
             continue
         slot_id = str(target.get("slot_id") or "")
-        if not slot_id or (attempts.get(slot_id) or 0) >= MAX_QUESTION_REPAIR_ATTEMPTS:
+        duplicate = str(target.get("validation_role") or "") == "duplicate"
+        attempt_limit = (
+            MAX_DUPLICATE_REPLACEMENT_ATTEMPTS_PER_SLOT
+            if duplicate
+            else MAX_QUESTION_REPAIR_ATTEMPTS
+        )
+        if not slot_id:
+            continue
+        content_exhausted = (
+            int(failures.get(slot_id) or 0) >= attempt_limit
+            or int(repair_calls.get(slot_id) or 0) >= MAX_CONTENT_REPAIR_CALLS_PER_SLOT
+        )
+        completion_exhausted = (
+            not completion_enabled
+            or int(completion_attempts.get(slot_id) or 0)
+            >= MAX_COMPLETION_ATTEMPTS_PER_SLOT
+        )
+        if duplicate and content_exhausted:
+            target.update(
+                status="terminal_failure",
+                failure_code="duplicate_repair_budget_exhausted",
+                failure_reason="All bounded duplicate repair attempts were rejected.",
+            )
+            continue
+        if content_exhausted and completion_exhausted:
+            if slot_id:
+                target.update(
+                    status="terminal_failure",
+                    failure_code="no_valid_source_grounded_replacement",
+                    failure_reason=(
+                        "Content repair and the bounded on-demand completion "
+                        "budget were exhausted without a valid grounded candidate."
+                    ),
+                )
             continue
         mn = int(target.get("model_number") or 1)
         active_exam = exam_by_model.get(mn)
         if active_exam is None:
             continue
-        # Consumed only after a viable candidate is ready for correctness
-        # evaluation; transport/schema/no-op failures have separate bounded
-        # provider retries and do not spend this correctness budget.
-        attempt = (attempts.get(slot_id) or 0) + 1
+        previous_attempts = int(failures.get(slot_id) or 0)
+        attempt = int(legacy_attempts.get(slot_id) or 0) + 1
         qtype = str(target.get("question_type") or _question_type_from_slot(slot_id))
         prefix = f"m{mn}_"
         qid = str(target.get("question_id") or f"model{mn}_{slot_id[len(prefix):] if slot_id.startswith(prefix) else slot_id}")
         retry_seed = retry_seeds.get(slot_id) or {}
         staged_exam = deepcopy(retry_seed.get("exam") or active_exam)
         staged_plans = deepcopy(retry_seed.get("plans") or plans)
+        durable_working = deepcopy(
+            (working_candidates.get(slot_id) or {}).get("candidate")
+        )
+        if durable_working:
+            # Resume from the latest Python-accepted content revision, never
+            # from the historical original or a rejected later proposal.
+            _put_question(staged_exam, qtype, durable_working)
         staged_state = {**state, "plans": staged_plans}
         plan_by_slot, source_by_chunk = _plan_context_for_model(staged_state, mn)
         if slot_id in plan_by_slot:
             plan_by_slot[slot_id]["recovery_failure_code"] = target.get("failure_code")
             plan_by_slot[slot_id]["recovery_failure_reason"] = target.get("failure_reason")
             plan_by_slot[slot_id]["recovery_attempt"] = attempt
-        had_original = _build_by_id(active_exam.get("questions") or {}).get(qid) is not None
+        original_entry = _build_by_id(active_exam.get("questions") or {}).get(qid)
+        had_original = original_entry is not None
+        original_question = deepcopy((original_entry or (None, None, {}))[2])
         memory = memory_by_slot.setdefault(slot_id, {
             "original_candidate_id": target.get("fitb_entry_id") or target.get("task_id"),
             "attempted_candidate_ids": [], "blacklisted_candidate_ids": [],
@@ -3488,18 +4359,132 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             "assignment_validated_attempts": {},
         })
         repair_action = str(target.get("repair_type") or "repair_question")
+        if target.get("status") == "validation_blocked":
+            # All role-local operational retries have already been exhausted.
+            # Do not charge a content-repair call for a Validator outage or an
+            # unavailable prerequisite; use bounded completion instead.
+            repair_action = "replace_assignment"
+            content_exhausted = True
+            target["status"] = "completion_pending"
+        if content_exhausted and not duplicate:
+            repair_action = "replace_assignment"
+            target["status"] = "completion_pending"
         prior_rejections = [
             item for item in (target.get("history") or [])
-            if item.get("status") in {"rejected", "candidate_generation_failed"}
+            if item.get("status") in {
+                "rejected", "candidate_generation_failed", "repair_conflict",
+                "identical_candidate_rejected",
+            }
             or item.get("revalidation_result") == "FAIL"
         ]
-        if repair_action == "repair_question" and prior_rejections:
-            repair_action = "regenerate_missing_slot"
-        if repair_action == "regenerate_missing_slot" and len(prior_rejections) >= 2:
+        latest_rejection = prior_rejections[-1] if prior_rejections else {}
+        retry_candidate_available = bool(retry_seed.get("exam"))
+        repair_strategy = "targeted_repair"
+        force_alternative = bool(memory.get("force_alternative_strategy"))
+        if repair_action == "adjust_difficulty":
+            difficulty_attempts = int(memory.get("difficulty_adjustment_attempts") or 0)
+            if difficulty_attempts >= 2:
+                repair_action = "replace_assignment"
+                repair_strategy = "catalog_replacement_after_difficulty"
+            else:
+                repair_strategy = "targeted_difficulty_adjustment"
+        elif repair_action == "repair_question" and force_alternative:
+            repair_action = (
+                "regenerate_missing_slot" if attempt < 3 else "replace_assignment"
+            )
+            repair_strategy = (
+                "regenerate_original_assignment" if attempt < 3
+                else "catalog_replacement"
+            )
+            memory["force_alternative_strategy"] = False
+        elif repair_action == "repair_question":
+            if latest_rejection.get("status") == "repair_conflict":
+                repair_strategy = "reconciled_targeted_repair"
+            elif retry_candidate_available and latest_rejection.get("progress") != "UNCHANGED":
+                # Revalidation supplied newer actionable findings. Continue from
+                # the staged candidate and repair only what remains unresolved.
+                repair_strategy = "targeted_followup_repair"
+            elif prior_rejections:
+                repair_action = "regenerate_missing_slot"
+                repair_strategy = "regenerate_original_assignment"
+        elif repair_action == "regenerate_missing_slot":
+            repair_strategy = "regenerate_original_assignment"
+        elif repair_action == "replace_assignment":
+            repair_strategy = (
+                "on_demand_completion_replacement"
+                if content_exhausted else "catalog_replacement"
+            )
+        if repair_action == "regenerate_missing_slot" and attempt >= 3:
             repair_action = "replace_assignment"
-        use_replacement = repair_action == "replace_assignment" or (
-            repair_action == "regenerate_missing_slot" and attempt > 1
-        )
+            repair_strategy = "catalog_replacement"
+        use_replacement = repair_action == "replace_assignment"
+        if use_replacement:
+            completion_attempts[slot_id] = int(
+                completion_attempts.get(slot_id) or 0
+            ) + 1
+        def repair_input_fingerprint() -> str:
+            return hashlib.sha256(json.dumps({
+                "question": staged_exam,
+                "failure_code": target.get("failure_code"),
+                "required_fixes": (target.get("verdict") or {}).get("required_fixes") or [],
+                "fields_to_fix": (target.get("verdict") or {}).get("fields_to_fix") or [],
+                "repair_action": repair_action,
+                "repair_strategy": repair_strategy,
+                "blacklisted_candidate_ids": sorted(
+                    map(str, memory.get("blacklisted_candidate_ids") or [])
+                ),
+                "attempted_candidate_ids": sorted(
+                    map(str, memory.get("attempted_candidate_ids") or [])
+                ),
+            }, ensure_ascii=False, sort_keys=True, default=str,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
+
+        attempted_inputs = set(memory.setdefault("attempted_repair_input_fingerprints", []))
+        unresolved_fingerprint = repair_input_fingerprint()
+        if unresolved_fingerprint in attempted_inputs and repair_action == "repair_question":
+            repair_action = "regenerate_missing_slot"
+            repair_strategy = "regenerate_original_assignment"
+            use_replacement = False
+            unresolved_fingerprint = repair_input_fingerprint()
+        if unresolved_fingerprint in attempted_inputs and repair_action == "regenerate_missing_slot":
+            repair_action = "replace_assignment"
+            repair_strategy = "catalog_replacement"
+            use_replacement = True
+            unresolved_fingerprint = repair_input_fingerprint()
+        if unresolved_fingerprint in attempted_inputs:
+            legacy_attempts[slot_id] = attempt
+            failures[slot_id] = min(
+                MAX_QUESTION_REPAIR_ATTEMPTS,
+                int(failures.get(slot_id) or 0) + 1,
+            )
+            target.update(
+                status="terminal_failure",
+                failure_code="no_recovery_strategy",
+                failure_reason=(
+                    "No genuinely different safe recovery strategy remains for the "
+                    "unchanged question and findings."
+                ),
+            )
+            event = {
+                "model_number": mn, "slot_id": slot_id, "question_id": qid,
+                "attempt": attempt, "repair_action": "no_progress_guard",
+                "repair_strategy": repair_strategy,
+                "status": "terminal_failure", "new_failure_code": "no_recovery_strategy",
+                "new_failure_reason": target["failure_reason"],
+            }
+            target.setdefault("history", []).append(deepcopy(event))
+            history.append(event)
+            warnings.append(f"repair: no-progress guard terminated {slot_id}")
+            continue
+        memory["last_content_repair_input_fingerprint"] = unresolved_fingerprint
+        memory["attempted_repair_input_fingerprints"].append(unresolved_fingerprint)
+        memory.setdefault("strategy_history", []).append({
+            "attempt": attempt,
+            "strategy": repair_strategy,
+            "repair_action": repair_action,
+            "input_fingerprint": unresolved_fingerprint,
+            "previous_failure": target.get("failure_reason"),
+        })
         selected_id = ""
         if use_replacement:
             from app.online.duplicate_pipeline import (
@@ -3537,7 +4522,19 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             failed_entry = _build_by_id(staged_exam.get("questions") or {}).get(qid)
             failed_item = (failed_entry or (None, None, {}))[2]
             replacement, selector_context = _select_replacement_candidate(
-                slot_id=slot_id, qtype=qtype, conflict_slots=[], conflict_edges=[],
+                slot_id=slot_id, qtype=qtype,
+                conflict_slots=[
+                    str((_build_by_id(staged_exam.get("questions") or {}).get(conflict) or (None, None, {}))[2].get("slot_id") or "")
+                    for conflict in target.get("conflicting_question_ids") or []
+                    if _build_by_id(staged_exam.get("questions") or {}).get(conflict)
+                ],
+                conflict_edges=[
+                    deepcopy(edge)
+                    for report in state.get("duplicate_reports") or []
+                    for group in report.get("duplicate_groups") or []
+                    if group.get("group_id") == target.get("duplicate_group_id")
+                    for edge in group.get("edges") or []
+                ],
                 candidates=candidate_pool, active_items=active_plan_items,
                 blacklist=excluded, previous_failures=list(memory.get("candidate_failures") or []),
                 failed_slot_context={
@@ -3556,16 +4553,28 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             )
             if replacement is None:
                 reason = "No unused or reusable grounded replacement remained for this slot."
+                if not completion_enabled:
+                    legacy_attempts[slot_id] = attempt
+                    failures[slot_id] = min(
+                        MAX_QUESTION_REPAIR_ATTEMPTS,
+                        int(failures.get(slot_id) or 0) + 1,
+                    )
+                exhausted_completion = (
+                    int(completion_attempts.get(slot_id) or 0)
+                    >= MAX_COMPLETION_ATTEMPTS_PER_SLOT
+                )
                 target.update(
-                    status="exhausted",
-                    failure_code="replacement_inventory_exhausted",
+                    status="terminal_failure" if exhausted_completion else "completion_pending",
+                    failure_code=(
+                        "no_valid_source_grounded_replacement"
+                        if exhausted_completion else "completion_candidate_unavailable"
+                    ),
                     failure_reason=reason,
                 )
                 history.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
                                 "attempt": attempt, "repair_action": repair_action,
                                 "status": "candidate_generation_failed", "new_failure_reason": reason})
                 continue
-            replacement["replacement_selector_context"] = selector_context
             for rejected in (selector_context.get("agent_choice") or {}).get(
                 "rejected_candidates", []
             ):
@@ -3602,29 +4611,172 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
                 target.update(failure_code="replacement_plan_write_failed",
                               failure_reason="Replacement could not be applied to the plan slot.")
                 continue
+            catalog = state.get("assessment_catalog") or {}
+            if catalog.get("catalog_version") == ASSESSMENT_CATALOG_VERSION:
+                from app.online.assessment_catalog import validate_plan_catalog_bindings
+                valid_chunk_ids = {
+                    str(chunk.get("child_id") or "")
+                    for chunk in state.get("retrieved_chunks") or []
+                    if chunk.get("child_id")
+                }
+                binding_errors = validate_plan_catalog_bindings(
+                    catalog, staged_plans, valid_chunk_ids or None,
+                )
+                if binding_errors:
+                    memory["blacklisted_candidate_ids"].append(selected_id)
+                    memory.setdefault("candidate_failures", []).append({
+                        "candidate_id": selected_id,
+                        "reason": "; ".join(binding_errors),
+                        "attempt": attempt,
+                        "stage": "replacement_catalog_binding",
+                    })
+                    target.update(
+                        status="invalid",
+                        failure_code="replacement_catalog_binding_invalid",
+                        failure_reason="; ".join(binding_errors),
+                    )
+                    continue
             staged_state = {**state, "plans": staged_plans}
             plan_by_slot, source_by_chunk = _plan_context_for_model(staged_state, mn)
             if slot_id in plan_by_slot:
                 plan_by_slot[slot_id]["recovery_failure_code"] = target.get("failure_code")
                 plan_by_slot[slot_id]["recovery_failure_reason"] = target.get("failure_reason")
                 plan_by_slot[slot_id]["recovery_attempt"] = attempt
+            evidence_error = _plan_evidence_consistency_error(
+                plan_by_slot.get(slot_id), source_by_chunk,
+            )
+            if evidence_error:
+                memory["blacklisted_candidate_ids"].append(selected_id)
+                memory.setdefault("candidate_failures", []).append({
+                    "candidate_id": selected_id,
+                    "reason": evidence_error,
+                    "attempt": attempt,
+                    "stage": "replacement_evidence_preflight",
+                })
+                target.update(
+                    status="invalid",
+                    failure_code="replacement_evidence_mismatch",
+                    failure_reason=evidence_error,
+                )
+                history.append({
+                    "model_number": mn, "slot_id": slot_id, "question_id": qid,
+                    "attempt": attempt, "repair_action": "replace_assignment",
+                    "candidate_task_id": selected_id,
+                    "status": "candidate_generation_failed",
+                    "new_failure_code": "replacement_evidence_mismatch",
+                    "new_failure_reason": evidence_error,
+                })
+                continue
             repair_action = "replace_fitb_entry" if qtype == "fill_in_the_blank" else "replace_task"
 
         if _build_by_id(staged_exam.get("questions") or {}).get(qid) is None:
             _put_question(staged_exam, qtype, _placeholder_question(qtype, slot_id, qid))
         generated_ok = False
+        outcome: Dict[str, Any] = {}
         outcome_warnings: list[str] = []
         selected_repair_role: str | None = None
-        if repair_action in {"regenerate_missing_slot", "replace_fitb_entry", "replace_task"}:
+        if repair_action == "adjust_difficulty":
+            from app.online.difficulty_adjustment import adjust_failed_plan_slot
+            difficulty_attempt = int(memory.get("difficulty_adjustment_attempts") or 0) + 1
+            memory["difficulty_adjustment_attempts"] = difficulty_attempt
+            findings = deepcopy(
+                (target.get("verdict") or {}).get("required_fixes")
+                or target.get("required_fixes")
+                or []
+            )
+            adjusted, adjustment_audit = adjust_failed_plan_slot(
+                state=state,
+                plans=staged_plans,
+                model_number=mn,
+                slot_id=slot_id,
+                question_type=qtype,
+                findings=findings,
+                attempt=difficulty_attempt,
+            )
+            target.setdefault("difficulty_recovery_history", []).append(
+                deepcopy(adjustment_audit)
+            )
+            if adjusted:
+                staged_state = {**state, "plans": staged_plans}
+                plan_by_slot, source_by_chunk = _plan_context_for_model(staged_state, mn)
+                if slot_id in plan_by_slot:
+                    plan_by_slot[slot_id]["recovery_failure_code"] = target.get("failure_code")
+                    plan_by_slot[slot_id]["recovery_failure_reason"] = target.get("failure_reason")
+                    plan_by_slot[slot_id]["recovery_attempt"] = attempt
+                generated_ok, outcome_warnings = _regenerate_plan_slot(
+                    staged_state, staged_exam, mn, qid, plan_by_slot, source_by_chunk,
+                )
+            else:
+                failure_reason = str(
+                    adjustment_audit.get("failure") or "unsupported adaptation"
+                )
+                if difficulty_attempt >= 2:
+                    # The source contract won: retain the honest observed
+                    # level instead of repeatedly pretending the task is easy.
+                    findings = list(findings or [])
+                    observed = next((
+                        str(row.get("observed_difficulty") or "")
+                        for row in findings if row.get("observed_difficulty")
+                    ), "") or str(
+                        (plan_by_slot.get(slot_id) or {}).get("actual_difficulty")
+                        or "medium"
+                    )
+                    active_plan = plan_by_slot.get(slot_id) or {}
+                    active_plan.update({
+                        "requested_difficulty": state.get("difficulty"),
+                        "actual_difficulty": observed,
+                        "difficulty": observed,
+                        "difficulty_status": "accepted_source_constraint",
+                        "difficulty_fallback_reason": failure_reason,
+                        "difficulty_adaptation": {
+                            **dict(active_plan.get("difficulty_adaptation") or {}),
+                            "status": "accepted_source_constraint",
+                            "reason": failure_reason,
+                        },
+                    })
+                    staged_entry = _build_by_id(
+                        staged_exam.get("questions") or {}
+                    ).get(qid)
+                    if staged_entry is not None:
+                        staged_entry[2]["difficulty"] = observed
+                        staged_entry[2]["actual_difficulty"] = observed
+                    generated_ok = staged_entry is not None
+                    outcome_warnings = []
+                    repair_strategy = "accepted_source_constraint"
+                else:
+                    generated_ok = False
+                    outcome_warnings = [
+                        "Targeted Difficulty Adjustment did not produce an accepted assignment: "
+                        + failure_reason
+                    ]
+        elif repair_action in {"regenerate_missing_slot", "replace_fitb_entry", "replace_task"}:
             generated_ok, outcome_warnings = _regenerate_plan_slot(
                 staged_state, staged_exam, mn, qid, plan_by_slot, source_by_chunk)
         else:
             verdict = deepcopy(target.get("verdict") or {})
             verdict.setdefault("question_id", qid)
             verdict.setdefault("action", "FIX_QUESTION")
-            verdict["fields_to_fix"] = list(
-                target.get("fields_to_fix") or verdict.get("fields_to_fix") or []
-            )
+            resolved_issue_ids = {
+                str(issue_id)
+                for revision in (working_candidates.get(slot_id) or {}).get("revisions") or []
+                if revision.get("status") == "accepted"
+                for issue_id in revision.get("resolved_issue_ids") or []
+                if issue_id
+            }
+            if resolved_issue_ids:
+                remaining = [
+                    issue for issue in verdict.get("required_fixes") or []
+                    if str(issue.get("issue_id") or "") not in resolved_issue_ids
+                ]
+                verdict["required_fixes"] = remaining
+                verdict["fields_to_fix"] = sorted({
+                    str(field) for issue in remaining
+                    for field in issue.get("fields_to_fix") or []
+                })
+            if not resolved_issue_ids:
+                verdict["fields_to_fix"] = list(
+                    target.get("fields_to_fix") or verdict.get("fields_to_fix") or []
+                )
             verdict["repair_attempt_history"] = [
                 {key: item.get(key) for key in (
                     "attempt", "repair_action", "status", "new_failure_code",
@@ -3639,52 +4791,249 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             ), "")
             if prior_rejection:
                 verdict["previous_repair_rejection"] = prior_rejection
-            repair_role = _repair_role_for(
-                qtype, verdict,
-                domain=str((state.get("assessment_profile") or {}).get("domain") or "STEM"),
-            )
-            selected_repair_role = repair_role
-            target["repair_role"] = repair_role
-            if repair_role == "stem_quantitative":
-                from app.llm.factory import create_review_client
-                client = create_review_client(domain="STEM", stage="stem_quantitative_repairer")
-                outcome = repair_exam(staged_exam, [verdict], client=client,
-                                      plan_by_slot=plan_by_slot, source_by_chunk=source_by_chunk,
-                                      repair_role="stem_quantitative")
-            else:
-                outcome = (
-                    repair_exam(staged_exam, [verdict], plan_by_slot=plan_by_slot,
-                                source_by_chunk=source_by_chunk)
-                    if plan_by_slot or source_by_chunk
-                    else repair_exam(staged_exam, [verdict])
+            stored_repair_domain = str(
+                (state.get("assessment_profile") or {}).get("domain") or ""
+            ).upper()
+            if stored_repair_domain:
+                from app.online.multi_repair import repair_question_specialized
+                outcome = repair_question_specialized(
+                    exam=staged_exam,
+                    verdict=verdict,
+                    qtype=qtype,
+                    plan_item=plan_by_slot.get(slot_id) or {},
+                    source_chunks=_assigned_source_chunks(
+                        plan_by_slot.get(slot_id), source_by_chunk
+                    ),
+                    domain=stored_repair_domain,
+                    previous_rejection=prior_rejection,
+                    previous_attempts=verdict.get("repair_attempt_history") or [],
+                    recovery_strategy=repair_strategy,
+                    content_repair_calls_used=int(repair_calls.get(slot_id) or 0),
+                    failed_repair_attempts_used=int(failures.get(slot_id) or 0),
                 )
+                repair_calls[slot_id] = int(
+                    outcome.get("content_repair_calls", repair_calls.get(slot_id) or 0)
+                )
+                failures[slot_id] = int(
+                    outcome.get("failed_repair_attempts", failures.get(slot_id) or 0)
+                )
+                if not failures[slot_id]:
+                    failures.pop(slot_id, None)
+                if not repair_calls[slot_id]:
+                    repair_calls.pop(slot_id, None)
+                revisions = list(outcome.get("candidate_revisions") or [])
+                if revisions:
+                    previous_revisions = list(
+                        (working_candidates.get(slot_id) or {}).get("revisions") or []
+                    )
+                    base_revision = len(previous_revisions)
+                    for offset, revision in enumerate(revisions, start=1):
+                        revision["revision"] = base_revision + offset
+                    combined_revisions = [*previous_revisions, *revisions]
+                    working_candidates[slot_id] = {
+                        "slot_id": slot_id,
+                        "question_id": qid,
+                        "assignment_fingerprint": (
+                            ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get(
+                                "assignment_fingerprint"
+                            )
+                        ),
+                        "latest_revision": combined_revisions[-1].get("revision"),
+                        "latest_fingerprint": revisions[-1].get("fingerprint"),
+                        "candidate": deepcopy(
+                            next((
+                                row.get("candidate") for row in reversed(revisions)
+                                if row.get("status") == "accepted" and row.get("candidate")
+                            ), None)
+                        ),
+                        "revisions": deepcopy(combined_revisions),
+                    }
+                if "content_repair_calls" not in outcome:
+                    # Compatibility for legacy/test repair adapters.
+                    repair_calls[slot_id] = int(repair_calls.get(slot_id) or 0) + 1
+                selected_repair_role = " -> ".join(
+                    outcome.get("repair_route") or []
+                )
+            else:
+                # Compatibility for persisted pre-domain jobs and narrow test doubles.
+                repair_role = _repair_role_for(qtype, verdict, domain="STEM")
+                selected_repair_role = repair_role
+                if repair_role == "stem_quantitative":
+                    from app.llm.factory import create_review_client
+                    client = create_review_client(
+                        domain="STEM", stage="stem_quantitative_repairer"
+                    )
+                    outcome = repair_exam(
+                        staged_exam, [verdict], client=client,
+                        plan_by_slot=plan_by_slot, source_by_chunk=source_by_chunk,
+                        repair_role="stem_quantitative",
+                    )
+                else:
+                    outcome = (
+                        repair_exam(
+                            staged_exam, [verdict], plan_by_slot=plan_by_slot,
+                            source_by_chunk=source_by_chunk,
+                        )
+                        if plan_by_slot or source_by_chunk
+                        else repair_exam(staged_exam, [verdict])
+                    )
+                # Legacy repairers expose one logical content proposal.
+                repair_calls[slot_id] = int(repair_calls.get(slot_id) or 0) + 1
+            target["repair_role"] = selected_repair_role
+            target["repair_route"] = list(outcome.get("repair_route") or [])
+            target["repair_traces"] = list(outcome.get("repair_traces") or [])
             generated_ok = qid in set(outcome.get("repaired_ids") or [])
             outcome_warnings = list(outcome.get("warnings") or [])
+            repair_call_logs.extend(outcome.get("repair_traces") or [])
         warnings.extend(outcome_warnings)
+        if not outcome.get("operational_error"):
+            legacy_attempts[slot_id] = attempt
         if not generated_ok:
             reason = "; ".join(outcome_warnings) or "Repairer did not produce a candidate."
+            if outcome.get("operational_error"):
+                memory.pop("last_content_repair_input_fingerprint", None)
+                if unresolved_fingerprint in memory.get(
+                    "attempted_repair_input_fingerprints", []
+                ):
+                    memory["attempted_repair_input_fingerprints"].remove(
+                        unresolved_fingerprint
+                    )
+                if memory.get("strategy_history") and (
+                    memory["strategy_history"][-1].get("input_fingerprint")
+                    == unresolved_fingerprint
+                ):
+                    memory["strategy_history"].pop()
+                operational_failures = int(
+                    memory.get("operational_retry_failures") or 0
+                ) + 1
+                memory["operational_retry_failures"] = operational_failures
+                exhausted = operational_failures >= MAX_CANDIDATE_GENERATION_FAILURES
+                target.update(
+                    status=("validation_blocked" if exhausted else "operational_retry_pending"),
+                    failure_code=(
+                        "operational_retry_exhausted"
+                        if exhausted else "operational_retry_pending"
+                    ),
+                    failure_reason=reason,
+                )
+                event = {
+                    "model_number": mn, "slot_id": slot_id,
+                    "question_id": qid, "attempt": attempt,
+                    "repair_action": repair_action,
+                    "repair_role": target.get("repair_role"),
+                    "status": target["status"], "operational": True,
+                    "new_failure_reason": reason,
+                }
+                target.setdefault("history", []).append(deepcopy(event))
+                history.append(event)
+                continue
+            if outcome.get("route_status") == "REPAIR_CONFLICT":
+                failures[slot_id] = int(failures.get(slot_id) or 0) + 1
+                exhausted = failures[slot_id] >= attempt_limit
+                target.update(
+                    status="terminal_failure" if exhausted else "invalid",
+                    failure_code=(
+                        "content_repair_budget_exhausted"
+                        if exhausted else "repair_conflict"
+                    ),
+                    failure_reason=reason,
+                    repair_conflict=deepcopy(
+                        (outcome.get("routing_details") or {}).get("conflicts") or []
+                    ),
+                )
+                event = {
+                    "model_number": mn, "slot_id": slot_id, "question_id": qid,
+                    "attempt": attempt, "repair_action": repair_action,
+                    "repair_strategy": repair_strategy,
+                    "repair_role": target.get("repair_role"),
+                    "status": "repair_conflict",
+                    "new_failure_code": "repair_conflict",
+                    "new_failure_reason": reason,
+                    "question_changed": False,
+                    "reconciled_conflicts": deepcopy(outcome.get("reconciled_conflicts") or []),
+                }
+                target.setdefault("history", []).append(deepcopy(event))
+                history.append(event)
+                memory["strategy_history"][-1].update(
+                    outcome="REPAIR_CONFLICT", failure_reason=reason,
+                )
+                continue
+            if outcome.get("route_status") in {"VALIDATION_BLOCKED", "ROUTING_BLOCKED"}:
+                no_strategy = outcome.get("route_status") == "ROUTING_BLOCKED"
+                target.update(
+                    status="terminal_failure" if no_strategy else "validation_blocked",
+                    failure_code=(
+                        "no_recovery_strategy" if no_strategy else "validation_blocked"
+                    ),
+                    failure_reason=reason,
+                )
+                event = {
+                    "model_number": mn, "slot_id": slot_id, "question_id": qid,
+                    "attempt": attempt, "repair_action": repair_action,
+                    "repair_strategy": repair_strategy,
+                    "status": target["status"],
+                    "new_failure_code": target["failure_code"],
+                    "new_failure_reason": reason,
+                }
+                target.setdefault("history", []).append(deepcopy(event))
+                history.append(event)
+                continue
+            if repair_action == "repair_question" and not outcome.get("operational_error"):
+                # Invalid/no-op/unauthorized proposals are failed content
+                # strategies. Specialized repair already reports these.
+                if not stored_repair_domain:
+                    failures[slot_id] = int(failures.get(slot_id) or 0) + 1
+                elif "failed_repair_attempts" not in outcome:
+                    failures[slot_id] = int(failures.get(slot_id) or 0) + 1
+            elif not completion_enabled and not outcome.get("operational_error"):
+                # Backward-compatible semantics for checkpoints created before
+                # the separate completion budget existed.
+                failures[slot_id] = int(failures.get(slot_id) or 0) + 1
             operational_failures = int(memory.get("candidate_generation_failures") or 0) + 1
             memory["candidate_generation_failures"] = operational_failures
+            memory["force_alternative_strategy"] = True
             if selected_id:
                 memory["blacklisted_candidate_ids"].append(selected_id)
                 memory["candidate_failures"].append({"candidate_id": selected_id,
                                                       "reason": reason, "attempt": attempt})
             target.update(
-                status=("exhausted" if operational_failures >= MAX_CANDIDATE_GENERATION_FAILURES else "invalid"),
+                status=(
+                    "terminal_failure"
+                    if (
+                        int(failures.get(slot_id) or 0) >= attempt_limit
+                        and (
+                            not completion_enabled
+                            or int(completion_attempts.get(slot_id) or 0)
+                            >= MAX_COMPLETION_ATTEMPTS_PER_SLOT
+                        )
+                    )
+                    or operational_failures >= MAX_CANDIDATE_GENERATION_FAILURES
+                    else "invalid"
+                ),
                 failure_code=(
                     "candidate_generation_budget_exhausted"
-                    if operational_failures >= MAX_CANDIDATE_GENERATION_FAILURES
+                    if (
+                        int(failures.get(slot_id) or 0) >= attempt_limit
+                        and (
+                            not completion_enabled
+                            or int(completion_attempts.get(slot_id) or 0)
+                            >= MAX_COMPLETION_ATTEMPTS_PER_SLOT
+                        )
+                    )
+                    or operational_failures >= MAX_CANDIDATE_GENERATION_FAILURES
                     else "candidate_generation_failed"
                 ),
                 failure_reason=reason,
             )
             target.setdefault("history", []).append({"attempt": attempt,
                 "repair_action": repair_action, "repair_role": target.get("repair_role"),
+                "repair_strategy": repair_strategy,
                 "requested_fields": list(target.get("fields_to_fix") or []),
                 "status": "candidate_generation_failed",
                 "new_failure_reason": reason})
             history.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
                             "attempt": attempt, "repair_action": repair_action,
+                            "repair_strategy": repair_strategy,
                             "status": "candidate_generation_failed", "new_failure_reason": reason})
             continue
         candidate_plan = plan_by_slot.get(slot_id) or {}
@@ -3700,17 +5049,106 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
         ).encode("utf-8")).hexdigest()
         assignment_attempts = memory.setdefault("assignment_validated_attempts", {})
         if int(assignment_attempts.get(assignment_fingerprint) or 0) >= MAX_ASSIGNMENT_REPAIR_ATTEMPTS:
-            target.update(failure_code="assignment_repair_budget_exhausted",
+            target.update(status=(
+                              "terminal_failure"
+                              if (
+                                  not completion_enabled
+                                  or int(completion_attempts.get(slot_id) or 0)
+                                  >= MAX_COMPLETION_ATTEMPTS_PER_SLOT
+                              ) else "invalid"
+                          ),
+                          failure_code="assignment_repair_budget_exhausted",
                           failure_reason="Assignment exhausted its validated-candidate budget.",
                           repair_type="replace_assignment")
             continue
-        attempts[slot_id] = attempt
+        staged_entry = _build_by_id(staged_exam.get("questions") or {}).get(qid)
+        staged_question = deepcopy((staged_entry or (None, None, {}))[2])
+        candidate_fingerprint = hashlib.sha256(json.dumps(
+            staged_question, ensure_ascii=False, sort_keys=True, default=str,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        rejected_fingerprints = set(memory.setdefault("rejected_candidate_fingerprints", []))
+        if candidate_fingerprint in rejected_fingerprints:
+            target.update(
+                status=(
+                    "terminal_failure"
+                    if (
+                        content_exhausted
+                        and (
+                            not completion_enabled
+                            or int(completion_attempts.get(slot_id) or 0)
+                            >= MAX_COMPLETION_ATTEMPTS_PER_SLOT
+                        )
+                    ) else "invalid"
+                ),
+                failure_code="identical_candidate_rejected",
+                failure_reason="Generation or repair reproduced a previously rejected candidate.",
+            )
+            memory["force_alternative_strategy"] = True
+            event = {
+                "model_number": mn, "slot_id": slot_id, "question_id": qid,
+                "attempt": attempt, "repair_action": repair_action,
+                "repair_strategy": repair_strategy,
+                "status": "identical_candidate_rejected",
+                "new_failure_code": "identical_candidate_rejected",
+                "new_failure_reason": target["failure_reason"],
+                "candidate_fingerprint": candidate_fingerprint,
+                "question_changed": False,
+            }
+            target.setdefault("history", []).append(deepcopy(event))
+            history.append(event)
+            warnings.append(f"repair: prevented identical candidate loop for {slot_id}")
+            continue
         assignment_attempts[assignment_fingerprint] = int(
             assignment_attempts.get(assignment_fingerprint) or 0
         ) + 1
+        actual_changes = _canonical_changes(qtype, original_question, staged_question)
+        fallback_metadata = {
+            "repair_method": repair_action,
+            "modified_fields": [change["field"] for change in actual_changes],
+            "changes": actual_changes,
+            "final_structural_diff": deepcopy(actual_changes),
+            "targeted_failure_codes": [target.get("failure_code")],
+            "targeted_issue_ids": [
+                issue.get("issue_id") for issue in
+                ((target.get("verdict") or {}).get("required_fixes") or [])
+                if issue.get("issue_id")
+            ],
+            "change_explanation": deepcopy(outcome.get("change_explanation") or {
+                "source": "existing_validator_and_planner_metadata",
+                "original_question_about": _question_task_text(qtype, original_question),
+                "original_answer_or_solution": _question_result_text(qtype, original_question),
+                "original_problem": target.get("failure_reason") or "",
+                "replacement_question_about": _question_task_text(qtype, staged_question),
+                "replacement_answer_or_solution": _question_result_text(qtype, staged_question),
+                "why_changed": target.get("what_must_change") or target.get("failure_reason") or "",
+                "intended_task": {
+                    "task_id": candidate_plan.get("task_id"),
+                    "idea_to_test": candidate_plan.get("idea_to_test"),
+                    "target": candidate_plan.get("target"),
+                    "task_operation": candidate_plan.get("task_operation"),
+                    "selected_variation_id": candidate_plan.get("selected_variation_id"),
+                },
+            }),
+            "replacement_selector_rationale": deepcopy(outcome.get("replacement_selector_rationale")),
+        }
+        candidate_id = f"{qid}:{attempt}:{candidate_fingerprint[:16]}"
+        previous_rejections = [
+            {"attempt": value.get("attempt"), "repair_method": value.get("repair_action"),
+             "changed_fields": value.get("changed_fields") or [],
+             "candidate_fingerprint": value.get("candidate_fingerprint"),
+             "failure_code": value.get("new_failure_code"),
+             "rejection_reason": value.get("new_failure_reason")}
+            for value in (target.get("history") or [])[-3:]
+            if value.get("status") == "rejected" and not value.get("operational")
+        ]
         candidates.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
+            "candidate_id": candidate_id, "candidate_fingerprint": candidate_fingerprint,
             "question_type": qtype, "attempt": attempt, "repair_action": repair_action,
+            "repair_strategy": repair_strategy,
             "repair_role": selected_repair_role,
+            "repair_route": list(outcome.get("repair_route") or []),
+            "repair_traces": list(outcome.get("repair_traces") or []),
             "requested_fields": list((target.get("verdict") or {}).get("fields_to_fix") or []),
             "had_original": had_original, "previous_failure_code": target.get("failure_code"),
             "previous_failure_reason": target.get("failure_reason"),
@@ -3721,6 +5159,17 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             "expected_assignment_fingerprint": ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get("assignment_fingerprint"),
             "expected_question_revision": ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get("question_revision"),
             "expected_question_fingerprint": ((state.get("slot_lifecycle") or {}).get(slot_id) or {}).get("question_fingerprint"),
+            "original_question": original_question,
+            "original_failure_findings": deepcopy(
+                (target.get("verdict") or {}).get("required_fixes") or [target.get("verdict") or {}]
+            ),
+            "repair_metadata": deepcopy((outcome.get("repair_metadata") or {}).get(qid) or fallback_metadata),
+            "previous_rejections": previous_rejections,
+            "unaffected_validation_roles": {
+                qid: deepcopy(
+                    (((state.get("validation_ledger") or {}).get(str(mn)) or {}).get(qid) or {}).get("specialized_roles") or {}
+                )
+            },
             "exam": staged_exam, "plans": staged_plans})
         if mn in validated_models:
             validated_models.remove(mn)
@@ -3732,11 +5181,16 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             "status": "candidate_generated", "failure_reason_received": target.get("failure_reason")})
 
     return {"repair_manifest": manifest, "repair_candidates": candidates,
-            "question_repair_attempts": attempts,
+            "question_repair_attempts": legacy_attempts,
+            "question_repair_calls": repair_calls,
+            "question_repair_failures": failures,
+            "slot_completion_attempts": completion_attempts,
+            "repair_working_candidates": working_candidates,
             "repair_replacement_memory": memory_by_slot,
             "repair_retry_seeds": retry_seeds,
             "validation_repair_history": history, "pending_revalidation_ids": {},
             "validated_models": validated_models, "warnings": warnings,
+            "repair_call_logs": repair_call_logs[-VALIDATOR_TRACE_MAX_ATTEMPTS:],
             "eval_stats": state.get("eval_stats")}
 
 
@@ -3747,7 +5201,9 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     section-level dependency. Every other target receives an isolated snapshot.
     """
     manifest = deepcopy(state.get("repair_manifest") or [])
-    active = [item for item in manifest if item.get("status") != "resolved"]
+    active = [item for item in manifest if item.get("status") not in {
+        "resolved", "validation_pending",
+    }]
     if len(active) < 2:
         return _repair_invalid_questions_serial(state)
 
@@ -3795,11 +5251,19 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         for item in manifest
     }
     attempts = dict(state.get("question_repair_attempts") or {})
+    repair_calls = dict(state.get("question_repair_calls") or {})
+    failures = dict(
+        state.get("question_repair_failures")
+        or state.get("question_repair_attempts") or {}
+    )
+    completion_attempts = dict(state.get("slot_completion_attempts") or {})
+    working_candidates = deepcopy(state.get("repair_working_candidates") or {})
     memory = deepcopy(state.get("repair_replacement_memory") or {})
     retry_seeds = deepcopy(state.get("repair_retry_seeds") or {})
     candidates: list[Dict[str, Any]] = []
     warnings = list(state.get("warnings") or [])
     history = list(state.get("validation_repair_history") or [])
+    repair_call_logs = list(state.get("repair_call_logs") or [])
     validated = set(state.get("validated_models") or [])
     for index in range(len(jobs)):
         result = completed[index]
@@ -3810,6 +5274,14 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             slot_id = str(target.get("slot_id") or "")
             if slot_id in (result.get("question_repair_attempts") or {}):
                 attempts[slot_id] = result["question_repair_attempts"][slot_id]
+            if slot_id in (result.get("question_repair_calls") or {}):
+                repair_calls[slot_id] = result["question_repair_calls"][slot_id]
+            if slot_id in (result.get("question_repair_failures") or {}):
+                failures[slot_id] = result["question_repair_failures"][slot_id]
+            if slot_id in (result.get("slot_completion_attempts") or {}):
+                completion_attempts[slot_id] = result["slot_completion_attempts"][slot_id]
+            if slot_id in (result.get("repair_working_candidates") or {}):
+                working_candidates[slot_id] = result["repair_working_candidates"][slot_id]
             if slot_id in (result.get("repair_replacement_memory") or {}):
                 memory[slot_id] = result["repair_replacement_memory"][slot_id]
             if slot_id in (result.get("repair_retry_seeds") or {}):
@@ -3817,6 +5289,7 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         candidates.extend(result.get("repair_candidates") or [])
         warnings.extend(result.get("warnings") or [])
         history.extend(result.get("validation_repair_history") or [])
+        repair_call_logs.extend(result.get("repair_call_logs") or [])
         validated.intersection_update(result.get("validated_models") or [])
 
     # One coordinator owns assignment/content reservations. Parallel workers may
@@ -3836,7 +5309,12 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
             values = section.get("items") if isinstance(section, dict) else section
             for question in values or []:
                 sid = str(question.get("slot_id") or "")
-                if sid:
+                lifecycle = (state.get("slot_lifecycle") or {}).get(sid) or {}
+                # Permanently failed candidates do not retain a reservation;
+                # active and finalized candidates still do.
+                if sid and lifecycle.get("current_status") not in {
+                    "FAILED_TO_REPAIR", "VALIDATION_BLOCKED",
+                }:
                     active_instances[sid] = assessment_instance_fingerprint(
                         (plan_by_model.get(mn) or {}).get(sid) or {}, question
                     )
@@ -3889,9 +5367,14 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
         "repair_manifest": ordered_manifest,
         "repair_candidates": candidates,
         "question_repair_attempts": attempts,
+        "question_repair_calls": repair_calls,
+        "question_repair_failures": failures,
+        "slot_completion_attempts": completion_attempts,
+        "repair_working_candidates": working_candidates,
         "repair_replacement_memory": memory,
         "repair_retry_seeds": retry_seeds,
         "validation_repair_history": history,
+        "repair_call_logs": repair_call_logs[-VALIDATOR_TRACE_MAX_ATTEMPTS:],
         "pending_revalidation_ids": {},
         "validated_models": sorted(validated),
         "warnings": warnings,

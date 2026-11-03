@@ -433,6 +433,111 @@ def test_slot_lifecycle_preserves_originating_failure_stage(
     assert result["m1_mcq_1"]["terminal_status"] == terminal_status
 
 
+def test_newer_pass_and_resolved_repair_clear_stale_terminal_failure():
+    records = initialize_slot_lifecycle([("mcq", 1)], 1)
+    records["m1_mcq_1"].update({
+        "planned": True,
+        "generated": True,
+        "question_id": "model1_mcq_1",
+        "validated": False,
+        "finalized": False,
+        "terminal_status": "repair_failed",
+        "failure_code": "repair_exhausted",
+        "failure_stage": "repair",
+    })
+    state = {
+        "generated_exams": [{
+            "model_number": 1,
+            "questions": {"mcq": [{
+                "slot_id": "m1_mcq_1",
+                "question_id": "model1_mcq_1",
+                "question": "Current repaired question",
+            }]},
+        }],
+        "validation_reports": [{
+            "model_number": 1,
+            "verdicts": [{
+                "question_id": "model1_mcq_1",
+                "action": "PASS",
+            }],
+        }],
+        "repair_manifest": [{
+            "slot_id": "m1_mcq_1",
+            "status": "resolved",
+        }],
+    }
+
+    result = reconcile_slot_lifecycle(records, state, stage="finalization")
+
+    assert result["m1_mcq_1"]["terminal_status"] == "finalized"
+    assert result["m1_mcq_1"]["finalized"] is True
+    assert result["m1_mcq_1"]["failure_code"] is None
+    assert result["m1_mcq_1"]["current_status"] == "PASS"
+
+
+@pytest.mark.parametrize(
+    ("manifest_status", "validation_status", "expected"),
+    [
+        ("invalid", "FAIL", "FAIL"),
+        ("repairing", "FAIL", "REPAIRING"),
+        ("validation_pending", "FAIL", "REVALIDATING"),
+        ("exhausted", "FAIL", "FAILED_TO_REPAIR"),
+        ("validation_blocked", "VALIDATION_BLOCKED", "VALIDATION_BLOCKED"),
+    ],
+)
+def test_lifecycle_projects_one_authoritative_current_status(
+    manifest_status, validation_status, expected,
+):
+    records = initialize_slot_lifecycle([("mcq", 1)], 1)
+    state = {
+        "generated_exams": [{
+            "model_number": 1,
+            "questions": {"mcq": [{
+                "slot_id": "m1_mcq_1", "question_id": "q1",
+                "question": "Question",
+            }]},
+        }],
+        "validation_reports": [{
+            "model_number": 1,
+            "verdicts": [{
+                "question_id": "q1", "action": "UNVALIDATED"
+                if validation_status == "VALIDATION_BLOCKED" else "FIX_QUESTION",
+                "validation_status": validation_status,
+                "failure_code": "validation_blocked"
+                if validation_status == "VALIDATION_BLOCKED" else "unsupported",
+            }],
+        }],
+        "repair_manifest": [{
+            "slot_id": "m1_mcq_1", "status": manifest_status,
+            "failure_code": "validation_blocked"
+            if manifest_status == "validation_blocked" else "unsupported",
+        }],
+    }
+
+    result = reconcile_slot_lifecycle(records, state, stage="repair")
+
+    assert result["m1_mcq_1"]["current_status"] == expected
+
+
+def test_pending_candidate_is_revalidating_and_does_not_mutate_history_twice():
+    records = initialize_slot_lifecycle([("mcq", 1)], 1)
+    state = {
+        "generated_exams": [{
+            "model_number": 1,
+            "questions": {"mcq": [{
+                "slot_id": "m1_mcq_1", "question_id": "q1",
+            }]},
+        }],
+        "repair_candidates": [{"slot_id": "m1_mcq_1", "question_id": "q1"}],
+    }
+    first = reconcile_slot_lifecycle(records, state, stage="repair")
+    second = reconcile_slot_lifecycle(first, state, stage="repair")
+
+    assert first["m1_mcq_1"]["current_status"] == "REVALIDATING"
+    assert second["m1_mcq_1"]["current_status"] == "REVALIDATING"
+    assert second["m1_mcq_1"]["history"] == first["m1_mcq_1"]["history"]
+
+
 def test_developer_diagnostic_preserves_original_exception_and_traceback():
     try:
         raise ValueError("original detail")

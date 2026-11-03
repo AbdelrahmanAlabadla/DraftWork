@@ -181,43 +181,57 @@ def test_twelve_mixed_revalidations_are_bounded_isolated_and_parallel(monkeypatc
     peak = 0
     completion_order: list[tuple[str, str]] = []
 
-    def fake_client(**_kwargs):
-        return object()
-
-    def fake_validate(exam, question_ids, _plans, _sources, _client=None, role="general"):
+    def fake_validate(exam, *, question_ids, **_kwargs):
         nonlocal active, peak
-        qid = list(question_ids)[0]
+        ids = list(question_ids)
+        qid = ids[0]
         # Reverse delays guarantee completion order differs from submission order.
         delay = 0.060 + (12 - int(qid[1:])) * 0.005
-        with scheduler.llm_request_slot(agent=role, operation="stress_validation"):
+        with scheduler.llm_request_slot(agent="specialized_validator", operation="stress_validation"):
             with lock:
                 active += 1
                 peak = max(peak, active)
             time.sleep(delay)
             with lock:
                 active -= 1
-                completion_order.append((qid, role))
-        if qid == "q5":
-            return {"model_number": 1, "all_pass": False, "warnings": [], "coverage": [],
-                    "verdicts": [{
-                        "question_id": qid,
-                        "action": "FIX_OPTIONS" if role == "general" else "FIX_ANSWER",
-                        "failure_code": "options" if role == "general" else "incorrect_calculation",
-                        "fields_to_fix": ["options"] if role == "general" else ["solution_steps"],
+                completion_order.append((",".join(ids), "specialized"))
+        verdicts = []
+        for current_qid in ids:
+            if current_qid == "q5":
+                verdicts.append({
+                        "question_id": current_qid,
+                        "action": "FIX_QUESTION_AND_ANSWER",
+                        "failure_code": "incorrect_calculation",
+                        "fields_to_fix": ["question", "solution_steps"],
                         "reason": "synthetic failure", "expected_fix": "repair",
-                        "validation_role": role,
-                    }]}
-        return {"model_number": 1, "all_pass": True, "warnings": [], "coverage": [],
-                "verdicts": [{"question_id": qid, "action": "PASS",
-                              "fields_to_fix": [], "validation_role": role}]}
+                        "validation_status": "FAIL",
+                        "required_fixes": [
+                            {"validator": "task_alignment", "failure_code": "wrong_givens",
+                             "fields_to_fix": ["question"], "reason": "wrong givens", "expected_fix": "fix"},
+                            {"validator": "quantitative", "failure_code": "incorrect_calculation",
+                             "fields_to_fix": ["solution_steps"], "reason": "bad math", "expected_fix": "fix"},
+                        ],
+                    })
+            else:
+                verdicts.append({"question_id": current_qid, "action": "PASS",
+                                 "fields_to_fix": [], "validation_status": "PASS"})
+        return {"model_number": 1, "all_pass": all(v["action"] == "PASS" for v in verdicts),
+                "warnings": [], "coverage": [], "verdicts": verdicts}
 
-    monkeypatch.setattr("app.llm.factory.create_review_client", fake_client)
-    monkeypatch.setattr(validator, "_validate_with_context", fake_validate)
+    monkeypatch.setattr("app.online.multi_validator.validate_exam_multi", fake_validate)
+    monkeypatch.setattr("app.online.duplicate_judge.request_structured", lambda _client, _prompt, **kwargs: {
+        "verdicts": [{
+            "pair_id": pair_id, "same_core_knowledge": "no",
+            "same_student_operation_or_method": "no", "same_target_or_result": "no",
+            "genuinely_new_reasoning": "yes",
+            "one_answer_substantially_gives_away_other": "no",
+        } for pair_id in kwargs.get("expected_ids") or []]
+    })
     active_exam = {"model_number": 1, "questions": {"word_problem": [
         _question(index, f"old {index}") for index in range(1, 13)
     ]}}
     plans = [{"model_number": 1, "items": {"word_problem": [{
-        "slot_id": f"s{index}", "question_type": "word_problem", "task_id": "task_speed",
+            "slot_id": f"s{index}", "question_type": "word_problem", "task_id": f"task_speed_{index}",
         "task_reused": True, "source_chunk_id": "c1", "support_chunk_ids": [],
     } for index in range(1, 13)]}}]
     candidates = [{
@@ -243,11 +257,11 @@ def test_twelve_mixed_revalidations_are_bounded_isolated_and_parallel(monkeypatc
     assert by_id["q5"]["question"] == "old 5"
     failed = next(item for item in result["repair_manifest"] if item["slot_id"] == "s5")
     assert [item["validator"] for item in failed["verdict"]["required_fixes"]] == [
-        "general", "stem_quantitative",
+        "task_alignment", "quantitative",
     ]
-    assert peak == 10
+    assert peak == 3
     assert completion_order != sorted(completion_order)
-    sequential_seconds = 2 * sum(0.060 + (12 - index) * 0.005 for index in range(1, 13))
+    sequential_seconds = sum(0.060 + (12 - index) * 0.005 for index in range(1, 13))
     assert elapsed < sequential_seconds
     print("repair_metrics", {"parallel_seconds": elapsed, "sequential_seconds": sequential_seconds,
                               "speedup": sequential_seconds / elapsed, "peak": peak,

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
+import pytest
 
 from app.llm.deepseek import DeepSeekNetworkError
 from app.online import assessment_catalog, duplicate_judge, duplicate_pipeline, validator
@@ -50,6 +52,7 @@ def _plan_item(task: dict, qid: str) -> dict:
     }
 
 
+@pytest.mark.skip(reason="legacy standalone duplicate graph lifecycle was removed by Duplicate Validation V2")
 def test_controlled_12_question_correctness_then_grouped_duplicate_flow(monkeypatch):
     # This lifecycle test expects one Judge call per scan. Parallel Judge
     # batching has dedicated coverage in test_performance_optimizations.py.
@@ -266,6 +269,22 @@ def test_failed_replacement_call_does_not_discard_successful_parallel_replacemen
         return qid, _sa(qid, "Distinct successful replacement", "new answer"), "why", []
 
     monkeypatch.setattr(duplicate_pipeline, "_generate_reserved", generate_one)
+    def choose_replacement(_client, prompt, **_kwargs):
+        context = json.loads(prompt.split("\n", 1)[1])
+        candidate = context["candidates"][0]
+        return {
+            "slot_to_replace": context["slot_to_replace"],
+            "conflicts_with": [], "conflict_reason": "mocked duplicate replacement",
+            "replacement_task_id": candidate.get("task_id"),
+            "replacement_fitb_entry_id": candidate.get("fitb_entry_id"),
+            "why_this_candidate_resolves_the_conflict": "mocked compatible candidate",
+            "checked_against_active_slots": True, "rejected_candidates": [],
+        }
+    monkeypatch.setattr("app.llm.client.request_structured", choose_replacement)
+    monkeypatch.setattr(
+        duplicate_pipeline, "_precommit_fallback_candidate",
+        lambda *_args, **_kwargs: (True, [], {}),
+    )
     state = {
         "generated_exams": [exam],
         "plans": plans,
@@ -434,6 +453,17 @@ def test_failed_original_regeneration_advances_to_other_used_task(monkeypatch):
     monkeypatch.setattr(
         duplicate_pipeline, "_precommit_fallback_candidate",
         lambda *_args, **_kwargs: (False, ["still duplicate"], {}),
+    )
+    monkeypatch.setattr(
+        "app.llm.client.request_structured",
+        lambda *_args, **_kwargs: {
+            "slot_to_replace": "s_q2", "conflicts_with": [],
+            "conflict_reason": "mocked duplicate replacement",
+            "replacement_task_id": task_a["task_id"],
+            "replacement_fitb_entry_id": None,
+            "why_this_candidate_resolves_the_conflict": "new practice variation",
+            "checked_against_active_slots": True, "rejected_candidates": [],
+        },
     )
     state = {
         "generated_exams": [exam], "plans": plans,
@@ -900,6 +930,114 @@ def test_compact_selector_blacklist_and_previous_failure_reach_second_attempt(mo
     assert selected["task_id"] == "next"
     assert context["previous_failures"][0]["candidate_id"] == "failed"
     assert "duplicate_after_replacement" in captured["prompt"]
+
+
+def test_selector_sends_only_top_five_and_never_embeds_historical_context(monkeypatch):
+    from app.llm import client as llm_client
+    captured = {}
+
+    def choose(_client, prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        return {
+            "slot_to_replace": "s9",
+            "replacement_task_id": "task_1",
+            "replacement_fitb_entry_id": None,
+            "checked_against_active_slots": True,
+            "rejected_candidates": [],
+        }
+
+    monkeypatch.setattr(llm_client, "request_structured", choose)
+    candidates = [{
+        "slot_id": "s9", "task_id": f"task_{index}",
+        "concept": f"concept_{index}", "task_operation": "solve",
+        "target": f"target_{index}", "source_chunk_id": f"c{index}",
+    } for index in range(1, 9)]
+    historical = {
+        "replacement_selector_context": {"recursive": "x" * 20_000},
+        "duplicate_replacement_selector_context": {"recursive": "y" * 20_000},
+        "task_id": "old",
+    }
+
+    selected, context = duplicate_pipeline._select_replacement_candidate(
+        slot_id="s9", qtype="equation", conflict_slots=[], conflict_edges=[],
+        candidates=candidates, active_items=[], blacklist=set(),
+        previous_failures=[{
+            "candidate_id": "old", "reason": "incorrect_result",
+            "replacement_selector_context": historical,
+        }],
+        failed_slot_context={
+            "slot_id": "s9", "question_id": "q9", "question_type": "equation",
+            "failure_code": "incorrect_result", "plan": historical,
+            "existing_question": {**historical, "question": "full text" * 1000},
+        },
+        existing_questions=[{
+            **historical, "question_id": "q1", "slot_id": "s1",
+            "question": "full question" * 1000, "solution_steps": ["step" * 1000],
+        }],
+    )
+
+    assert selected["task_id"] == "task_1"
+    assert len(context["candidates"]) == 5
+    assert context["eligible_candidate_count"] == 8
+    assert context["candidate_window_size"] == 5
+    assert captured["kwargs"]["operation"] == "catalog_replacement_selector"
+    assert "replacement_selector_context" not in captured["prompt"]
+    assert "duplicate_replacement_selector_context" not in captured["prompt"]
+    assert "full question" not in captured["prompt"]
+    assert len(captured["prompt"]) < 15_000
+
+
+def test_duplicate_scan_skips_unchanged_state_and_targets_changed_question(monkeypatch):
+    calls = []
+
+    def review(_exam, **kwargs):
+        calls.append(kwargs.get("changed_question_ids"))
+        return {
+            "candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
+            "similarity_distribution": {
+                "question_count": 2, "possible_pair_count": 1,
+                "evaluated_pair_count": 1, "candidate_count": 0,
+                "embedding_calls": 0,
+            },
+            "fact_cache": kwargs.get("fact_cache") or {},
+        }
+
+    monkeypatch.setattr(duplicate_pipeline, "review_duplicate_candidates", review)
+    exam = {"model_number": 1, "questions": {"mcq": [
+        _mcq("q1", "First question", "1"),
+        _mcq("q2", "Second question", "2"),
+    ]}}
+    plans = [{"model_number": 1, "items": {"mcq": [
+        _plan_item(_task("q1", "mcq"), "q1"),
+        _plan_item(_task("q2", "mcq"), "q2"),
+    ]}}]
+    state = {
+        "generated_exams": [exam], "plans": plans,
+        "validation_reports": [{"model_number": 1, "verdicts": [
+            {"question_id": "q1", "action": "PASS"},
+            {"question_id": "q2", "action": "PASS"},
+        ]}],
+        "duplicate_reports": [], "duplicate_similarity_distributions": [],
+        "duplicate_scan_count": 0, "duplicate_fact_cache": {},
+        "pending_revalidation_ids": {}, "duplicate_repair_rounds": 0,
+        "invalid_questions": [], "warnings": [],
+    }
+
+    first = duplicate_pipeline.scan_exam_duplicates(state)
+    assert calls == [None]
+    assert first["duplicate_scan_count"] == 1
+
+    unchanged_state = {**state, **first}
+    second = duplicate_pipeline.scan_exam_duplicates(unchanged_state)
+    assert calls == [None]
+    assert second["duplicate_scan_count"] == 1
+
+    changed_state = {**unchanged_state, **second}
+    changed_state["generated_exams"][0]["questions"]["mcq"][1]["question"] = "Changed question"
+    third = duplicate_pipeline.scan_exam_duplicates(changed_state)
+    assert calls[-1] == {"q2"}
+    assert third["duplicate_scan_count"] == 2
 
 
 def test_global_budget_prevents_extra_duplicate_judge_call(monkeypatch):

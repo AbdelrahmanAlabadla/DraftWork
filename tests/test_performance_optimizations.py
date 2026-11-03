@@ -144,7 +144,7 @@ def test_dynamic_usage_index_tracks_slots_and_questions():
     assert usage["t2"]["count"] == 1
 
 
-def test_duplicate_judge_runs_thirteen_independent_batches_with_ten_workers(monkeypatch):
+def test_duplicate_validator_runs_thirteen_independent_batches_with_ten_workers(monkeypatch):
     pairs = [{
         "pair_id": f"pair_{index}",
         "left": {"question_id": f"q{index}a", "question_type": "why",
@@ -154,10 +154,10 @@ def test_duplicate_judge_runs_thirteen_independent_batches_with_ten_workers(monk
     } for index in range(13)]
     monkeypatch.setattr(
         duplicate_judge, "shortlist_duplicate_pairs",
-        lambda _exam, _forced=None: (pairs, {"pair_count": 13}),
+        lambda _exam, *_args, **_kwargs: (pairs, {"candidate_count": 13}),
     )
-    monkeypatch.setattr(duplicate_judge, "DUPLICATE_JUDGE_BATCH_SIZE", 1)
-    monkeypatch.setattr(duplicate_judge, "MAX_PARALLEL_DUPLICATE_JUDGE_CALLS", 10)
+    monkeypatch.setattr(duplicate_judge, "DUPLICATE_VALIDATOR_BATCH_SIZE", 1)
+    monkeypatch.setattr(duplicate_judge, "MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS", 10)
     monkeypatch.setattr(duplicate_judge, "create_llm_client", lambda: SimpleNamespace(last_usage={}))
     active = 0
     peak = 0
@@ -280,14 +280,15 @@ def test_independent_repair_jobs_overlap_and_merge_by_slot(monkeypatch):
 
 
 def test_independent_candidate_revalidations_overlap_and_commit_separately(monkeypatch):
-    barrier = threading.Barrier(2)
+    scopes = []
 
     def fake_validate(exam, question_ids, *_args):
-        barrier.wait(timeout=2)
-        qid = list(question_ids)[0]
+        ids = list(question_ids)
+        scopes.append(ids)
         return {"model_number": 1, "all_pass": True, "warnings": [], "coverage": [],
                 "verdicts": [{"question_id": qid, "action": "PASS",
-                              "validation_role": "general", "fields_to_fix": []}]}
+                              "validation_role": "general", "fields_to_fix": []}
+                             for qid in ids]}
 
     monkeypatch.setattr(validator, "_validate_with_context", fake_validate)
     active_exam = {"model_number": 1, "questions": {"why": [
@@ -319,6 +320,7 @@ def test_independent_candidate_revalidations_overlap_and_commit_separately(monke
     assert [item["question"] for item in result["generated_exams"][0]["questions"]["why"]] == [
         "new 1", "new 2",
     ]
+    assert scopes == [["q1", "q2"]]
     assert all(item["status"] == "resolved" for item in result["repair_manifest"])
 
 

@@ -307,6 +307,10 @@ def _execute_adjustment(work: dict[str, Any]) -> dict[str, Any]:
         "task": _focused_task_input(original, qtype, actual, requested),
         "assigned_evidence": deepcopy(work["evidence"]),
         "occupied_task_summaries": deepcopy(work["occupied_tasks"]),
+        "difficulty_validator_findings": deepcopy(
+            work.get("validator_findings") or []
+        ),
+        "recovery_instruction": work.get("recovery_instruction") or "",
     }, ensure_ascii=False)
     response_model = _response_model_for(original, qtype, requested, evidence_ids)
     decision: PlanDifficultyAdjustmentDecision | None = None
@@ -600,7 +604,15 @@ def _apply_catalog_fallbacks(
                     if chosen is not None:
                         break
                 if chosen is None:
-                    item["difficulty_adaptation"] = {**adaptation, "status": "retained"}
+                    item["difficulty_adaptation"] = {
+                        **adaptation, "status": "accepted_source_constraint",
+                    }
+                    item["difficulty_status"] = "accepted_source_constraint"
+                    item["requested_difficulty"] = requested
+                    item["actual_difficulty"] = str(
+                        item.get("actual_difficulty") or item.get("difficulty") or "medium"
+                    )
+                    item["difficulty"] = item["actual_difficulty"]
                     item["difficulty_fallback_reason"] = (
                         item.get("difficulty_fallback_reason")
                         or "No compatible catalog alternative remained after three adjustment attempts."
@@ -614,6 +626,10 @@ def _apply_catalog_fallbacks(
                 )
                 replacement.update({
                     "requested_difficulty": requested,
+                    "difficulty_status": (
+                        "matched" if chosen_level == requested
+                        else "accepted_source_constraint"
+                    ),
                     "selected_replacement_task_id": chosen.get("task_id"),
                     "difficulty_fallback_reason": (
                         None if chosen_level == requested else
@@ -622,7 +638,10 @@ def _apply_catalog_fallbacks(
                     "adjustment_attempts": int(item.get("adjustment_attempts") or 0),
                     "adjustment_failure_reason": item.get("adjustment_failure_reason"),
                     "difficulty_adaptation": {
-                        "status": "fallback", "from_difficulty": item.get("actual_difficulty"),
+                        "status": (
+                            "fallback" if chosen_level == requested
+                            else "accepted_source_constraint"
+                        ), "from_difficulty": item.get("actual_difficulty"),
                         "to_difficulty": requested, "base_task_id": chosen.get("task_id"),
                         "strategy": "catalog_fallback", "failed_strategies": list(
                             adaptation.get("failed_strategies") or []
@@ -757,6 +776,114 @@ def adjust_plan_difficulty(state: dict[str, Any]) -> dict[str, Any]:
             "difficulty_adjustment_history": history,
             "difficulty_adjustment_attempts": attempts,
             "difficulty_verification_slot_ids": verification_ids}
+
+
+def adjust_failed_plan_slot(
+    *,
+    state: dict[str, Any],
+    plans: list[dict[str, Any]],
+    model_number: int,
+    slot_id: str,
+    question_type: str,
+    findings: list[dict[str, Any]],
+    attempt: int,
+) -> tuple[bool, dict[str, Any]]:
+    """Re-run Difficulty Adjustment for one validator-rejected assignment.
+
+    This is deliberately assignment-level recovery.  It never edits the generated
+    question and never traverses unrelated plan slots.  The regenerated question is
+    independently checked by the normal full candidate-validation path.
+    """
+    target: dict[str, Any] | None = None
+    siblings: list[dict[str, Any]] = []
+    for plan in plans:
+        if int(plan.get("model_number") or 0) != int(model_number):
+            continue
+        for qtype, values in (plan.get("items") or {}).items():
+            if qtype == question_type:
+                siblings = list(values or [])
+            for item in values or []:
+                if str(item.get("slot_id") or "") == slot_id:
+                    target = item
+                    question_type = str(qtype)
+    if target is None:
+        return False, {"status": "failed", "reason": "difficulty slot not found"}
+
+    requested = str(
+        target.get("requested_difficulty")
+        or state.get("difficulty")
+        or target.get("difficulty")
+        or "medium"
+    )
+    observed = next((
+        str(value.get("observed_difficulty"))
+        for value in findings
+        if value.get("observed_difficulty")
+    ), str(target.get("actual_difficulty") or target.get("difficulty") or "medium"))
+    chunks = {
+        str(chunk.get("child_id")): str(chunk.get("content") or "")
+        for chunk in state.get("retrieved_chunks") or [] if chunk.get("child_id")
+    }
+    evidence_ids = [
+        str(value) for value in (
+            [target.get("source_chunk_id")]
+            + list(target.get("support_chunk_ids") or [])
+        ) if value
+    ]
+    original = deepcopy(target)
+    adaptation = deepcopy(target.get("difficulty_adaptation") or {})
+    adaptation.update({
+        "status": "pending", "from_difficulty": observed,
+        "to_difficulty": requested,
+    })
+    work = {
+        "slot_id": slot_id,
+        "target_item": target,
+        "original": original,
+        "adaptation": adaptation,
+        "qtype": question_type,
+        "requested": requested,
+        "actual": observed,
+        "attempt": attempt,
+        "evidence_ids": evidence_ids,
+        "evidence": {key: chunks.get(key, "") for key in evidence_ids},
+        "occupied_tasks": [
+            {
+                "slot_id": other.get("slot_id"),
+                "task_family_id": other.get("task_family_id"),
+                "concept": other.get("concept"),
+                "task_operation": other.get("task_operation"),
+                "target": other.get("target"),
+                "actual_difficulty": other.get("actual_difficulty") or other.get("difficulty"),
+            }
+            for other in siblings if other is not target
+        ],
+        "domain": str((state.get("assessment_profile") or {}).get("domain") or ""),
+        "validator_findings": deepcopy(findings),
+        "recovery_instruction": (
+            "Revise the real cognitive requirements for this one assignment. Preserve every "
+            "mandatory operation and student work product. Do not merely change difficulty "
+            "labels or shorten the answer. If the immutable task cannot meet the requested "
+            "level, return adjustment_succeeded=false."
+        ),
+    }
+    result = _execute_adjustment(work)
+    audit: list[dict[str, Any]] = []
+    _apply_adjustment_result(target, result, audit)
+    accepted = bool(
+        (target.get("difficulty_adaptation") or {}).get("status") == "adapted"
+    )
+    return accepted, {
+        "status": "succeeded" if accepted else "failed",
+        "slot_id": slot_id,
+        "attempt": attempt,
+        "requested_difficulty": requested,
+        "observed_difficulty": observed,
+        "findings": deepcopy(findings),
+        "audit": audit,
+        "rejection_reasons": list(result.get("rejection_reasons") or []),
+        "failure": result.get("failure") or target.get("adjustment_failure_reason"),
+    }
 
 
 def adjust_generated_question(*, state: dict[str, Any], qtype: str, question: dict[str, Any],
