@@ -85,6 +85,80 @@ def test_catalog_compiles_once_then_reuses_exact_selection(monkeypatch, tmp_path
     assert first["assessment_catalog_key"] == second["assessment_catalog_key"]
 
 
+def test_catalog_reuses_identical_content_with_different_chunk_uuids(monkeypatch, tmp_path):
+    monkeypatch.setattr(catalog.config, "ASSESSMENT_CATALOG_CACHE_DIR", str(tmp_path))
+    calls = []
+    fake_client = SimpleNamespace(last_usage={})
+    monkeypatch.setattr(catalog, "create_assessment_compiler_client", lambda **_kw: fake_client)
+
+    def fake_request(_client, _prompt, **_kwargs):
+        calls.append(1)
+        return {
+            "assessment_profile": _profile("old-c1"),
+            "tasks": [{
+                "knowledge_anchor": "work equals force times displacement",
+                "concept": "mechanical work", "relationship": "W = Fd",
+                "task_operation": "explain", "student_work_product": "explanation",
+                "target": "meaning of work", "reasoning_mode": "conceptual_reasoning",
+                "allowed_question_types": ["why"], "evidence_chunk_ids": ["old-c1"],
+                "required_givens": [], "allowed_variations": [], "variable_givens": [],
+                "complexity_boundaries": [], "exact_source_instance": False,
+                "scenario_family": None, "text_answerable": True,
+                "native_difficulty": "medium", "prerequisites": [],
+            }],
+            "fitb_bank": [{
+                "answer": "work", "evidence_chunk_id": "old-c1",
+                "clue_basis": "force times displacement",
+            }],
+            "batch_complete": True,
+        }
+
+    monkeypatch.setattr(catalog, "request_structured", fake_request)
+    base = {
+        "processed_document_key": "same-processed-content",
+        "document_language": "en", "domain_type": "stem", "subject": "mathematics",
+    }
+    old = catalog.prepare_assessment_catalog({**base, "document_id": "old-doc", "retrieved_chunks": [{
+        "child_id": "old-c1", "parent_id": "old-p1", "child_order": 0,
+        "page_number": 1, "content": "Work is force times displacement.",
+    }]})
+    new = catalog.prepare_assessment_catalog({**base, "document_id": "new-doc", "retrieved_chunks": [{
+        "child_id": "new-c9", "parent_id": "new-p7", "child_order": 0,
+        "page_number": 1, "content": "Work is force times displacement.",
+    }]})
+
+    assert calls == [1]
+    assert old["assessment_catalog_cache_hit"] is False
+    assert new["assessment_catalog_cache_hit"] is True
+    payload = new["assessment_catalog"]
+    assert payload["selected_chunk_ids"] == ["new-c9"]
+    assert payload["tasks"][0]["evidence_chunk_ids"] == ["new-c9"]
+    assert payload["fitb_bank"][0]["evidence_chunk_id"] == "new-c9"
+    assert all(
+        ids == ["new-c9"]
+        for profile in payload["assessment_profile"]["question_types"].values()
+        if (ids := profile.get("evidence_chunk_ids"))
+    )
+
+
+def test_catalog_remap_rejects_ambiguous_or_incomplete_source_manifest():
+    payload = {
+        "selected_chunk_ids": ["old"],
+        "source_chunk_manifest": [
+            {"chunk_id": "old", "fingerprint": "same", "ordinal": 0},
+            {"chunk_id": "other", "fingerprint": "same", "ordinal": 1},
+        ],
+        "tasks": [], "fitb_bank": [],
+    }
+    current = [{"chunk_id": "new", "fingerprint": "same", "ordinal": 0}]
+    assert catalog._remap_catalog_evidence(payload, current) is None
+
+    payload["source_chunk_manifest"] = [
+        {"chunk_id": "old", "fingerprint": "missing", "ordinal": 0}
+    ]
+    assert catalog._remap_catalog_evidence(payload, current) is None
+
+
 def test_same_version_compatible_catalog_is_migrated_without_provider_call(
     monkeypatch, tmp_path,
 ):
@@ -167,8 +241,44 @@ def test_catalog_key_changes_with_selection_processed_version_and_logic(monkeypa
     assert one == catalog.catalog_cache_key("processed-a", ["c1", "c2"])
     assert one != catalog.catalog_cache_key("processed-a", ["c1"])
     assert one != catalog.catalog_cache_key("processed-b", ["c1", "c2"])
+    assert one != catalog.catalog_cache_key(
+        "processed-a", ["c1", "c2"], {"model": "different-compiler"}
+    )
     monkeypatch.setattr(catalog.config, "ASSESSMENT_CATALOG_VERSION", "catalog-next")
     assert one != catalog.catalog_cache_key("processed-a", ["c1", "c2"])
+
+
+def test_source_fingerprint_changes_with_content_or_provenance():
+    original = catalog._source_chunk_manifest([{
+        "child_id": "a", "parent_id": "p", "child_order": 0,
+        "page_number": 1, "content": "x + 1 = 2",
+    }], "processed")
+    changed_content = catalog._source_chunk_manifest([{
+        "child_id": "b", "parent_id": "q", "child_order": 0,
+        "page_number": 1, "content": "x + 2 = 3",
+    }], "processed")
+    changed_page = catalog._source_chunk_manifest([{
+        "child_id": "c", "parent_id": "r", "child_order": 0,
+        "page_number": 2, "content": "x + 1 = 2",
+    }], "processed")
+    assert original[0]["fingerprint"] != changed_content[0]["fingerprint"]
+    assert original[0]["fingerprint"] != changed_page[0]["fingerprint"]
+
+
+def test_catalog_remap_rejects_unmapped_nested_evidence_reference():
+    payload = {
+        "selected_chunk_ids": ["old"],
+        "source_chunk_manifest": [{
+            "chunk_id": "old", "fingerprint": "fp", "ordinal": 0,
+        }],
+        "tasks": [{
+            "evidence_chunk_ids": ["old"],
+            "allowed_variations": [{"evidence_chunk_ids": ["not-in-manifest"]}],
+        }],
+        "fitb_bank": [],
+    }
+    current = [{"chunk_id": "new", "fingerprint": "fp", "ordinal": 0}]
+    assert catalog._remap_catalog_evidence(payload, current) is None
 
 
 def test_finalizer_builds_separate_fitb_bank_and_allocates_entry_ids():

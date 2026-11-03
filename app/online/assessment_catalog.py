@@ -1190,6 +1190,7 @@ def _apply_effective_variation(
     item.update({
         "source_chunk_id": evidence[0] if evidence else item.get("source_chunk_id"),
         "support_chunk_ids": list(dict.fromkeys(evidence[1:])),
+        "source_evidence_ids": list(dict.fromkeys(evidence)),
         "canonical_skill": operation,
         "student_work_product": product,
         "target": target,
@@ -1248,6 +1249,148 @@ def _expand_compact_task(task: dict[str, Any]) -> dict[str, Any]:
     return expanded
 
 
+def _normalized_chunk_text(value: Any) -> str:
+    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split())
+
+
+def _source_chunk_manifest(
+    chunks: list[dict[str, Any]], processed_document_key: str,
+) -> list[dict[str, Any]]:
+    """Build document-row-independent identities for the selected evidence.
+
+    UUIDs remain in the manifest only as remapping endpoints.  Identity uses
+    normalized content, stable order/parent boundaries, provenance, and the
+    processed-document key (which already captures preprocessing versions).
+    """
+    parent_ordinals: dict[str, int] = {}
+    manifest: list[dict[str, Any]] = []
+    for ordinal, chunk in enumerate(chunks):
+        chunk_id = str(chunk.get("child_id") or "").strip()
+        if not chunk_id:
+            continue
+        raw_parent = str(chunk.get("parent_id") or f"__parent_at_{ordinal}")
+        parent_ordinal = parent_ordinals.setdefault(raw_parent, len(parent_ordinals))
+        metadata = chunk.get("metadata") if isinstance(chunk.get("metadata"), dict) else {}
+        provenance = {
+            key: chunk.get(key, metadata.get(key))
+            for key in (
+                "page", "page_number", "page_start", "page_end", "section",
+                "section_path", "start_char", "end_char", "child_order",
+            )
+            if chunk.get(key, metadata.get(key)) is not None
+        }
+        identity = {
+            "processed_document_key": processed_document_key,
+            "ordinal": ordinal,
+            "parent_ordinal": parent_ordinal,
+            "parent_content": _normalized_chunk_text(
+                chunk.get("parent_content") or metadata.get("parent_content")
+            ),
+            "content": _normalized_chunk_text(chunk.get("content")),
+            "provenance": provenance,
+        }
+        fingerprint = hashlib.sha256(
+            json.dumps(identity, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"), default=str).encode("utf-8")
+        ).hexdigest()
+        manifest.append({
+            "chunk_id": chunk_id,
+            "fingerprint": fingerprint,
+            "ordinal": ordinal,
+            "parent_ordinal": parent_ordinal,
+        })
+    return manifest
+
+
+def _manifest_id_mapping(
+    cached_manifest: list[dict[str, Any]], current_manifest: list[dict[str, Any]],
+) -> dict[str, str] | None:
+    """Return a complete one-to-one evidence map, rejecting ambiguity."""
+    def index(values: list[dict[str, Any]]) -> dict[str, dict[str, Any]] | None:
+        result: dict[str, dict[str, Any]] = {}
+        for value in values:
+            fingerprint = str(value.get("fingerprint") or "")
+            chunk_id = str(value.get("chunk_id") or "")
+            if not fingerprint or not chunk_id or fingerprint in result:
+                return None
+            result[fingerprint] = value
+        return result
+
+    cached = index(cached_manifest)
+    current = index(current_manifest)
+    if cached is None or current is None or set(cached) != set(current):
+        return None
+    if any(
+        int(cached[fp].get("ordinal", -1)) != int(current[fp].get("ordinal", -2))
+        for fp in cached
+    ):
+        return None
+    return {
+        str(cached[fp]["chunk_id"]): str(current[fp]["chunk_id"])
+        for fp in cached
+    }
+
+
+_EVIDENCE_ID_KEYS = frozenset({
+    "selected_chunk_ids", "evidence_chunk_ids", "source_chunk_ids",
+    "supporting_chunk_ids", "effective_evidence_chunk_ids",
+    "evidence_ids", "assigned_child_chunk_ids",
+})
+_EVIDENCE_ID_SCALAR_KEYS = frozenset({
+    "evidence_chunk_id", "source_chunk_id", "supporting_chunk_id", "child_id",
+})
+
+
+def _remap_catalog_evidence(
+    payload: dict[str, Any], current_manifest: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    cached_manifest = payload.get("source_chunk_manifest")
+    if not isinstance(cached_manifest, list):
+        # Safe lazy compatibility for historical entries is limited to exact
+        # document-specific IDs; cross-document migration without source
+        # fingerprints would be unverifiable.
+        current_ids = {str(row["chunk_id"]) for row in current_manifest}
+        return deepcopy(payload) if set(map(str, payload.get("selected_chunk_ids") or [])) == current_ids else None
+    mapping = _manifest_id_mapping(cached_manifest, current_manifest)
+    if mapping is None:
+        return None
+
+    unknown_reference = False
+
+    def walk(value: Any, key: str = "") -> Any:
+        nonlocal unknown_reference
+        if isinstance(value, dict):
+            return {child_key: walk(child, child_key) for child_key, child in value.items()}
+        if isinstance(value, list):
+            if key in _EVIDENCE_ID_KEYS:
+                remapped = []
+                for item in value:
+                    source_id = str(item)
+                    if source_id not in mapping:
+                        unknown_reference = True
+                        remapped.append(item)
+                    else:
+                        remapped.append(mapping[source_id])
+                return remapped
+            return [walk(item, key) for item in value]
+        if key in _EVIDENCE_ID_SCALAR_KEYS and value is not None:
+            source_id = str(value)
+            if source_id not in mapping:
+                unknown_reference = True
+                return value
+            return mapping[source_id]
+        return value
+
+    remapped = walk(deepcopy(payload))
+    if unknown_reference:
+        return None
+    remapped["source_chunk_manifest"] = deepcopy(current_manifest)
+    remapped["selected_chunk_ids"] = sorted(
+        str(row["chunk_id"]) for row in current_manifest
+    )
+    return remapped
+
+
 def catalog_cache_key(
     processed_document_key: str,
     selected_chunk_ids: list[str],
@@ -1264,9 +1407,13 @@ def catalog_cache_key(
         inspect.getsource(_catalog_prompt),
         json.dumps(AssessmentCatalogResponse.model_json_schema(), sort_keys=True),
     ))
+    ordered_membership = list(map(str, selected_chunk_ids))
     payload = {
         "processed_document_key": processed_document_key,
-        "selected_chunk_ids": sorted(set(map(str, selected_chunk_ids))),
+        "selected_source_membership": (
+            ordered_membership if all(value.startswith("chunkfp:") for value in ordered_membership)
+            else sorted(set(ordered_membership))
+        ),
         "catalog_version": config.ASSESSMENT_CATALOG_VERSION,
         # Deliberately exclude unrelated module text (logging, comments, imports).
         # Only behavior that can change a finalized catalog invalidates this cache.
@@ -1433,7 +1580,8 @@ def _write_compiler_cache(key: str, raw: dict[str, Any]) -> None:
 
 
 def _compatible_compiler_seed(
-    processed_document_key: str, selected_chunk_ids: list[str]
+    processed_document_key: str, selected_chunk_ids: list[str],
+    current_manifest: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Return a same-version, same-evidence Catalog without an LLM call.
 
@@ -1450,13 +1598,19 @@ def _compatible_compiler_seed(
         except (OSError, ValueError, TypeError):
             continue
         source_version = str(payload.get("catalog_version") or "")
+        candidate = (
+            _remap_catalog_evidence(payload, current_manifest)
+            if current_manifest is not None else deepcopy(payload)
+        )
+        if candidate is None:
+            continue
         migratable_version = source_version in {
             config.ASSESSMENT_CATALOG_VERSION,
             "catalog-v12-grouped-type-variations",
         }
         migrated_tasks: list[dict[str, Any]] = []
         migration_failed = False
-        for task in payload.get("tasks") or []:
+        for task in candidate.get("tasks") or []:
             migrated, diagnostics = _repair_catalog_numerical_contract(task)
             if any(item.get("disposition") == "quarantined" for item in diagnostics):
                 migration_failed = True
@@ -1467,22 +1621,22 @@ def _compatible_compiler_seed(
             migrated_tasks.append(migrated)
         if (
             migratable_version
-            and payload.get("processed_document_key") == processed_document_key
-            and sorted(set(map(str, payload.get("selected_chunk_ids") or []))) == selected
-            and payload.get("assessment_profile")
-            and payload["assessment_profile"].get("subject")
-            and payload["assessment_profile"].get("domain") in {"STEM", "NON_STEM"}
-            and bool(payload.get("tasks"))
-            and isinstance(payload.get("fitb_bank"), list)
+            and candidate.get("processed_document_key") == processed_document_key
+            and sorted(set(map(str, candidate.get("selected_chunk_ids") or []))) == selected
+            and candidate.get("assessment_profile")
+            and candidate["assessment_profile"].get("subject")
+            and candidate["assessment_profile"].get("domain") in {"STEM", "NON_STEM"}
+            and bool(candidate.get("tasks"))
+            and isinstance(candidate.get("fitb_bank"), list)
             and not migration_failed
             and all(_cached_task_contract_valid(task) for task in migrated_tasks)
         ):
             return {
-                "assessment_profile": payload["assessment_profile"],
+                "assessment_profile": candidate["assessment_profile"],
                 "tasks": migrated_tasks,
-                "fitb_bank": payload["fitb_bank"],
+                "fitb_bank": candidate["fitb_bank"],
                 "catalog_compilation_complete": True,
-                "recovered_batch_count": int(payload.get("recovered_batch_count") or 0),
+                "recovered_batch_count": int(candidate.get("recovered_batch_count") or 0),
             }
     return None
 
@@ -1682,6 +1836,7 @@ Complete selected source:
 def _finalize_catalog(
     raw: dict[str, Any], *, key: str, processed_document_key: str,
     selected_chunk_ids: list[str], usage: dict[str, Any] | None,
+    source_chunk_manifest: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     valid_ids = set(map(str, selected_chunk_ids))
     finalized: list[dict[str, Any]] = []
@@ -1899,6 +2054,7 @@ def _finalize_catalog(
         "catalog_version": config.ASSESSMENT_CATALOG_VERSION,
         "processed_document_key": processed_document_key,
         "selected_chunk_ids": sorted(valid_ids),
+        "source_chunk_manifest": deepcopy(source_chunk_manifest or []),
         "assessment_profile": profile,
         "tasks": finalized,
         "fitb_bank": fitb_bank,
@@ -2071,7 +2227,11 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
             ],
         }
     selected = [str(chunk.get("child_id")) for chunk in chunks if chunk.get("child_id")]
-    membership = _catalog_source_membership(chunks)
+    processed_key = str(state.get("processed_document_key") or state.get("document_id") or "")
+    source_manifest = _source_chunk_manifest(chunks, processed_key)
+    membership = [
+        f"chunkfp:{row['fingerprint']}" for row in source_manifest
+    ]
     compiler_identity = {
         **compiler_identity,
         "batching": CATALOG_BATCHING_VERSION,
@@ -2079,9 +2239,10 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
             json.dumps(membership, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         ).hexdigest(),
     }
-    processed_key = str(state.get("processed_document_key") or state.get("document_id") or "")
-    key = catalog_cache_key(processed_key, selected, compiler_identity)
+    key = catalog_cache_key(processed_key, membership, compiler_identity)
     cached = _read_cache(key)
+    if cached is not None:
+        cached = _remap_catalog_evidence(cached, source_manifest)
     if cached is not None and not _cached_catalog_matches_evidence(
         cached, processed_key, selected
     ):
@@ -2113,7 +2274,7 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
     compiler_cache_hit = raw is not None
     compatibility_cache_hit = False
     if raw is None:
-        raw = _compatible_compiler_seed(processed_key, selected)
+        raw = _compatible_compiler_seed(processed_key, selected, source_manifest)
         if raw is not None:
             compatibility_cache_hit = True
             compiler_cache_hit = True
@@ -2275,6 +2436,7 @@ def prepare_assessment_catalog(state: dict[str, Any]) -> dict[str, Any]:
     payload = _finalize_catalog(
         raw if isinstance(raw, dict) else {}, key=key,
         processed_document_key=processed_key, selected_chunk_ids=selected,
+        source_chunk_manifest=source_manifest,
         usage=compiler_usage or (
             getattr(client, "last_usage", None) if client is not None else {}
         ),
@@ -2392,6 +2554,16 @@ def materialize_plan_item(
         "exact_source_instance": bool(task.get("exact_source_instance", False)),
         "text_answerable": task.get("text_answerable") is True,
         "reasoning_mode": task.get("reasoning_mode"),
+        "requires_quantitative_validation": bool(
+            task.get("requires_quantitative_validation")
+            or task.get("reasoning_mode") in {
+                "calculation", "symbolic_manipulation", "derivation_relationship",
+                "law_or_theorem_application", "estimation_reasonableness",
+            }
+            or any(word in str(task.get("task_operation") or "").casefold() for word in (
+                "calculate", "compute", "solve", "derive", "balance", "evaluate", "convert",
+            ))
+        ),
         "difficulty": difficulty,
         "requested_difficulty": difficulty,
         "actual_difficulty": difficulty,
