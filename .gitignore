@@ -10,3 +10,15 @@ tmp/
 *.log
 .idea/
 artifacts/
+
+# Generated forensic/replay material and local database backups.  These can
+# contain production-derived content, checkpoints, exports, or credentials and
+# are intentionally kept out of source control.
+/all_markdown_files/
+/backups/
+/exam_forensic_*/
+/live_exam_replay/
+/DraftWork_Forensic_Report.zip
+/exam_forensic_*.zip
+/*_AUDIT.md
+/*_REPORT.md
