@@ -26,7 +26,7 @@ from app.exports.common import (
     response_line_count,
 )
 from app.language import detect_language
-from app.exports.math_renderer import render_math
+from app.exports.math_renderer import latex_to_plain_text, render_math
 
 PAGE_MARGIN_MM = 12.7  # exactly 0.5 inch
 FOOTER_Y_MM = -9.5
@@ -315,10 +315,24 @@ def _draw_mixed_math(
     x = pdf.l_margin if x is None else x
     width = pdf.epw if width is None else width
     start_y = pdf.get_y()
-    for kind, value in split_equation_content(text, undelimited_as_math=False):
+    parts = split_equation_content(text, undelimited_as_math=False)
+    if parts and all(
+        kind == "text" or latex_to_plain_text(value) is not None
+        for kind, value in parts
+    ):
+        inline = " ".join(
+            value if kind == "text" else str(latex_to_plain_text(value))
+            for kind, value in parts
+        )
+        pdf.set_xy(x, pdf.get_y())
+        pdf.set_font(BODY_FONT, "B" if bold else "", BODY_SIZE if bold else 10.5)
+        pdf.multi_cell(width, line_height, inline, align=_align(pdf, inline),
+                       new_x="LEFT", new_y="NEXT")
+        return pdf.get_y() - start_y
+    for kind, value in parts:
         if kind == "text":
             pdf.set_xy(x, pdf.get_y())
-            pdf.set_font(BODY_FONT, "B" if bold else "", BODY_SIZE if bold else 9.6)
+            pdf.set_font(BODY_FONT, "B" if bold else "", BODY_SIZE if bold else 10.5)
             pdf.multi_cell(width, line_height, value, align=_align(pdf, value),
                            new_x="LEFT", new_y="NEXT")
             continue
@@ -603,6 +617,14 @@ def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
     number_gutter = 12.0
     equation_width = pdf.epw - (2 * number_gutter)
     parts = split_equation_content(equation)
+    if (parts and any(kind == "text" for kind, _ in parts)
+            and not re.search(r"\$\$|\\\[", equation)
+            and all(kind == "text" or latex_to_plain_text(value) is not None
+                    for kind, value in parts)):
+        parts = [("text", " ".join(
+            value if kind == "text" else str(latex_to_plain_text(value))
+            for kind, value in parts
+        ))]
     equation_h = 0.0
     layouts = []
     for kind, value in parts:
@@ -764,21 +786,10 @@ def _draw_answer_key(
                     _clean(item.get("final_answer"), "(missing final answer)"),
                 ]
                 for value in values:
-                    rendered = render_math(value)
-                    if rendered:
-                        natural_w = rendered.width_px / 220 * 25.4
-                        natural_h = rendered.height_px / 220 * 25.4
-                        width = min(pdf.epw - 12, natural_w)
-                        height = natural_h * (width / natural_w if natural_w else 1.0)
-                        pdf.ensure_space(height + 2)
-                        stream = io.BytesIO(rendered.png)
-                        stream.name = "answer-equation.png"
-                        pdf.image(stream, x=pdf.l_margin + (pdf.epw - width) / 2,
-                                  y=pdf.get_y(), w=width, h=height)
-                        pdf.set_y(pdf.get_y() + height + 1.5)
-                    else:
-                        pdf.multi_cell(0, 5.0, value, align="C",
-                                       new_x="LEFT", new_y="NEXT")
+                    _draw_mixed_math(
+                        pdf, value, x=pdf.l_margin + 6,
+                        width=pdf.epw - 12, line_height=5.0,
+                    )
                 pdf.ln(1)
                 continue
             answer = _answer_text(item, language=pdf.language)

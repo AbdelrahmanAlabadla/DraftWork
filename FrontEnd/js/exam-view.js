@@ -231,8 +231,12 @@ function addStudentSection(paper, qtype, label, questions, language, examLabels)
     if (qtype === "mcq") {
       const options = element("div", "preview-options");
       Object.keys(item.options || {}).sort().forEach((letter) => {
-        const optionText = `${letter}. ${item.options[letter]}`;
-        options.appendChild(contentElement("div", "preview-option", optionText, language));
+        const option = element("div", "preview-option");
+        option.appendChild(element("span", "preview-option-marker", `${letter}.`));
+        const content = element("span", "preview-option-content");
+        renderMixedMath(content, clean(item.options[letter]), language);
+        option.appendChild(content);
+        options.appendChild(option);
       });
       question.appendChild(options);
     } else if (["why", "equation", "word_problem", "essay"].includes(qtype)) {

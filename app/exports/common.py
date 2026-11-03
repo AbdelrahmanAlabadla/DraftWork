@@ -138,7 +138,14 @@ def split_equation_content(
         cursor = match.end()
     tail = text[cursor:].strip()
     if tail:
-        result.append(("text" if result or not undelimited_as_math else "math", tail))
+        display_environment = bool(re.search(
+            r"\\begin\{(?:aligned|array|cases|matrix|bmatrix|pmatrix)\}", tail
+        ))
+        result.append((
+            "math" if display_environment or (not result and undelimited_as_math)
+            else "text",
+            tail,
+        ))
     return result
 
 
