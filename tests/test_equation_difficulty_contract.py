@@ -192,7 +192,7 @@ def test_hard_allocation_prefers_native_hard_before_fallback_candidate():
     assert issues == []
     assert item["base_catalog_task_id"] == "hard"
     assert item["actual_difficulty"] == "hard"
-    assert item["difficulty_adaptation"] is None
+    assert item["difficulty_design"]["status"] == "not_required"
 
 
 def test_hard_shortage_keeps_medium_as_pending_grounded_adaptation():
@@ -204,7 +204,7 @@ def test_hard_shortage_keeps_medium_as_pending_grounded_adaptation():
     assert issues == []
     assert item["requested_difficulty"] == "hard"
     assert item["actual_difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "pending"
+    assert item["difficulty_design"]["status"] == "pending"
     assert item["base_catalog_task_id"] == "medium"
 
 
@@ -224,8 +224,8 @@ def test_exhausted_hard_adaptation_records_honest_medium_fallback(monkeypatch):
     assert result["plan_errors"] == []
     assert item["requested_difficulty"] == "hard"
     assert item["actual_difficulty"] == item["difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "accepted_source_constraint"
-    assert item["adjustment_attempts"] == 3
+    assert item["difficulty_design"]["status"] == "accepted_source_constraint"
+    assert item["adjustment_attempts"] == 1
     assert item["difficulty_fallback_reason"]
 
 

@@ -18,9 +18,11 @@ from app.llm.schemas import (
     planner_response_model,
     strict_json_schema,
 )
+from app.llm.schemas import DIFFICULTY_DESIGN_STATUSES
 from app.logging_conf import get_logger
 from app.online.assessment_catalog import (
     CANONICAL_TASK_ID_FIELDS,
+    apply_difficulty_fallback_metadata,
     apply_canonical_task_ids,
     is_authorized_catalog_exhaustion_reuse,
     is_authorized_fitb_entry_reuse,
@@ -240,6 +242,8 @@ def parse_plans(raw: object, num_models: int) -> list[dict[str, Any]]:
                     ],
                     "exact_source_instance": bool(q.get("exact_source_instance", False)),
                     "text_answerable": q.get("text_answerable", True),
+                    "requires_supplied_graph": q.get("requires_supplied_graph"),
+                    "subject": q.get("subject"),
                     "reasoning_mode": str(q.get("reasoning_mode") or "").strip(),
                     "difficulty": str(q.get("difficulty") or "").strip().lower(),
                     "idea_to_test": idea,
@@ -606,11 +610,15 @@ def validate_plans(
                         entry[field] = None
                     identity_complete = bool(entry.get("fitb_entry_id"))
                 else:
-                    preserved_family_id = (
-                        entry.get("task_family_id")
-                        if entry.get("difficulty_adaptation") else None
-                    )
-                    identity_complete = apply_canonical_task_ids(entry)
+                    preserved_family_id = entry.get("task_family_id")
+                    if entry.get("base_catalog_task_id"):
+                        # Catalog identity and family are immutable; validation must
+                        # not rewrite them from the current wording.
+                        identity_complete = bool(
+                            entry.get("task_id") and entry.get("base_catalog_task_id")
+                        )
+                    else:
+                        identity_complete = apply_canonical_task_ids(entry)
                     if identity_complete and preserved_family_id:
                         if not entry.get("effective_instance_id"):
                             entry["derived_task_id"] = entry.get("task_id")
@@ -690,14 +698,34 @@ def validate_plans(
                 slot_difficulty = str(entry.get("difficulty") or "")
                 if slot_difficulty not in {"easy", "medium", "hard"}:
                     errors.append(f"Slot {sid} has an invalid difficulty.")
-                elif requested_difficulty in {"easy", "medium", "hard"} and (
-                    slot_difficulty != requested_difficulty
-                ) and not entry.get("difficulty_fallback_reason") and (
-                    (entry.get("difficulty_adaptation") or {}).get("status") != "pending"
-                ):
-                    errors.append(
-                        f"Slot {sid} difficulty must be {requested_difficulty}."
-                    )
+                design = entry.get("difficulty_design")
+                if design is not None:
+                    if not isinstance(design, dict):
+                        errors.append(f"Slot {sid} has malformed difficulty-design metadata.")
+                    else:
+                        design_status = str(design.get("status") or "")
+                        if design_status not in DIFFICULTY_DESIGN_STATUSES:
+                            errors.append(
+                                f"Slot {sid} has invalid difficulty-design status "
+                                f"{design_status!r}."
+                            )
+                        elif design_status in {"pending", "not_required"} and (
+                            entry.get("effective_instance_id")
+                            or design.get("effective_instance_id")
+                        ):
+                            errors.append(
+                                f"Slot {sid} has {design_status} difficulty metadata with "
+                                "a designed effective-instance identity."
+                            )
+                        elif design_status == "designed" and not entry.get(
+                            "effective_instance_id"
+                        ):
+                            errors.append(
+                                f"Slot {sid} has designed difficulty metadata without an "
+                                "effective-instance identity."
+                            )
+                # Difficulty is a prior only: a mismatch is reported through
+                # difficulty_design/difficulty_observation, never as a plan error.
                 adaptation_status = str(
                     (entry.get("difficulty_adaptation") or {}).get("status") or ""
                 )
@@ -824,25 +852,49 @@ def validate_plans(
                         )
                     elif entry.get("effective_instance_id"):
                         adaptation = entry.get("difficulty_adaptation") or {}
+                        design = entry.get("difficulty_design") or {}
+                        effective_givens = list(entry.get("effective_givens") or [])
+                        adapted_ok = (
+                            adaptation.get("status") == "adapted"
+                            and adaptation.get("base_variation_id") == selected_id
+                            and adaptation.get("effective_instance_id")
+                            == entry.get("effective_instance_id")
+                        )
+                        designed_ok = (
+                            design.get("status") == "designed"
+                            and design.get("effective_instance_id")
+                            == entry.get("effective_instance_id")
+                        )
                         if (
-                            adaptation.get("status") != "adapted"
-                            or adaptation.get("base_variation_id") != selected_id
-                            or adaptation.get("effective_instance_id")
-                            != entry.get("effective_instance_id")
-                            or list(entry.get("effective_givens") or [])
+                            not (adapted_ok or designed_ok)
+                            or effective_givens
                             != list(entry.get("given_conditions") or [])
                         ):
                             errors.append(
                                 f"Slot {sid} has inconsistent effective-instance metadata."
                             )
-                if (
-                    _VISUAL_DEPENDENCY_RE.search(str(entry.get("idea_to_test") or ""))
-                    and not (required_givens or given_conditions)
-                ):
-                    errors.append(
-                        f"Slot {sid} appears to depend on a visual representation but does not "
-                        "list the text givens needed to make it self-contained."
+                        adjustment_kind = str(design.get("adjustment_kind") or "")
+                        source_givens = list(selected.get("givens") or [])
+                        numerical_instance = bool(
+                            adjustment_kind in {"numerical", "combined"}
+                            or (source_givens and effective_givens != source_givens)
+                        )
+                        from app.online.models import numeric_variation_allowed
+                        numerical_authorized = numeric_variation_allowed(entry)
+                        if numerical_instance and not numerical_authorized:
+                            errors.append(
+                                f"Slot {sid} has unauthorized effective numerical givens."
+                            )
+                if not (required_givens or given_conditions):
+                    from app.online.assessment_catalog import (
+                        requires_unsupported_supplied_graph,
                     )
+                    if requires_unsupported_supplied_graph(entry):
+                        errors.append(
+                            f"Slot {sid} appears to depend on a visual representation that cannot "
+                            "be supplied: the student must read a graph/figure that is not present "
+                            "as text. Choose a source-supported alternative angle."
+                        )
                 key = duplicate_task_key(entry)
                 if not all(key[:2]):
                     continue
@@ -914,7 +966,9 @@ def validate_plans(
 
     # Models may share a concept for equivalent coverage. Only an effectively
     # identical idea assignment is rejected across models.
-    concepts_by_type: dict[str, list[tuple[int, str, set[str]]]] = {}
+    concepts_by_type: dict[
+        str, list[tuple[int, str, set[str], dict[str, Any]]]
+    ] = {}
     for model in plans:
         number = model["model_number"]
         for qtype in VALID_TYPES:
@@ -925,15 +979,29 @@ def validate_plans(
             concepts_by_type.setdefault(qtype, [])
             for index, entry in enumerate(model["items"].get(qtype) or [], start=1):
                 concepts_by_type[qtype].append(
-                    (number, slot_id(number, qtype, index), _concept_tokens(entry))
+                    (
+                        number,
+                        slot_id(number, qtype, index),
+                        _concept_tokens(entry),
+                        entry,
+                    )
                 )
 
     for qtype, entries in concepts_by_type.items():
         for i in range(len(entries)):
-            num_i, sid_i, toks_i = entries[i]
+            num_i, sid_i, toks_i, item_i = entries[i]
             for j in range(i + 1, len(entries)):
-                num_j, sid_j, toks_j = entries[j]
+                num_j, sid_j, toks_j, item_j = entries[j]
                 if num_i == num_j:
+                    continue
+                # The Catalog allocator is allowed to reuse a compatible task
+                # only after its unused inventory is exhausted.  That explicit
+                # contract names the prior slot and the distinctions the
+                # generated instance must realize.  Planning cannot inspect the
+                # eventual question, so leave that pair to the actual-question
+                # cross-model Duplicate V2 stage instead of rejecting it from
+                # token overlap alone.
+                if _authorized_reuse_pair(item_i, sid_i, item_j, sid_j):
                     continue
                 if _concept_overlap(toks_i, toks_j) >= 0.85:
                     errors.append(
@@ -978,11 +1046,11 @@ def finalize_plans(
                     for field in CANONICAL_TASK_ID_FIELDS:
                         item[field] = None
                 else:
-                    preserved_family_id = (
-                        item.get("task_family_id")
-                        if item.get("difficulty_adaptation") else None
-                    )
-                    apply_canonical_task_ids(item)
+                    preserved_family_id = item.get("task_family_id")
+                    # Catalog-bound items already own canonical identity. Recomputing
+                    # it would rewrite immutable task family metadata.
+                    if not item.get("base_catalog_task_id"):
+                        apply_canonical_task_ids(item)
                     if preserved_family_id:
                         if not item.get("effective_instance_id"):
                             item["derived_task_id"] = item.get("task_id")
@@ -1188,7 +1256,7 @@ def _safe_dumps(raw: object) -> str:
 
 def plan_exams(state: ExamState) -> dict[str, Any]:
     """First planning call (all models at once). Shared across the workflow."""
-    from app.online.assessment_catalog import allocate_catalog_plan
+    from app.online.assessment_catalog import allocate_catalog_plan, build_planner_index
 
     document_id = state.get("document_id")
     tasks = state.get("tasks") or []
@@ -1228,6 +1296,7 @@ def plan_exams(state: ExamState) -> dict[str, Any]:
         )
         return {
             "plans": plans,
+            "assessment_catalog_planner_index": build_planner_index(catalog),
             "assessment_profile": profile,
             "planning_issues": planning_issues,
             "plan_errors": errors,
@@ -1635,11 +1704,12 @@ def _semantic_catalog_replacement(
 ) -> dict[str, Any] | None:
     """Ask for a grounded repair goal, then enforce that goal against catalog tasks."""
     from app.online.assessment_catalog import (
-        _difficulty_for,
-        _replacement_representation_rank,
+        _native_difficulty,
+        build_task_usage_index,
         compatible_task_inventory,
         eligible_task_variations,
         materialize_plan_item,
+        rank_task_variation_candidates,
     )
 
     catalog = state.get("assessment_catalog") or {}
@@ -1655,34 +1725,36 @@ def _semantic_catalog_replacement(
     }
     difficulty = str(state.get("difficulty") or "mix")
     represented = [item for slot, item in items.items() if slot != sid]
-    used_ids = {str(item.get("task_id") or "") for item in represented if item.get("task_id")}
-    candidates: list[dict[str, Any]] = []
+    usage = build_task_usage_index(plans)
+    raw_candidates: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     for task in catalog.get("tasks") or []:
         task_id = str(task.get("task_id") or "")
         evidence = [str(value) for value in task.get("evidence_chunk_ids") or []]
-        level = _difficulty_for(task, difficulty)
+        level = _native_difficulty(task) or "medium"
         if (
             not task_id or task_id == str(current.get("task_id") or "")
             or not eligible_task_variations(task, qtype)
-            or level is None or task.get("text_answerable") is not True
+            or task.get("text_answerable") is not True
             or not evidence or any(value not in valid_chunk_ids for value in evidence)
         ):
             continue
         materialized = materialize_plan_item(task, sid, level)
         if not _candidate_resolves_conflicts(materialized, conflicts):
             continue
-        rank = _replacement_representation_rank(
-            task, represented, include_task_usage=True
+        variation = eligible_task_variations(task, qtype)[0]
+        raw_candidates.append((task, level, variation))
+    candidates: list[dict[str, Any]] = []
+    for task, level, variation in rank_task_variation_candidates(
+        raw_candidates, question_type=qtype, requested_difficulty=difficulty,
+        task_usage=usage,
+    ):
+        materialized = materialize_plan_item(
+            task, sid, level, selected_variation_id=variation.get("variation_id")
         )
         candidates.append({
             **_repair_semantic_record(materialized),
-            "selection_type": "intentional_reuse" if task_id in used_ids else "unused_task",
-            "representation_rank": list(rank),
+            "task_usage": int(usage.get(str(task.get("task_id") or ""), 0)),
         })
-    candidates.sort(key=lambda value: (
-        value["selection_type"] != "unused_task",
-        *value["representation_rank"], str(value.get("task_id") or ""),
-    ))
     if not candidates:
         return None
     prompt = (
@@ -1690,7 +1762,8 @@ def _semantic_catalog_replacement(
         "then select only a replacement_task_id from the supplied candidates. The replacement must "
         "change the assessed operation, target/result, reasoning path, or student work product in a "
         "material way. Changing wording, numbers, or scenario alone is invalid. Prefer unused_task. "
-        "Choose intentional_reuse only when no unused candidate resolves the conflict.\n\n"
+        "The candidates are already ordered by the authoritative task selector. Select the first "
+        "candidate that genuinely resolves the stated semantic conflict; do not re-rank them.\n\n"
         f"Broken slot:\n{json.dumps(_repair_semantic_record(current), ensure_ascii=False)}\n\n"
         f"Conflicting slots:\n{json.dumps([_repair_semantic_record(x) for x in conflicts], ensure_ascii=False)}\n\n"
         f"Validation errors:\n{json.dumps(_slot_errors(errors, sid), ensure_ascii=False)}\n\n"
@@ -1726,7 +1799,7 @@ def _semantic_catalog_replacement(
         if str(task.get("task_id") or "") == str(parsed.replacement_task_id)
     )
     replacement = materialize_plan_item(
-        task, sid, _difficulty_for(task, difficulty) or str(current.get("difficulty") or "medium")
+        task, sid, _native_difficulty(task) or str(current.get("difficulty") or "medium")
     )
     if not _candidate_resolves_conflicts(replacement, conflicts):
         return None
@@ -1770,7 +1843,7 @@ def _deterministic_variation_replacements(
 ) -> list[dict[str, Any]]:
     """Try other self-contained angles of the same catalog task before an LLM repair."""
     from app.online.assessment_catalog import (
-        _difficulty_for,
+        _native_difficulty,
         eligible_task_variation_candidates,
         materialize_plan_item,
     )
@@ -1790,7 +1863,7 @@ def _deterministic_variation_replacements(
         return []
     difficulty = str(state.get("difficulty") or "mix")
     level = (
-        _difficulty_for(task, difficulty)
+        _native_difficulty(task)
         or str(current.get("difficulty") or "medium")
     )
     current_signature = (
@@ -1829,9 +1902,9 @@ def _deterministic_catalog_replacements(
 ) -> list[dict[str, Any]]:
     """Rank every valid document task without restricting replacement topic."""
     from app.online.assessment_catalog import (
-        _difficulty_for, _native_difficulty, eligible_task_variation_candidates,
-        materialize_plan_item, normalize_planner_diversity_text,
-        score_task_variation_candidate,
+        _native_difficulty, build_task_usage_index,
+        eligible_task_variation_candidates, materialize_plan_item,
+        rank_task_variation_candidates,
     )
 
     current = _plan_items_by_slot(plans).get(sid) or {}
@@ -1846,23 +1919,13 @@ def _deterministic_catalog_replacements(
     requested = str(state.get("difficulty") or "mix")
     failed = set(map(str, state.get("plan_failed_candidate_ids") or []))
 
-    def count(field: str, value: Any) -> int:
-        return sum(str(item.get(field) or "") == str(value or "") for item in represented)
-
-    def normalized_count(field: str, value: Any) -> int:
-        key = normalize_planner_diversity_text(value)
-        return sum(
-            normalize_planner_diversity_text(item.get(field)) == key
-            for item in represented if key
-        )
-
-    ranked: list[tuple[int, str, str, dict[str, Any]]] = []
+    raw: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
     for task in (state.get("assessment_catalog") or {}).get("tasks") or []:
         task_id = str(task.get("task_id") or "")
         if not task_id or task_id == str(current.get("base_catalog_task_id") or current.get("task_id") or ""):
             continue
-        exact_level = _difficulty_for(task, requested)
-        level = exact_level or _native_difficulty(task)
+        exact_level = _native_difficulty(task) or "medium"
+        level = exact_level
         if level is None:
             continue
         for variation in eligible_task_variation_candidates(
@@ -1874,52 +1937,43 @@ def _deterministic_catalog_replacements(
             )
             if candidate_key in failed:
                 continue
-            scenario = variation.get("application")
-            if scenario is None:
-                scenario = task.get("scenario_family")
-            target = variation.get("target") or task.get("target")
-            group_id = str(variation.get("variation_group_id") or "")
-            score = score_task_variation_candidate(
-                task, variation, requested_difficulty=requested,
-                task_uses=sum(
-                    str(item.get("base_catalog_task_id") or item.get("task_id") or "") == task_id
-                    for item in represented
-                ),
-                scenario_uses=normalized_count("scenario_family", scenario),
-                target_uses=normalized_count("target", target),
-                variation_group_uses=count("selected_variation_group_id", group_id),
-            )["score"]
+            raw.append((task, level, variation))
+    usage = build_task_usage_index(plans, excluding_slot_id=sid)
+    ranked: list[dict[str, Any]] = []
+    for task, level, variation in rank_task_variation_candidates(
+        raw, question_type=qtype, requested_difficulty=requested, task_usage=usage,
+    ):
+            task_id = str(task.get("task_id") or "")
+            candidate_key = f"{sid}:{task_id}:{variation.get('variation_id') or ''}"
             replacement = materialize_plan_item(
                 task, sid, level, selected_variation_id=variation.get("variation_id")
             )
-            replacement["planner_candidate_score"] = score
+            usage_row = usage.get(task_id, 0)
+            replacement["task_usage_count_at_selection"] = int(
+                usage_row.get("count", 0) if isinstance(usage_row, dict) else usage_row
+            )
             replacement["planner_candidate_attempt_id"] = candidate_key
             replacement["catalog_replacement_stage"] = "deterministic_ranked_cross_task"
             replacement["requested_difficulty"] = requested
-            if requested in {"easy", "medium", "hard"} and exact_level is None:
-                replacement.update({
-                    "difficulty_fallback_reason": (
-                        "Plan repair used the nearest source-supported task after no unused "
-                        f"{requested} candidate remained."
-                    ),
-                    "difficulty_adaptation": {
-                        "status": "fallback",
-                        "from_difficulty": level,
-                        "to_difficulty": requested,
-                        "base_task_id": task_id,
-                        "strategy": "catalog_plan_repair_fallback",
-                        "failed_strategies": [],
-                    },
-                })
+            replacement["native_difficulty_prior"] = level
+            replacement["difficulty_design"] = {
+                "status": (
+                    "pending"
+                    if requested in {"easy", "medium", "hard"} and level != requested
+                    else "not_required"
+                ),
+                "policy_version": "difficulty-design-v1",
+                "native_prior": level,
+                "requested": requested,
+            }
             conflict_ids = _conflicting_slot_ids(errors, sid)
             if conflict_ids:
                 replacement["plan_repair_conflicts_with"] = conflict_ids
                 replacement["plan_repair_required_differences"] = [
                     "Use a different eligible task and bound variation."
                 ]
-            ranked.append((-score, task_id, str(variation.get("variation_id") or ""), replacement))
-    ranked.sort(key=lambda value: value[:3])
-    return [value[3] for value in ranked]
+            ranked.append(replacement)
+    return ranked
 
 
 def _repair_plan_slot(
