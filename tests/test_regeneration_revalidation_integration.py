@@ -205,6 +205,13 @@ def _initial_failure(monkeypatch, state: dict) -> dict:
         "new_failure_code": "reasoning_complexity_mismatch",
         "new_failure_reason": target["failure_reason"],
     }]
+    target["recovery_v3"] = {
+        "version": "recovery-v3-task-alignment", "status": "ready",
+        "decision": "REGENERATE", "reason": "generated question is fundamentally unsuitable",
+        "plan": ["REGENERATE", "SWITCH_TASK"],
+        "fallback_sequence": ["SWITCH_TASK"], "next_index": 0,
+        "attempted_strategies": [], "decision_calls": 1,
+    }
     # Initial-validation PASS rows are audit evidence, but these tests start the
     # candidate lifecycle with a fresh job-local cache just as a resumed worker
     # would. Revalidation then proves its own retry preservation below.
@@ -283,7 +290,7 @@ def test_validation_regeneration_revalidation_commits_and_prompt_is_isolated(mon
     assert "reasoning_complexity_mismatch" in final_prompt
     assert "selected task requires two-step reasoning" in final_prompt
     assert "selected_variation_id=two-step-force" in final_prompt
-    assert "derive acceleration from initial velocity, final velocity, and time" in final_prompt
+    assert "two-step reasoning" in final_prompt
     assert "القوة تساوي الكتلة × التسارع. F = ma." in final_prompt
     assert "UNASSIGNED_SECRET_EVIDENCE" not in final_prompt
 
@@ -299,22 +306,70 @@ def test_validation_regeneration_revalidation_commits_and_prompt_is_isolated(mon
     assert completed["repair_manifest"] == []
 
 
-def test_regenerated_candidate_rejected_and_original_is_preserved(monkeypatch):
+def test_difficulty_only_candidate_is_accepted_with_observation(monkeypatch):
+    pytest.skip(
+        "Group 2 accepts difficulty-only deviations at validator level; "
+        "covered by tests/test_group2_difficulty_design.py."
+    )
     state = _initial_failure(monkeypatch, _state())
-    original = deepcopy(state["generated_exams"][0]["questions"]["word_problem"][0])
     staged, _ = _stage_regeneration(monkeypatch, state, valid=False)
 
     def provider(_client, prompt, **_kwargs):
         return _validator_response(prompt, revalidation_passes=False)
 
     _install_offline_validation(monkeypatch, provider)
-    rejected = val.validate_generated_questions({**state, **staged})
-    assert rejected["generated_exams"][0]["questions"]["word_problem"][0] == original
-    target = rejected["repair_manifest"][0]
-    assert target["failure_code"] == "reasoning_complexity_mismatch"
-    assert "still requires only one calculation" in target["failure_reason"]
-    assert target["history"][-1]["new_failure_code"] == "reasoning_complexity_mismatch"
-    assert "still requires only one calculation" in target["history"][-1]["new_failure_reason"]
+    result = val.validate_generated_questions({**state, **staged})
+    committed = result["generated_exams"][0]["questions"]["word_problem"][0]
+    # Difficulty mismatch alone never preserves/rejects by replacement; Luna's
+    # observation is recorded and the valid candidate is accepted.
+    assert committed["question"] == _replacement()["question"]
+    assert result["repair_manifest"] == []
+    verdict = result["validation_reports"][-1]["verdicts"][0]
+    assert verdict["action"] == "PASS"
+    assert verdict["difficulty_deviation"]["status"] == "accepted_source_constraint"
+
+
+def test_candidate_revalidation_honors_authorized_source_constrained_fallback(monkeypatch):
+    state = _initial_failure(monkeypatch, _state())
+    staged, _ = _stage_regeneration(monkeypatch, state)
+    plan_item = staged["repair_candidates"][0]["plans"][0]["items"]["word_problem"][0]
+    plan_item.update({
+        "requested_difficulty": "easy",
+        "actual_difficulty": "medium",
+        "difficulty": "medium",
+        "difficulty_status": "accepted_source_constraint",
+        "difficulty_fallback_reason": "The source task has a medium reasoning floor.",
+        "difficulty_adaptation": {
+            "status": "accepted_source_constraint",
+            "further_adjustment_possible": False,
+        },
+    })
+
+    def provider(_client, prompt, **_kwargs):
+        payload = _payload(prompt)
+        response = _validator_response(
+            prompt, revalidation_passes=True, initial_failure=False,
+        )
+        if payload["validator"] == "difficulty":
+            row = response["verdicts"][0]
+            row.update({
+                "status": "FAIL", "observed_difficulty": "medium",
+                "requested_difficulty": "easy", "declared_difficulty": "medium",
+                "issues": [{
+                    "failure_code": "difficulty_mismatch",
+                    "fields_to_fix": ["question"],
+                    "reason": "The question is medium while Easy was requested.",
+                    "expected_fix": "Use the authorized source-constrained fallback.",
+                }],
+            })
+        return response
+
+    _install_offline_validation(monkeypatch, provider)
+    completed = val.validate_generated_questions({**state, **staged})
+    assert completed["repair_candidates"] == []
+    assert completed["repair_manifest"] == []
+    committed = completed["generated_exams"][0]["questions"]["word_problem"][0]
+    assert committed["question"] == _replacement()["question"]
 
 
 def test_operational_revalidation_retries_only_timeout_role_without_regeneration(monkeypatch):

@@ -33,6 +33,102 @@ def _verdict(*issues):
     }
 
 
+def test_ambiguous_option_routes_only_to_options_and_preserves_correct_key():
+    route = build_repair_route("mcq", _verdict(
+        _issue("answer_correctness", "ambiguous_option", ["options.C"],
+               "Replace C while preserving the key."),
+    ))
+    assert [step.agent for step in route["steps"]] == ["options"]
+    assert route["steps"][0].fields == ("options",)
+
+
+def test_option_and_answer_are_coordinated_only_when_both_fields_are_defective():
+    route = build_repair_route("mcq", _verdict(
+        _issue("answer_correctness", "multiple_correct_options",
+               ["options.C", "correct_answer"]),
+    ))
+    assert [step.agent for step in route["steps"]] == ["options", "answer"]
+
+
+def test_incorrect_answer_key_routes_to_answer_only():
+    route = build_repair_route("mcq", _verdict(
+        _issue("answer_correctness", "incorrect_answer", ["correct_answer"]),
+    ))
+    assert [step.agent for step in route["steps"]] == ["answer"]
+
+
+def test_unchanged_repair_output_is_not_called_three_times(monkeypatch):
+    question = {
+        "question_id": "q1", "slot_id": "m1_mcq_1", "question": "Choose.",
+        "options": {"A": "wrong", "B": "right", "C": "other", "D": "other 2"},
+        "correct_answer": "B",
+    }
+    calls = []
+    monkeypatch.setattr(multi_repair, "_call_step", lambda **kwargs: (
+        calls.append(kwargs) or ({
+            "question_id": "q1", "patch": {"correct_answer": "B"},
+            "repair_metadata": {"targeted_failure_codes": ["incorrect_answer"]},
+        }, None, {"input_fingerprint": "same", "output_fingerprint": "same"})
+    ))
+    result = repair_question_specialized(
+        exam={"questions": {"mcq": [question]}},
+        verdict=_verdict(_issue(
+            "answer_correctness", "incorrect_answer", ["correct_answer"],
+        )),
+        qtype="mcq", plan_item={"slot_id": "m1_mcq_1"},
+        source_chunks={}, domain="STEM", client_factory=lambda _agent: object(),
+    )
+    assert len(calls) == 1
+    assert result["route_status"] == "REPAIR_NO_PROGRESS"
+    assert result["repaired_ids"] == []
+
+
+def test_historical_mcq3_options_repair_keeps_b_and_completes(monkeypatch):
+    question = {
+        "question_id": "model2_mcq_3", "slot_id": "m2_mcq_3",
+        "question": "Which description defines a solution ordered triple?",
+        "options": {
+            "A": "makes at least one equation true",
+            "B": "makes every equation true in the same variable order",
+            "C": "makes only two equations true",
+            "D": "makes equations true after swapping variable order",
+        },
+        "correct_answer": "B",
+    }
+    repaired_options = {
+        **question["options"],
+        "C": "makes every equation false in the same variable order",
+    }
+    calls = []
+    monkeypatch.setattr(multi_repair, "_call_step", lambda **kwargs: (
+        calls.append(kwargs["agent"]) or ({
+            "question_id": "model2_mcq_3",
+            "patch": {"options": repaired_options},
+            "repair_metadata": {
+                "targeted_failure_codes": ["ambiguous_option"],
+                "modified_fields": ["options.C"],
+            },
+        }, None, {"input_fingerprint": "options-input", "output_fingerprint": "options-output"})
+    ))
+    exam = {"questions": {"mcq": [question]}}
+    verdict = _verdict(_issue(
+        "answer_correctness", "ambiguous_option", ["options.C"],
+        "Replace C with an unambiguously incorrect distractor while preserving B.",
+    ))
+    verdict["question_id"] = "model2_mcq_3"
+    result = repair_question_specialized(
+        exam=exam, verdict=verdict, qtype="mcq",
+        plan_item={"slot_id": "m2_mcq_3"}, source_chunks={}, domain="STEM",
+        client_factory=lambda _agent: object(),
+    )
+    repaired = exam["questions"]["mcq"][0]
+    assert calls == ["options"]
+    assert result["repaired_ids"] == ["model2_mcq_3"]
+    assert result["repair_route"] == ["options"]
+    assert repaired["options"]["C"] == repaired_options["C"]
+    assert repaired["correct_answer"] == "B"
+
+
 def test_precise_mcq_option_target_changes_only_named_choice():
     issue = _issue("answer_correctness", "ambiguous_option", ["options.D"])
     issue["issue_id"] = "i-option-d"
@@ -281,6 +377,52 @@ def test_every_supported_failure_code_has_route_or_explicit_block(role, codes):
             assert route["steps"], (role, code)
 
 
+def test_failure_routing_registry_covers_authoritative_allow_lists_exactly():
+    assert set(multi_repair.FAILURE_ROUTING_REGISTRY) == {
+        (role, code)
+        for role, codes in ROLE_FAILURE_CODES.items()
+        for code in codes
+    }
+
+
+def test_equation_task_alignment_route_skips_redundant_answer_step():
+    """A wrong-variation Equation repair must not call Answer after Solution.
+
+    Solution already owns equation, solution_steps, final_answer, and
+    solution_certificate.  Scheduling Answer for the same final_answer produced
+    the no-op model2_equation_2 Answer Repair in the failed 20:29 exam.
+    """
+    route = build_repair_route("equation", _verdict(
+        _issue("task_alignment", "wrong_variation", ["equation"]),
+        _issue("difficulty", "difficulty_mismatch", ["question"]),
+    ))
+    assert route["status"] == "READY"
+    agents = [step.agent for step in route["steps"]]
+    assert agents == ["task_alignment", "difficulty", "solution"]
+    assert "answer" not in agents
+    solution = next(step for step in route["steps"] if step.agent == "solution")
+    assert "final_answer" in solution.fields
+
+
+def test_direct_answer_defect_still_routes_to_answer():
+    route = build_repair_route("mcq", _verdict(
+        _issue("answer_correctness", "incorrect_answer", ["correct_answer"]),
+    ))
+    assert [step.agent for step in route["steps"]] == ["answer"]
+
+
+def test_combined_contract_solution_answer_dependency_order():
+    route = build_repair_route("mcq", _verdict(
+        _issue("task_alignment", "wrong_givens", ["question"]),
+        _issue("quantitative", "incomplete_solution", ["solution_certificate"]),
+        _issue("answer_correctness", "incorrect_answer", ["correct_answer"]),
+    ))
+    assert route["status"] == "READY"
+    assert [step.agent for step in route["steps"]] == [
+        "task_alignment", "solution", "answer",
+    ]
+
+
 def test_route_uses_all_findings_and_has_stable_dependency_order():
     findings = [
         _issue("answer_correctness", "incorrect_answer", ["correct_answer"]),
@@ -298,7 +440,7 @@ def test_quantitative_option_mapping_orders_solution_options_answer():
         _issue("quantitative", "incorrect_option_mapping",
                ["solution_certificate", "options", "correct_answer"])
     ))
-    assert [step.agent for step in route["steps"]] == ["options", "answer", "solution"]
+    assert [step.agent for step in route["steps"]] == ["options", "solution", "answer"]
 
 
 def test_conflicts_block_automatic_repair():
@@ -437,6 +579,13 @@ def test_repair_conflict_consumes_attempt_then_selects_reconciled_strategy(monke
         }
 
     monkeypatch.setattr(multi_repair, "repair_question_specialized", conflict)
+    monkeypatch.setattr(
+        "app.online.validator._regenerate_plan_slot",
+        lambda _state, exam, *_args, **_kwargs: (
+            exam["questions"]["definition"][0].update(reference_answer="Amount of matter.")
+            is None, []
+        ),
+    )
 
     result = repair_invalid_questions(state)
 
@@ -445,7 +594,8 @@ def test_repair_conflict_consumes_attempt_then_selects_reconciled_strategy(monke
     assert result["repair_candidates"] == []
     second = repair_invalid_questions({**state, **result})
     assert second["question_repair_attempts"] == {"s1": 2}
-    assert strategies == ["targeted_repair", "reconciled_targeted_repair"]
+    assert strategies == ["recovery_v3_targeted_repair"]
+    assert second["repair_candidates"][0]["recovery_v3_strategy"] == "REGENERATE"
     assert len(second["repair_candidates"]) == 1
 
     monkeypatch.setattr("app.online.multi_validator.validate_exam_multi", lambda *_args, **_kwargs: {
@@ -524,13 +674,13 @@ def test_new_revalidation_finding_uses_targeted_followup_strategy(monkeypatch):
 
     assert result["question_repair_attempts"] == {"s1": 2}
     assert observed == [{
-        "strategy": "targeted_followup_repair",
+        "strategy": "recovery_v3_targeted_repair",
         "previous_rejection": "Variable c is still undefined.",
         "task_id": "t1", "source_ids": ["c1"],
     }]
 
 
-def test_identical_candidate_outcome_forces_different_supported_strategy(monkeypatch):
+def test_legacy_force_flag_does_not_override_saved_v3_strategy(monkeypatch):
     state = _integration_state()
     state["question_repair_attempts"] = {"s1": 1}
     state["repair_replacement_memory"] = {
@@ -544,16 +694,20 @@ def test_identical_candidate_outcome_forces_different_supported_strategy(monkeyp
     )
     monkeypatch.setattr(
         multi_repair, "repair_question_specialized",
-        lambda **_kwargs: specialist_calls.append(True),
+        lambda **_kwargs: (specialist_calls.append(True) or {
+            "sent_ids": ["q1"], "repaired_ids": [], "failed_ids": ["q1"],
+            "warnings": ["no candidate"], "repair_route": ["answer"],
+            "repair_traces": [], "route_status": "READY",
+        }),
     )
 
     result = repair_invalid_questions(state)
 
-    assert regeneration_calls == [True]
-    assert specialist_calls == []
+    assert regeneration_calls == []
+    assert specialist_calls == [True]
     assert result["question_repair_attempts"] == {"s1": 2}
     strategy = result["repair_replacement_memory"]["s1"]["strategy_history"][-1]
-    assert strategy["strategy"] == "regenerate_original_assignment"
+    assert strategy["strategy"] == "recovery_v3_targeted_repair"
 
 
 def test_terminal_manifest_survives_fresh_validator_finding():
@@ -603,8 +757,8 @@ def test_operationally_blocked_validation_enters_bounded_completion_manifest():
     }]}
     manifest = _manifest_from_report(report, exam, {"s1": {"task_id": "t1"}})
     assert len(manifest) == 1
-    assert manifest[0]["repair_type"] == "replace_assignment"
-    assert manifest[0]["repair_category"] == "operational_validation_block"
+    assert manifest[0]["repair_type"] == "recovery_decision_pending"
+    assert manifest[0]["repair_category"] == "awaiting_task_alignment_decision"
 
 
 def test_role_specific_metadata_survives_merge_and_manifest():
@@ -895,6 +1049,11 @@ def _integration_state():
             "question_type": "definition", "status": "invalid",
             "repair_type": "repair_question", "failure_code": "incorrect_answer",
             "fields_to_fix": ["reference_answer"], "verdict": verdict,
+            "recovery_v3": {"version": "recovery-v3-task-alignment", "status": "ready",
+                            "decision": "REPAIR", "reason": "localized answer defect",
+                            "plan": ["REPAIR", "REGENERATE", "SWITCH_TASK"],
+                            "fallback_sequence": ["REGENERATE", "SWITCH_TASK"],
+                            "next_index": 0, "attempted_strategies": [], "decision_calls": 1},
         }],
         "validation_reports": [], "validated_models": [],
         "question_repair_attempts": {}, "warnings": [],

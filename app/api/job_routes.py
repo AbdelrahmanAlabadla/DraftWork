@@ -27,6 +27,7 @@ from app.file_validation import InvalidPdfError, validate_pdf
 from app.jobs import service as job_service
 from app.offline.structure_store import build_structure_payload
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
+from app.exports.document_ir import build_document_ir
 from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
 
 
@@ -488,7 +489,30 @@ def get_exam_audit_events(
         events = repositories.list_exam_audit_events(exam_id, session_id, user_id)
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
+    # Owners/teachers receive only student-safe lifecycle events. Internal
+    # diagnostics, tracebacks, checkpoint details, and provider errors remain
+    # backend-only.
+    public_event_types = {
+        "exam_created", "pipeline_stage", "exam_assembled",
+        "exam_saved", "question_shortage", "job_cancelled",
+    }
+    events = [
+        event for event in events
+        if str(event.get("event_type") or "") in public_event_types
+    ]
     return {"exam_id": exam_id, "events": events}
+
+
+@router.get("/exams/{exam_id}/usage")
+def get_exam_usage(
+    exam_id: str,
+    session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
+) -> dict[str, Any]:
+    try:
+        return repositories.get_exam_usage_summary(exam_id, session_id, user_id)
+    except repositories.ResourceNotFound as exc:
+        raise _http_not_found(exc)
 
 
 def _owned_exam(
@@ -498,6 +522,27 @@ def _owned_exam(
         return _exam_for_actor(exam_id, session_id, user_id)
     except repositories.ResourceNotFound as exc:
         raise _http_not_found(exc)
+
+
+@router.get("/exams/{exam_id}/document-ir")
+def get_document_ir(
+    exam_id: str,
+    model_number: int = 1,
+    kind: str = "student",
+    session_id: str = Depends(require_session_id),
+    user_id: str | None = Depends(optional_user_id),
+) -> dict[str, Any]:
+    """Return the shared versioned document model used by all renderers."""
+    record = _owned_exam(exam_id, session_id, user_id)
+    exams = [exam for exam in (record.get("exams") or []) if isinstance(exam, dict)]
+    exam = next(
+        (item for item in exams if int(item.get("model_number") or 1) == int(model_number)),
+        None,
+    )
+    if exam is None:
+        raise HTTPException(status_code=404, detail="Exam model not found.")
+    mode = kind if kind in {"student", "answers"} else "student"
+    return build_document_ir(exam, record.get("metadata") or {}, kind=mode)
 
 
 @router.post("/exams/{exam_id}/export/pdf")

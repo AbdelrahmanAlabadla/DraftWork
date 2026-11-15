@@ -111,9 +111,10 @@ def test_all_question_types_and_all_five_roles_receive_role_scoped_inputs():
     for item in grounding["payload"]["questions"]:
         assert set(item) <= {
             "question_id", "question_type", "question_and_answer",
-            "assigned_child_chunks", "grounding_contract",
+            "assigned_evidence_ids", "grounding_contract", "unit_contract",
         }
-        assert len(item["assigned_child_chunks"]) == 1
+        assert len(item["assigned_evidence_ids"]) == 1
+        assert item["assigned_evidence_ids"][0] in grounding["payload"]["evidence_registry"]
 
 
 def test_batch_size_type_queues_and_global_concurrency_are_measured():
@@ -201,7 +202,7 @@ def test_conflicting_findings_are_preserved():
     assert set(verdict["fields_to_fix"]) == {"term", "reference_answer"}
 
 
-def test_revalidation_payload_contains_original_findings_and_repair_metadata():
+def test_revalidation_payload_keeps_only_findings_that_affect_the_verdict():
     questions = {"definition": [{"question_id": "q0", "slot_id": "s0", "term": "mass", "reference_answer": "matter"}]}
     plans, sources = _contexts(questions)
     state = {"lock": threading.Lock(), "active": 0, "peak": 0, "calls": []}
@@ -211,13 +212,28 @@ def test_revalidation_payload_contains_original_findings_and_repair_metadata():
         client_factory=lambda _role: EvaluationClient(state),
         revalidation_context={"q0": {
             "original_question": {"term": "mass", "reference_answer": "wrong"},
-            "original_failure_findings": [{"failure_code": "incorrect_answer"}],
+            "original_failure_findings": [{
+                "validator": "answer_correctness",
+                "failure_code": "incorrect_answer",
+            }],
             "repair_metadata": {"modified_fields": ["reference_answer"], "targeted_failure_codes": ["incorrect_answer"]},
+            "previous_rejections": [{"attempt": 1, "rejection_reason": "old"}],
         }},
     )
     assert result["all_pass"] is True
-    assert all("revalidation" in call["payload"]["questions"][0] for call in state["calls"])
-    assert state["calls"][0]["payload"]["questions"][0]["revalidation"]["repair_metadata"]["modified_fields"] == ["reference_answer"]
+    contexts = [
+        call["payload"]["questions"][0]["revalidation"]
+        for call in state["calls"]
+        if call["payload"]["validator"] == "answer_correctness"
+    ]
+    assert contexts
+    context = contexts[0]
+    assert context["original_failure_findings"] == [{
+        "validator": "answer_correctness", "failure_code": "incorrect_answer",
+    }]
+    assert "repair_metadata" not in context
+    assert "original_question" not in context
+    assert "previous_rejections" not in context
 
 
 def test_input_protection_boundaries():

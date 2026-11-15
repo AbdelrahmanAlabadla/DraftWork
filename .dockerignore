@@ -14,3 +14,14 @@ output
 tmp
 tests
 *.log
+artifacts
+reports
+backups
+all_markdown_files
+live_exam_replay
+exam_forensic_*
+*.zip
+*.pdf
+*.docx
+docs
+scripts/live_*

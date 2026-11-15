@@ -33,7 +33,7 @@ EXPORT_TYPE_LABELS_BY_LANG = {
     "ar": {
         "mcq": "أسئلة الاختيار من متعدد",
         "fill_in_the_blank": "أكمل الفراغ",
-        "true_false": "صح / خطأ",
+        "true_false": "صح / غلط",
         "definition": "تعريف",
         "why": "علّل",
         "equation": "حل المعادلات وأظهر خطواتك.",
@@ -43,8 +43,8 @@ EXPORT_TYPE_LABELS_BY_LANG = {
 }
 
 TRUE_FALSE_CHOICES_BY_LANG = {
-    "en": "(   ) True     (   ) False",
-    "ar": "(   ) صح     (   ) خطأ",
+    "en": "True (   ) False (   )",
+    "ar": "صح (   ) غلط (   )",
 }
 
 HEADER_LABELS_BY_LANG = {

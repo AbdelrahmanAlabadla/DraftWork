@@ -335,6 +335,7 @@ def test_global_duplicate_detects_same_scenario_across_types_even_with_different
 
 def test_plan_rejects_visual_dependency_without_reproduced_text_givens():
     item = _item("chunk-a", "interpret the wage table")
+    item["requires_supplied_graph"] = True
     errors = planner.validate_plans(
         [{"model_number": 1, "items": {"word_problem": [item]}}],
         [("word_problem", 1)], 1, {"chunk-a"},
@@ -359,6 +360,7 @@ def test_arabic_energy_form_is_not_misread_as_a_visual_dependency():
 
 def test_arabic_explicit_figure_reference_is_a_visual_dependency():
     item = _item("chunk-a", "فسر البيانات الموضحة في الشكل التالي")
+    item["requires_supplied_graph"] = True
     errors = planner.validate_plans(
         [{"model_number": 1, "items": {"word_problem": [item]}}],
         [("word_problem", 1)], 1, {"chunk-a"},
@@ -649,7 +651,9 @@ def test_deterministic_plan_repair_selects_cross_topic_candidate_without_llm(mon
 
 
 def test_exhausted_plan_repair_never_prunes_requested_slot(monkeypatch):
-    bad = _item("chunk-a", "bad visual task", target="missing table value")
+    bad = _item("chunk-a", "read values from the supplied graph",
+                target="values read from the supplied graph")
+    bad["requires_supplied_graph"] = True
     bad["slot_id"] = "m1_word_problem_1"
     good = _item("chunk-a", "good concept", target="supported concept")
     good["slot_id"] = "m1_mcq_1"

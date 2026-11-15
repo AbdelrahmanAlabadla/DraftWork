@@ -104,11 +104,11 @@ def test_all_batches_complete_without_retry_and_preserve_arabic_variations(monke
 
     _install(monkeypatch, tmp_path, responder)
     result = catalog.prepare_assessment_catalog(_state())
-    assert sorted(calls.values()) == [1, 1]
+    assert sorted(calls.values()) == [1, 1, 1]
     compiled = result["assessment_catalog"]
     assert compiled["catalog_compilation_complete"] is True
     assert len(compiled["tasks"]) == 1
-    assert len(compiled["tasks"][0]["evidence_chunk_ids"]) == 2
+    assert len(compiled["tasks"][0]["evidence_chunk_ids"]) == 3
     assert all(task["allowed_variations"][0]["target"] == "الزمن" for task in compiled["tasks"])
 
 
@@ -145,7 +145,7 @@ def test_one_hundred_parents_can_fill_fifty_catalog_workers(monkeypatch, tmp_pat
 
 def test_one_incomplete_batch_is_the_only_batch_retried(monkeypatch, tmp_path):
     state = _state()
-    batches = catalog._balanced_catalog_batches(state["retrieved_chunks"], 2)
+    batches = catalog._balanced_catalog_batches(state["retrieved_chunks"])
     target = tuple(str(row["child_id"]) for row in batches[1])
     calls = Counter()
     lock = threading.Lock()
@@ -163,7 +163,7 @@ def test_one_incomplete_batch_is_the_only_batch_retried(monkeypatch, tmp_path):
     _install(monkeypatch, tmp_path, responder)
     result = catalog.prepare_assessment_catalog(state)
     assert calls[target] == 2
-    assert sorted(calls.values()) == [1, 2]
+    assert sorted(calls.values()) == [1, 1, 2]
     assert result["assessment_catalog"]["catalog_compilation_complete"] is True
 
 
@@ -180,14 +180,14 @@ def test_several_incomplete_batches_retry_independently(monkeypatch, tmp_path):
 
     _install(monkeypatch, tmp_path, responder)
     result = catalog.prepare_assessment_catalog(_state(17))
-    assert sorted(calls.values()) == [2, 2, 2]
+    assert sorted(calls.values()) == [2, 2, 2, 2, 2, 2]
     assert result["assessment_catalog"]["catalog_compilation_complete"] is True
 
 
 def test_repeated_incomplete_batch_fails_bounded_and_keeps_completed_batch_cache(
     monkeypatch, tmp_path,
 ):
-    state = _state(); batches = catalog._balanced_catalog_batches(state["retrieved_chunks"], 2)
+    state = _state(); batches = catalog._balanced_catalog_batches(state["retrieved_chunks"])
     target = tuple(str(row["child_id"]) for row in batches[1]); calls = Counter(); lock = threading.Lock()
 
     def failing(_client, prompt, **kwargs):
@@ -204,7 +204,7 @@ def test_repeated_incomplete_batch_fails_bounded_and_keeps_completed_batch_cache
     successful = next(ids for ids in calls if ids != target)
     assert calls[successful] == 1
     cached_after_failure = list(tmp_path.rglob("*.json"))
-    assert len(cached_after_failure) == 1
+    assert len(cached_after_failure) == 2
     assert "compiler" in cached_after_failure[0].parts
     # A restart reuses the completed batch file and recompiles only the failed batch.
     def succeeding(_client, prompt, **kwargs):

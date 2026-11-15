@@ -866,10 +866,11 @@ def list_job_pipeline_events(job_id: str) -> list[dict[str, Any]]:
     with db.connection() as conn:
         with conn.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
-                """SELECT e.stage, e.payload, e.created_at
+                """SELECT e.stage, e.event_type, e.payload, e.created_at
                      FROM exam_audit_events e
                      JOIN exams x ON x.id = e.exam_id
-                    WHERE x.job_id = %s AND e.event_type = 'pipeline_stage'
+                    WHERE x.job_id = %s
+                      AND e.event_type IN ('pipeline_stage', 'model_recovery_progress')
                     ORDER BY e.created_at, e.id""",
                 (job_id,),
             )
@@ -1202,6 +1203,41 @@ def get_exam_id_for_job(job_id: str) -> str | None:
     return str(row[0]) if row else None
 
 
+def record_exam_diagnostic_event(
+    exam_id: str, *, job_id: str | None, stage: str, component: str,
+    error_type: str, message: str, continued: bool = True,
+    traceback_text: str = "",
+) -> None:
+    """Persist a nonfatal internal diagnostic without consuming checkpoint state."""
+    import re
+
+    def clean(value: Any, limit: int) -> str:
+        text = str(value or "")
+        text = re.sub(
+            r"(?i)(authorization|api[_-]?key|password|secret|token|cookie)"
+            r"(\s*[=:]\s*)(?:bearer\s+)?([^\s,;]+)",
+            r"\1\2[REDACTED]", text,
+        )
+        return text[:limit]
+
+    payload = {
+        "component": clean(component, 120),
+        "error_type": clean(error_type, 120),
+        "message": clean(message, 2000),
+        "traceback": clean(traceback_text, 4000),
+        "continued": bool(continued),
+    }
+    with db.connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """INSERT INTO exam_audit_events (
+                       exam_id, job_id, stage, event_type, payload
+                   ) VALUES (%s, %s, %s, 'internal_diagnostic', %s)""",
+                (exam_id, job_id, stage, _jsonb(payload)),
+            )
+        conn.commit()
+
+
 def append_exam_audit_event(
     exam_id: str, *, job_id: str, claim_generation: int,
     checkpoint_revision: int, request_fingerprint: str,
@@ -1482,6 +1518,20 @@ def record_llm_request_event(
     duration_ms: int | None = None, metadata: dict[str, Any] | None = None,
 ) -> None:
     """Persist one compact request outcome without prompt or credential data."""
+    from app.logging_conf import current_llm_attribution
+    attribution = current_llm_attribution()
+    event_metadata = {**attribution, **(metadata or {})}
+    if not event_metadata.get("stage"):
+        label = str(agent_role or operation or "").lower()
+        event_metadata["stage"] = (
+            "catalog" if "catalog" in label or "compiler" in label else
+            "planning" if "planner" in label or "plan_review" in label else
+            "difficulty_adjustment" if "adjust" in label else
+            "revalidation" if "revalid" in label else
+            "repair" if "repair" in label or "replacement" in label else
+            "validation" if "validator" in label or "duplicate" in label else
+            "generation" if "generator" in label else "unknown"
+        )
     with db.connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
@@ -1495,7 +1545,7 @@ def record_llm_request_event(
                    ) VALUES (
                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-                   )""",
+                   ) ON CONFLICT DO NOTHING""",
                 (
                     job_id, provider, model, operation, agent_role, request_id,
                     provider_request_id, status, error_category,
@@ -1504,10 +1554,95 @@ def record_llm_request_event(
                     max(0, int(retry_count)), retry_after_seconds,
                     bool(usage_available), input_tokens, output_tokens,
                     reasoning_tokens, estimated_cost_usd, duration_ms,
-                    _jsonb(metadata or {}),
+                    _jsonb(event_metadata),
                 ),
             )
         conn.commit()
+
+
+def get_exam_usage_summary(
+    exam_id: str, session_id: str, user_id: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate actual persisted provider attempts for one owned exam."""
+    get_exam_for_session(exam_id, session_id, user_id)
+    with db.connection() as conn:
+        with conn.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                """SELECT e.job_id, j.started_at, j.finished_at
+                     FROM exams e LEFT JOIN jobs j ON j.id = e.job_id
+                     WHERE e.id = %s""",
+                (exam_id,),
+            )
+            header = dict(cursor.fetchone() or {})
+            job_id = header.get("job_id")
+            if not job_id:
+                return {
+                    "exam_id": exam_id, "provider_calls": None,
+                    "totals": None, "agents": [], "stages": [],
+                    "stage_wall_time_ms": None,
+                }
+            cursor.execute(
+                """SELECT COALESCE(agent_role, operation, 'unknown') AS agent,
+                          COALESCE(metadata->>'stage', 'unknown') AS stage,
+                          COUNT(*) AS calls,
+                          COUNT(input_tokens) AS input_known,
+                          SUM(input_tokens) AS input_tokens,
+                          COUNT(output_tokens) AS output_known,
+                          SUM(output_tokens) AS output_tokens,
+                          COUNT(reasoning_tokens) AS reasoning_known,
+                          SUM(reasoning_tokens) AS reasoning_tokens,
+                          COUNT(estimated_cost_usd) AS cost_known,
+                          SUM(estimated_cost_usd) AS estimated_cost_usd,
+                          COUNT(duration_ms) AS latency_known,
+                          SUM(duration_ms) AS latency_ms,
+                          COUNT(*) FILTER (WHERE status = 'success') AS successful,
+                          COUNT(*) FILTER (WHERE status <> 'success') AS failed
+                     FROM llm_request_events
+                     WHERE job_id = %s
+                     GROUP BY COALESCE(agent_role, operation, 'unknown'),
+                              COALESCE(metadata->>'stage', 'unknown')
+                     ORDER BY agent, stage""",
+                (job_id,),
+            )
+            raw = [dict(row) for row in cursor.fetchall()]
+
+    def complete_sum(rows: list[dict[str, Any]], field: str, known: str) -> Any:
+        calls = sum(int(row.get("calls") or 0) for row in rows)
+        if calls == 0 or sum(int(row.get(known) or 0) for row in rows) != calls:
+            return None
+        return sum((row.get(field) or 0) for row in rows)
+
+    by_agent: dict[str, list[dict[str, Any]]] = {}
+    by_stage: dict[str, list[dict[str, Any]]] = {}
+    for row in raw:
+        by_agent.setdefault(str(row["agent"]), []).append(row)
+        by_stage.setdefault(str(row["stage"]), []).append(row)
+
+    def summary(name: str, rows: list[dict[str, Any]], key: str) -> dict[str, Any]:
+        calls = sum(int(row.get("calls") or 0) for row in rows)
+        return {
+            key: name, "calls": calls,
+            "successful": sum(int(row.get("successful") or 0) for row in rows),
+            "failed": sum(int(row.get("failed") or 0) for row in rows),
+            "input_tokens": complete_sum(rows, "input_tokens", "input_known"),
+            "output_tokens": complete_sum(rows, "output_tokens", "output_known"),
+            "reasoning_tokens": complete_sum(rows, "reasoning_tokens", "reasoning_known"),
+            "estimated_cost_usd": complete_sum(rows, "estimated_cost_usd", "cost_known"),
+            "latency_ms": complete_sum(rows, "latency_ms", "latency_known"),
+        }
+
+    totals = summary("total", raw, "scope") if raw else None
+    wall_ms = None
+    if header.get("started_at") and header.get("finished_at"):
+        wall_ms = int((header["finished_at"] - header["started_at"]).total_seconds() * 1000)
+    return {
+        "exam_id": exam_id,
+        "provider_calls": totals["calls"] if totals else 0,
+        "totals": totals,
+        "agents": [summary(name, rows, "agent") for name, rows in sorted(by_agent.items())],
+        "stages": [summary(name, rows, "stage") for name, rows in sorted(by_stage.items())],
+        "stage_wall_time_ms": wall_ms,
+    }
 
 
 def job_status_counts() -> dict[str, int]:

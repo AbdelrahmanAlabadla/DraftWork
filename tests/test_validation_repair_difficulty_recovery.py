@@ -87,12 +87,46 @@ def test_targeted_difficulty_adjustment_changes_only_requested_slot(monkeypatch)
     assert prompts[0]["difficulty_validator_findings"][0]["observed_difficulty"] == "medium"
 
 
-def test_difficulty_failure_classifies_as_assignment_adjustment():
-    from app.online.validator import _repair_classification
-
-    assert _repair_classification("reasoning_complexity_mismatch") == (
-        "difficulty_assignment_mismatch", "adjust_difficulty",
+def test_targeted_difficulty_reuses_unchanged_terminal_fallback(monkeypatch):
+    plan_item = {
+        "slot_id": "m1_equation_1", "question_type": "equation",
+        "task_id": "t1", "source_chunk_id": "c1", "support_chunk_ids": [],
+        "selected_variation_id": "v1", "permitted_variations": [{
+            "variation_id": "v1", "numeric_values_may_change": False,
+        }],
+        "task_operation": "solve_system", "target": "three-variable solution",
+        "difficulty": "medium", "actual_difficulty": "medium",
+        "requested_difficulty": "easy",
+        "difficulty_status": "accepted_source_constraint",
+        "difficulty_fallback_reason": "The required reasoning remains medium.",
+        "difficulty_adaptation": {
+            "status": "accepted_source_constraint",
+            "further_adjustment_possible": False,
+        },
+    }
+    plans = [{"model_number": 1, "items": {"equation": [plan_item]}}]
+    monkeypatch.setattr(
+        difficulty_adjustment, "request_structured",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("provider called")),
     )
+    ok, audit = difficulty_adjustment.adjust_failed_plan_slot(
+        state={
+            "difficulty": "easy", "assessment_profile": {"domain": "STEM"},
+            "retrieved_chunks": [{"child_id": "c1", "content": "solve the system"}],
+        },
+        plans=plans, model_number=1, slot_id="m1_equation_1",
+        question_type="equation", findings=[], attempt=2,
+    )
+    assert ok is True
+    assert audit["status"] == "reused_terminal_decision"
+    assert audit["provider_call_made"] is False
+    assert plan_item["difficulty_status"] == "accepted_source_constraint"
+
+
+def test_difficulty_strategy_is_dispatched_from_task_alignment_decision():
+    from app.online.validator import recovery_v3_dispatch_action
+
+    assert recovery_v3_dispatch_action("REPAIR") == "repair_question"
 
 
 def test_true_false_atomic_route_coordinates_statement_answer_and_certificate():
@@ -188,8 +222,16 @@ def test_answer_correctness_prompt_requires_all_mcq_options_and_precise_target()
     assert "options.D" in prompt
 
 
-def test_quantitative_revalidation_bypasses_prior_pass_cache_for_every_role(monkeypatch):
-    multi_validator.clear_job_validation_cache("full-revalidation")
+def test_revalidation_reuses_unchanged_verdicts_and_reruns_changed_content(monkeypatch):
+    """Revalidation must be proportional to the question revision that changed.
+
+    The earlier regression re-ran every validator role for an unchanged
+    quantitative question on each recovery cycle.  Verdicts are now role-scoped
+    by their own dependency payload: an unchanged revision reuses its passing
+    results, while an answer/solution edit reruns only the roles that consume
+    those fields.
+    """
+    multi_validator.clear_job_validation_cache("selective-revalidation")
     question = {
         "question_id": "q1", "slot_id": "m1_equation_1",
         "equation": "Solve x+1=2", "solution_steps": ["x=1"],
@@ -221,19 +263,36 @@ def test_quantitative_revalidation_bypasses_prior_pass_cache_for_every_role(monk
 
     monkeypatch.setattr(multi_validator, "request_structured", response)
     factory = lambda _role: type("Client", (), {"provider_name": "mock", "model": "mock"})()
-    multi_validator.validate_exam_multi(
-        exam, plan_by_slot=plan, source_by_chunk={"c1": "x+1=2"},
-        domain="STEM", client_factory=factory, cache_scope="full-revalidation",
-    )
-    calls.clear()
-    result = multi_validator.validate_exam_multi(
-        exam, plan_by_slot=plan, source_by_chunk={"c1": "x+1=2"},
-        domain="STEM", client_factory=factory, cache_scope="full-revalidation",
-        revalidation_context={"q1": {
-            "original_failure_findings": [], "force_full_revalidation": True,
-        }},
-    )
-    assert result["all_pass"]
+
+    def run(target_exam, context):
+        return multi_validator.validate_exam_multi(
+            target_exam, plan_by_slot=plan, source_by_chunk={"c1": "x+1=2"},
+            domain="STEM", client_factory=factory, cache_scope="selective-revalidation",
+            revalidation_context={"q1": context},
+        )
+
+    run(exam, {"original_failure_findings": []})
     assert set(calls) == {
         "grounding", "task_alignment", "answer_correctness", "difficulty", "quantitative",
     }
+
+    # An unchanged revision must not pay for another validator call at all.
+    calls.clear()
+    unchanged = run(deepcopy(exam), {"original_failure_findings": []})
+    assert unchanged["all_pass"]
+    assert calls == []
+
+    # Changing only the answer/solution reruns the roles that consume those
+    # fields and reuses the roles whose inputs did not change.
+    changed = deepcopy(exam)
+    changed["questions"]["equation"][0].update({
+        "solution_steps": ["x=2"], "final_answer": "x=2",
+        "solution_certificate": _certificate("(2,2)"),
+    })
+    calls.clear()
+    result = run(changed, {"original_failure_findings": []})
+    assert result["all_pass"]
+    assert set(calls) == {
+        "grounding", "answer_correctness", "difficulty", "quantitative",
+    }
+    assert "task_alignment" not in calls

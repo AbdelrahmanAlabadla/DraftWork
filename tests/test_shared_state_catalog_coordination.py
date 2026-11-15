@@ -5,6 +5,7 @@ from copy import deepcopy
 from app.online import assessment_catalog, duplicate_pipeline
 from app.online.graph import _route_after_validation
 from app.online.lifecycle import (
+    assignment_fingerprint,
     assessment_instance_fingerprint,
     initialize_slot_lifecycle,
     reconcile_slot_lifecycle,
@@ -34,6 +35,50 @@ def test_slot_lifecycle_preserves_original_assignment_and_revisions_current_stat
     assert slot["current_assignment"]["task_id"] == "systems"
     assert slot["assignment_revision"] == 2
     assert slot["history"][-1]["event"] == "assignment_changed"
+
+
+def test_effective_difficulty_design_changes_assignment_fingerprint():
+    base = _plan("tip", ["60", "17%"])["items"]["mcq"][0]
+    cognitive = {
+        **base,
+        "reasoning_requirements": ["Calculate the subtotal.", "Apply the percentage."],
+        "cognitive_transformations": ["apply_percentage"],
+        "difficulty_design": {"status": "designed", "adjustment_kind": "cognitive"},
+    }
+    numerical = {
+        **cognitive,
+        "effective_instance_id": "derived_tip_80",
+        "effective_givens": ["80", "15%"],
+        "difficulty_design": {
+            "status": "designed", "adjustment_kind": "numerical",
+            "effective_instance_id": "derived_tip_80",
+        },
+    }
+
+    assert assignment_fingerprint(base) != assignment_fingerprint(cognitive)
+    assert assignment_fingerprint(cognitive) != assignment_fingerprint(numerical)
+
+
+def test_assignment_fingerprint_is_stable_for_key_order_and_resume():
+    item = _plan("tip", ["60", "17%"])["items"]["mcq"][0]
+    item["difficulty_design"] = {
+        "status": "designed",
+        "details": {"z": 2, "a": 1},
+    }
+    reordered = deepcopy(item)
+    reordered["difficulty_design"] = {
+        "details": {"a": 1, "z": 2},
+        "status": "designed",
+    }
+    assert assignment_fingerprint(item) == assignment_fingerprint(reordered)
+
+    records = initialize_slot_lifecycle([("mcq", 1)], 1)
+    state = {"plans": [{"model_number": 1, "items": {"mcq": [item]}}]}
+    first = reconcile_slot_lifecycle(records, state, stage="difficulty_adjustment")
+    resumed = reconcile_slot_lifecycle(first, deepcopy(state), stage="resume")
+    assert resumed["m1_mcq_1"]["assignment_revision"] == 1
+    assert resumed["m1_mcq_1"]["difficulty_design"] == item["difficulty_design"]
+    assert resumed["m1_mcq_1"]["difficulty_adjustment"] == item["difficulty_design"]
 
 
 def test_question_content_revision_changes_only_when_content_changes():

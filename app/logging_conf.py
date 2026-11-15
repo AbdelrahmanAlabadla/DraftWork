@@ -5,6 +5,8 @@ import json
 import logging
 import re
 import sys
+import traceback
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -23,6 +25,9 @@ _REQUEST_ID_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
 _JOB_ID_VAR: contextvars.ContextVar[str] = contextvars.ContextVar("job_id", default="-")
 _DOCUMENT_ID_VAR: contextvars.ContextVar[str] = contextvars.ContextVar(
     "document_id", default="-"
+)
+_LLM_ATTRIBUTION_VAR: contextvars.ContextVar[dict[str, object]] = contextvars.ContextVar(
+    "llm_attribution", default={}
 )
 
 class RequestContextFilter(logging.Filter):
@@ -75,6 +80,20 @@ class JsonFormatter(logging.Formatter):
                 payload[key] = value
         if record.exc_info:
             payload["exception_type"] = record.exc_info[0].__name__
+            try:
+                exc_message = str(record.exc_info[1] or "")
+                trace = "".join(traceback.format_exception(*record.exc_info))
+                payload["exception_message"] = _URL_PASSWORD_RE.sub(
+                    r"\1[REDACTED]\3",
+                    _SECRET_RE.sub(r"\1\2[REDACTED]", exc_message),
+                )[:2000]
+                payload["traceback"] = _URL_PASSWORD_RE.sub(
+                    r"\1[REDACTED]\3",
+                    _SECRET_RE.sub(r"\1\2[REDACTED]", trace),
+                )[-4000:]
+            except Exception:
+                # Logging must never raise while describing a failure.
+                pass
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
@@ -113,11 +132,37 @@ def set_request_id(request_id: str) -> None:
     _REQUEST_ID_VAR.set(request_id)
 
 
-def set_job_context(job_id: str, document_id: str = "-") -> None:
+def set_job_context(job_id: str, document_id: str = "-", exam_id: str | None = None) -> None:
     _JOB_ID_VAR.set(job_id)
     _DOCUMENT_ID_VAR.set(document_id)
+    if exam_id is not None:
+        _LLM_ATTRIBUTION_VAR.set({"exam_id": exam_id})
 
 
 def current_job_id() -> str | None:
     value = _JOB_ID_VAR.get()
     return None if value == "-" else value
+
+
+def current_llm_attribution() -> dict[str, object]:
+    return dict(_LLM_ATTRIBUTION_VAR.get() or {})
+
+
+def set_llm_attribution(**values: object) -> None:
+    _LLM_ATTRIBUTION_VAR.set({
+        **current_llm_attribution(),
+        **{key: value for key, value in values.items() if value is not None},
+    })
+
+
+@contextmanager
+def llm_attribution(**values: object):
+    """Attach durable request attribution to calls in this execution context."""
+    merged = {**current_llm_attribution(), **{
+        key: value for key, value in values.items() if value is not None
+    }}
+    token = _LLM_ATTRIBUTION_VAR.set(merged)
+    try:
+        yield
+    finally:
+        _LLM_ATTRIBUTION_VAR.reset(token)

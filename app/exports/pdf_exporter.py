@@ -1,14 +1,11 @@
-"""Compact, print-ready PDF export for final validated exams (fpdf2).
+"""Print-ready A4 PDF export for the redesigned exam document.
 
-The student copy is rendered first and never contains answer data.  A grouped
-teacher answer key follows on separate pages.  The layout is deliberately
-dense: A4 with 0.5-inch margins, row-level page breaking for objective
-questions, and flexible ruled response areas for open-ended questions.
+The exporter consumes the shared document IR (``app.exports.document_ir``) and
+draws black-and-white A4 pages.  It never parses raw question strings and never
+turns an inline variable into a standalone image.
 """
 from __future__ import annotations
 
-import base64
-import binascii
 import io
 import re
 from pathlib import Path
@@ -17,856 +14,902 @@ from typing import Any
 from fpdf import FPDF
 from fpdf.enums import MethodReturnValue, TextDirection
 
-from app.exports.common import (
-    expand_fill_blank_text,
-    exam_document_language,
-    group_exam_sections,
-    is_complete_equation_prompt,
-    split_equation_content,
-    response_line_count,
-)
-from app.language import detect_language
-from app.exports.math_renderer import latex_to_plain_text, render_math
+from app.exports.document_ir import build_document_ir
+from app.exports.math_renderer import render_math
 
-PAGE_MARGIN_MM = 12.7  # exactly 0.5 inch
-FOOTER_Y_MM = -9.5
-BODY_FONT = "helvetica"
-ARABIC_FONT = "Tajawal"
-MATH_FONT = "DejaVuSans"
-FONT_DIR = Path(__file__).parent / "fonts"
+PAGE_MARGIN_MM = 15.0
+CONTENT_WIDTH_MM = 180.0
 BODY_SIZE = 10.5
-LINE_HEIGHT = 5.4
-ANSWER_LINE_HEIGHT = 5.65  # 16 pt, matching the DOCX response-line spacing
+LINE_HEIGHT = 5.6
+SMALL_SIZE = 8.8
+INK = (0, 0, 0)
+RULE = (0, 0, 0)
+ARABIC_FONT = "Amiri"
+LATIN_FONT = "DejaVu"
+FONT_DIR = Path(__file__).parent / "fonts"
 
-INK = (31, 41, 55)
-MUTED = (100, 116, 139)
-ACCENT = (51, 65, 85)
-SECTION_FILL = (232, 238, 245)
-RULE = (180, 190, 202)
-
-_REPLACEMENTS = {
-    "\u2014": "-", "\u2013": "-", "\u2018": "'", "\u2019": "'",
-    "\u201c": '"', "\u201d": '"', "\u2026": "...", "\u00a0": " ",
-    "\u2212": "-", "\u2192": "->", "\u00b7": "-",
-}
-
-# Set by render_exam_pdf: when a Unicode-capable TTF is registered, text is NOT
-# crushed down to latin-1 (which would destroy Arabic) and shaping is enabled.
-_UNICODE_OUTPUT = False
+_ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
 
 
-def _latin(text: object) -> str:
-    value = str(text or "")
-    for src, dst in _REPLACEMENTS.items():
-        value = value.replace(src, dst)
-    if _UNICODE_OUTPUT:
-        return value
-    return value.encode("latin-1", "replace").decode("latin-1")
+def _answer_text(item: dict[str, Any], language: str) -> str:
+    """Compatibility helper used by export contract tests and extensions."""
+    if item.get("qtype") == "true_false" or "answer" in item:
+        answer = item.get("answer")
+        if answer is True:
+            return "صح" if language == "ar" else "True"
+        if answer is False:
+            return "غلط" if language == "ar" else "False"
+    return str(item.get("correct_answer") or item.get("final_answer") or "")
+_NUMBER_RE = re.compile(r"[-+]?\d")
 
 
-def _clean(value: object, fallback: str = "") -> str:
-    text = _latin(value).strip()
-    return text or fallback
+def _has_arabic(value: object) -> bool:
+    return bool(_ARABIC_RE.search(str(value or "")))
 
 
-def _image_stream(data_url: object) -> io.BytesIO | None:
-    """Decode an optional browser data URL without trusting its file name."""
-    if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
-        return None
-    try:
-        _, encoded = data_url.split(",", 1)
-        raw = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error):
-        return None
-    if not raw or len(raw) > 2_500_000:
-        return None
-    stream = io.BytesIO(raw)
-    stream.name = "exam-logo"
-    return stream
+def _clean(value: object) -> str:
+    return re.sub(r"[ \t]+", " ", str(value or "")).strip()
 
 
 class _ExamPDF(FPDF):
-    def __init__(self, language: str = "en") -> None:
+    def __init__(self, language: str) -> None:
         super().__init__(orientation="P", unit="mm", format="A4")
-        self.set_margins(PAGE_MARGIN_MM, PAGE_MARGIN_MM, PAGE_MARGIN_MM)
-        self.set_auto_page_break(auto=True, margin=PAGE_MARGIN_MM)
         self.language = language
         self.rtl = language == "ar"
-        self._running_title = "Generated Exam"
-        self._running_model = ""
-        self._copy_label = "Student copy"
-
-    def header(self) -> None:
-        # Deliberately blank: the exam title belongs only in the first-page
-        # title block, not in a repeated running header.
-        self.set_y(self.t_margin)
+        self.set_margins(PAGE_MARGIN_MM, PAGE_MARGIN_MM, PAGE_MARGIN_MM)
+        self.set_auto_page_break(True, margin=13)
+        self.set_draw_color(*RULE)
         self.set_text_color(*INK)
+        self.body_font = ARABIC_FONT if self.rtl else LATIN_FONT
+        self.add_font(ARABIC_FONT, "", str(FONT_DIR / "Amiri-Regular.ttf"))
+        self.add_font(ARABIC_FONT, "B", str(FONT_DIR / "Amiri-Bold.ttf"))
+        self.add_font(LATIN_FONT, "", str(FONT_DIR / "DejaVuSans.ttf"))
+        self.add_font(LATIN_FONT, "B", str(FONT_DIR / "DejaVuSans-Bold.ttf"))
+        try:
+            self.set_fallback_fonts([LATIN_FONT, ARABIC_FONT])
+        except Exception:
+            pass
 
     def footer(self) -> None:
-        self.set_y(FOOTER_Y_MM)
-        self.set_x(self.l_margin)
-        self.set_font(BODY_FONT, "", 7.5)
-        self.set_text_color(*MUTED)
-        self.cell(0, 4, f"Page {self.page_no()} of {{nb}}", align="C")
-        self.set_text_color(*INK)
+        # Page totals are painted in a final pass after pagination is complete.
+        return
 
     def ensure_space(self, height: float) -> bool:
-        """Start a page only when the requested minimum block cannot fit."""
         if self.get_y() + height <= self.page_break_trigger:
             return False
         self.add_page()
-        self.set_x(self.l_margin)
+        self.set_x(PAGE_MARGIN_MM)
         return True
 
-
-def _register_arabic_font() -> bool:
-    """Check the bundled Amiri TTFs load correctly. Returns False when
-    unavailable so the exporter degrades to Helvetica instead of failing."""
-    regular = FONT_DIR / "Tajawal-Regular.ttf"
-    bold = FONT_DIR / "Tajawal-Bold.ttf"
-    if not (regular.is_file() and bold.is_file()):
-        return False
-
-    probe = FPDF()
-    try:
-        probe.add_font(ARABIC_FONT, "", str(regular))
-        probe.add_font(ARABIC_FONT, "B", str(bold))
-    except Exception:
-        return False
-    return True
+    def set_token_font(self, token: dict[str, Any], size: float, bold: bool) -> None:
+        font = ARABIC_FONT if token["font"] == "arabic" else LATIN_FONT
+        self.set_font(font, "B" if bold else "", size)
+        self.set_text_shaping(
+            True,
+            direction=TextDirection.RTL if token["dir"] == "rtl" else TextDirection.LTR,
+        )
 
 
-def _register_math_font() -> bool:
-    """Check that the bundled Unicode font can render calculation notation."""
-    regular = FONT_DIR / "DejaVuSans.ttf"
-    bold = FONT_DIR / "DejaVuSans-Bold.ttf"
-    if not (regular.is_file() and bold.is_file()):
-        return False
-    probe = FPDF()
-    try:
-        probe.add_font(MATH_FONT, "", str(regular))
-        probe.add_font(MATH_FONT, "B", str(bold))
-    except Exception:
-        return False
-    return True
+def _token(text: str, *, font: str | None = None, direction: str | None = None,
+           nowrap: bool = False) -> dict[str, Any]:
+    text = normalize_numerals(text)
+    if not text:
+        return {}
+    if direction is None:
+        direction = "rtl" if _has_arabic(text) else "ltr"
+    if font is None:
+        font = "arabic" if direction == "rtl" else "latin"
+    return {"text": text, "font": font, "dir": direction, "nowrap": nowrap}
 
 
-_SCRIPT_LETTER_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u0600-\u06ff]")
-
-
-def _text_is_rtl(text: object, fallback: bool = False) -> bool:
-    value = str(text or "")
-    if not _SCRIPT_LETTER_RE.search(value):
-        return fallback
-    return detect_language(value) == "ar"
-
-
-def _align(pdf: "_ExamPDF", text: object = "") -> str:
-    return "R" if _text_is_rtl(text, pdf.rtl) else "L"
-
-
-def _text_height(pdf: _ExamPDF, text: str, width: float, line_height: float = LINE_HEIGHT) -> float:
-    height = pdf.multi_cell(
-        width,
-        line_height,
-        _latin(text),
-        dry_run=True,
-        output=MethodReturnValue.HEIGHT,
+def normalize_numerals(value: object) -> str:
+    return str(value or "").translate(
+        str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
     )
-    return max(float(height), line_height)
 
 
-def _field(value: object, underscore_count: int) -> str:
-    return _clean(value) or ("_" * underscore_count)
+def _run_tokens(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    tokens: list[dict[str, Any]] = []
+    for run in runs:
+        if run.get("type") == "text":
+            value = normalize_numerals(run.get("text") or "")
+            for part in re.split(r"(\s+)", value):
+                if not part:
+                    continue
+                if part.isspace():
+                    tokens.append({"space": True})
+                else:
+                    tokens.append(_token(part))
+        elif run.get("type") == "math":
+            plain = run.get("plain") or run.get("latex") or ""
+            plain = normalize_numerals(plain)
+            # Keep the complete expression as one LTR unit.  Splitting at
+            # spaces would let RTL paragraph layout reverse the operands.
+            tokens.append(_token(plain, font="latin", direction="ltr", nowrap=True))
+    return [token for token in tokens if token and (token.get("space") or token.get("text"))]
 
 
-def _draw_logo(pdf: _ExamPDF, data_url: object, x: float, y: float) -> None:
-    stream = _image_stream(data_url)
-    if stream is None:
-        return
-    try:
-        pdf.image(stream, x=x, y=y, w=20, h=13, keep_aspect_ratio=True)
-    except Exception:
-        # A malformed/unsupported optional logo must never prevent export.
-        return
-
-
-def _draw_free_field(
-    pdf: _ExamPDF,
-    x: float,
-    y: float,
-    width: float,
-    label: str,
-    value: object,
-    *,
-    rtl: bool,
-    size: float = 8.5,
-) -> None:
-    """Draw a label and value/blank line without a box or shaded background."""
-    label_text = f"{label}:"
-    clean_value = _clean(value)
-    pdf.set_font(BODY_FONT, "B", size)
-    label_w = min(width * 0.46, pdf.get_string_width(label_text) + 2.5)
-    value_w = max(8.0, width - label_w - 1.5)
-    pdf.set_text_color(*MUTED)
-    if rtl:
-        pdf.set_xy(x + width - label_w, y)
-        pdf.cell(label_w, 5.5, label_text, align="R")
-        value_x = x
-    else:
-        pdf.set_xy(x, y)
-        pdf.cell(label_w, 5.5, label_text, align="L")
-        value_x = x + label_w + 1.5
-
-    pdf.set_font(BODY_FONT, "", size)
-    pdf.set_text_color(*INK)
-    if clean_value:
-        pdf.set_xy(value_x, y)
-        pdf.cell(value_w, 5.5, clean_value, align="R" if rtl else "L")
-    else:
-        line_y = y + 4.8
-        pdf.set_draw_color(*RULE)
-        pdf.line(value_x + 0.8, line_y, value_x + value_w - 0.8, line_y)
-
-
-def _draw_exam_header(pdf: _ExamPDF, metadata: dict[str, Any], model_number: int) -> None:
-    from app.exports.common import HEADER_LABELS_BY_LANG
-
-    labels = HEADER_LABELS_BY_LANG.get(pdf.language, HEADER_LABELS_BY_LANG["en"])
-    title = _clean(metadata.get("exam_title"), "Examination")
-    if pdf.rtl:
-        # Mirror the logo positions for RTL layout.
-        _draw_logo(pdf, metadata.get("left_logo_data"), pdf.w - pdf.r_margin - 20, pdf.get_y() + 1)
-        _draw_logo(pdf, metadata.get("right_logo_data"), pdf.l_margin, pdf.get_y() + 1)
-    else:
-        _draw_logo(pdf, metadata.get("left_logo_data"), pdf.l_margin, pdf.get_y() + 1)
-        _draw_logo(pdf, metadata.get("right_logo_data"), pdf.w - pdf.r_margin - 20, pdf.get_y() + 1)
-
-    y = pdf.get_y()
-    pdf.set_xy(pdf.l_margin + 22, y + 1)
-    pdf.set_font(BODY_FONT, "B", 16)
-    pdf.set_text_color(*INK)
-    pdf.multi_cell(pdf.epw - 44, 7, title, align="C", new_x="LEFT", new_y="NEXT")
-    pdf.set_x(pdf.l_margin + 22)
-    pdf.set_font(BODY_FONT, "", 9)
-    pdf.set_text_color(*MUTED)
-    pdf.cell(pdf.epw - 44, 5, labels["model"].format(n=model_number), align="C")
-    pdf.set_y(max(pdf.get_y() + 7, y + 17))
-
-    meta_values = [
-        (labels["duration"], metadata.get("duration")),
-        (labels["teacher"], metadata.get("teacher_name")),
-        (labels["date"], metadata.get("exam_date")),
-    ]
-    col_w = pdf.epw / len(meta_values)
-    meta_y = pdf.get_y()
-    for index, (label, value) in enumerate(meta_values):
-        visual_col = len(meta_values) - 1 - index if pdf.rtl else index
-        _draw_free_field(
-            pdf,
-            pdf.l_margin + visual_col * col_w,
-            meta_y,
-            col_w - 3,
-            label,
-            value,
-            rtl=pdf.rtl,
-            size=8.2,
-        )
-    pdf.set_y(meta_y + 8)
-
-    student_w = pdf.epw * 0.67
-    if pdf.rtl:
-        _draw_free_field(
-            pdf, pdf.l_margin, pdf.get_y(), pdf.epw - student_w - 3,
-            labels["class"], metadata.get("class_name"), rtl=True, size=9.5,
-        )
-        _draw_free_field(
-            pdf, pdf.l_margin + pdf.epw - student_w, pdf.get_y(), student_w,
-            labels["student_name"].rstrip(": "), None, rtl=True, size=9.5,
-        )
-    else:
-        _draw_free_field(
-            pdf, pdf.l_margin, pdf.get_y(), student_w - 3,
-            labels["student_name"].rstrip(": "), None, rtl=False, size=9.5,
-        )
-        _draw_free_field(
-            pdf, pdf.l_margin + student_w, pdf.get_y(), pdf.epw - student_w,
-            labels["class"], metadata.get("class_name"), rtl=False, size=9.5,
-        )
-    pdf.ln(9)
-
-
-def _draw_section_heading(pdf: _ExamPDF, label: str, minimum_after: float = 12) -> None:
-    pdf.ensure_space(7 + minimum_after)
-    pdf.set_fill_color(*SECTION_FILL)
-    pdf.set_draw_color(*RULE)
-    pdf.set_text_color(*ACCENT)
-    pdf.set_font(BODY_FONT, "B", 11)
-    pdf.cell(0, 7, _latin(label), border="B", fill=True, align=_align(pdf, label))
-    pdf.ln(9)
-    pdf.set_text_color(*INK)
-
-
-def _draw_mixed_math(
-    pdf: _ExamPDF, text: str, *, x: float | None = None, width: float | None = None,
-    line_height: float = LINE_HEIGHT, bold: bool = False,
-) -> float:
-    """Render delimited TeX as LTR images and prose with natural direction."""
-    x = pdf.l_margin if x is None else x
-    width = pdf.epw if width is None else width
-    start_y = pdf.get_y()
-    parts = split_equation_content(text, undelimited_as_math=False)
-    if parts and all(
-        kind == "text" or latex_to_plain_text(value) is not None
-        for kind, value in parts
-    ):
-        inline = " ".join(
-            value if kind == "text" else str(latex_to_plain_text(value))
-            for kind, value in parts
-        )
-        pdf.set_xy(x, pdf.get_y())
-        pdf.set_font(BODY_FONT, "B" if bold else "", BODY_SIZE if bold else 10.5)
-        pdf.multi_cell(width, line_height, inline, align=_align(pdf, inline),
-                       new_x="LEFT", new_y="NEXT")
-        return pdf.get_y() - start_y
-    for kind, value in parts:
-        if kind == "text":
-            pdf.set_xy(x, pdf.get_y())
-            pdf.set_font(BODY_FONT, "B" if bold else "", BODY_SIZE if bold else 10.5)
-            pdf.multi_cell(width, line_height, value, align=_align(pdf, value),
-                           new_x="LEFT", new_y="NEXT")
-            continue
-        rendered = render_math(value)
-        if rendered:
-            natural_w = rendered.width_px / 220 * 25.4
-            natural_h = rendered.height_px / 220 * 25.4
-            draw_w = min(width, max(4.0, natural_w))
-            draw_h = max(3.0, natural_h * (draw_w / natural_w if natural_w else 1.0))
-            pdf.ensure_space(draw_h + 1)
-            stream = io.BytesIO(rendered.png)
-            stream.name = "inline-math.png"
-            pdf.image(stream, x=x + (width - draw_w) / 2, y=pdf.get_y(), w=draw_w, h=draw_h)
-            pdf.set_y(pdf.get_y() + draw_h + 1)
+def _plain_runs_text(runs: list[dict[str, Any]]) -> str:
+    pieces = []
+    for run in runs:
+        if run.get("type") == "text":
+            pieces.append(normalize_numerals(run.get("text") or ""))
         else:
-            pdf.set_xy(x, pdf.get_y())
-            pdf.multi_cell(width, line_height, value, align="C", new_x="LEFT", new_y="NEXT")
-    return pdf.get_y() - start_y
+            pieces.append(normalize_numerals(run.get("plain") or run.get("latex") or ""))
+    return _clean(" ".join(pieces))
 
 
-def _draw_question_stem(pdf: _ExamPDF, number: int, text: str, minimum_after: float = 0) -> None:
-    rtl = _text_is_rtl(text, pdf.rtl)
-    marker = f"{number}. " if rtl else f"Q{number}. "
-    stem = marker + _clean(text, "(missing question text)")
-    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    height = _text_height(pdf, stem, pdf.epw)
-    pdf.ensure_space(height + minimum_after)
-    _draw_mixed_math(pdf, stem, bold=True)
+def _paragraph_text(runs: list[dict[str, Any]], *, rtl: bool) -> str:
+    """Compose one logical paragraph while isolating LTR mathematical runs."""
+    pieces: list[str] = []
+    for run in runs:
+        if run.get("type") == "text":
+            value = normalize_numerals(run.get("text") or "")
+        else:
+            value = normalize_numerals(run.get("plain") or run.get("latex") or "")
+            if rtl and value:
+                value = f"\u2066{value}\u2069"
+        if value:
+            pieces.append(value)
+    return _clean(" ".join(pieces))
 
 
-def _draw_mcq_option(pdf: _ExamPDF, letter: str, option: object, width: float) -> float:
-    text = _clean(option)
-    pdf.set_font(BODY_FONT, "", 9.6)
-    if any(kind == "math" for kind, _ in split_equation_content(text, undelimited_as_math=False)):
-        return max(8.0, _text_height(pdf, text, width - 11, 5.0))
-    return _text_height(pdf, text, width - 11, 5.0)
-
-
-def _draw_mcq_option_at(
-    pdf: _ExamPDF,
-    x: float,
-    y: float,
-    width: float,
-    letter: str,
-    option: object,
+def _draw_logical_paragraph(
+    pdf: _ExamPDF, text: str, x: float, width: float, *,
+    size: float = BODY_SIZE, bold: bool = False, align: str | None = None,
 ) -> float:
-    """Render the Latin marker separately so bidi cannot move it after Arabic."""
-    option_text = _clean(option)
-    row_rtl = pdf.rtl
-    marker_w = 9.0
-    gap = 1.5
-    text_w = width - marker_w - gap
-    height = _draw_mcq_option(pdf, letter, option_text, width)
-    marker_x = x + text_w + gap if row_rtl else x
-    text_x = x if row_rtl else x + marker_w + gap
+    """Render a complete bidi paragraph with one wrapping/alignment context."""
+    if not text:
+        return 0.0
+    pdf.set_font(pdf.body_font, "B" if bold else "", size)
+    pdf.set_text_shaping(
+        True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR,
+    )
+    paragraph_align = align or ("R" if pdf.rtl else "L")
+    measured = pdf.multi_cell(
+        width, LINE_HEIGHT, text, align=paragraph_align,
+        dry_run=True, output=MethodReturnValue.HEIGHT,
+    )
+    pdf.set_xy(x, pdf.get_y())
+    pdf.multi_cell(
+        width, LINE_HEIGHT, text, align=paragraph_align,
+        new_x="LEFT", new_y="NEXT",
+    )
+    return float(measured)
 
-    pdf.set_xy(marker_x, y)
-    pdf.set_font(BODY_FONT, "B", 9.6)
-    # Arabic text shaping must not reorder a Latin marker from ``A.`` to
-    # ``.A``. Keep the marker LTR, then restore automatic shaping for the
-    # option text so Arabic and mixed formulas retain their own direction.
-    shaping_enabled = pdf.text_shaping is not None
-    if shaping_enabled:
-        pdf.set_text_shaping(True, direction=TextDirection.LTR)
-    try:
-        pdf.cell(marker_w, 5.0, f"{letter}.", align="R" if row_rtl else "L")
-    finally:
-        if shaping_enabled:
+
+def _token_width(pdf: FPDF, token: dict[str, Any], size: float, bold: bool) -> float:
+    if token.get("space"):
+        return size * 0.18
+    pdf.set_token_font(token, size, bold)
+    return float(pdf.get_string_width(token["text"]))
+
+
+def _layout(pdf: FPDF, tokens: list[dict[str, Any]], width: float, size: float,
+            bold: bool) -> list[tuple[list[dict[str, Any]], float]]:
+    lines: list[tuple[list[dict[str, Any]], float]] = []
+    line: list[dict[str, Any]] = []
+    line_w = 0.0
+    for token in tokens:
+        if token.get("space"):
+            if line:
+                line.append(token)
+                line_w += _token_width(pdf, token, size, bold)
+            continue
+        w = _token_width(pdf, token, size, bold)
+        if line and line_w + w > width and not token.get("nowrap"):
+            while line and line[-1].get("space"):
+                line.pop()
+            lines.append((line, line_w))
+            line = []
+            line_w = 0.0
+        if not line and w > width and token.get("nowrap"):
+            # A single unbreakable group wider than the column: keep it whole
+            # and let the renderer degrade to a smaller size later.
+            line.append(token)
+            line_w = w
+            continue
+        line.append(token)
+        line_w += w
+    while line and line[-1].get("space"):
+        line.pop()
+    if line:
+        lines.append((line, line_w))
+    return lines or [([], 0.0)]
+
+
+def _draw_line(pdf: FPDF, line: list[dict[str, Any]], line_w: float, x: float,
+               width: float, y: float, size: float, bold: bool, align: str) -> None:
+    if not line:
+        return
+    gap = size * 0.18
+    offset = 0.0
+    if align == "center":
+        offset = max(0.0, (width - line_w) / 2)
+    elif (align == "end" and not pdf.rtl) or (align == "start" and pdf.rtl):
+        offset = max(0.0, width - line_w)
+    if pdf.rtl:
+        cursor = x + width - offset
+        for token in line:
+            if token.get("space"):
+                cursor -= gap
+                continue
+            tw = _token_width(pdf, token, size, bold)
+            cursor -= tw
+            pdf.set_token_font(token, size, bold)
+            pdf.set_xy(cursor, y)
+            pdf.cell(tw, size * 0.53, token["text"], align="L")
+    else:
+        cursor = x + offset
+        for token in line:
+            if token.get("space"):
+                cursor += gap
+                continue
+            tw = _token_width(pdf, token, size, bold)
+            pdf.set_token_font(token, size, bold)
+            pdf.set_xy(cursor, y)
+            pdf.cell(tw, size * 0.53, token["text"], align="L")
+            cursor += tw
+
+
+def draw_flow(
+    pdf: _ExamPDF,
+    runs: list[dict[str, Any]],
+    x: float,
+    width: float,
+    *,
+    size: float = BODY_SIZE,
+    bold: bool = False,
+    align: str = "start",
+    line_height: float = LINE_HEIGHT,
+    allow_break: bool = True,
+) -> float:
+    tokens = _run_tokens(runs)
+    if not tokens:
+        return 0.0
+    lines = _layout(pdf, tokens, width, size, bold)
+    start_y = pdf.get_y()
+    y = start_y
+    for line, line_w in lines:
+        if allow_break and y + line_height > pdf.page_break_trigger:
+            pdf.add_page()
+            y = pdf.get_y()
+        _draw_line(pdf, line, line_w, x, width, y, size, bold, align)
+        y += line_height
+    pdf.set_y(y)
+    return y - start_y
+
+
+def draw_paragraph(
+    pdf: _ExamPDF, block: dict[str, Any], x: float, width: float,
+    *, size: float = BODY_SIZE, bold: bool = False, align: str = "start",
+) -> float:
+    runs = block.get("runs") or []
+    # Preserve extractable words and natural spacing for prose, but let the
+    # token composer handle Latin/numeric-only content inside an RTL page.
+    if all(run.get("type") == "text" for run in runs):
+        text = _clean(" ".join(run.get("text") or "" for run in runs))
+        if text and (not pdf.rtl or _has_arabic(text)):
+            pdf.set_font(pdf.body_font, "B" if bold else "", size)
             pdf.set_text_shaping(
                 True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR
             )
-    pdf.set_xy(text_x, y)
-    pdf.set_font(BODY_FONT, "", 9.6)
-    _draw_mixed_math(pdf, option_text, x=text_x, width=text_w, line_height=5.0)
-    return height
-
-
-def _draw_mcq(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    _draw_question_stem(pdf, item["number"], item["text"], minimum_after=5)
-    options = list((item.get("options") or {}).items())
-    if not options:
-        pdf.ln(2)
-        return
-
-    gutter = 5.0
-    col_w = (pdf.epw - gutter) / 2
-    two_column = all(_draw_mcq_option(pdf, str(letter), option, col_w) <= 10.1 for letter, option in options)
-    pdf.set_font(BODY_FONT, "", 9.6)
-
-    if two_column:
-        for index in range(0, len(options), 2):
-            pair = options[index:index + 2]
-            heights = [_draw_mcq_option(pdf, str(letter), option, col_w) for letter, option in pair]
-            row_h = max(heights) + 1.2
-            pdf.ensure_space(row_h)
-            row_y = pdf.get_y()
-            for col, (letter, option) in enumerate(pair):
-                visual_col = 1 - col if pdf.rtl else col
-                x = pdf.l_margin + visual_col * (col_w + gutter)
-                _draw_mcq_option_at(pdf, x + 2, row_y, col_w - 2, str(letter), option)
-            pdf.set_y(row_y + row_h)
-    else:
-        for letter, option in options:
-            height = _draw_mcq_option(pdf, str(letter), option, pdf.epw - 4) + 0.8
-            pdf.ensure_space(height)
-            row_y = pdf.get_y()
-            _draw_mcq_option_at(
-                pdf, pdf.l_margin + 4, row_y, pdf.epw - 4, str(letter), option
+            measured = pdf.multi_cell(
+                width, LINE_HEIGHT, text, align="R" if pdf.rtl else "L",
+                dry_run=True, output=MethodReturnValue.HEIGHT,
             )
-            pdf.set_y(row_y + height)
-            pdf.ln(0.8)
-    pdf.ln(2.2)
+            pdf.set_xy(x, pdf.get_y())
+            pdf.multi_cell(
+                width, LINE_HEIGHT, text, align="R" if pdf.rtl else "L",
+                new_x="LEFT", new_y="NEXT",
+            )
+            return float(measured)
+    return draw_flow(pdf, runs, x, width, size=size, bold=bold, align=align)
 
 
-def _draw_word_bank(pdf: _ExamPDF, words: list[str]) -> None:
-    if not words:
-        return
-    from app.online.models import UI_STRINGS_BY_LANG
+def measure_flow(pdf: _ExamPDF, runs: list[dict[str, Any]], width: float,
+                 *, size: float = BODY_SIZE, bold: bool = False) -> float:
+    tokens = _run_tokens(runs)
+    if not tokens:
+        return 0.0
+    return len(_layout(pdf, tokens, width, size, bold)) * LINE_HEIGHT
 
-    strings = UI_STRINGS_BY_LANG.get(pdf.language, UI_STRINGS_BY_LANG["en"])
-    bank_label = strings["word_bank"] if pdf.rtl else "WORD BANK"
-    bank_text = "   |   ".join(_latin(word) for word in words)
-    pdf.set_font(BODY_FONT, "", 9.4)
-    text_h = _text_height(pdf, bank_text, pdf.epw - 8, 5.0)
-    box_h = text_h + 9
-    pdf.ensure_space(box_h + 5)
-    x, y = pdf.l_margin, pdf.get_y()
-    pdf.set_fill_color(248, 250, 252)
+
+def draw_display_math(pdf: _ExamPDF, block: dict[str, Any], x: float, width: float) -> float:
+    latex = block.get("latex") or ""
+    rendered = None if _has_arabic(latex) else render_math(latex, font_size=13, dpi=260)
+    if rendered:
+        natural_w = rendered.width_px / 260 * 25.4
+        natural_h = rendered.height_px / 260 * 25.4
+        draw_w = min(width, max(8.0, natural_w))
+        draw_h = max(4.0, natural_h * (draw_w / natural_w if natural_w else 1.0))
+        pdf.ensure_space(draw_h + 3)
+        stream = io.BytesIO(rendered.png)
+        stream.name = "display-math.png"
+        pdf.image(stream, x=x + (width - draw_w) / 2, y=pdf.get_y(), w=draw_w, h=draw_h)
+        pdf.set_y(pdf.get_y() + draw_h + 2.5)
+        return draw_h + 2.5
+    plain = block.get("plain") or block.get("latex") or ""
+    text = _clean(normalize_numerals(plain))
+    if text:
+        if pdf.rtl:
+            # Keep Latin variables, units and operators in logical LTR order,
+            # while the complete display remains one centered RTL paragraph.
+            text = re.sub(
+                r"([A-Za-z0-9]+(?:\s*[+\-*/=<>≤≥.,:]\s*[A-Za-z0-9%]+)*)",
+                lambda match: f"\u2066{match.group(1)}\u2069",
+                text,
+            )
+        return _draw_logical_paragraph(
+            pdf, text, x, width, size=BODY_SIZE, align="C",
+        )
+    return 0.0
+
+
+def _runs_text(runs: list[dict[str, Any]]) -> str:
+    return _clean(" ".join(
+        normalize_numerals(run.get("text") or run.get("plain") or "")
+        for run in runs
+    ))
+
+
+def _table_column_widths(pdf: _ExamPDF, table: dict[str, Any], width: float) -> list[float]:
+    headers = table.get("headers") or []
+    if not headers:
+        return []
+    count = len(headers)
+    if count == 1:
+        return [width]
+    pdf.set_font(LATIN_FONT, "", SMALL_SIZE)
+    weights = []
+    for index in range(count):
+        values = [_runs_text(headers[index])]
+        for row in table.get("rows") or []:
+            if index < len(row):
+                values.append(_runs_text(row[index]))
+        longest = max((pdf.get_string_width(value) for value in values), default=8.0)
+        weights.append(max(12.0, min(80.0, longest + 4)))
+    total = sum(weights)
+    raw = [width * weight / total for weight in weights]
+    minimum = min(18.0, width / count)
+    raw = [max(minimum, value) for value in raw]
+    factor = width / sum(raw)
+    return [value * factor for value in raw]
+
+
+def draw_table(
+    pdf: _ExamPDF, table: dict[str, Any], x: float, width: float,
+    *, font_size: float = SMALL_SIZE, repeat_headers: bool = True,
+) -> float:
+    headers = table.get("headers") or []
+    rows = table.get("rows") or []
+    if not headers:
+        return 0.0
+    columns = _table_column_widths(pdf, table, width)
+    pad_x = 1.8
+    pad_y = 1.7
+    line_h = 4.3
+    start_y = pdf.get_y()
+    caption = _clean(table.get("caption") or "")
+    if caption:
+        pdf.set_font(pdf.body_font, "B", 9)
+        pdf.set_text_shaping(True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR)
+        pdf.set_xy(x, pdf.get_y())
+        pdf.cell(width, 5.2, caption, align="C", new_x="LEFT", new_y="NEXT")
+        pdf.set_y(pdf.get_y() + 1)
     pdf.set_draw_color(*RULE)
-    pdf.rect(x, y, pdf.epw, box_h, style="DF")
-    pdf.set_xy(x + 4, y + 2)
-    pdf.set_font(BODY_FONT, "B", 8.5)
-    pdf.set_text_color(*MUTED)
-    pdf.cell(pdf.epw - 8, 4, bank_label, align="C")
-    pdf.set_xy(x + 4, y + 6)
-    pdf.set_font(BODY_FONT, "", 9.4)
-    pdf.set_text_color(*INK)
-    pdf.multi_cell(pdf.epw - 8, 5.0, bank_text, align="C", new_x="LEFT", new_y="NEXT")
-    pdf.set_y(y + box_h + 4)
+    pdf.set_line_width(0.35)
 
+    def row_height(cells: list[list[dict[str, Any]]], bold: bool = False) -> float:
+        heights = []
+        for index, cell in enumerate(cells):
+            if index >= len(columns):
+                break
+            heights.append(measure_flow(pdf, cell, columns[index] - 2 * pad_x,
+                                        size=font_size, bold=bold))
+        return max([line_h] + heights) + 2 * pad_y
 
-def _draw_fill_blank(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    # The blank is part of the question stem.  Do not add a second ruled line
-    # between fill-in-the-blank questions.
-    printed_item = dict(item)
-    printed_item["text"] = expand_fill_blank_text(item.get("text"))
-    _draw_question_stem(pdf, printed_item["number"], printed_item["text"])
-    pdf.ln(4)
+    def cell_text(cell: list[dict[str, Any]], cx: float, cy: float, cw: float,
+                  rh: float, align: str, bold: bool) -> None:
+        pdf.set_xy(cx + pad_x, cy + pad_y)
+        draw_flow(pdf, cell, cx + pad_x, cw - 2 * pad_x, size=font_size,
+                  bold=bold, align=align, line_height=line_h, allow_break=False)
 
-
-def _draw_true_false(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    raw_statement = _clean(item['text'], '(missing statement)')
-    statement_rtl = _text_is_rtl(raw_statement, pdf.rtl)
-    marker = f"{item['number']}. " if statement_rtl else f"Q{item['number']}. "
-    statement = marker + raw_statement
-    choices = ("صح", "خطأ") if pdf.rtl else ("True", "False")
-    choices_w = 28.0 if pdf.rtl else 32.0
-    gutter = 3.0
-    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    inline_statement_w = pdf.epw - choices_w - gutter
-    inline = pdf.get_string_width(statement) + 3.0 <= inline_statement_w
-    statement_w = inline_statement_w if inline else pdf.epw
-    height = _text_height(pdf, statement, statement_w)
-    controls_height = 0 if inline else LINE_HEIGHT
-    pdf.ensure_space(height + controls_height + 4)
-    row_y = pdf.get_y()
-    if pdf.rtl:
-        statement_x = pdf.w - pdf.r_margin - statement_w
-    else:
-        statement_x = pdf.l_margin
-    pdf.set_xy(statement_x, row_y)
-    actual_height = _draw_mixed_math(
-        pdf, statement, x=statement_x, width=statement_w, bold=True
-    )
-    height = max(height, actual_height)
-    half = choices_w / 2
-    if inline:
-        choices_y = row_y
-        choices_x = pdf.l_margin if pdf.rtl else statement_x + statement_w + gutter
-    else:
-        choices_y = row_y + height
-        choices_x = pdf.l_margin if pdf.rtl else pdf.w - pdf.r_margin - choices_w
-    for index, label in enumerate(choices):
-        visual_index = 1 - index if pdf.rtl else index
-        pdf.set_xy(choices_x + visual_index * half, choices_y)
-        pdf.set_font(BODY_FONT, "", 9.5)
-        pdf.cell(half, LINE_HEIGHT, f"{label} (   )", align="R" if pdf.rtl else "L")
-    pdf.set_y(row_y + height + controls_height + 3)
-
-
-def _draw_answer_lines(pdf: _ExamPDF, count: int, *, rtl: bool = False) -> None:
-    for _ in range(count):
-        pdf.ensure_space(ANSWER_LINE_HEIGHT)
-        y = pdf.get_y() + ANSWER_LINE_HEIGHT - 1.2
-        start_x = pdf.l_margin if rtl else pdf.l_margin + 4
-        end_x = pdf.w - pdf.r_margin - (4 if rtl else 0)
-        pdf.set_draw_color(71, 85, 105)
-        pdf.set_line_width(0.18)
-        pdf.line(start_x, y, end_x, y)
-        pdf.ln(ANSWER_LINE_HEIGHT)
-
-
-def _draw_open_ended(
-    pdf: _ExamPDF,
-    item: dict[str, Any],
-    qtype: str,
-) -> None:
-    raw_text = _clean(item['text'], '(missing question text)')
-    text_rtl = _text_is_rtl(raw_text, pdf.rtl)
-    marker = f"{item['number']}. " if text_rtl else f"Q{item['number']}. "
-    text = marker + raw_text
-    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    stem_h = _text_height(pdf, text, pdf.epw)
-    line_count = response_line_count(qtype)
-    block_height = stem_h + 1 + (line_count * ANSWER_LINE_HEIGHT) + 2.5
-    usable_page_height = pdf.page_break_trigger - pdf.t_margin
-    # Keep a question and its complete writing area together whenever that
-    # block can fit on one page. This prevents orphan response lines on the
-    # next page while still allowing an exceptionally large block to flow.
-    pdf.ensure_space(
-        block_height if block_height <= usable_page_height
-        else stem_h + ANSWER_LINE_HEIGHT + 2
-    )
-    _draw_mixed_math(pdf, text, bold=True)
-    pdf.ln(1)
-    _draw_answer_lines(pdf, line_count, rtl=text_rtl)
-    pdf.ln(2.5)
-    pdf.set_text_color(*INK)
-
-
-def _draw_definition(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    marker = f"{item['number']}. "
-    raw_term = _clean(item.get("text"), "(missing term)")
-    term = marker + raw_term + ": "
-    if any(
-        kind == "math"
-        for kind, _value in split_equation_content(raw_term, undelimited_as_math=False)
-    ):
-        pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-        pdf.ensure_space(LINE_HEIGHT * 2 + 4)
-        _draw_mixed_math(pdf, term, bold=True)
-        y = pdf.get_y() + 1
-        pdf.set_draw_color(71, 85, 105)
-        pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
-        pdf.set_y(y + 4)
-        return
-    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    term_rtl = _text_is_rtl(raw_term, pdf.rtl)
-    term_w = min(pdf.epw * 0.38, max(28.0, pdf.get_string_width(term) + 3.0))
-    line_gap = 3.0
-    line_w = pdf.epw - term_w - line_gap
-    height = _text_height(pdf, term, term_w)
-    pdf.ensure_space(height + 4)
-    row_y = pdf.get_y()
-    if term_rtl:
-        term_x = pdf.w - pdf.r_margin - term_w
-        line_start = pdf.l_margin
-        line_end = term_x - line_gap
-    else:
-        term_x = pdf.l_margin
-        line_start = term_x + term_w + line_gap
-        line_end = pdf.w - pdf.r_margin
-    pdf.set_xy(term_x, row_y)
-    pdf.multi_cell(
-        term_w,
-        LINE_HEIGHT,
-        term,
-        align="R" if term_rtl else "L",
-        new_x="LEFT",
-        new_y="NEXT",
-    )
-    line_y = row_y + min(height, LINE_HEIGHT) - 1.0
-    pdf.set_draw_color(71, 85, 105)
-    pdf.set_line_width(0.18)
-    pdf.line(line_start, line_y, line_end, line_y)
-    pdf.set_y(row_y + height)
-    pdf.ln(4)
-
-
-def _draw_equation(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    equation = _clean(item.get("text"), "(missing equation)")
-    number_gutter = 12.0
-    equation_width = pdf.epw - (2 * number_gutter)
-    parts = split_equation_content(equation)
-    if (parts and any(kind == "text" for kind, _ in parts)
-            and not re.search(r"\$\$|\\\[", equation)
-            and all(kind == "text" or latex_to_plain_text(value) is not None
-                    for kind, value in parts)):
-        parts = [("text", " ".join(
-            value if kind == "text" else str(latex_to_plain_text(value))
-            for kind, value in parts
-        ))]
-    equation_h = 0.0
-    layouts = []
-    for kind, value in parts:
-        rendered = render_math(value) if kind == "math" else None
-        if rendered:
-            natural_w = rendered.width_px / 220 * 25.4
-            natural_h = rendered.height_px / 220 * 25.4
-            draw_w = min(equation_width, natural_w)
-            height = max(LINE_HEIGHT, natural_h * (draw_w / natural_w if natural_w else 1.0))
-        else:
-            pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-            draw_w = equation_width
-            height = _text_height(pdf, value, equation_width)
-        layouts.append((kind, value, rendered, draw_w, height))
-        equation_h += height + 1.5
-    pdf.ensure_space(equation_h + ANSWER_LINE_HEIGHT + 4)
     y = pdf.get_y()
-    number_x = pdf.w - pdf.r_margin - number_gutter if pdf.rtl else pdf.l_margin
-    pdf.set_xy(number_x, y)
-    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    pdf.cell(number_gutter, LINE_HEIGHT, f"{item['number']}.", align="R" if pdf.rtl else "L")
-    cursor_y = y
-    for kind, value, rendered, draw_w, height in layouts:
-        if rendered:
-            stream = io.BytesIO(rendered.png)
-            stream.name = "equation.png"
-            image_x = pdf.l_margin + number_gutter + (equation_width - draw_w) / 2
-            pdf.image(stream, x=image_x, y=cursor_y, w=draw_w, h=height)
-        else:
-            pdf.set_xy(pdf.l_margin + number_gutter, cursor_y)
-            pdf.multi_cell(equation_width, LINE_HEIGHT, value,
-                           align=_align(pdf, value) if kind == "text" else "C",
-                           new_x="LEFT", new_y="NEXT")
-        cursor_y += height + 1.5
-    pdf.set_y(cursor_y)
-    pdf.ln(1)
-    _draw_answer_lines(pdf, response_line_count("equation"), rtl=pdf.rtl)
-    pdf.ln(2.5)
-    pdf.set_text_color(*INK)
-
-
-def _draw_word_problem(pdf: _ExamPDF, item: dict[str, Any]) -> None:
-    raw_text = _clean(item.get("text"), "(missing question text)")
-    text = f"{item['number']}. " + raw_text
-    pdf.set_font(BODY_FONT, "B", BODY_SIZE)
-    stem_h = _text_height(pdf, text, pdf.epw)
-    pdf.ensure_space(stem_h + ANSWER_LINE_HEIGHT + 2)
-    _draw_mixed_math(pdf, text, bold=True)
-    pdf.ln(1)
-    _draw_answer_lines(pdf, response_line_count("word_problem"), rtl=_text_is_rtl(raw_text, pdf.rtl))
-    pdf.ln(2.5)
-    pdf.set_text_color(*INK)
-
-
-def _draw_student_exam(
-    pdf: _ExamPDF,
-    exam: dict[str, Any],
-    metadata: dict[str, Any],
-) -> list[dict[str, Any]]:
-    model_number = int(exam.get("model_number") or 1)
-    title = _clean(metadata.get("exam_title") or exam.get("title"), "Examination")
-    from app.exports.common import HEADER_LABELS_BY_LANG
-
-    labels = HEADER_LABELS_BY_LANG.get(pdf.language, HEADER_LABELS_BY_LANG["en"])
-    pdf._running_title = title
-    pdf._running_model = labels["model"].format(n=model_number)
-    pdf._copy_label = "Student copy"
-    pdf.add_page()
-    _draw_exam_header(pdf, metadata, model_number)
-
-    sections = group_exam_sections(exam.get("questions") or {}, language=pdf.language)
-    for section_index, section in enumerate(sections):
-        if section["qtype"] == "essay" and section_index > 0:
+    header_h = row_height(headers, bold=True)
+    if y + header_h > pdf.page_break_trigger:
+        pdf.add_page()
+        y = pdf.get_y()
+    # Header row: white fill, bold text, thin rules.
+    cx = x
+    for index, cell in enumerate(headers[:len(columns)]):
+        cw = columns[index]
+        pdf.rect(cx, y, cw, header_h)
+        cell_text(cell, cx, y, cw, header_h,
+                  "center" if table.get("align", [])[index:index + 1] == ["center"] else
+                  ("end" if (table.get("align") or [])[index:index + 1] == ["end"] else "start"),
+                  True)
+        cx += cw
+    y += header_h
+    for row_index, row in enumerate(rows):
+        rh = row_height(row)
+        if y + rh > pdf.page_break_trigger:
             pdf.add_page()
-        minimum_after = 22 if section["qtype"] in {
-            "why", "equation", "word_problem", "essay"
-        } else 18
-        _draw_section_heading(pdf, section["label"], minimum_after=minimum_after)
-        if section["qtype"] == "fill_in_the_blank":
-            _draw_word_bank(pdf, section.get("word_bank") or [])
-
-        items = section["items"]
-        for item in items:
-            qtype = section["qtype"]
-            if qtype == "mcq":
-                _draw_mcq(pdf, item)
-            elif qtype == "fill_in_the_blank":
-                _draw_fill_blank(pdf, item)
-            elif qtype == "true_false":
-                _draw_true_false(pdf, item)
-            elif qtype == "definition":
-                _draw_definition(pdf, item)
-            elif qtype == "equation":
-                _draw_equation(pdf, item)
-            elif qtype == "word_problem":
-                _draw_word_problem(pdf, item)
-            else:
-                _draw_open_ended(pdf, item, qtype)
-
-    return sections
+            y = pdf.get_y()
+            if repeat_headers:
+                cx = x
+                for index, cell in enumerate(headers[:len(columns)]):
+                    cw = columns[index]
+                    pdf.rect(cx, y, cw, header_h)
+                    cell_text(cell, cx, y, cw, header_h, "start", True)
+                    cx += cw
+                y += header_h
+        cx = x
+        for index, cell in enumerate(row[:len(columns)]):
+            cw = columns[index]
+            pdf.rect(cx, y, cw, rh)
+            align = (table.get("align") or [])[index] if index < len(table.get("align") or []) else "start"
+            if table.get("compact"):
+                align = "center"
+            cell_text(cell, cx, y, cw, rh, align, False)
+            cx += cw
+        y += rh
+    pdf.set_y(y + 1.5)
+    return y - start_y + 1.5
 
 
-def _answer_text(item: dict[str, Any], language: str = "en") -> str:
-    from app.exports.common import ANSWER_LABELS_BY_LANG
-
-    labels = ANSWER_LABELS_BY_LANG.get(language, ANSWER_LABELS_BY_LANG["en"])
-    qtype = item["qtype"]
-    if qtype == "mcq":
-        return _clean(item.get("correct_answer"), labels["missing"])
-    if qtype == "true_false":
-        from app.online.models import tf_answer_label
-
-        raw = _clean(item.get("answer"), labels["missing"])
-        if raw.lower() in {"true", "false"}:
-            return tf_answer_label(raw, language)
-        return raw
-    if qtype == "fill_in_the_blank":
-        return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or labels["missing"]
-    if qtype in {"equation", "word_problem"}:
-        steps = [_clean(step) for step in (item.get("solution_steps") or []) if _clean(step)]
-        final = _clean(item.get("final_answer"), labels["missing_final"])
-        return " → ".join([*steps, final])
-    answer = _clean(item.get("reference_answer"), labels["missing_reference"])
-    key_points = [_clean(point) for point in (item.get("key_points") or []) if _clean(point)]
-    if key_points:
-        separator = f" | {labels['key_points']}: "
-        answer += separator + "; ".join(key_points)
-    return answer
+def draw_response_lines(pdf: _ExamPDF, count: int, x: float, width: float) -> float:
+    if count <= 0:
+        return 0.0
+    line_h = 6.5
+    # Keep at least two lines together; do not force a whole page of blank
+    # lines when only a short answer area remains.
+    if pdf.get_y() + min(2, count) * line_h > pdf.page_break_trigger:
+        pdf.add_page()
+    start = pdf.get_y()
+    for _ in range(count):
+        if pdf.get_y() + line_h > pdf.page_break_trigger:
+            pdf.add_page()
+        pdf.set_draw_color(*RULE)
+        pdf.set_line_width(0.4)
+        pdf.line(x, pdf.get_y(), x + width, pdf.get_y())
+        pdf.set_y(pdf.get_y() + line_h)
+    return pdf.get_y() - start
 
 
-def _draw_answer_key(
+def _draw_number(pdf: _ExamPDF, number: int, x: float, y: float, width: float,
+                 align: str) -> None:
+    pdf.set_font(LATIN_FONT, "B", 10.5)
+    pdf.set_text_shaping(True, direction=TextDirection.LTR)
+    pdf.set_xy(x, y)
+    pdf.cell(width, LINE_HEIGHT, f"{number}.", align=align)
+
+
+def _draw_question_text(
     pdf: _ExamPDF,
-    sections: list[dict[str, Any]],
-    metadata: dict[str, Any],
-    model_number: int,
-) -> None:
-    from app.exports.common import HEADER_LABELS_BY_LANG
+    question: dict[str, Any],
+    x: float,
+    width: float,
+    *,
+    include_number: bool = True,
+) -> float:
+    blocks = question.get("blocks") or []
+    start = pdf.get_y()
+    content_x = x
+    content_w = width
+    first = True
+    for block in blocks:
+        if block.get("type") == "table":
+            if first:
+                pdf.set_y(start + LINE_HEIGHT)
+            draw_table(pdf, block, content_x, content_w)
+            first = False
+            continue
+        pdf.set_x(content_x)
+        if first:
+            pdf.set_y(start)
+        if block.get("type") == "paragraph":
+            text = _paragraph_text(block.get("runs") or [], rtl=pdf.rtl)
+            if first and include_number:
+                marker = f"{int(question['number'])}.\u00a0"
+                text = marker + text
+            _draw_logical_paragraph(pdf, text, content_x, content_w, bold=True)
+        elif block.get("type") == "math" and block.get("display"):
+            draw_display_math(pdf, block, content_x, content_w)
+        first = False
+    used = pdf.get_y() - start
+    return max(used, LINE_HEIGHT)
 
-    if not sections:
+
+def _option_blocks_height(pdf: _ExamPDF, option: dict[str, Any], width: float) -> float:
+    height = 0.0
+    for block in option.get("blocks") or []:
+        if block.get("type") == "table":
+            height += 10.0 + len(block.get("rows") or []) * 7.5
+        elif block.get("type") == "paragraph":
+            height += measure_flow(pdf, block.get("runs") or [], width)
+        elif block.get("type") == "math":
+            height += LINE_HEIGHT
+    return max(height, 5.5)
+
+
+def _draw_option(pdf: _ExamPDF, option: dict[str, Any], x: float, y: float,
+                 width: float) -> float:
+    pdf.set_y(y)
+    needed = _option_blocks_height(pdf, option, width)
+    if pdf.get_y() + needed + 2 > pdf.page_break_trigger:
+        pdf.add_page()
+        y = pdf.get_y()
+    label = f"{option.get('label', 'A')}."
+    content_x = x
+    content_w = width
+    pdf.set_y(y)
+    used = 0.0
+    for block in option.get("blocks") or []:
+        if block.get("type") == "paragraph":
+            text = _paragraph_text(block.get("runs") or [], rtl=pdf.rtl)
+            marker = f"{label}\u00a0"
+            used = max(used, _draw_logical_paragraph(
+                pdf, marker + text, content_x, content_w, size=10.2,
+            ))
+        elif block.get("type") == "table":
+            _draw_logical_paragraph(
+                pdf, label, content_x, content_w,
+                size=10.2, bold=True,
+            )
+            used = max(used, draw_table(pdf, block, content_x, content_w, font_size=8.2))
+        elif block.get("type") == "math":
+            used = max(used, draw_flow(
+                pdf, [block], content_x, content_w, size=10.2,
+                align="R" if pdf.rtl else "L",
+            ))
+    return max(used, LINE_HEIGHT)
+
+
+def _use_two_option_columns(pdf: _ExamPDF, question: dict[str, Any], width: float) -> bool:
+    options = question.get("options") or []
+    if not options:
+        return False
+    tables = [
+        block for option in options for block in (option.get("blocks") or [])
+        if block.get("type") == "table"
+    ]
+    if tables:
+        # Compact numeric option tables remain readable in two columns when
+        # their shape and content fit the measured half-page width.  Larger or
+        # prose-heavy tables stack automatically.
+        return all(
+            block.get("compact")
+            and len(block.get("headers") or []) <= 3
+            and len(block.get("rows") or []) <= 5
+            and max(
+                (len(_runs_text(cell)) for row in (
+                    [block.get("headers") or []] + list(block.get("rows") or [])
+                ) for cell in row),
+                default=0,
+            ) <= 12
+            for block in tables
+        )
+    col_w = (width - 8) / 2
+    if tables:
+        return True
+    # Measure actual wrapped height, not character counts.  Long or multiline
+    # options automatically fall back to one column.
+    return all(
+        _option_blocks_height(pdf, option, col_w) <= LINE_HEIGHT * 2.1
+        for option in options
+    )
+
+
+def draw_options(pdf: _ExamPDF, question: dict[str, Any], x: float, width: float) -> float:
+    options = question.get("options") or []
+    if not options:
+        return 0.0
+    two_columns = _use_two_option_columns(pdf, question, width)
+    if two_columns:
+        col_w = (width - 8) / 2
+        start = pdf.get_y()
+        heights = []
+        for index, option in enumerate(options):
+            col = index % 2
+            visual = 1 - col if pdf.rtl else col
+            ox = x + visual * (col_w + 8)
+            oy = start + (index // 2) * 0.0
+            # Draw each row only after knowing both heights; a simple row
+            # pass keeps A/B and C/D aligned.
+            heights.append(_option_blocks_height(pdf, option, col_w))
+        row_heights = [max(heights[i:i + 2]) + 2 for i in range(0, len(heights), 2)]
+        for index, option in enumerate(options):
+            row = index // 2
+            col = index % 2
+            visual = 1 - col if pdf.rtl else col
+            ox = x + visual * (col_w + 8)
+            oy = start + sum(row_heights[:row])
+            _draw_option(pdf, option, ox, oy, col_w)
+        pdf.set_y(start + sum(row_heights))
+        return sum(row_heights)
+    start = pdf.get_y()
+    initial = start
+    for option in options:
+        pdf.set_y(start)
+        _draw_option(pdf, option, x, start, width)
+        start = pdf.get_y() + 1.0
+    pdf.set_y(start)
+    return start - initial
+
+
+def draw_true_false(pdf: _ExamPDF, question: dict[str, Any], x: float, width: float,
+                    choices: str) -> float:
+    blocks = question.get("blocks") or []
+    if not blocks or any(block.get("type") != "paragraph" for block in blocks):
+        height = _draw_question_text(pdf, question, x, width)
+        pdf.set_font(pdf.body_font, "", 9.8)
+        pdf.set_text_shaping(True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR)
+        pdf.set_xy(x, pdf.get_y())
+        pdf.multi_cell(width, LINE_HEIGHT, choices, align="R" if pdf.rtl else "L",
+                       new_x="LEFT", new_y="NEXT")
+        return height + LINE_HEIGHT
+    runs: list[dict[str, Any]] = []
+    for block in blocks:
+        runs.extend(block.get("runs") or [])
+    statement = _paragraph_text(runs, rtl=pdf.rtl)
+    marker = f"{int(question.get('number') or 1)}.\u00a0"
+    # Keep both labels and checkbox pairs as one unbreakable group.  Avoid
+    # directional controls around Arabic here: HarfBuzz already has the
+    # paragraph base direction and some PDF extractors drop isolated content.
+    group = choices.replace(" ", "\u00a0")
+    return _draw_logical_paragraph(
+        pdf, f"{marker}{statement} {group}", x, width, bold=True,
+    )
+
+
+def _options_height(pdf: _ExamPDF, question: dict[str, Any], width: float) -> float:
+    options = question.get("options") or []
+    if not options:
+        return 0.0
+    two = _use_two_option_columns(pdf, question, width)
+    if two:
+        col_w = (width - 8) / 2
+        heights = [_option_blocks_height(pdf, option, col_w) for option in options]
+        return sum(max(heights[i:i + 2]) + 2 for i in range(0, len(heights), 2))
+    return sum(_option_blocks_height(pdf, option, width) + 1 for option in options)
+
+
+def _estimate_question_height(pdf: _ExamPDF, question: dict[str, Any], width: float) -> float:
+    blocks = question.get("blocks") or []
+    table = next((block for block in blocks if block.get("type") == "table"), None)
+    non_table = [block for block in blocks if block.get("type") != "table"]
+    height = 0.0
+    for block in non_table:
+        if block.get("type") == "paragraph":
+            height += measure_flow(pdf, block.get("runs") or [], width, bold=True)
+        elif block.get("type") == "math" and block.get("display"):
+            height += 20.0
+    height += _options_height(pdf, question, width)
+    height += int(question.get("response_lines") or 0) * 6.5
+    if table:
+        table_w = min(64.0, width * 0.38)
+        question_w = width - table_w - 8.0
+        table_height = 12.0 + len(table.get("rows") or []) * 8.0
+        if question_w >= 90 and table_height + 20 <= (pdf.page_break_trigger - pdf.get_y()):
+            height = max(height, table_height + 12)
+        else:
+            height += table_height + 8
+    return max(height, LINE_HEIGHT)
+
+
+def _draw_question(pdf: _ExamPDF, question: dict[str, Any], x: float, width: float) -> None:
+    estimated = _estimate_question_height(pdf, question, width)
+    if pdf.get_y() > PAGE_MARGIN_MM + 4 and pdf.get_y() + estimated > pdf.page_break_trigger:
+        pdf.add_page()
+    qtype = question.get("qtype")
+    if qtype == "definition":
+        _draw_question_text(pdf, question, x, width)
+        draw_response_lines(pdf, 1, x, width)
+        pdf.ln(2.5)
         return
-    labels = HEADER_LABELS_BY_LANG.get(pdf.language, HEADER_LABELS_BY_LANG["en"])
-    pdf._copy_label = "Teacher answer key"
-    pdf.add_page()
-    pdf.set_font(BODY_FONT, "B", 15)
-    pdf.set_text_color(*INK)
-    pdf.cell(0, 8, labels["answer_key"].format(n=model_number), align="C")
-    pdf.ln(11)
+    if qtype == "true_false":
+        pdf.ensure_space(14)
+        draw_true_false(pdf, question, x, width, question.get("true_false_choices") or "")
+        pdf.ln(2.5)
+        return
 
-    for section in sections:
-        _draw_section_heading(pdf, section["label"], minimum_after=11)
-        for item in section["items"]:
-            if item["qtype"] == "equation":
-                marker = f"{item['number']}. " if pdf.rtl else f"Q{item['number']}. "
-                pdf.set_font(BODY_FONT, "B", 9.5)
-                pdf.cell(0, 5.0, marker, align="R" if pdf.rtl else "L",
-                         new_x="LEFT", new_y="NEXT")
-                values = [
-                    *[_clean(step) for step in item.get("solution_steps") or [] if _clean(step)],
-                    _clean(item.get("final_answer"), "(missing final answer)"),
-                ]
-                for value in values:
-                    _draw_mixed_math(
-                        pdf, value, x=pdf.l_margin + 6,
-                        width=pdf.epw - 12, line_height=5.0,
-                    )
-                pdf.ln(1)
-                continue
-            answer = _answer_text(item, language=pdf.language)
-            answer_rtl = pdf.rtl if item["qtype"] == "mcq" else _text_is_rtl(answer, pdf.rtl)
-            marker = f"{item['number']}. " if answer_rtl else f"Q{item['number']}. "
-            text = marker + answer
-            pdf.set_font(BODY_FONT, "", 9.5)
-            height = _text_height(pdf, text, pdf.epw, 5.0)
-            pdf.ensure_space(height + 2)
-            _draw_mixed_math(pdf, text, line_height=5.0)
+    blocks = question.get("blocks") or []
+    table = next((block for block in blocks if block.get("type") == "table"), None)
+    non_table = [block for block in blocks if block.get("type") != "table"]
+    if table:
+        table_w = min(64.0, width * 0.38)
+        question_w = width - table_w - 8.0
+        table_height = 12.0 + len(table.get("rows") or []) * 8.0
+        side_by_side = question_w >= 90.0 and table_height + 20 <= (
+            pdf.page_break_trigger - pdf.get_y()
+        )
+        if side_by_side:
+            start = pdf.get_y()
+            qx = x + table_w + 8.0 if pdf.rtl else x
+            tx = x if pdf.rtl else x + question_w + 8.0
+            q_question = dict(question)
+            q_question["blocks"] = non_table
+            used = _draw_question_text(pdf, q_question, qx, question_w)
+            options_used = draw_options(pdf, question, qx, question_w)
+            q_end = pdf.get_y()
+            pdf.set_y(start)
+            draw_table(pdf, table, tx, table_w)
+            table_end = pdf.get_y()
+            pdf.set_y(max(q_end, table_end) + 3)
+            return
+        # Stacked layout: question and options first, then the table.
+        q_question = dict(question)
+        q_question["blocks"] = non_table
+        _draw_question_text(pdf, q_question, x, width)
+        draw_options(pdf, question, x, width)
+        draw_table(pdf, table, x, width)
+        return
+
+    _draw_question_text(pdf, question, x, width)
+    draw_options(pdf, question, x, width)
+    lines = int(question.get("response_lines") or 0)
+    if lines:
+        draw_response_lines(pdf, lines, x, width)
+
+
+def _draw_header(pdf: _ExamPDF, document: dict[str, Any]) -> None:
+    meta = document["metadata"]
+    pdf.set_y(PAGE_MARGIN_MM)
+    title = meta.get("title") or ("امتحان" if pdf.rtl else "Examination")
+    pdf.set_font(pdf.body_font, "B", 20)
+    pdf.set_text_shaping(True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR)
+    pdf.cell(0, 9, title, align="C", new_x="LEFT", new_y="NEXT")
+    pdf.set_font(pdf.body_font, "", 9.5)
+    pdf.cell(0, 5, meta.get("model_label") or "", align="C", new_x="LEFT", new_y="NEXT")
+    pdf.ln(3)
+    pdf.set_draw_color(*RULE)
+    pdf.set_line_width(0.7)
+    pdf.line(PAGE_MARGIN_MM, pdf.get_y(), PAGE_MARGIN_MM + CONTENT_WIDTH_MM, pdf.get_y())
+    pdf.ln(3)
+    fields = [
+        (meta.get("duration_label"), meta.get("duration")),
+        (meta.get("teacher_label"), meta.get("teacher_name")),
+        (meta.get("date_label"), meta.get("exam_date")),
+    ]
+    col_w = CONTENT_WIDTH_MM / 3
+    y = pdf.get_y()
+    for index, (label, value) in enumerate(fields):
+        visual = 2 - index if pdf.rtl else index
+        x = PAGE_MARGIN_MM + visual * col_w
+        pdf.set_xy(x, y)
+        pdf.set_font(pdf.body_font, "B", 9)
+        pdf.cell(20, 5, f"{label}:", align="R" if pdf.rtl else "L")
+        pdf.set_font(pdf.body_font, "", 9)
+        pdf.cell(col_w - 22, 5, _clean(value), align="R" if pdf.rtl else "L")
+    pdf.set_y(y + 7)
+    pdf.set_line_width(0.4)
+    pdf.line(PAGE_MARGIN_MM, pdf.get_y(), PAGE_MARGIN_MM + CONTENT_WIDTH_MM, pdf.get_y())
+    pdf.ln(4)
+    pdf.set_font(pdf.body_font, "", 9.3)
+    class_value = _clean(meta.get("class_name"))
+    pdf.cell(100, 6, f"{meta.get('student_name_label')}: ______________________________",
+             align="R" if pdf.rtl else "L")
+    pdf.cell(80, 6, f"{meta.get('class_label')}: {class_value or '________________'}",
+             align="R" if pdf.rtl else "L", new_x="LEFT", new_y="NEXT")
+    pdf.ln(3)
+
+
+def _draw_section_heading(pdf: _ExamPDF, heading: str) -> None:
+    pdf.ensure_space(16)
+    pdf.ln(2)
+    pdf.set_font(pdf.body_font, "B", 11.5)
+    pdf.set_text_shaping(True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR)
+    pdf.set_xy(PAGE_MARGIN_MM, pdf.get_y())
+    pdf.cell(CONTENT_WIDTH_MM, 6.5, heading, align="R" if pdf.rtl else "L",
+             new_x="LEFT", new_y="NEXT")
+    pdf.set_draw_color(*RULE)
+    pdf.set_line_width(0.55)
+    pdf.line(PAGE_MARGIN_MM, pdf.get_y(), PAGE_MARGIN_MM + CONTENT_WIDTH_MM, pdf.get_y())
+    pdf.ln(4)
+
+
+def _draw_student(pdf: _ExamPDF, document: dict[str, Any]) -> None:
+    _draw_header(pdf, document)
+    for section in document.get("sections") or []:
+        first_item = (section.get("items") or [None])[0]
+        if first_item:
+            # Keep the heading with the first question; never leave a heading
+            # stranded at the bottom of a page.
+            first_height = _estimate_question_height(
+                pdf, first_item, CONTENT_WIDTH_MM
+            )
+            # Reserve the real first-question footprint plus the compact
+            # heading gap.  The former +8 mm guard forced a short word problem
+            # onto an otherwise empty second page even when it fit safely.
+            pdf.ensure_space(max(24.0, min(55.0, first_height) + 4))
+        _draw_section_heading(pdf, section.get("heading") or "")
+        if section.get("word_bank"):
+            pdf.set_font(pdf.body_font, "B", 9.2)
+            bank = "  |  ".join(section["word_bank"])
+            pdf.set_text_shaping(True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR)
+            pdf.set_xy(PAGE_MARGIN_MM, pdf.get_y())
+            pdf.multi_cell(CONTENT_WIDTH_MM, 5.4, bank, align="R" if pdf.rtl else "L",
+                           new_x="LEFT", new_y="NEXT")
+            pdf.ln(2)
+        for question in section.get("items") or []:
+            _draw_question(pdf, question, PAGE_MARGIN_MM, CONTENT_WIDTH_MM)
             pdf.ln(1.5)
 
 
-def _render_model_pdf(
-    exam: dict[str, Any], metadata: dict[str, Any], *, answers: bool
-) -> bytes:
-    """Render one model as either a student exam or a standalone answer key."""
-    global _UNICODE_OUTPUT, BODY_FONT
-    metadata = dict(metadata or {})
-    language = exam_document_language(exam, metadata)
-    has_arabic = _register_arabic_font()
-    has_math = _register_math_font()
-    try:
-        pdf = _ExamPDF(language)
-        pdf.alias_nb_pages()
-        questions = exam.get("questions") or {}
-        needs_math_font = any(questions.get(qtype) for qtype in ("equation", "word_problem"))
-        content_blob = f"{metadata.get('exam_title', '')} {exam.get('questions', '')}"
-        needs_arabic_font = pdf.rtl or detect_language(content_blob) == "ar"
-        if needs_arabic_font and has_arabic:
-            BODY_FONT = ARABIC_FONT
-            _UNICODE_OUTPUT = True
-            pdf.add_font(ARABIC_FONT, "", str(FONT_DIR / "Tajawal-Regular.ttf"))
-            pdf.add_font(ARABIC_FONT, "B", str(FONT_DIR / "Tajawal-Bold.ttf"))
-            if has_math:
-                pdf.add_font(MATH_FONT, "", str(FONT_DIR / "DejaVuSans.ttf"))
-                pdf.add_font(MATH_FONT, "B", str(FONT_DIR / "DejaVuSans-Bold.ttf"))
-                try:
-                    pdf.set_fallback_fonts([MATH_FONT])
-                except Exception:
-                    pass
-            try:
-                pdf.set_text_shaping(
-                    True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR
-                )
-            except Exception:
-                pass
-        elif needs_math_font and has_math:
-            BODY_FONT = MATH_FONT
-            _UNICODE_OUTPUT = True
-            pdf.add_font(MATH_FONT, "", str(FONT_DIR / "DejaVuSans.ttf"))
-            pdf.add_font(MATH_FONT, "B", str(FONT_DIR / "DejaVuSans-Bold.ttf"))
-        else:
-            # Latin content keeps the original Helvetica layout.
-            BODY_FONT = "helvetica"
-            _UNICODE_OUTPUT = False
+def _draw_answers(pdf: _ExamPDF, document: dict[str, Any]) -> None:
+    pdf.set_y(PAGE_MARGIN_MM)
+    pdf.set_font(pdf.body_font, "B", 16)
+    pdf.set_text_shaping(True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR)
+    pdf.cell(0, 9, document["metadata"].get("answer_key_title") or "", align="C",
+             new_x="LEFT", new_y="NEXT")
+    pdf.ln(3)
+    for section in document.get("sections") or []:
+        _draw_section_heading(pdf, section.get("heading") or "")
+        for question in section.get("items") or []:
+            pdf.ensure_space(12)
+            number = int(question.get("number") or 1)
+            first_paragraph = True
+            for block in question.get("answer_blocks") or []:
+                if block.get("type") == "paragraph":
+                    text = _paragraph_text(block.get("runs") or [], rtl=pdf.rtl)
+                    if first_paragraph:
+                        text = f"{number}.\u00a0{text}"
+                    _draw_logical_paragraph(
+                        pdf, text, PAGE_MARGIN_MM, CONTENT_WIDTH_MM, size=9.5,
+                    )
+                    first_paragraph = False
+                elif block.get("type") == "math" and block.get("display"):
+                    draw_display_math(pdf, block, PAGE_MARGIN_MM + 10,
+                                      CONTENT_WIDTH_MM - 10)
+                elif block.get("type") == "table":
+                    draw_table(pdf, block, PAGE_MARGIN_MM + 10,
+                               CONTENT_WIDTH_MM - 10, font_size=8.5)
+            pdf.ln(1.5)
 
-        if exam.get("questions"):
-            model_number = int(exam.get("model_number") or 1)
-            if answers:
-                sections = group_exam_sections(
-                    exam.get("questions") or {}, language=language
-                )
-                _draw_answer_key(pdf, sections, metadata, model_number)
-            else:
-                _draw_student_exam(pdf, exam, metadata)
 
-        return bytes(pdf.output())
-    finally:
-        _UNICODE_OUTPUT = False
+def _render(exam: dict[str, Any], metadata: dict[str, Any], *, kind: str) -> bytes:
+    document = build_document_ir(exam, metadata, kind=kind)
+    language = document.get("language") or "en"
+    pdf = _ExamPDF(language)
+    pdf.alias_nb_pages()
+    pdf.set_title(document["metadata"].get("title") or "Exam")
+    pdf.add_page()
+    if kind == "answers":
+        _draw_answers(pdf, document)
+    else:
+        _draw_student(pdf, document)
+    _draw_page_footers(pdf)
+    return bytes(pdf.output())
+
+
+def _draw_page_footers(pdf: _ExamPDF) -> None:
+    """Paint stable localized page totals after the last page is known."""
+    total = len(pdf.pages)
+    current = pdf.page
+    auto_break = pdf.auto_page_break
+    bottom_margin = pdf.b_margin
+    pdf.set_auto_page_break(False)
+    for number in range(1, total + 1):
+        pdf.page = number
+        pdf.set_y(-11)
+        pdf.set_font(pdf.body_font, "", 8)
+        pdf.set_text_color(*INK)
+        text = (
+            f"صفحة {number} من {total}"
+            if pdf.rtl else f"Page {number} of {total}"
+        )
+        pdf.set_text_shaping(
+            True, direction=TextDirection.RTL if pdf.rtl else TextDirection.LTR,
+        )
+        pdf.cell(0, 4, text, align="C")
+    pdf.page = current
+    pdf.set_auto_page_break(auto_break, margin=bottom_margin)
 
 
 def render_exam_pdf(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
-    """Render one model's student exam without any answer-key pages."""
-    return _render_model_pdf(exam, metadata, answers=False)
+    return _render(exam, metadata, kind="student")
 
 
 def render_answers_pdf(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
-    """Render one model's answer key as a separate PDF."""
-    return _render_model_pdf(exam, metadata, answers=True)
+    return _render(exam, metadata, kind="answers")

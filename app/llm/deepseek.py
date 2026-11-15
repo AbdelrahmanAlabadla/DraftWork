@@ -225,7 +225,8 @@ class DeepSeekClient:
             concurrency.release()
 
     async def _request_with_backoff(
-        self, *, timeout: int, agent: str = "", **kwargs
+        self, *, timeout: int, agent: str = "", request_budget=None,
+        budget_ids: list[str] | None = None, **kwargs
     ):
         self.last_transient_retries = 0
         account_scope = self._account_scope()
@@ -238,6 +239,8 @@ class DeepSeekClient:
                 ), {}, "INSUFFICIENT_QUOTA",
             )
         for transient_attempt in range(DEEPSEEK_MAX_TRANSIENT_RETRIES + 1):
+            if request_budget is not None:
+                request_budget.consume(budget_ids)
             request_event_id = str(uuid.uuid4())
             request_started = time.perf_counter()
             try:
@@ -618,6 +621,7 @@ class DeepSeekClient:
         temperature: float = 0.1,
         max_tokens: int | None = None,
         timeout: int = 600,
+        request_budget=None,
     ) -> object:
         try:
             schema = strict_json_schema(response_model)
@@ -692,7 +696,8 @@ class DeepSeekClient:
                 if self.supports_temperature:
                     request_kwargs["temperature"] = temperature
                 response = await self._request_with_backoff(
-                    agent=agent, **request_kwargs
+                    agent=agent, request_budget=request_budget,
+                    budget_ids=expected_ids, **request_kwargs
                 )
             except BadRequestError as exc:
                 message = str(exc)
@@ -793,8 +798,12 @@ class DeepSeekClient:
                 continue
 
             try:
-                validated = response_model.model_validate_json(previous_output)
-                value = validated.model_dump()
+                from app.llm.math_strings import (
+                    repair_raw_json_latex_escapes, sanitize_math_strings,
+                )
+                parse_output = repair_raw_json_latex_escapes(previous_output)
+                validated = response_model.model_validate_json(parse_output)
+                value = sanitize_math_strings(validated.model_dump())
                 self._validate_expected_ids(value, expected_ids, expected_id_field)
                 self._record_structured_attempt(
                     operation=operation, agent=agent, request_id=attempt_request_id,
@@ -855,6 +864,7 @@ class DeepSeekClient:
         temperature: float = 0.1,
         max_tokens: int | None = None,
         timeout: int = 600,
+        request_budget=None,
     ) -> object:
         return _run_sync(
             self.achat_structured(
@@ -871,6 +881,7 @@ class DeepSeekClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                request_budget=request_budget,
             )
         )
 

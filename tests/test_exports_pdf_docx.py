@@ -240,18 +240,18 @@ def test_docx_export_valid_zip():
     assert len(docx_bytes) > 500
 
 
-def test_docx_uses_a4_half_inch_margins_and_grouped_sections():
+def test_docx_uses_a4_fifteen_mm_margins_and_grouped_sections():
     exam, metadata = _model_and_metadata()
     docx_bytes = render_exam_docx(exam, metadata)
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
         document_xml = archive.read("word/document.xml").decode("utf-8")
-    # A4 is 11906 x 16838 twips; 0.5 inch is 720 twips.
+    # A4 is 11906 x 16838 twips; 15 mm is approximately 850 twips.
     assert 'w:w="11906"' in document_xml
     assert 'w:h="16838"' in document_xml
-    assert 'w:top="720"' in document_xml
-    assert 'w:right="720"' in document_xml
-    assert 'w:bottom="720"' in document_xml
-    assert 'w:left="720"' in document_xml
+    assert 'w:top="850"' in document_xml
+    assert 'w:right="850"' in document_xml
+    assert 'w:bottom="850"' in document_xml
+    assert 'w:left="850"' in document_xml
     for heading in (
         "Multiple Choice Questions", "Fill in the Blank", "True / False", "Define",
         "Why Questions", "Solve the equations and show your steps.",
@@ -338,7 +338,9 @@ def test_arabic_docx_marks_paragraphs_and_runs_rtl():
     assert "أسئلة الاختيار من متعدد" in document_xml
     assert "w:bidi" in document_xml
     assert "w:rtl" in document_xml
-    assert 'w:val="right"' in document_xml
+    # Word mirrors physical left/right inside bidi paragraphs; logical start
+    # is the interoperable right reading edge.
+    assert 'w:val="start"' in document_xml
 
 
 def test_export_fill_blank_adds_four_writing_characters():
@@ -354,18 +356,14 @@ def test_arabic_docx_separates_mcq_markers_and_uses_tajawal():
         document_xml = archive.read("word/document.xml").decode("utf-8")
     assert '<w:t>A.</w:t>' in document_xml
     assert "استقبال المؤثرات .A" not in document_xml
-    formula = document_xml.index("n = c / v")
-    marker = document_xml.index("<w:t>B.</w:t>")
-    assert formula < marker
-    marker_properties = document_xml[marker - 400:marker]
-    assert '<w:bidi w:val="0"/>' in marker_properties
-    assert '<w:rtl w:val="0"/>' in marker_properties
-    assert 'w:jc w:val="right"' in document_xml[formula - 500:formula]
-    assert 'w:ascii="Tajawal"' in document_xml
+    assert 'w:ascii="Arial"' in document_xml
     assert "F6F8FB" not in document_xml
+    # The marker is its own LTR-isolated cell/run and the answer text is
+    # present without a leading dot.
+    assert '<w:t>B.</w:t>' in document_xml
+    assert "n = c / v" in document_xml
     response_line = document_xml.index(RESPONSE_LINE_TEXT)
     assert '<w:bidi/>' in document_xml[response_line - 500:response_line]
-    assert 'w:right="230"' in document_xml[response_line - 500:response_line]
 
 
 def test_docx_definition_uses_a_long_flexible_answer_line():
@@ -374,15 +372,13 @@ def test_docx_definition_uses_a_long_flexible_answer_line():
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
         root = ET.fromstring(archive.read("word/document.xml"))
     ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-    definition_table = next(
-        table for table in root.findall(".//w:tbl", ns)
-        if "Operating system" in "".join(table.itertext())
+    paragraphs = root.findall(".//w:p", ns)
+    term_index = next(
+        index for index, paragraph in enumerate(paragraphs)
+        if "Operating system" in "".join(paragraph.itertext())
     )
-    cells = definition_table.findall("./w:tr/w:tc", ns)
-    assert len(cells) == 2
-    widths = [int(cell.find("./w:tcPr/w:tcW", ns).get(f"{{{ns['w']}}}w")) for cell in cells]
-    assert widths[1] > widths[0] * 2
-    assert cells[1].find(".//w:pBdr/w:bottom", ns) is not None
+    line_paragraph = paragraphs[term_index + 1]
+    assert line_paragraph.find("./w:pPr/w:pBdr/w:bottom", ns) is not None
 
 
 def test_arabic_docx_places_true_false_choices_after_statement():
@@ -403,10 +399,11 @@ def test_arabic_docx_places_true_false_choices_after_statement():
         index for index, paragraph in enumerate(paragraphs)
         if statement in "".join(paragraph.itertext())
     )
-    assert "صح" in "".join(paragraphs[statement_index + 1].itertext())
-    assert all(statement not in "".join(table.itertext()) for table in root.findall(".//w:tbl", ns))
-    assert paragraphs[statement_index].find("./w:pPr/w:bidi", ns) is not None
-    assert paragraphs[statement_index + 1].find("./w:pPr/w:bidi", ns) is not None
+    statement_paragraph = paragraphs[statement_index]
+    assert "صح" in "".join(statement_paragraph.itertext())
+    assert "غلط" in "".join(statement_paragraph.itertext())
+    assert "True (   ) False (   )" not in "".join(statement_paragraph.itertext())
+    assert statement_paragraph.find("./w:pPr/w:bidi", ns) is not None
 
 
 def test_english_docx_remains_ltr():
@@ -415,7 +412,10 @@ def test_english_docx_remains_ltr():
     with zipfile.ZipFile(io.BytesIO(document)) as archive:
         document_xml = archive.read("word/document.xml").decode("utf-8")
     assert "w:bidi" not in document_xml
-    assert "w:rtl" not in document_xml
+    # Explicit LTR run properties are allowed; no RTL paragraph/run flag may
+    # be enabled in an English document.
+    assert 'w:rtl w:val="1"' not in document_xml
+    assert "<w:rtl/>" not in document_xml
 
 
 def test_equations_are_rendered_as_math_images_in_pdf_and_docx():
@@ -443,8 +443,11 @@ def test_equations_are_rendered_as_math_images_in_pdf_and_docx():
     with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
         document_xml = archive.read("word/document.xml").decode("utf-8")
         media = [name for name in archive.namelist() if name.startswith("word/media/")]
-    assert source not in document_xml
-    assert media
+    # Simple inline math is editable Unicode; complex display math uses an
+    # image fallback.  Raw LaTeX must never appear.
+    assert "sin θc" in document_xml
+    assert "\\frac" not in document_xml
+    assert "\\begin" not in document_xml
 
 
 def test_browser_preview_uses_structured_student_and_key_layout():
@@ -452,12 +455,20 @@ def test_browser_preview_uses_structured_student_and_key_layout():
 
     root = Path(__file__).resolve().parents[1]
     preview_js = (root / "FrontEnd/js/exam-view.js").read_text(encoding="utf-8")
+    ir_js = (root / "FrontEnd/js/document-ir.js").read_text(encoding="utf-8")
     main_js = (root / "FrontEnd/js/main.js").read_text(encoding="utf-8")
     assert "marked.parse" not in preview_js
     assert 'why: 3, equation: 5, word_problem: 5, essay: 22' in preview_js
-    assert "buildAnswerKey(exam, labels, language, examLabels)" in preview_js
-    assert "item.correct_answer" in preview_js
-    assert "addResponseLines(question" in preview_js
+    assert "buildDocumentIR(exam, metadata, \"student\")" in preview_js
+    assert "buildDocumentIR(exam, metadata, \"answers\")" in preview_js
+    assert "renderStudent(document)" in preview_js
+    assert "renderAnswers(answers)" in preview_js
+    assert "/document-ir?model_number=" in preview_js
+    assert "diagnosticPanel" in preview_js
+    assert "preview-with-table" in preview_js
+    assert "exam-table" in preview_js
+    assert "parseCoordinateTable" in ir_js
+    assert "parseContent" in ir_js
     assert "renderExamOutput(data.exams, data.metadata || {})" in main_js
 
 
@@ -472,18 +483,21 @@ def test_browser_preview_matches_export_header_tf_blanks_and_math_layout():
 
     assert 'const grid = element("div", "preview-meta-row")' in preview_js
     assert "[labels.className, metadata.class_name]" not in preview_js
-    assert '"preview-student-name"' in preview_js
-    assert '"preview-student-class"' in preview_js
-    assert 'blank + blank[0].repeat(4)' in preview_js
-    assert 'stem.appendChild(element("span", "preview-tf-choices"' in preview_js
-    assert "renderEquationContent(equation, value, language)" in preview_js
-    assert "renderMixedMath" in preview_js
+    assert '"preview-student-field preview-student-name"' in preview_js
+    assert '"preview-student-field preview-student-class"' in preview_js
+    assert "preview-tf-choices" in preview_js
+    assert "true_false_choices" in preview_js
+    assert "renderEquation" in preview_js
+    assert "renderMixedMath" not in preview_js
     assert "(?<!\\$)\\$" in math_js
     assert "window.katex.render" in math_js
     assert "toMathLatex" in math_js
-    assert "katex@0.18.7/dist/katex.min.js" in html
-    assert ".preview-equation-text .katex-display" in css
+    assert 'vendor/katex/katex.min.js' in html
+    assert 'vendor/katex/katex.min.css' in html
+    assert "cdn.jsdelivr.net/npm/katex" not in html
+    assert ".preview-section-heading" in css
     assert "unicode-bidi: isolate" in css
+    assert "black-and-white" in css or "#ffffff" in css
 
 
 def test_frontend_markdown_copy_is_questions_first_and_uses_toast():
@@ -513,8 +527,9 @@ def test_frontend_has_content_direction_and_localized_dynamic_statuses():
     i18n = (root / "FrontEnd/js/i18n.js").read_text(encoding="utf-8")
     upload = (root / "FrontEnd/js/upload.js").read_text(encoding="utf-8")
     export = (root / "FrontEnd/js/export.js").read_text(encoding="utf-8")
-    assert "applyContentDirection" in preview_js
-    assert "applyContentDirection(stitle" in topics_js
+    assert "buildDocumentIR" in preview_js
+    assert "renderEquation" in preview_js
+    assert "applyContentDirection" in topics_js
     for key in (
         "status.uploading", "stage.generating_titles", "status.generation_failed",
         "status.creating_export", "status.export_downloaded", "saved.loading",

@@ -67,6 +67,24 @@ def test_objective_types_reject_mismatching_selected_variation(question_type):
     assert exam_builder._bind_selected_variation(question, plan, question_type) is False
 
 
+def test_generator_binds_same_authorized_effective_givens_as_validators():
+    plan = _plan("mcq")
+    plan.update({
+        "effective_instance_id": "derived_constraints_1",
+        "effective_givens": ["2 <= c <= 5", "1 <= p <= 4", "c + p <= 7"],
+        "difficulty_design": {
+            "status": "designed", "adjustment_kind": "numerical",
+            "effective_instance_id": "derived_constraints_1",
+        },
+    })
+    plan["permitted_variations"][0]["numeric_values_may_change"] = True
+    question = {"selected_variation_id": "variation-selected"}
+
+    assert exam_builder._bind_selected_variation(question, plan, "mcq") is True
+    assert question["selected_variation"]["givens"] == plan["effective_givens"]
+    assert question["base_selected_variation"]["givens"] == _variation("mcq")["givens"]
+
+
 def test_objective_bundle_retries_existing_call_after_variation_mismatch(monkeypatch):
     mcq_plan = {**_plan("mcq"), "slot_id": "m1_mcq_1", "assigned_sources": {"chunk-1": "evidence"}}
     tf_plan = {**_plan("true_false"), "slot_id": "m1_true_false_1", "assigned_sources": {"chunk-1": "evidence"}}
@@ -91,7 +109,7 @@ def test_objective_bundle_retries_existing_call_after_variation_mismatch(monkeyp
         calls.append(1)
         return response("variation-unused" if len(calls) == 1 else "variation-selected")
 
-    monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: object())
+    monkeypatch.setattr("app.llm.factory.create_generation_client", lambda **_kwargs: object())
     monkeypatch.setattr(exam_builder, "request_structured", fake_request)
     bundle, warnings = exam_builder._generate_obj_bundle(
         {"mcq": [mcq_plan], "true_false": [tf_plan]}, "", "medium", 1,
@@ -162,7 +180,7 @@ def test_true_false_polarity_mismatch_retries_with_explicit_feedback(monkeypatch
             }]},
         }
 
-    monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: object())
+    monkeypatch.setattr("app.llm.factory.create_generation_client", lambda **_kwargs: object())
     monkeypatch.setattr(exam_builder, "request_structured", fake_request)
     bundle, warnings = exam_builder._generate_obj_bundle(
         {"mcq": [], "true_false": [plan]}, "", "medium", 1,
@@ -225,7 +243,7 @@ def test_structured_retry_records_failed_and_successful_attempts(monkeypatch):
         _response('{"questions":[', response_id="provider-failed"),
         _response(
             '{"questions":[{"slot_id":"m1_true_false_1",'
-            '"statement":"1 + 1 = 2","answer":"True"}]}',
+                '"statement":"1 + 1 = 2","answer":true}]}',
             response_id="provider-success",
         ),
     ])

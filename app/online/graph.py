@@ -5,12 +5,52 @@ from typing import Any, Callable, Optional, TypedDict
 
 from langgraph.graph import StateGraph, END
 
-from app.online.validator import MAX_QUESTION_REPAIR_ATTEMPTS, REPAIR_ACTIONS
+from app.online.validator import (
+    MAX_QUESTION_REPAIR_ATTEMPTS, REPAIR_ACTIONS, recovery_eligibility,
+)
 from app.config import (
     MAX_CONTENT_REPAIR_CALLS_PER_SLOT,
     MAX_COMPLETION_ATTEMPTS_PER_SLOT,
 )
 from app.online.eval_stats import PipelineEvalStats
+from app.logging_conf import get_logger
+from app.api.repositories import InvalidState
+from app.online.diagnostics import record_optional_failure
+
+logger = get_logger("GRAPH")
+
+
+def _safe_optional_callback(
+    callback: Any, *args: Any,
+    job_id: str | None = None, stage: str = "pipeline",
+    component: str = "callback", propagate_control: bool = True,
+) -> None:
+    """Run diagnostic/progress side effects without aborting the exam.
+
+    Checkpoint ownership/revision/corruption errors are never swallowed while
+    the pipeline is healthy. During handling of an already-fatal node error,
+    audit failures are logged rather than replacing the original traceback.
+    """
+    if not callable(callback):
+        return
+    try:
+        callback(*args)
+    except InvalidState:
+        if propagate_control:
+            raise
+        logger.warning(
+            "checkpoint audit failed while reporting a node error | stage=%s",
+            stage, exc_info=True,
+        )
+    except Exception as exc:
+        record_optional_failure(
+            exc, stage=stage, component=component,
+            job_id=job_id, continued=True,
+        )
+        logger.warning(
+            "optional pipeline callback failed | component=%s | error=%s: %s",
+            component, type(exc).__name__, exc, exc_info=True,
+        )
 
 
 class ExamState(TypedDict):
@@ -26,6 +66,7 @@ class ExamState(TypedDict):
     session_id: Optional[str]
     index_job_id: Optional[str]
     processed_document_key: Optional[str]
+    source_document_hash: Optional[str]
     domain_type: str
     subject: str
     difficulty: Optional[str]
@@ -35,6 +76,7 @@ class ExamState(TypedDict):
     context: str  # selected-content fallback, capped by deployment prompt budget
     planner_context: str  # selected content for one planner call, capped at 120k
     assessment_catalog: dict[str, Any]
+    assessment_catalog_planner_index: list[dict[str, Any]]
     assessment_catalog_key: str
     assessment_catalog_cache_hit: bool
     assessment_compiler_cache_hit: bool
@@ -51,6 +93,7 @@ class ExamState(TypedDict):
     unresolved_plan_duplicate_conflicts: list[dict[str, Any]]
     difficulty_adjustment_history: list[dict[str, Any]]
     difficulty_adjustment_attempts: dict[str, int]
+    difficulty_adaptation_records: dict[str, dict[str, Any]]
     difficulty_verification_slot_ids: list[str]
     # --- Generation -----------------------------------------------------
     generated_exams: list[dict[str, Any]]  # one result per model, accumulates cross-model memory
@@ -58,6 +101,9 @@ class ExamState(TypedDict):
     mcq_task_reassignments: list[dict[str, Any]]
     # --- Post-generation validation / repair ----------------------------
     validation_reports: list[dict[str, Any]]  # one report per validated model
+    model_lifecycle_status: dict[int, dict[str, Any]]  # independent local readiness
+    cross_model_duplicate_scan_after_local_completion: bool
+    _independent_model_rounds: dict[int, int]
     validation_ledger: dict[str, dict[str, Any]]
     validation_call_logs: list[dict[str, Any]]
     repair_call_logs: list[dict[str, Any]]
@@ -82,6 +128,7 @@ class ExamState(TypedDict):
     final_global_reviews: list[dict[str, Any]]  # complete-exam AI reviews after changes
     exam_quality_findings: list[dict[str, Any]]  # persisted exam-level issues/warnings
     duplicate_reports: list[dict[str, Any]]  # actual-question pair adjudications by scan
+    duplicate_findings: list[dict[str, Any]]  # structured pair findings with lifecycle
     duplicate_similarity_distributions: list[dict[str, Any]]
     pending_duplicate_groups: list[dict[str, Any]]
     duplicate_repair_rounds: int  # complete exam-wide scan/repair cycles already used
@@ -97,6 +144,12 @@ class ExamState(TypedDict):
     duplicate_scan_count: int
     duplicate_fact_cache: dict[str, dict[str, str]]  # content-keyed Luna facts for unchanged pairs
     duplicate_screen_fingerprints: dict[str, dict[str, str]]
+    cross_model_duplicate_scan_complete: bool
+    cross_model_duplicate_scan_revision: int
+    cross_model_duplicate_findings: list[dict[str, Any]]
+    cross_model_duplicate_fingerprints: dict[str, str]
+    cross_model_duplicate_fact_cache: dict[str, dict[str, Any]]
+    cross_model_duplicate_last_review: dict[str, Any]
     slot_lifecycle: dict[str, dict[str, Any]]
     developer_diagnostics: list[dict[str, Any]]
     eval_stats: PipelineEvalStats  # JSON-safe V1 pipeline telemetry
@@ -105,6 +158,7 @@ class ExamState(TypedDict):
     error: Optional[str]
     progress_callback: Optional[Callable[[str, int], None]]
     audit_callback: Optional[Callable[[str, str, dict[str, Any]], None]]
+    performance_telemetry: list[dict[str, Any]]
     is_cancelled: Optional[Callable[[], bool]]
 
 
@@ -173,6 +227,11 @@ def _audit_node_output(
 def _with_progress(node, stage: str, progress: int, *, after_repair: bool = False):
     """Report the real graph step before running a node."""
     def wrapped(state: ExamState):
+        from app.online.performance import finish_timing, merge_telemetry, start_timing
+        from app.llm.scheduler import scheduler_request_events, scheduler_snapshot
+        stage_timing = start_timing(stage=stage)
+        scheduler_before = scheduler_snapshot(str(state.get("job_id") or "") or None)
+        events_before = len(scheduler_request_events(str(state.get("job_id") or "") or None))
         from app.llm.factory import (
             reset_online_assessment_domain,
             set_online_assessment_domain,
@@ -191,7 +250,11 @@ def _with_progress(node, stage: str, progress: int, *, after_repair: bool = Fals
             ):
                 current_stage = "validating_updates"
                 current_progress = 95
-            callback(current_stage, current_progress)
+            _safe_optional_callback(
+                callback, current_stage, current_progress,
+                job_id=str(state.get("job_id") or ""),
+                stage=current_stage, component="progress_callback",
+            )
         before = None
         if state.get("audit_callback") and node.__name__ in _AUDIT_NODE_EVENTS:
             before = deepcopy({
@@ -213,8 +276,11 @@ def _with_progress(node, stage: str, progress: int, *, after_repair: bool = Fals
             )
             audit_callback = state.get("audit_callback")
             if audit_callback:
-                audit_callback(
-                    diagnostic["stage"], "stage_exception", diagnostic
+                _safe_optional_callback(
+                    audit_callback, diagnostic["stage"], "stage_exception", diagnostic,
+                    job_id=str(state.get("job_id") or ""),
+                    stage=diagnostic["stage"], component="audit_callback",
+                    propagate_control=False,
                 )
             raise
         finally:
@@ -226,7 +292,46 @@ def _with_progress(node, stage: str, progress: int, *, after_repair: bool = Fals
             merged_state,
             stage=_AUDIT_NODE_EVENTS.get(node.__name__, (stage, ""))[0],
         )
-        _audit_node_output(state, node.__name__, result, before)
+        scheduler_after = scheduler_snapshot(str(state.get("job_id") or "") or None)
+        new_request_events = scheduler_request_events(
+            str(state.get("job_id") or "") or None
+        )[events_before:]
+        stage_event = finish_timing(
+            stage_timing,
+            scheduler_completed_delta=(
+                int(scheduler_after.get("completed") or 0)
+                - int(scheduler_before.get("completed") or 0)
+            ),
+            scheduler_queue_ms_delta=round(
+                float(scheduler_after.get("total_queue_ms") or 0)
+                - float(scheduler_before.get("total_queue_ms") or 0), 3,
+            ),
+            scheduler_peak_active=scheduler_after.get("peak"),
+            synchronization_barrier=node.__name__ in {
+                "prepare_assessment_catalog", "adjust_plan_difficulty",
+                "validate_generated_questions", "assemble_exams_node",
+            },
+        )
+        provider_events = [{
+            "stage": "provider_request", **value,
+        } for value in new_request_events]
+        result["performance_telemetry"] = merge_telemetry(
+            state, result.get("performance_telemetry") or [],
+            provider_events, [stage_event],
+        )
+        try:
+            _audit_node_output(state, node.__name__, result, before)
+        except InvalidState:
+            raise
+        except Exception as exc:
+            record_optional_failure(
+                exc, stage=stage, component="audit_callback",
+                job_id=str(state.get("job_id") or ""), continued=True,
+            )
+            logger.warning(
+                "optional audit callback failed | node=%s | error=%s: %s",
+                node.__name__, type(exc).__name__, exc, exc_info=True,
+            )
         return result
 
     return wrapped
@@ -238,6 +343,7 @@ def build_exam_graph() -> StateGraph:
     from app.online.planner import plan_exams, repair_plan
     from app.online.difficulty_adjustment import adjust_plan_difficulty
     from app.online.exam_builder import generate_exams_node, assemble_exams_node
+    from app.online.independent_recovery import run_independent_model_recovery
     from app.online.receive import receive_request
     from app.online.validator import (
         validate_generated_questions,
@@ -265,6 +371,13 @@ def build_exam_graph() -> StateGraph:
         adjust_plan_difficulty, "adjusting_difficulty", 30
     ))
     builder.add_node("generate_exams", _with_progress(generate_exams_node, "generating_exam", 50))
+    builder.add_node(
+        "independent_model_recovery",
+        _with_progress(
+            run_independent_model_recovery,
+            "validating_exam", 80,
+        ),
+    )
     builder.add_node(
         "validate_generated_questions",
         _with_progress(
@@ -332,7 +445,15 @@ def build_exam_graph() -> StateGraph:
             "stop_with_error": "stop_with_error",
         },
     )
-    builder.add_edge("generate_exams", "validate_generated_questions")
+    builder.add_conditional_edges(
+        "generate_exams",
+        _route_after_generate,
+        {
+            "independent_model_recovery": "independent_model_recovery",
+            "validate_generated_questions": "validate_generated_questions",
+        },
+    )
+    builder.add_edge("independent_model_recovery", "assemble_exams")
     builder.add_conditional_edges(
         "validate_generated_questions",
         _route_after_validation,
@@ -407,8 +528,37 @@ def _route_after_plan(state: ExamState) -> str:
             "repair_plan" if (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
             else "stop_with_error"
         )
+    from app.llm.schemas import DIFFICULTY_DESIGN_STATUSES
+    malformed_design = any(
+        not isinstance(design := item.get("difficulty_design"), dict)
+        or str(design.get("status") or "") not in DIFFICULTY_DESIGN_STATUSES
+        or (
+            str(design.get("status") or "") in {"pending", "not_required"}
+            and bool(item.get("effective_instance_id") or design.get("effective_instance_id"))
+        )
+        or (
+            str(design.get("status") or "") == "designed"
+            and not item.get("effective_instance_id")
+        )
+        for plan in state.get("plans") or []
+        for values in (plan.get("items") or {}).values()
+        for item in values or []
+        if item.get("difficulty_design") is not None
+    )
+    if malformed_design:
+        return (
+            "repair_plan" if (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
+            else "stop_with_error"
+        )
+    requested = str(state.get("difficulty") or "mix")
     if any(
-        (item.get("difficulty_adaptation") or {}).get("status") == "pending"
+        (item.get("difficulty_design") or {}).get("status") == "pending"
+        or (item.get("difficulty_adaptation") or {}).get("status") == "pending"
+        or (
+            not item.get("difficulty_design")
+            and requested in {"easy", "medium", "hard"}
+            and str(item.get("actual_difficulty") or item.get("difficulty")) != requested
+        )
         for plan in state.get("plans") or []
         for values in (plan.get("items") or {}).values()
         for item in values or []
@@ -418,7 +568,7 @@ def _route_after_plan(state: ExamState) -> str:
 
 
 def _route_after_difficulty_adjustment(state: ExamState) -> str:
-    """Finish bounded adjustment attempts before generation."""
+    """One design pass only; never loop on an unattainable difficulty label."""
     from app.online.planner import MAX_PLAN_ATTEMPTS
     if state.get("error"):
         return "stop_with_error"
@@ -427,12 +577,14 @@ def _route_after_difficulty_adjustment(state: ExamState) -> str:
             "repair_plan" if (state.get("plan_attempts") or 0) < MAX_PLAN_ATTEMPTS
             else "stop_with_error"
         )
-    return "adjust_plan_difficulty" if any(
-        (item.get("difficulty_adaptation") or {}).get("status") == "pending"
-        for plan in state.get("plans") or []
-        for values in (plan.get("items") or {}).values()
-        for item in values or []
-    ) else "generate_exams"
+    return "generate_exams"
+
+
+def _route_after_generate(state: ExamState) -> str:
+    """Use isolated local lifecycles when more than one model is requested."""
+    if int(state.get("num_models") or 1) > 1:
+        return "independent_model_recovery"
+    return "validate_generated_questions"
 
 
 def _route_after_validation(state: ExamState) -> str:
@@ -460,23 +612,14 @@ def _route_after_validation(state: ExamState) -> str:
         ):
             continue
         slot_id = str(target.get("slot_id") or "")
-        if target_status == "validation_blocked":
-            if (
-                slot_id and completion_enabled
-                and int(completion.get(slot_id) or 0) < MAX_COMPLETION_ATTEMPTS_PER_SLOT
-            ):
-                return "repair_invalid_questions"
-            continue
-        if slot_id and (
-            (
-                int(failures.get(slot_id) or 0) < MAX_QUESTION_REPAIR_ATTEMPTS
-                and int(calls.get(slot_id) or 0) < MAX_CONTENT_REPAIR_CALLS_PER_SLOT
-            )
-            or (
-                completion_enabled
-                and int(completion.get(slot_id) or 0) < MAX_COMPLETION_ATTEMPTS_PER_SLOT
-            )
-        ):
+        decision = recovery_eligibility(
+            target,
+            failures=int(failures.get(slot_id) or 0),
+            calls=int(calls.get(slot_id) or 0),
+            completion_attempts=int(completion.get(slot_id) or 0),
+            completion_enabled=completion_enabled,
+        )
+        if slot_id and decision["eligible"]:
             return "repair_invalid_questions"
     # Compatibility for an in-flight/pre-manifest state. New validations always
     # populate the manifest; this prevents persisted older jobs from skipping a

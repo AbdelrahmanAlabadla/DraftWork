@@ -3,7 +3,7 @@ import {
   deleteJSON, getJSON, postJSON, waitForJob,
 } from "./api.js";
 import { state } from "./state.js";
-import { completionSummaryMessage, examResourcePath, renderPartialExamWarning, resolveExamId } from "./exam-lifecycle.js";
+import { completionSummaryMessage, examResourcePath, recoveryProgressRows, renderPartialExamWarning, resolveExamId } from "./exam-lifecycle.js";
 import { examStageLabel, initI18n, localizedError, t } from "./i18n.js";
 import { initUpload } from "./upload.js";
 import { initSettings } from "./settings.js";
@@ -13,6 +13,7 @@ import { copyExam, renderExamOutput } from "./exam-view.js";
 import { initExport } from "./export.js";
 import { initAuthNavigation } from "./auth.js";
 import { initMyExamsDialog, loadExamIntoPreview } from "./my-exams-dialog.js";
+import { loadUsageDashboard } from "./usage-dashboard.js";
 
 initI18n();
 // Account controls load independently so a slow Clerk CDN never blocks the
@@ -68,6 +69,31 @@ function initGenerate() {
 
   function workflowIndex(stage) {
     return workflowStages.findIndex((item) => item.stages.includes(stage));
+  }
+
+  function renderModelRecovery(events = []) {
+    const root = document.getElementById("modelRecoveryProgress");
+    if (!root) return;
+    const progressRows = recoveryProgressRows(events);
+    if (!progressRows.length) {
+      root.hidden = true;
+      root.replaceChildren();
+      return;
+    }
+    const rows = progressRows.map(({model, ...payload}) => {
+      const row = document.createElement("div");
+      row.className = "model-recovery-row";
+      const phaseKey = `recovery_phase.${payload.phase || "validating"}`;
+      const phase = t(phaseKey);
+      row.textContent = model
+        ? t("recovery_phase.model", { model, phase: phase === phaseKey ? payload.phase : phase })
+        : (phase === phaseKey ? payload.phase : phase);
+      row.dataset.phase = String(payload.phase || "");
+      row.dataset.model = String(model);
+      return row;
+    });
+    root.replaceChildren(...rows);
+    root.hidden = false;
   }
 
   function renderWorkflow(stage, events = [], jobStatus = "running") {
@@ -138,6 +164,7 @@ function initGenerate() {
       stage: examStageLabel(effectiveStage), progress,
     });
     renderWorkflow(effectiveStage, events, jobStatus);
+    renderModelRecovery(events);
   }
 
   function renderGenerationFailure(message) {
@@ -284,6 +311,7 @@ function initGenerate() {
         }
         state.examId = examId;
         renderGeneratedExam(examResponse.data);
+        loadUsageDashboard(examId).catch(() => {});
         generationCompleted = true;
         genStatus.classList.add("complete");
         renderGenerationProgress("completed", 100);

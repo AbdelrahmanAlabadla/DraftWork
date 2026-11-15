@@ -121,6 +121,7 @@ def test_compatible_catalog_ignores_historical_chunk_order(monkeypatch, tmp_path
     }
     path.write_text(__import__("json").dumps({
         "catalog_version": "v-test", "processed_document_key": "processed",
+        "catalog_compiler_fingerprint": catalog.catalog_compiler_fingerprint(),
         "selected_chunk_ids": ["c2", "c1"],
         "assessment_profile": {"subject": "mathematics", "domain": "STEM"},
         "tasks": [task], "fitb_bank": [],

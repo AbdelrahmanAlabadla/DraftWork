@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import uuid
 from typing import Any
 
 from app import config
@@ -152,6 +153,7 @@ class OpenAIClient(DeepSeekClient):
                 repositories.record_llm_request_event(
                     job_id=current_job_id(), provider=self.provider_name,
                     model=self.model, operation=agent, agent_role=agent,
+                    request_id=str(uuid.uuid4()),
                     provider_request_id=str(getattr(response, "id", "") or "") or None,
                     status="success", usage_available=True,
                     input_tokens=int(values["input_tokens"]),

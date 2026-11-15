@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from copy import deepcopy
 
@@ -58,7 +58,7 @@ def test_full_validation_creates_missing_slot_target_for_fifth_tf(monkeypatch):
     assert out["validation_reports"][0]["missing_slots"][0]["slot_id"] == slots[-1]
     target = out["repair_manifest"][0]
     assert target["slot_id"] == slots[-1]
-    assert target["repair_type"] == "regenerate_missing_slot"
+    assert target["repair_type"] == "recovery_decision_pending"
     assert _route_after_validation(out) == "repair_invalid_questions"
 
 
@@ -76,16 +76,10 @@ def test_missing_whole_section_creates_one_target_per_expected_slot(monkeypatch)
     assert out["validation_reports"][0]["missing_sections"] == ["true_false"]
 
 
-def test_unsupported_given_routes_to_task_alignment_content_repair_first():
-    assert val._repair_classification("unsupported_given") == (
-        "question_repairable", "repair_question"
-    )
-    assert val._repair_classification("invalid_structure") == (
-        "structure_invalid", "repair_question"
-    )
-    assert val._repair_classification(
-        "incomplete_solution", validation_role="stem_quantitative"
-    ) == ("quantitative_solution_invalid", "repair_question")
+def test_python_dispatch_does_not_classify_failure_codes():
+    assert val.recovery_v3_dispatch_action("REPAIR") == "repair_question"
+    assert val.recovery_v3_dispatch_action("REGENERATE") == "regenerate_missing_slot"
+    assert val.recovery_v3_dispatch_action("SWITCH_TASK") == "replace_assignment"
 
 
 def test_repair_budget_is_per_slot(monkeypatch):
@@ -107,6 +101,10 @@ def test_repair_budget_is_per_slot(monkeypatch):
             "repair_type": "repair_question", "validation_role": "general",
             "verdict": {"question_id": f"model1_true_false_{index}", "action": "FIX_QUESTION",
                         "fields_to_fix": ["statement"], "reason": "fix it"},
+                "recovery_v3": {"version": "recovery-v3-task-alignment", "status": "ready",
+                                "decision": "REPAIR", "reason": "localized wording",
+                                "plan": ["REPAIR"], "fallback_sequence": [],
+                                "next_index": 0, "attempted_strategies": [], "decision_calls": 1},
         })
     out = val.repair_invalid_questions({
         "generated_exams": [exam], "plans": [], "repair_manifest": manifest,
@@ -145,7 +143,10 @@ def test_failed_candidate_stays_outside_active_exam_and_records_new_reason(monke
     assert out["generated_exams"][0]["questions"]["true_false"][0]["statement"] == "old"
     assert out["repair_manifest"][0]["failure_reason"] == "new exact reason"
     assert out["repair_retry_seeds"]["m1_true_false_1"]["exam"]["questions"]["true_false"][0]["statement"] == "candidate"
-    assert "task_1" in out["repair_replacement_memory"]["m1_true_false_1"]["blacklisted_candidate_ids"]
+    memory = out["repair_replacement_memory"]["m1_true_false_1"]
+    assert "task_1" not in memory.get("blacklisted_candidate_ids", [])
+    assert memory["candidate_failures"][-1]["candidate_id"] == "task_1"
+    assert memory["candidate_failures"][-1]["candidate_instance_key"]
 
 
 def test_passing_candidate_fills_missing_slot_and_resolves_manifest(monkeypatch):
@@ -155,6 +156,19 @@ def test_passing_candidate_fills_missing_slot_and_resolves_manifest(monkeypatch)
     staged["questions"]["true_false"].append(_tf(slots[1]))
     monkeypatch.setattr(val, "_validate_with_context",
                         lambda exam, ids=None, *_args: _pass_report(exam, ids))
+    monkeypatch.setattr(
+        "app.online.duplicate_pipeline.scan_exam_duplicates",
+        lambda _state: {"duplicate_reports": []},
+    )
+    monkeypatch.setattr(
+        "app.online.duplicate_judge.review_duplicate_candidates",
+        lambda _exam, **kwargs: {
+            "candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
+            "similarity_distribution": {}, "usage": {},
+            "fact_cache": kwargs.get("fact_cache") or {},
+            "fact_cache_hits": 0, "fact_cache_misses": 0,
+        },
+    )
     out = val.validate_generated_questions({
         "generated_exams": [active], "plans": _plan(slots), "validation_reports": [],
         "validated_models": [], "repair_manifest": [{"model_number": 1, "slot_id": slots[1],
@@ -198,3 +212,16 @@ def test_resolved_manifest_supersedes_stale_invalid_lifecycle_record():
     assert lifecycle["m1_true_false_1"]["validated"] is True
     assert lifecycle["m1_true_false_1"]["failure_code"] is None
     assert lifecycle["m1_true_false_1"]["terminal_status"] == "finalized"
+
+
+def test_missing_slot_manifest_derives_question_type_without_nameerror():
+    """Missing-slot recovery must not rely on an undefined helper."""
+    targets = val._manifest_from_report(
+        {"model_number": 1, "verdicts": [], "missing_slots": [{
+            "slot_id": "m1_equation_1",
+        }]},
+        {"model_number": 1, "questions": {}},
+        {},
+    )
+    assert targets[0]["question_type"] == "equation"
+    assert targets[0]["failure_code"] == "missing_requested_slot"

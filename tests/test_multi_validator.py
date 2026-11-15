@@ -120,6 +120,23 @@ def test_invalid_row_retries_only_that_question_and_preserves_valid_rows(monkeyp
     assert result["all_pass"] is True
 
 
+def test_missing_validator_request_record_is_reconstructed_from_authoritative_exam():
+    calls: list[dict] = []
+    plans, sources = _contexts(1)
+    malformed = {"model_number": 1, "questions": {"definition": []}}
+    result = validate_exam_multi(
+        malformed, plan_by_slot=plans, source_by_chunk=sources, domain="NON_STEM",
+        question_ids=["q0"], authoritative_exam=_exam(1),
+        client_factory=lambda _role: PassingClient(calls),
+    )
+    assert result["all_pass"] is True
+    assert result["validator_request_events"] == [{
+        "question_id": "q0", "slot_id": "s0", "status": "request_reconstructed",
+        "request_errors": ["selected question missing from assembled validator request"],
+        "remaining_errors": [],
+    }]
+
+
 def test_provider_errors_block_validation_without_content_repair(monkeypatch):
     monkeypatch.setattr("app.online.multi_validator.time.sleep", lambda _seconds: None)
 
@@ -151,6 +168,7 @@ def test_insufficient_evidence_is_content_failure_not_validation_block(monkeypat
             "question_id": "q0", "status": "FAIL", "issues": [{
                 "failure_code": "insufficient_evidence",
                 "fields_to_fix": ["term"],
+                "challenged_claim": "Gravity 0 is the attraction between masses.",
                 "reason": "The assigned source does not support this definition.",
                 "expected_fix": "Use a source-supported definition or assignment.",
             }],
@@ -266,9 +284,10 @@ def test_grounding_payload_enforces_per_question_evidence_boundaries():
     )
     grounding = next(call for call in calls if call["validator"] == "grounding")
     for item in grounding["questions"]:
-        assert [chunk["chunk_id"] for chunk in item["assigned_child_chunks"]] == [
+        assert item["assigned_evidence_ids"] == [
             f"chunk-s{item['question_id'][1:]}"
         ]
+        assert grounding["evidence_registry"][item["assigned_evidence_ids"][0]]
         assert "task_contract" not in item
 
     claimed = _definition(0) | {"effective_evidence_chunk_ids": ["chunk-s1"]}

@@ -62,6 +62,11 @@ def _state(question: dict, verdict: dict, *, attempts: int = 0) -> dict:
             "question_type": "mcq", "status": "invalid", "repair_type": "repair_question",
             "failure_code": verdict["failure_code"], "failure_reason": verdict["reason"],
             "fields_to_fix": list(verdict["fields_to_fix"]), "verdict": deepcopy(verdict),
+            "recovery_v3": {"version": "recovery-v3-task-alignment", "status": "ready",
+                            "decision": "REPAIR", "reason": "localized defect",
+                            "plan": ["REPAIR", "REGENERATE", "SWITCH_TASK"],
+                            "fallback_sequence": ["REGENERATE", "SWITCH_TASK"],
+                            "next_index": 0, "attempted_strategies": [], "decision_calls": 1},
         }],
         "question_repair_attempts": ({slot_id: attempts} if attempts else {}),
         "repair_replacement_memory": {}, "repair_retry_seeds": {},
@@ -124,7 +129,7 @@ def test_mcq_conflict_reconciles_then_revalidates_with_production_nodes(monkeypa
     assert first["question_repair_attempts"] == {"m1_mcq_4": 1}
     assert first["repair_manifest"][0]["status"] == "candidate_generated"
     assert len(provider_calls) == 1
-    assert first["repair_candidates"][0]["repair_strategy"] == "targeted_repair"
+    assert first["repair_candidates"][0]["repair_strategy"] == "recovery_v3_targeted_repair"
 
     monkeypatch.setattr(multi_validator, "validate_exam_multi", lambda *_a, **_k: _pass_report(question["question_id"]))
     final = validate_generated_questions({**state, **first})
@@ -173,6 +178,11 @@ def test_tf5_descriptive_metadata_stages_atomically_and_reaches_revalidation(mon
             "repair_type": "repair_question", "failure_code": "unsupported",
             "failure_reason": issue["reason"], "fields_to_fix": ["statement"],
             "verdict": verdict,
+            "recovery_v3": {"version": "recovery-v3-task-alignment", "status": "ready",
+                            "decision": "REPAIR", "reason": "localized defect",
+                            "plan": ["REPAIR", "REGENERATE", "SWITCH_TASK"],
+                            "fallback_sequence": ["REGENERATE", "SWITCH_TASK"],
+                            "next_index": 0, "attempted_strategies": [], "decision_calls": 1},
         }],
         "question_repair_attempts": {}, "repair_replacement_memory": {},
         "repair_retry_seeds": {}, "repair_candidates": [], "validation_reports": [],
@@ -226,6 +236,10 @@ def test_restart_uses_different_strategy_after_identical_candidate(monkeypatch):
     question = _mcq("q1", "m1_mcq_1")
     verdict = _issue("incorrect_answer", ["solution_certificate"], "Certificate is wrong.", "Fix it.")
     state = _state(question, verdict, attempts=1)
+    state["repair_manifest"][0]["recovery_v3"].update(
+        decision="REGENERATE", plan=["REGENERATE", "SWITCH_TASK"],
+        fallback_sequence=["SWITCH_TASK"],
+    )
     state["repair_replacement_memory"] = {"m1_mcq_1": {"force_alternative_strategy": True}}
     calls: list[dict] = []
 
@@ -241,7 +255,7 @@ def test_restart_uses_different_strategy_after_identical_candidate(monkeypatch):
     monkeypatch.setattr("app.online.validator._regenerate_plan_slot", regenerate)
     resumed = repair_invalid_questions(deepcopy(state))
     candidate = resumed["repair_candidates"][0]
-    assert candidate["repair_strategy"] == "regenerate_original_assignment"
+    assert candidate["repair_strategy"] == "recovery_v3_regenerate_assignment"
     assert candidate["attempt"] == 2
     assert calls[0]["task_id"] == "task-m1_mcq_1"
     assert calls[0]["source_chunk_id"] == "c1"

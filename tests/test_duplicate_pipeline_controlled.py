@@ -399,6 +399,13 @@ def test_exact_task_reuse_is_transactional_and_rolls_back_failed_precommit(monke
         return "q2", _sa("q2", "Fallback candidate", "candidate answer"), "why", []
     monkeypatch.setattr(duplicate_pipeline, "_generate_reserved", generate_reused)
     monkeypatch.setattr(
+        duplicate_pipeline, "_select_replacement_candidate",
+        lambda *_args, **kwargs: (
+            kwargs["candidates"][0],
+            {"selection_source": "controlled_test", "agent_choice": {}},
+        ),
+    )
+    monkeypatch.setattr(
         duplicate_pipeline, "_precommit_fallback_candidate",
         lambda *_args, **_kwargs: (False, ["forced duplicate conflict"], {}),
     )
@@ -669,7 +676,7 @@ def test_third_attempt_uses_numeric_variation_then_requires_duplicate_recheck(mo
     }) == "assemble_exams"
 
 
-def test_numeric_variation_requires_task_authorization_and_respects_exact_source_instance():
+def test_numeric_variation_is_default_for_ordinary_tasks_and_exact_source_is_fixed():
     item = {
         "question_id": "q1", "slot_id": "s1",
         "equation": r"Solve: \[2x+5=15\]", "solution_steps": ["x=5"],
@@ -685,13 +692,13 @@ def test_numeric_variation_requires_task_authorization_and_respects_exact_source
 
     assert duplicate_pipeline._numeric_variation_applicable(
         state, exam, 1, "q1", "equation", item,
-    ) is False
+    ) is True
 
     plan["variable_givens"] = ["coefficients and constants"]
     plan["allowed_variations"] = [{
         "target": "solution", "operation": "solve_equation",
         "givens": ["coefficients and constants"], "representation": None,
-        "application": None, "numeric_values_may_change": True,
+        "application": None, "numeric_values_may_change": False,
     }]
     assert duplicate_pipeline._numeric_variation_applicable(
         state, exam, 1, "q1", "equation", item,
@@ -874,9 +881,30 @@ def test_duplicate_verification_completes_exactly_three_attempts(monkeypatch):
     ]
 
 
-def test_compact_selector_rejects_unused_semantic_collision(monkeypatch):
+def test_failed_task_exclusion_requires_explicit_task_wide_proof():
+    history = [
+        {"model_number": 1, "slot_id": "s1", "task_id": "task-a",
+         "status": "validation_failed"},
+        {"model_number": 1, "slot_id": "s1", "task_id": "task-b",
+         "status": "wrong_answer"},
+        {"model_number": 1, "slot_id": "s1", "task_id": "task-c",
+         "status": "validation_failed", "task_wide": True},
+    ]
+    assert duplicate_pipeline._failed_task_exclusions(
+        history, 1, "s1",
+    ) == {"task-c"}
+
+
+def test_compact_selector_sends_matching_metadata_to_luna(monkeypatch):
     from app.llm import client as llm_client
-    monkeypatch.setattr(llm_client, "request_structured", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("offline")))
+    monkeypatch.setattr(
+        llm_client, "request_structured",
+        lambda *_a, **_k: {
+            "replacement_task_id": "unused_good",
+            "slot_to_replace": "s2",
+            "checked_against_active_slots": True,
+        },
+    )
     active = [{"slot_id": "s1", "task_id": "active", "concept": "energy",
                "task_operation": "define", "target": "definition"}]
     unsafe = {"slot_id": "s2", "task_id": "unused_bad", "concept": "energy",
@@ -888,7 +916,10 @@ def test_compact_selector_rejects_unused_semantic_collision(monkeypatch):
         candidates=[unsafe, safe], active_items=active, blacklist=set(), previous_failures=[],
     )
     assert selected["task_id"] == "unused_good"
-    assert [item["task_id"] for item in context["candidates"]] == ["unused_good"]
+    # Matching metadata is a similarity signal, not a hard rejection.
+    assert {item["task_id"] for item in context["candidates"]} == {
+        "unused_bad", "unused_good",
+    }
     assert all("question" not in item for item in context["active_slots"])
 
 
@@ -930,6 +961,33 @@ def test_compact_selector_blacklist_and_previous_failure_reach_second_attempt(mo
     assert selected["task_id"] == "next"
     assert context["previous_failures"][0]["candidate_id"] == "failed"
     assert "duplicate_after_replacement" in captured["prompt"]
+
+
+def test_compact_selector_respects_explicit_no_candidate(monkeypatch):
+    from app.llm import client as llm_client
+
+    monkeypatch.setattr(llm_client, "request_structured", lambda *_a, **_k: {
+        "slot_to_replace": "s2",
+        "conflicts_with": [],
+        "conflict_reason": "Every eligible candidate remains too difficult.",
+        "replacement_task_id": None,
+        "replacement_fitb_entry_id": None,
+        "why_this_candidate_resolves_the_conflict": "No candidate is suitable.",
+        "checked_against_active_slots": True,
+        "rejected_candidates": [
+            {"candidate_id": "medium-task", "reason": "Requires medium reasoning."},
+        ],
+    })
+    selected, context = duplicate_pipeline._select_replacement_candidate(
+        slot_id="s2", qtype="word_problem", conflict_slots=[], conflict_edges=[],
+        candidates=[{
+            "slot_id": "s2", "task_id": "medium-task", "concept": "break even",
+            "task_operation": "model_and_solve", "target": "break-even point",
+        }],
+        active_items=[], blacklist=set(), previous_failures=[],
+    )
+    assert selected is None
+    assert context["selection_source"] == "agent_no_candidate"
 
 
 def test_selector_sends_only_top_five_and_never_embeds_historical_context(monkeypatch):

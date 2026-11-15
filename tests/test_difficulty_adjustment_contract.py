@@ -8,7 +8,7 @@ import time
 import pytest
 from pydantic import ValidationError
 
-from app.llm.schemas import strict_json_schema
+from app.llm.schemas import DifficultyAdaptation, strict_json_schema
 from app.logging_conf import current_job_id, set_job_context
 from app.online import assessment_catalog, difficulty_adjustment, graph, planner
 
@@ -100,8 +100,23 @@ def _successful_response(state: dict) -> dict:
     }
 
 
-def _run(monkeypatch, response: object):
-    state = _state()
+def _noop_response(state: dict, slot_id: str | None = None) -> dict:
+    original = state["plans"][0]["items"]["equation"][0]
+    return {
+        "slot_id": slot_id or original["slot_id"],
+        "adjustment_succeeded": True,
+        "achieved_difficulty": state["difficulty"],
+        "further_adjustment_possible": False,
+        "attempted_fields": [],
+        "adjusted_fields": None,
+        "evidence_support": ["chunk-main"],
+        "evidence_justification": "The assigned task already has the requested demand.",
+        "reason": "No difficulty design change is required.",
+    }
+
+
+def _run(monkeypatch, response: object, state: dict | None = None):
+    state = state or _state()
     monkeypatch.setattr(
         difficulty_adjustment, "request_structured", lambda *_args, **_kwargs: response
     )
@@ -115,6 +130,9 @@ def _multi_state(count: int) -> dict:
     for index in range(1, count + 1):
         item = deepcopy(template)
         item["slot_id"] = f"m1_equation_{index}"
+        item["task_id"] = f"task_{index}"
+        item["base_catalog_task_id"] = f"task_{index}"
+        item["coverage_id"] = f"coverage_{index}"
         items.append(item)
     state["tasks"] = [("equation", count)]
     state["plans"][0]["items"]["equation"] = items
@@ -171,11 +189,41 @@ def test_adjustment_schema_is_a_strict_patch_and_enumerates_assigned_evidence():
     )
     assert schema["properties"]["slot_id"]["enum"] == [original["slot_id"]]
     assert set(patch_schema["properties"]) == {
-        "reasoning_requirements", "prerequisites", "given_conditions",
+        "adjustment_kind", "reasoning_requirements", "cognitive_transformations",
+        "removed_requirements", "prerequisites", "given_conditions",
         "required_givens", "idea_to_test", "strategy",
     }
     assert "task_family_id" not in patch_schema["properties"]
     assert patch_schema["additionalProperties"] is False
+
+
+def test_runtime_source_constrained_fallback_matches_legacy_adaptation_schema():
+    item = {
+        "task_id": "task_linear", "difficulty": "medium",
+        "actual_difficulty": "medium", "difficulty_adaptation": None,
+    }
+    assessment_catalog.apply_difficulty_fallback_metadata(
+        item, "hard", "medium", "The source supports only medium difficulty."
+    )
+
+    parsed = DifficultyAdaptation.model_validate(item["difficulty_adaptation"])
+    assert parsed.status == "accepted_source_constraint"
+    assert parsed.achieved_difficulty == "medium"
+    assert parsed.further_adjustment_possible is False
+    assert parsed.base_task_id is None
+
+
+@pytest.mark.parametrize(
+    "status", ["adapted", "retained", "failed", "fallback", "completed"]
+)
+def test_valid_legacy_adaptation_checkpoint_statuses_remain_schema_compatible(status):
+    parsed = DifficultyAdaptation.model_validate({
+        "status": status,
+        "from_difficulty": "medium",
+        "to_difficulty": "hard",
+        "base_task_id": "task_linear" if status == "adapted" else None,
+    })
+    assert parsed.status == status
 
 
 def test_plan_adjustment_input_is_focused_and_excludes_pipeline_metadata(monkeypatch):
@@ -198,6 +246,7 @@ def test_plan_adjustment_input_is_focused_and_excludes_pipeline_metadata(monkeyp
     assert set(task) == {
         "immutable_identifiers", "task_contract", "current_givens_and_constraints",
         "reasoning_profile", "actual_difficulty", "requested_difficulty",
+        "allowed_transformations", "native_difficulty_prior",
     }
     rendered = json.dumps(captured)
     assert "task_inventory" not in rendered
@@ -208,6 +257,7 @@ def test_plan_adjustment_input_is_focused_and_excludes_pipeline_metadata(monkeyp
 
 def test_unauthorized_givens_patch_is_rejected_and_preserves_instance(monkeypatch):
     state = _state()
+    state["plans"][0]["items"]["equation"][0]["exact_source_instance"] = True
     original = deepcopy(state["plans"][0]["items"]["equation"][0])
     response = _successful_response(state)
     response["adjusted_fields"].update({
@@ -215,7 +265,7 @@ def test_unauthorized_givens_patch_is_rejected_and_preserves_instance(monkeypatc
         "required_givens": ["A source-grounded linear equation."],
         "idea_to_test": "Solve a linear equation requiring connected transformations.",
     })
-    _, result = _run(monkeypatch, response)
+    _, result = _run(monkeypatch, response, state=state)
     item = result["plans"][0]["items"]["equation"][0]
     for field in (
         "slot_id", "base_catalog_task_id", "task_family_id",
@@ -250,7 +300,14 @@ def test_authorized_numeric_patch_creates_traceable_effective_instance(monkeypat
     assert adjusted["effective_givens"] == ["-3x + 5 = 17"]
     assert adjusted["effective_instance_id"].startswith("derived_")
     assert adjusted["derived_task_id"] == adjusted["effective_instance_id"]
-    assert adjusted["difficulty_adaptation"]["base_variation_id"] == item["selected_variation_id"]
+    assert adjusted["difficulty_design"]["effective_instance_id"] == adjusted["effective_instance_id"]
+    assert adjusted["difficulty_design"]["status"] == "designed"
+    assert adjusted["actual_difficulty"] == "medium"
+    assert planner.validate_plans(
+        result["plans"], state["tasks"], state["num_models"],
+        {"chunk-main", "chunk-support"}, state["difficulty"],
+        state["assessment_profile"], state["planning_issues"],
+    ) == []
 
 
 def test_no_op_reasoning_patch_is_rejected_and_original_is_retained(monkeypatch):
@@ -264,7 +321,7 @@ def test_no_op_reasoning_patch_is_rejected_and_original_is_retained(monkeypatch)
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
     assert item["actual_difficulty"] == "medium"
-    assert "reasoning_requirements_meaningfully_changed=false" in audit["rejection_reasons"]
+    assert "meaningful_change_present=false" in audit["rejection_reasons"]
 
 
 def test_valid_grounded_adjustment_is_accepted_and_audited(monkeypatch):
@@ -273,14 +330,192 @@ def test_valid_grounded_adjustment_is_accepted_and_audited(monkeypatch):
     _, result = _run(monkeypatch, response)
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
-    assert item["actual_difficulty"] == item["difficulty"] == "hard"
-    assert item["difficulty_adaptation"]["status"] == "adapted"
-    assert item["difficulty_adaptation"]["evidence_support"] == [
+    assert item["actual_difficulty"] == item["difficulty"] == "medium"
+    assert item["requested_difficulty"] == "hard"
+    assert item["difficulty_design"]["status"] == "designed"
+    assert item["difficulty_design"]["evidence_support"] == [
         "chunk-main", "chunk-support"
     ]
     assert audit["status"] == "succeeded"
     assert audit["rejection_reasons"] == []
     assert all(audit["acceptance_checks"].values())
+
+
+def test_valid_noop_retains_catalog_instance_and_passes_full_planner_validation(monkeypatch):
+    state = _state()
+    original = deepcopy(state["plans"][0]["items"]["equation"][0])
+    calls = 0
+
+    def respond(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return _noop_response(state)
+
+    monkeypatch.setattr(
+        difficulty_adjustment, "request_structured", respond,
+    )
+
+    result = difficulty_adjustment.adjust_plan_difficulty(state)
+    item = result["plans"][0]["items"]["equation"][0]
+
+    assert item["difficulty_status"] == "not_required"
+    assert item["difficulty_design"]["status"] == "not_required"
+    assert not item.get("effective_instance_id")
+    assert item.get("derived_task_id") == original["task_id"]
+    assert item["task_id"] == original["task_id"]
+    assert item["selected_variation_id"] == original["selected_variation_id"]
+    assert result["difficulty_adjustment_attempts"][item["slot_id"]] == 1
+    assert calls == 1
+    assert planner.validate_plans(
+        result["plans"], state["tasks"], state["num_models"],
+        {"chunk-main", "chunk-support"}, state["difficulty"],
+        state["assessment_profile"], state["planning_issues"],
+    ) == []
+
+
+def test_noop_checkpoint_round_trip_remains_valid(monkeypatch):
+    state = _state()
+    monkeypatch.setattr(
+        difficulty_adjustment, "request_structured",
+        lambda *_args, **_kwargs: _noop_response(state),
+    )
+    result = difficulty_adjustment.adjust_plan_difficulty(state)
+    replayed_plans = json.loads(json.dumps(result["plans"]))
+
+    assert planner.validate_plans(
+        replayed_plans, state["tasks"], state["num_models"],
+        {"chunk-main", "chunk-support"}, state["difficulty"],
+        state["assessment_profile"], state["planning_issues"],
+    ) == []
+
+
+def test_contradictory_not_required_effective_instance_is_still_rejected(monkeypatch):
+    state = _state()
+    monkeypatch.setattr(
+        difficulty_adjustment, "request_structured",
+        lambda *_args, **_kwargs: _noop_response(state),
+    )
+    result = difficulty_adjustment.adjust_plan_difficulty(state)
+    item = result["plans"][0]["items"]["equation"][0]
+    item["effective_instance_id"] = "derived_contradiction"
+    item["derived_task_id"] = "derived_contradiction"
+    item["effective_givens"] = list(item.get("given_conditions") or [])
+    item["difficulty_design"]["effective_instance_id"] = "derived_contradiction"
+
+    errors = planner.validate_plans(
+        result["plans"], state["tasks"], state["num_models"],
+        {"chunk-main", "chunk-support"}, state["difficulty"],
+        state["assessment_profile"], state["planning_issues"],
+    )
+    assert "Slot m1_equation_1 has inconsistent effective-instance metadata." in errors
+
+
+def test_unauthorized_effective_numerical_instance_is_rejected_by_planner():
+    state = _state()
+    item = state["plans"][0]["items"]["equation"][0]
+    item["exact_source_instance"] = True
+    item.update({
+        "effective_instance_id": "derived_unauthorized",
+        "derived_task_id": "derived_unauthorized",
+        "effective_givens": ["99x = 1"],
+        "given_conditions": ["99x = 1"],
+        "difficulty_design": {
+            "status": "designed", "adjustment_kind": "numerical",
+            "effective_instance_id": "derived_unauthorized",
+        },
+    })
+
+    errors = planner.validate_plans(
+        state["plans"], state["tasks"], state["num_models"],
+        {"chunk-main", "chunk-support"}, state["difficulty"],
+        state["assessment_profile"], state["planning_issues"],
+    )
+    assert "Slot m1_equation_1 has unauthorized effective numerical givens." in errors
+
+
+def test_unknown_difficulty_design_status_is_rejected_and_never_routes_to_generation():
+    state = _state()
+    item = state["plans"][0]["items"]["equation"][0]
+    item["difficulty_design"] = {"status": "desigend"}
+    errors = planner.validate_plans(
+        state["plans"], state["tasks"], state["num_models"],
+        {"chunk-main", "chunk-support"}, state["difficulty"],
+        state["assessment_profile"], state["planning_issues"],
+    )
+    assert "Slot m1_equation_1 has invalid difficulty-design status 'desigend'." in errors
+    assert graph._route_after_plan({
+        **state, "plan_errors": [], "plan_attempts": 1,
+    }) == "repair_plan"
+
+
+@pytest.mark.parametrize(
+    ("status", "effective_id", "expected_route"),
+    [
+        ("pending", None, "adjust_plan_difficulty"),
+        ("not_required", None, "generate_exams"),
+        ("accepted_source_constraint", None, "generate_exams"),
+        ("designed", "derived_valid", "generate_exams"),
+    ],
+)
+def test_every_valid_difficulty_design_status_routes_consistently(
+    status, effective_id, expected_route,
+):
+    state = _state()
+    item = state["plans"][0]["items"]["equation"][0]
+    item["difficulty_design"] = {"status": status}
+    if effective_id:
+        item["effective_instance_id"] = effective_id
+        item["derived_task_id"] = effective_id
+        item["effective_givens"] = list(item.get("given_conditions") or [])
+        item["difficulty_design"]["effective_instance_id"] = effective_id
+    assert graph._route_after_plan({
+        **state, "plan_errors": [], "plan_attempts": 1,
+    }) == expected_route
+
+
+def test_mixed_noop_and_designed_slots_pass_full_planner_validation(monkeypatch):
+    state = _multi_state(2)
+    second = state["plans"][0]["items"]["equation"][1]
+    second.update({
+        "concept": "linear inequalities",
+        "topic": "linear inequalities",
+        "canonical_skill": "solve linear inequalities",
+        "knowledge_focus": "inequality solution sets",
+        "task_operation": "solve_inequality",
+        "target": "solution interval",
+        "student_work_product": "solve inequality",
+        "idea_to_test": "solve a linear inequality",
+    })
+    state["assessment_profile"]["question_types"]["equation"]["task_operations"].append(
+        "solve_inequality"
+    )
+
+    def respond(_client, prompt, **_kwargs):
+        payload = json.loads(prompt)
+        results = []
+        for entry in payload["tasks"]:
+            slot_id = entry["task"]["immutable_identifiers"]["slot_id"]
+            if slot_id.endswith("_1"):
+                results.append(_noop_response(state, slot_id))
+            else:
+                decision = _successful_response(state)
+                decision["slot_id"] = slot_id
+                results.append(decision)
+        return {"results": results}
+
+    monkeypatch.setattr(difficulty_adjustment, "request_structured", respond)
+    result = difficulty_adjustment.adjust_plan_difficulty(state)
+    first, second = result["plans"][0]["items"]["equation"]
+
+    assert first["difficulty_design"]["status"] == "not_required"
+    assert not first.get("effective_instance_id")
+    assert second["difficulty_design"]["status"] == "designed"
+    assert second["effective_instance_id"].startswith("derived_")
+    assert planner.validate_plans(
+        result["plans"], state["tasks"], state["num_models"],
+        {"chunk-main", "chunk-support"}, state["difficulty"],
+        state["assessment_profile"], state["planning_issues"],
+    ) == []
 
 
 @pytest.mark.parametrize(
@@ -300,7 +535,7 @@ def test_old_full_task_contract_shapes_are_rejected_with_exact_schema_error(
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
     assert item["actual_difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "accepted_source_constraint"
+    assert item["difficulty_design"]["status"] == "accepted_source_constraint"
     assert "structured_response_invalid" in item["adjustment_failure_reason"]
     assert "adjusted_task" in audit["reason"]
     assert audit["model_decision"] == "invalid_response"
@@ -311,7 +546,16 @@ def test_old_full_task_contract_shapes_are_rejected_with_exact_schema_error(
     [
         (lambda value: value.update(slot_id="other-slot"), "slot ID"),
         (lambda value: value.update(evidence_support=["unknown-chunk"]), "evidence_support"),
-        (lambda value: value.update(achieved_difficulty="medium"), "achieved_difficulty"),
+        (
+            lambda value: value.update(
+                adjusted_fields={
+                    **(value.get("adjusted_fields") or {}),
+                    "adjustment_kind": "cognitive",
+                    "cognitive_transformations": ["invented_quadratic_operation"],
+                }
+            ),
+            "transformations_authorized",
+        ),
         (
             lambda value: value["adjusted_fields"].update(task_family_id="different-family"),
             "task_family_id",
@@ -328,7 +572,7 @@ def test_invalid_identity_evidence_and_difficulty_retain_original(
     item = result["plans"][0]["items"]["equation"][0]
     audit = result["difficulty_adjustment_history"][0]
     assert item["actual_difficulty"] == "medium"
-    assert item["difficulty_adaptation"]["status"] == "accepted_source_constraint"
+    assert item["difficulty_design"]["status"] == "accepted_source_constraint"
     combined = " ".join([
         item["adjustment_failure_reason"], audit["reason"],
         *audit["rejection_reasons"],
@@ -448,15 +692,15 @@ def test_parallel_rate_limit_failure_does_not_discard_other_results(monkeypatch)
     monkeypatch.setattr(difficulty_adjustment, "request_structured", fake_request)
     result = difficulty_adjustment.adjust_plan_difficulty(state)
     history = result["difficulty_adjustment_history"]
-    assert [row["slot_id"] for row in history].count("m1_equation_3") == 3
+    assert [row["slot_id"] for row in history].count("m1_equation_3") == 1
     assert [row["status"] for row in history].count("succeeded") == 5
     failed = next(row for row in history if row["slot_id"] == "m1_equation_3")
     assert failed["status"] == "failed"
     assert "provider capacity" in failed["reason"]
-    assert result["difficulty_adjustment_attempts"]["m1_equation_3"] == 3
+    assert result["difficulty_adjustment_attempts"]["m1_equation_3"] == 1
 
 
-def test_exhausted_adjustment_uses_requested_catalog_fallback(monkeypatch):
+def test_exhausted_adjustment_keeps_the_valid_task_without_replacement(monkeypatch):
     state = _state()
     alternative = deepcopy(_catalog_task())
     alternative.update({
@@ -470,7 +714,6 @@ def test_exhausted_adjustment_uses_requested_catalog_fallback(monkeypatch):
     state["difficulty"] = "easy"
     original = state["plans"][0]["items"]["equation"][0]
     original["requested_difficulty"] = "easy"
-    original["difficulty_adaptation"]["to_difficulty"] = "easy"
     state["assessment_catalog"]["tasks"].append(alternative)
 
     def decline(_client, prompt, **_kwargs):
@@ -486,11 +729,12 @@ def test_exhausted_adjustment_uses_requested_catalog_fallback(monkeypatch):
     monkeypatch.setattr(difficulty_adjustment, "request_structured", decline)
     result = difficulty_adjustment.adjust_plan_difficulty(state)
     item = result["plans"][0]["items"]["equation"][0]
-    assert result["difficulty_adjustment_attempts"][original["slot_id"]] == 3
-    assert item["selected_replacement_task_id"] == "task_easy_alternative"
-    assert item["base_catalog_task_id"] == "task_easy_alternative"
-    assert item["requested_difficulty"] == item["actual_difficulty"] == "easy"
-    assert item["difficulty_adaptation"]["status"] == "fallback"
+    assert result["difficulty_adjustment_attempts"][original["slot_id"]] == 1
+    assert item.get("selected_replacement_task_id") is None
+    assert item["base_catalog_task_id"] == "task_linear"
+    assert item["requested_difficulty"] == "easy"
+    assert item["actual_difficulty"] == "medium"
+    assert item["difficulty_design"]["status"] == "accepted_source_constraint"
 
 
 def test_catalog_fallback_prefers_unused_nearby_level_over_used_exact_level():
@@ -529,7 +773,7 @@ def test_catalog_fallback_prefers_unused_nearby_level_over_used_exact_level():
         },
     })
 
-    difficulty_adjustment._apply_catalog_fallbacks(
+    difficulty_adjustment._legacy_apply_catalog_fallbacks(
         plans, {"tasks": [occupied_easy, failed, unused_medium]}, "easy"
     )
 
@@ -559,11 +803,10 @@ def test_fallback_preserves_native_level_and_routes_to_adjustment(native, reques
     assert item["requested_difficulty"] == requested
     assert item["difficulty"] == item["actual_difficulty"] == native
     assert item["reasoning_depth"] == native
-    assert item["difficulty_adaptation"] == {
-        "status": "pending", "from_difficulty": native,
-        "to_difficulty": requested, "base_task_id": "task_linear",
-        "strategy": None, "failed_strategies": [],
-    }
+    assert item["difficulty_design"]["status"] == (
+        "pending" if native != requested else "not_required"
+    )
+    assert item["difficulty_design"]["native_prior"] == native
     assert planner.validate_plans(
         plans, [("equation", 1)], 1, {"chunk-main", "chunk-support"},
         requested, _state()["assessment_profile"], [],
@@ -592,7 +835,10 @@ def test_mixed_allocation_preserves_native_levels_without_pending_adjustment():
     assert issues == []
     assert {item["difficulty"] for item in items} == {"easy", "medium", "hard"}
     assert all(item["requested_difficulty"] == "mix" for item in items)
-    assert all(item["difficulty_adaptation"] is None for item in items)
+    assert all(
+        (item["difficulty_design"] or {}).get("status") == "not_required"
+        for item in items
+    )
 
 
 def test_successful_medium_to_easy_adjustment_updates_all_current_level_fields(monkeypatch):
@@ -623,8 +869,8 @@ def test_successful_medium_to_easy_adjustment_updates_all_current_level_fields(m
     item = result["plans"][0]["items"]["equation"][0]
     assert result["plan_errors"] == []
     assert item["requested_difficulty"] == "easy"
-    assert item["difficulty"] == item["actual_difficulty"] == item["reasoning_depth"] == "easy"
-    assert item["difficulty_adaptation"]["status"] == "adapted"
+    assert item["difficulty"] == item["actual_difficulty"] == item["reasoning_depth"] == "medium"
+    assert item["difficulty_design"]["status"] == "designed"
 
 
 def test_failed_job_ten_slot_shape_is_pending_adjustment_not_plan_repair():
@@ -658,7 +904,7 @@ def test_failed_job_ten_slot_shape_is_pending_adjustment_not_plan_repair():
     assert {item["base_catalog_task_id"] for item in items} == set(historical_ids)
     assert all(item["difficulty"] == item["actual_difficulty"] == "medium" for item in items)
     assert all(item["reasoning_depth"] == "medium" for item in items)
-    assert all((item["difficulty_adaptation"] or {}).get("status") == "pending" for item in items)
+    assert all((item["difficulty_design"] or {}).get("status") == "pending" for item in items)
     assert graph._route_after_plan({
         "plans": plans, "plan_errors": [], "planning_issues": [], "plan_attempts": 1,
     }) == "adjust_plan_difficulty"
@@ -751,6 +997,7 @@ def test_generated_adjustment_uses_same_focused_task_contract(monkeypatch):
     assert set(captured["task"]) == {
         "immutable_identifiers", "task_contract", "current_givens_and_constraints",
         "reasoning_profile", "actual_difficulty", "requested_difficulty",
+        "allowed_transformations", "native_difficulty_prior",
     }
     rendered = json.dumps(captured["task"])
     assert "task_inventory" not in rendered

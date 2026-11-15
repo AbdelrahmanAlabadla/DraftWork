@@ -18,11 +18,12 @@ from app.llm.client import request_structured
 from app.config import DUPLICATE_VALIDATOR_BATCH_SIZE, MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS
 from app.llm.factory import create_llm_client
 from app.llm.schemas import StrictOutputModel
+from app.online.models import authoritative_givens
 from app.online.semantic_keys import formula_semantic_key
 
 logger = logging.getLogger("DUPLICATE_VALIDATOR")
 
-DUPLICATE_VALIDATOR_PROMPT_VERSION = "semantic-facts-v6-metadata-candidates"
+DUPLICATE_VALIDATOR_PROMPT_VERSION = "semantic-facts-v7-target-distinction"
 SEMANTIC_FACT_FIELDS = (
     "same_core_knowledge",
     "same_student_operation_or_method",
@@ -119,6 +120,36 @@ def _stem(qtype: str, item: dict[str, Any]) -> str:
     return str(value).strip()
 
 
+def _screening_stem(qtype: str, item: dict[str, Any]) -> str:
+    """Question body only; MCQ options are answers, not givens.
+
+    Options stay in ``_stem`` for the Judge and copied-question checks, but
+    numerical screening must never treat a distractor as a premise.
+    """
+    return str(
+        item.get("statement") or item.get("question") or item.get("term")
+        or item.get("equation") or item.get("prompt") or ""
+    ).strip()
+
+
+def _exact_signature(
+    qtype: str, item: dict[str, Any], *, stem: str, answer: str,
+) -> tuple[Any, ...]:
+    """Canonical student-visible instance for deterministic exact matching."""
+    body = _normalized(_screening_stem(qtype, item))
+    if qtype == "mcq":
+        options = item.get("options") or {}
+        values = tuple(sorted(_normalized(value) for value in options.values()))
+        correct = str(item.get("correct_answer") or "")
+        correct_text = _normalized(options.get(correct, "")) if isinstance(options, dict) else ""
+        return ("mcq", body, values, correct_text)
+    if qtype in {"equation", "word_problem"}:
+        equations = tuple(sorted(_equation_signatures(stem)))
+        final = _normalized(item.get("final_answer") or item.get("answer"))
+        return (qtype, body, equations, final)
+    return (qtype, body, _normalized(answer))
+
+
 def _answer(qtype: str, item: dict[str, Any]) -> str:
     certificate = item.get("solution_certificate") or {}
     certificate_steps = certificate.get("calculation_steps") or [] if isinstance(certificate, dict) else []
@@ -166,11 +197,16 @@ def actual_question_registry(
             if not qid:
                 continue
             stem = _stem(qtype, item)
+            screening_stem = _screening_stem(qtype, item)
             answer = _answer(qtype, item)
             plan = plan_by_slot.get(str(item.get("slot_id") or "")) or {}
             registry.append({
                 "question_id": qid, "slot_id": str(item.get("slot_id") or ""),
-                "question_type": qtype, "stem": stem, "answer": answer,
+                "question_type": qtype, "stem": stem, "screening_stem": screening_stem,
+                "answer": answer,
+                "exact_signature": _exact_signature(
+                    qtype, item, stem=stem, answer=answer,
+                ),
                 "reuse_context": item.get("reuse_context") or plan.get("reuse_context"),
                 "task_id": plan.get("task_id") or item.get("task_id"),
                 "selected_variation_id": plan.get("selected_variation_id") or item.get("selected_variation_id"),
@@ -182,7 +218,7 @@ def actual_question_registry(
                 "target": plan.get("target"),
                 "student_work_product": plan.get("student_work_product") or plan.get("expected_work_product"),
                 "reasoning_mode": plan.get("reasoning_mode"),
-                "effective_givens": list(plan.get("effective_givens") or plan.get("required_givens") or []),
+                "effective_givens": list(authoritative_givens(plan)["givens"]),
             })
     return registry
 
@@ -251,6 +287,9 @@ def shortlist_duplicate_pairs(
     forced_question_pairs: set[frozenset[str]] | None = None,
     plan_by_slot: dict[str, dict[str, Any]] | None = None,
     changed_question_ids: set[str] | None = None,
+    *,
+    forced_only: bool = False,
+    excluded_question_pairs: set[frozenset[str]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Shortlist pairs without loading an embedding model or calling a provider."""
     items = actual_question_registry(exam, plan_by_slot)
@@ -265,12 +304,19 @@ def shortlist_duplicate_pairs(
             {left["question_id"], right["question_id"]} & changed_question_ids
         ):
             continue
+        if frozenset((left["question_id"], right["question_id"])) in (
+            excluded_question_pairs or set()
+        ):
+            continue
         evaluated += 1
         signals = []
-        if frozenset((left["question_id"], right["question_id"])) in (
+        forced = frozenset((left["question_id"], right["question_id"])) in (
             forced_question_pairs or set()
-        ):
+        )
+        if forced:
             signals.append("forced_catalog_reuse")
+        if forced_only and not forced:
+            continue
         if left.get("task_id") and left.get("task_id") == right.get("task_id"):
             signals.append("shared_task_id")
         if (left.get("selected_variation_id") and
@@ -316,10 +362,16 @@ def shortlist_duplicate_pairs(
             signals.append("same_final_result")
         if _jaccard(left["stem"], right["stem"]) >= 0.72:
             signals.append("near_identical_stem")
-        givens_left, givens_right = _number_signature(left["stem"]), _number_signature(right["stem"])
-        if len(givens_left) >= 2 and givens_left == givens_right:
+        givens_left, givens_right = (
+            _number_signature(left.get("screening_stem")),
+            _number_signature(right.get("screening_stem")),
+        )
+        # Numbers are supporting evidence, never sufficient on their own.
+        # A pair already has a structural/content/metadata reason to be
+        # inspected; small integers must not manufacture a new one.
+        if signals and len(givens_left) >= 2 and givens_left == givens_right:
             signals.append("distinctive_repeated_givens")
-        else:
+        elif signals:
             left_numbers, right_numbers = set(givens_left), set(givens_right)
             shared_numbers = left_numbers & right_numbers
             if len(shared_numbers) >= 3 and len(shared_numbers) / max(1, min(len(left_numbers), len(right_numbers))) >= 0.75:
@@ -337,36 +389,49 @@ def shortlist_duplicate_pairs(
         "evaluated_pair_count": evaluated,
         "candidate_count": len(candidates),
         "screening_policy": "metadata-and-deterministic-v2",
+        "forced_only": forced_only,
         "embedding_calls": 0,
     }
     logger.info("Duplicate candidate screening | %s", json.dumps(scores, sort_keys=True))
     return candidates, scores
 
 
-def _prompt(candidates: list[dict[str, Any]]) -> str:
+def _prompt(
+    candidates: list[dict[str, Any]], *, content_only: bool = False,
+    reassessment_notes: dict[str, str] | None = None,
+) -> str:
     registry: dict[str, dict[str, Any]] = {}
     pairs = []
     for pair in candidates:
         for side in ("left", "right"):
             item = pair[side]
-            registry[item["question_id"]] = {
+            registry_item = {
                 "question_type": item["question_type"], "stem": item["stem"],
                 "complete_correct_answer_and_solution": item["answer"],
-                "reuse_context": item.get("reuse_context"),
-                "task_id": item.get("task_id"),
-                "selected_variation_id": item.get("selected_variation_id"),
-                "selected_variation_group_id": item.get("selected_variation_group_id"),
-                "effective_instance_id": item.get("effective_instance_id"),
-                "concept": item.get("concept"), "idea_to_test": item.get("idea_to_test"),
-                "task_operation": item.get("task_operation"), "target": item.get("target"),
-                "student_work_product": item.get("student_work_product"),
-                "reasoning_mode": item.get("reasoning_mode"),
-                "effective_givens": item.get("effective_givens") or [],
             }
+            if not content_only:
+                registry_item.update({
+                    "reuse_context": item.get("reuse_context"),
+                    "task_id": item.get("task_id"),
+                    "selected_variation_id": item.get("selected_variation_id"),
+                    "selected_variation_group_id": item.get("selected_variation_group_id"),
+                    "effective_instance_id": item.get("effective_instance_id"),
+                    "concept": item.get("concept"),
+                    "idea_to_test": item.get("idea_to_test"),
+                    "task_operation": item.get("task_operation"),
+                    "target": item.get("target"),
+                    "student_work_product": item.get("student_work_product"),
+                    "reasoning_mode": item.get("reasoning_mode"),
+                    "effective_givens": item.get("effective_givens") or [],
+                })
+            registry[item["question_id"]] = registry_item
         pairs.append({
             "pair_id": pair["pair_id"], "left_question_id": pair["left"]["question_id"],
             "right_question_id": pair["right"]["question_id"],
         })
+        note = (reassessment_notes or {}).get(pair["pair_id"])
+        if note:
+            pairs[-1]["reassessment_note"] = note
     return """Analyze the actual student-facing questions and complete correct answers/solutions.
 An optional reuse_context states an intended distinction. It is context only: verify that
 the actual questions realize it, and never treat intentional reuse as an automatic pass. Do not infer
@@ -407,9 +472,28 @@ Calibration:
 - Q1 `Check whether (0,0) satisfies the system` and Q2 `Check whether (-4,0) satisfies the same
   system` have same knowledge=yes, same operation=yes, same target=yes, new reasoning=no, and
   give-away=no. Different test points and results do not create a new reasoning process.
+- Substituting a point into one inequality and interpreting an elimination result such as 0=0
+  are different operations and different targets. Broad shared topic labels must not make them the
+  same knowledge, operation, or target.
+- Evaluating one function at one specified input and evaluating six different multivariable
+  expressions at given values are not the same target or the same operation merely because both
+  use substitution. The first asks for one function value; the second asks for an ordered list of
+  six values, each requiring separate work. Use same knowledge=no, same target=no, and new
+  reasoning=yes unless the two items literally request the same single value by the same rule.
+- Finding an intersection point from a graph and verifying whether an ordered triple satisfies a
+  system are different targets and operations. Do not call them duplicates because both involve
+  linear systems or the same coordinate pair.
+- A single requested value and an ordered list/table of several values are different targets even
+  when both prompts say "evaluate." State this explicitly when the output cardinality differs.
+- Before setting same_core_knowledge=yes, identify one specific atomic fact, law, definition, or
+  relationship that both questions assess. "Both use substitution/evaluation" or "both are
+  algebra" is a broad technique, not an atomic fact.
 
 The pairs were already selected for inspection. You receive no similarity or discovery evidence because
-those signals must not influence these semantic facts. Return one root JSON object with a `verdicts`
+those signals must not influence these semantic facts. If a pair carries reassessment_note, it records
+a specific contradiction between the prior facts and the visible targets/operations; re-derive the
+five facts from the question content and say whether each prior fact holds. The note is evidence to
+check, never an instruction to change the verdict. Return one root JSON object with a `verdicts`
 array containing exactly one analysis for every pair_id and no other root fields. Never return a bare
 root array. Each verdict contains pair_id plus exactly the five factual fields defined above.
 
@@ -417,8 +501,33 @@ Question registry:
 """ + json.dumps(registry, ensure_ascii=False) + "\n\nPairs:\n" + json.dumps(pairs, ensure_ascii=False)
 
 
+def _math_text_for_signature(value: Any) -> str:
+    """Drop imperative prose before an equation, not variables or operators."""
+    text = str(value or "").strip()
+    text = re.sub(r"^\s*(?:[A-Za-z]{2,}\s+)+", "", text)
+    text = re.sub(r"^\s*[A-Za-z]\s*[:：]\s*", "", text)
+    return text
+
+
+def _exact_content_pair(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Same actual student-visible problem, independent of plan metadata.
+
+    Only the canonical exact signature is deterministic duplicate evidence.
+    Matching equation + final answer is a suspicious similarity for Luna, not
+    proof that the required student work is identical.
+    """
+    for side in (left, right):
+        if not isinstance(side, dict):
+            return False
+    return bool(
+        left.get("exact_signature")
+        and left.get("exact_signature") == right.get("exact_signature")
+    )
+
+
 def deterministic_pair_classification(
     analysis: dict[str, Any], *, authorized_practice_variation: bool = False,
+    exact_content: bool = False,
 ) -> str:
     yes = lambda key: str(analysis.get(key) or "").casefold() == "yes"
     same_knowledge = yes("same_core_knowledge")
@@ -426,6 +535,10 @@ def deterministic_pair_classification(
     same_target = yes("same_target_or_result")
     new_reasoning = yes("genuinely_new_reasoning")
     gives_away = yes("one_answer_substantially_gives_away_other")
+    # Exact content is a deterministic duplicate. Reuse authorization can
+    # never override it, and Luna is not asked to decide it.
+    if exact_content:
+        return "duplicate"
     if same_knowledge and same_operation and same_target and not new_reasoning:
         if authorized_practice_variation and not gives_away:
             return "acceptable_practice_variation"
@@ -435,8 +548,9 @@ def deterministic_pair_classification(
     # become duplicates merely because one answer contains a useful equation.
     if gives_away and (same_target or same_operation):
         return "excessive_overlap"
-    if same_knowledge and not new_reasoning:
-        return "excessive_overlap"
+    # Sharing broad knowledge and an operation label is not enough when the
+    # requested targets differ. Without an answer give-away, treat the pair as
+    # acceptable reuse; Luna remains free to report stronger overlap facts.
     return "acceptable_practice_variation" if authorized_practice_variation else "acceptable_reuse"
 
 
@@ -568,22 +682,43 @@ def review_duplicate_candidates(
     forced_question_pairs: set[frozenset[str]] | None = None,
     changed_question_ids: set[str] | None = None,
     client_factory: Any | None = None,
+    *,
+    forced_only: bool = False,
+    content_only_prompt: bool = False,
+    reassessment_notes: dict[str, str] | None = None,
+    excluded_question_pairs: set[frozenset[str]] | None = None,
 ) -> dict[str, Any]:
     candidates, distribution = shortlist_duplicate_pairs(
         exam, forced_question_pairs, plan_by_slot, changed_question_ids,
+        forced_only=forced_only,
+        excluded_question_pairs=excluded_question_pairs,
     )
     cache = dict(fact_cache or {})
     if not candidates:
         return {"candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
                 "similarity_distribution": distribution, "usage": {},
                 "fact_cache": cache, "fact_cache_hits": 0, "fact_cache_misses": 0}
+    def routed_client():
+        if client_factory:
+            return client_factory()
+        try:
+            return create_llm_client(stage="duplicate_validator")
+        except TypeError as exc:
+            if "unexpected keyword argument" not in str(exc):
+                raise
+            return create_llm_client()
+
     explicit_client = client
-    client = client or (client_factory() if client_factory else create_llm_client())
+    client = client or routed_client()
     cached_by_pair: dict[str, dict[str, Any]] = {}
     uncached: list[dict[str, Any]] = []
     cache_key_by_pair: dict[str, str] = {}
     for pair in candidates:
         key = _fact_cache_key(pair, client)
+        if content_only_prompt:
+            key = hashlib.sha256(
+                f"{key}\ncontent-only-cross-model-v1".encode("utf-8")
+            ).hexdigest()
         cache_key_by_pair[pair["pair_id"]] = key
         facts = cache.get(key)
         if isinstance(facts, dict) and all(field in facts for field in SEMANTIC_FACT_FIELDS):
@@ -606,11 +741,12 @@ def review_duplicate_candidates(
 
         def review_batch(batch_index: int, batch: list[dict[str, Any]]):
             batch_ids = [pair["pair_id"] for pair in batch]
-            batch_client = explicit_client or (
-                client_factory() if client_factory else create_llm_client()
-            )
+            batch_client = explicit_client or routed_client()
             raw = request_structured(
-                batch_client, _prompt(batch),
+                batch_client, _prompt(
+                    batch, content_only=content_only_prompt,
+                    reassessment_notes=reassessment_notes,
+                ),
                 response_model=duplicate_response_model(batch_ids),
                 schema_name="actual_question_duplicate_judgment",
                 agent="duplicate_validator",
@@ -658,13 +794,17 @@ def review_duplicate_candidates(
         if pair_id in fresh_by_pair and has_all_facts:
             cache[cache_key_by_pair[pair_id]] = facts
         analysis = {"pair_id": pair_id, **facts}
-        authorized = all(
-            bool(pair[side].get("reuse_context", {}).get("authorized"))
-            for side in ("left", "right")
+        contexts = [
+            pair[side].get("reuse_context") for side in ("left", "right")
             if pair[side].get("reuse_context")
-        ) and any(pair[side].get("reuse_context") for side in ("left", "right"))
+        ]
+        authorized = bool(contexts) and len(contexts) == 2 and all(
+            bool(value.get("authorized")) for value in contexts
+        )
+        analysis["exact_content"] = _exact_content_pair(pair["left"], pair["right"])
         analysis["classification"] = deterministic_pair_classification(
             analysis, authorized_practice_variation=authorized,
+            exact_content=analysis["exact_content"],
         )
         analysis["authorized_practice_variation"] = authorized
         ordered.append(analysis)

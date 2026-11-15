@@ -23,7 +23,9 @@ ASSIGNMENT_FIELDS = (
     "task_family_id", "selected_variation_id", "selected_variation_group_id",
     "task_operation", "target", "student_work_product", "effective_givens",
     "required_givens", "source_chunk_id", "support_chunk_ids", "actual_difficulty",
-    "difficulty",
+    "difficulty", "requested_difficulty", "effective_instance_id",
+    "difficulty_status", "difficulty_design", "cognitive_transformations",
+    "reasoning_requirements", "given_conditions", "prerequisites",
 )
 
 
@@ -185,7 +187,10 @@ def reconcile_slot_lifecycle(
                     "effective_givens": deepcopy(item.get("effective_givens") or []),
                     "requested_difficulty": item.get("requested_difficulty"),
                     "actual_difficulty": item.get("actual_difficulty") or item.get("difficulty"),
-                    "difficulty_adjustment": deepcopy(item.get("difficulty_adaptation")),
+                    "difficulty_design": deepcopy(item.get("difficulty_design")),
+                    "difficulty_adjustment": deepcopy(
+                        item.get("difficulty_design") or item.get("difficulty_adaptation")
+                    ),
                     "difficulty_fallback_reason": item.get("difficulty_fallback_reason"),
                     "base_catalog_task_id": item.get("base_catalog_task_id"),
                     "base_task_family_id": item.get("base_task_family_id"),

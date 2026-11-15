@@ -58,18 +58,15 @@ def _parent_chunks(parent_count: int) -> list[dict]:
     ]
 
 
-@pytest.mark.parametrize(
-    ("parent_count", "request_count"),
-    [(2, 1), (4, 2), (5, 3), (20, 10), (100, 50)],
-)
-def test_catalog_batches_contain_two_complete_parent_groups(parent_count, request_count):
+@pytest.mark.parametrize("parent_count", [2, 4, 5, 20, 100])
+def test_catalog_batches_isolate_complete_parent_groups(parent_count):
     chunks = _parent_chunks(parent_count)
-    batches = assessment_catalog._balanced_catalog_batches(chunks, 1)
-    assert len(batches) == request_count
+    batches = assessment_catalog._balanced_catalog_batches(chunks, 99)
+    assert len(batches) == parent_count
     assert [row["child_id"] for batch in batches for row in batch] == [
         row["child_id"] for row in chunks
     ]
-    assert all(len(dict.fromkeys(row["parent_id"] for row in batch)) <= 2 for batch in batches)
+    assert all(len(dict.fromkeys(row["parent_id"] for row in batch)) == 1 for batch in batches)
     locations = {}
     for batch_index, batch in enumerate(batches):
         for row in batch:
@@ -83,7 +80,7 @@ def test_catalog_batches_respect_partial_selection_and_skip_empty_parents():
     selected = [row for row in all_chunks if row["child_id"] in selected_ids]
     batches = assessment_catalog._balanced_catalog_batches(selected)
     assert [[row["child_id"] for row in batch] for batch in batches] == [
-        ["p0-c0", "p1-c1"], ["p2-c0", "p2-c1", "p2-c2"]
+        ["p0-c0"], ["p1-c1"], ["p2-c0", "p2-c1", "p2-c2"]
     ]
     assert all(row["parent_id"] != "p3" for batch in batches for row in batch)
 
@@ -281,6 +278,19 @@ def test_independent_repair_jobs_overlap_and_merge_by_slot(monkeypatch):
 
 def test_independent_candidate_revalidations_overlap_and_commit_separately(monkeypatch):
     scopes = []
+    monkeypatch.setattr(
+        "app.online.duplicate_pipeline.scan_exam_duplicates",
+        lambda _state: {"duplicate_reports": []},
+    )
+    monkeypatch.setattr(
+        "app.online.duplicate_judge.review_duplicate_candidates",
+        lambda _exam, **kwargs: {
+            "candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
+            "similarity_distribution": {}, "usage": {},
+            "fact_cache": kwargs.get("fact_cache") or {},
+            "fact_cache_hits": 0, "fact_cache_misses": 0,
+        },
+    )
 
     def fake_validate(exam, question_ids, *_args):
         ids = list(question_ids)
@@ -324,7 +334,17 @@ def test_independent_candidate_revalidations_overlap_and_commit_separately(monke
     assert all(item["status"] == "resolved" for item in result["repair_manifest"])
 
 
-def test_deterministic_replacement_prefers_conflict_resolution_before_usage(monkeypatch):
+def test_replacement_selector_decides_after_metadata_differences(monkeypatch):
+    from app.llm import client as llm_client
+
+    monkeypatch.setattr(
+        llm_client, "request_structured",
+        lambda *_args, **_kwargs: {
+            "replacement_task_id": "different",
+            "slot_to_replace": "replace",
+            "checked_against_active_slots": True,
+        },
+    )
     candidates = [
         {"task_id": "same", "concept": "motion", "target": "distance",
          "task_operation": "calculate", "reasoning_mode": "substitution"},
@@ -341,7 +361,8 @@ def test_deterministic_replacement_prefers_conflict_resolution_before_usage(monk
         allow_semantic_overlap_candidates=True,
     )
     assert chosen["task_id"] == "different"
-    assert context["selection_source"] == "deterministic_conflict_ranking"
+    assert context.get("selection_source") != "deterministic_conflict_ranking"
+    assert context["agent_choice"]["replacement_task_id"] == "different"
 
 
 def test_catalog_cache_key_ignores_unrelated_module_bytes(monkeypatch):
@@ -358,7 +379,7 @@ def test_catalog_prompt_has_no_task_quota_and_batching_ignores_child_count():
     assert "minimum, quota, or maximum" in prompt
     chunks = _parent_chunks(3)
     batches = assessment_catalog._balanced_catalog_batches(chunks, 99)
-    assert [len(batch) for batch in batches] == [3, 3]
+    assert [len(batch) for batch in batches] == [1, 2, 3]
 
 
 def test_catalog_finalizer_does_not_truncate_at_legacy_48_task_cap():

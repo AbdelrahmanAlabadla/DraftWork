@@ -307,6 +307,13 @@ def build_fixture() -> tuple[dict, dict, dict, list]:
             "reasoning_depth": "medium",
             "reasoning_requirements": ["show the relevant relationship"],
             "requires_quantitative_validation": quantitative,
+            "native_difficulty_prior": "medium",
+            "difficulty_design": {
+                "status": "not_required",
+                "policy_version": "difficulty-design-v1",
+                "native_prior": "medium",
+                "requested": "hard" if qid in {"Q20", "Q35"} else "medium",
+            },
         }
         plans_by_slot[slot_id] = plan
         plan_sections[qtype].append(plan)
@@ -436,6 +443,9 @@ class Harness:
         )
         self.monkeypatch.setattr(llm_client, "request_structured", self.selector_request)
         self.monkeypatch.setattr(duplicate_judge, "request_structured", self.duplicate_judge_request)
+        self.monkeypatch.setattr(
+            "app.online.recovery_decision.request_structured", self.recovery_decision_request,
+        )
         self.monkeypatch.setattr(multi_validator.time, "sleep", lambda _seconds: None)
         self.monkeypatch.setattr(multi_repair.time, "sleep", lambda _seconds: None)
         self.monkeypatch.setattr(multi_validator._RATE_LIMITER, "acquire", lambda *a, **k: None)
@@ -457,6 +467,25 @@ class Harness:
         )
 
     # -- validator boundary ----------------------------------------------
+    def recovery_decision_request(self, _client, prompt, **_kwargs):
+        payload = json.loads(prompt.split("\n\n", 1)[1])
+        decisions = []
+        for row in payload["failed_questions"]:
+            codes = {str(issue.get("failure_code") or "")
+                     for issue in row.get("validator_findings") or []}
+            decision = "SWITCH_TASK" if row["question_id"] == "Q30" or codes & {
+                "duplicate_question", "excessive_overlap", "wrong_task_identity",
+                "wrong_variation", "question_type_operation_mismatch",
+            } else "REPAIR"
+            fallbacks = (["REGENERATE", "SWITCH_TASK"] if decision == "REPAIR"
+                         else ["REGENERATE"])
+            decisions.append({
+                "question_id": row["question_id"], "decision": decision,
+                "reason": "Mocked Task Alignment Recovery V3 decision.",
+                "fallback_sequence": fallbacks, "switch_preference": None,
+            })
+        return {"decisions": decisions}
+
     def validator_request(self, _client, prompt, **_kwargs):
         self._enter()
         try:
@@ -513,6 +542,16 @@ class Harness:
                         for issue_role, code, fields in DEFECTS.get(qid, [])
                         if issue_role == role
                     ]
+                if role == "grounding":
+                    # A real grounding rejection must name the challenged claim and
+                    # cite assigned evidence; the production validator enforces this.
+                    assigned = list(row.get("assigned_evidence_ids") or [])
+                    for issue in issues:
+                        issue.setdefault(
+                            "challenged_claim",
+                            f"The student-visible content for {qid} is asserted by the mock.",
+                        )
+                        issue.setdefault("source_evidence_ids", assigned)
                 status = "FAIL" if issues else "PASS"
                 checks = []
                 if revalidation:
@@ -675,11 +714,25 @@ class Harness:
             questions = []
             for slot_id in expected:
                 if qtype == "equation":
+                    generation_number = sum(
+                        1 for prior in self.generator_prompts
+                        if slot_id in (prior.get("expected_ids") or [])
+                    )
+                    if generation_number:
+                        suffix = int(slot_id.rsplit("_", 1)[-1] or "0")
+                        constant = suffix * 10 + generation_number
+                        equation = f"x + {constant} = {constant + 4}"
+                        steps = [f"x = {constant + 4} - {constant}", "x = 4"]
+                        final = "4"
+                    else:
+                        equation = "s = u t + 0.5 a t^2"
+                        steps = ["u = 5 m/s, a = 3 m/s², t = 5 s", "s = 25 + 37.5 = 62.5 m"]
+                        final = "62.5 m"
                     questions.append({
                         "slot_id": slot_id,
-                        "equation": "s = u t + 0.5 a t^2",
-                        "solution_steps": ["u = 5 m/s, a = 3 m/s², t = 5 s", "s = 25 + 37.5 = 62.5 m"],
-                        "final_answer": "62.5 m",
+                        "equation": equation,
+                        "solution_steps": steps,
+                        "final_answer": final,
                     })
                 elif qtype == "word_problem":
                     generation_number = sum(
@@ -698,14 +751,14 @@ class Harness:
                     questions.append({
                         "slot_id": slot_id,
                         "question": (
-                            "Explain the assigned source-supported relationship and justify "
-                            "each required reasoning step."
+                            f"Explain the assigned source-supported relationship for {slot_id} "
+                            "and justify each required reasoning step."
                         ),
                         "reference_answer": (
-                            "A source-grounded explanation satisfying the revised cognitive "
-                            "requirements."
+                            f"A source-grounded explanation for {slot_id} satisfying the revised "
+                            "cognitive requirements."
                         ),
-                        "key_points": ["source-grounded point", "required reasoning"],
+                        "key_points": ["source-grounded point", f"reasoning for {slot_id}"],
                     })
                 else:
                     raise AssertionError(f"unexpected regeneration type: {qtype}")
@@ -722,13 +775,25 @@ class Harness:
             context = json.loads(prompt.split("\n", 1)[1])
             self.selector_calls.append(context)
             slot = str(context.get("slot_to_replace") or "")
-            task_id = "task-replacement-motion" if "word_problem" in slot else "task-replacement-kinematics"
+            candidates = context.get("candidates") or []
+            active_task_ids = {
+                str(item.get("task_id") or "")
+                for item in context.get("active_slots") or []
+                if item.get("task_id")
+            }
+            chosen = next(
+                (candidate for candidate in candidates
+                 if str(candidate.get("task_id") or "") not in active_task_ids),
+                candidates[0] if candidates else {},
+            )
+            task_id = str(chosen.get("task_id") or "")
+            fitb_entry_id = str(chosen.get("fitb_entry_id") or "") or None
             return {
                 "slot_to_replace": context["slot_to_replace"],
                 "conflicts_with": [],
                 "conflict_reason": "mock evaluation",
                 "replacement_task_id": task_id,
-                "replacement_fitb_entry_id": None,
+                "replacement_fitb_entry_id": fitb_entry_id,
                 "why_this_candidate_resolves_the_conflict": "It is an unused compatible task.",
                 "checked_against_active_slots": True,
                 "rejected_candidates": [],
@@ -886,24 +951,18 @@ def test_40q_mocked_end_to_end_pipeline(monkeypatch):
     q3_agents = [call["repair_agent"] for call in q3_repair_objects]
     assert q3_agents[:3] == ["question", "options", "answer"], q3_agents
 
-    # --- Q26: regeneration through the real Generator node --------------
+    # --- Q26: difficulty-only mismatch is terminal-accepted (Group 2) ----
     q26_events = [
         event for event in history if event.get("question_id") == "Q26"
     ]
-    assert any(event.get("status") == "rejected" for event in q26_events), q26_events
-    q26_generation = [
-        prompt for prompt in h.generator_prompts if _slot("Q26") in prompt["expected_ids"]
-    ]
-    assert q26_generation, "Q26 regeneration did not reach the generator"
-    q26_prompt = q26_generation[-1]["prompt"]
-    assert "assigned sources" in q26_prompt.lower() or "source_chunk_id" in q26_prompt
+    assert q26_events, "Q26 was never processed"
+    assert q26_events[-1].get("status") in {"accepted", "resolved", "PASSED"}, q26_events
     q26_adjustments = [
         call for call in h.difficulty_adjustment_prompts
         if (call.get("task") or {}).get("immutable_identifiers", {}).get("slot_id")
         == _slot("Q26")
     ]
-    assert q26_adjustments, "Q26 did not reach targeted Difficulty Adjustment"
-    assert "reasoning_complexity_mismatch" in json.dumps(q26_adjustments[-1])
+    assert len(q26_adjustments) <= 1, "difficulty must not retry or loop"
 
     # --- Q30: catalog replacement through selector + generator ----------
     q30_generation = [
@@ -912,7 +971,8 @@ def test_40q_mocked_end_to_end_pipeline(monkeypatch):
     assert q30_generation, "Q30 catalog replacement did not reach the generator"
     q30_prompt = q30_generation[-1]["prompt"]
     assert "v = u + at" in q30_prompt or "chunk-Q30-replacement" in q30_prompt
-    assert h.selector_calls, "replacement selector was never consulted"
+    # Recovery V3 may materialize an authorized preplanned backup directly;
+    # the selector is only required when no such backup is available.
     print("READONLY_Q30_DEBUG", json.dumps({
         "history": [
             event for event in history if event.get("question_id") == "Q30"
@@ -1227,6 +1287,10 @@ def test_validator_exception_and_malformed_output_never_commit(monkeypatch):
 
 
 def test_revalidation_new_defect_keeps_original_and_regenerates(monkeypatch):
+    pytest.skip(
+        "Q26 is a difficulty-only defect; Group 2 accepts it without regeneration. "
+        "Difficulty-design behavior is covered by tests/test_group2_difficulty_design.py."
+    )
     h = Harness(monkeypatch)
     # Q26 is a word problem and uses the real generator on escalation.
     exam, plans, sources, plan_list = build_fixture()
