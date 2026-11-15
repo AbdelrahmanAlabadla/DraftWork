@@ -28,6 +28,7 @@ from app.online.exam_builder import (
 )
 from app.online.assessment_catalog import CatalogCompilationCancelled
 from app.metrics import increment, observe
+from app.online.diagnostics import record_optional_failure
 
 
 logger = get_logger("WORKER")
@@ -299,6 +300,29 @@ class _CheckpointWriter:
             self.revision = next_revision
 
 
+def _optional_checkpoint_append(
+    checkpoint_writer: _CheckpointWriter, *,
+    job_id: str, exam_id: str, stage: str, event_type: str,
+    payload: dict[str, Any],
+) -> None:
+    """Append optional provenance/diagnostic events without hiding checkpoint faults."""
+    try:
+        checkpoint_writer.append(
+            stage=stage, event_type=event_type, payload=payload,
+        )
+    except repositories.InvalidState:
+        raise
+    except Exception as exc:
+        record_optional_failure(
+            exc, stage=stage, component=f"{event_type}_audit",
+            job_id=job_id, exam_id=exam_id, continued=True,
+        )
+        logger.warning(
+            "optional checkpoint audit append failed; continuing | stage=%s | event=%s | error=%s: %s",
+            stage, event_type, type(exc).__name__, exc, exc_info=True,
+        )
+
+
 @celery_app.task(
     bind=True,
     base=TrackedJobTask,
@@ -441,7 +465,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
     if document is None:
         repositories.fail_job(job_id, "DOCUMENT_NOT_FOUND", "Document record is missing", claim_generation=claim_generation)
         return {"job_id": job_id, "status": "failed"}
-    set_job_context(job_id, str(document["id"]))
+    set_job_context(job_id, str(document["id"]), exam_id=exam_id)
 
     try:
         repositories.update_job_progress(job_id, "analyzing_request", 5, claim_generation=claim_generation)
@@ -488,9 +512,11 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             if binding_errors:
                 raise RuntimeError("Replay checkpoint catalog binding failure: " + "; ".join(binding_errors))
             clear_job_validation_cache(job_id)
-            checkpoint_writer.append(
-                "replay", "questions_generated",
-                {"node_output": checkpoint_state, "replay_provenance": provenance},
+            _optional_checkpoint_append(
+                checkpoint_writer,
+                job_id=job_id, exam_id=exam_id, stage="replay",
+                event_type="questions_generated",
+                payload={"node_output": checkpoint_state, "replay_provenance": provenance},
             )
         else:
             checkpoint_state = repositories.load_generation_checkpoint(
@@ -510,6 +536,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                     processed_document_key=str(
                         (document.get("stats") or {}).get("processed_document_key") or ""
                     ) or None,
+                    source_document_hash=str(document.get("sha256") or "") or None,
                     domain_type=str(
                         (document.get("stats") or {}).get("domain_type") or ""
                     ) or None,
@@ -550,8 +577,9 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             *difficulty_warnings,
         ]
         if shortage_warnings:
-            checkpoint_writer.append(
-                stage="finalization",
+            _optional_checkpoint_append(
+                checkpoint_writer,
+                job_id=job_id, exam_id=exam_id, stage="finalization",
                 event_type="question_shortage",
                 payload={"warnings": shortage_warnings},
             )
@@ -672,7 +700,7 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             "exam_id": exam_id,
             "exam_status": status,
         }
-    except CatalogCompilationCancelled:
+    except (CatalogCompilationCancelled, PipelineCancelled):
         increment("genexam_jobs", type="exam_generation", status="cancelled")
         return {"job_id": job_id, "status": "cancelled"}
     except (DeadlineExceeded, SoftTimeLimitExceeded) as exc:

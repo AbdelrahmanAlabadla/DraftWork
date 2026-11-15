@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass, field
 
 import requests
 
@@ -15,6 +16,30 @@ from app.llm.json_utils import (
 from app.logging_conf import get_logger
 
 logger = get_logger("LLM")
+
+
+class ProviderRequestBudgetExceeded(RuntimeError):
+    pass
+
+
+@dataclass
+class ProviderRequestBudget:
+    """A shared counter for actual provider calls made for stable slot IDs."""
+    max_requests_per_slot: int
+    counts: dict[str, int] = field(default_factory=dict)
+
+    def consume(self, slot_ids: list[str] | None) -> None:
+        ids = [str(value) for value in (slot_ids or ["__request__"])]
+        exhausted = [sid for sid in ids if self.counts.get(sid, 0) >= self.max_requests_per_slot]
+        if exhausted:
+            raise ProviderRequestBudgetExceeded(
+                "provider request budget exhausted for " + ", ".join(exhausted)
+            )
+        for sid in ids:
+            self.counts[sid] = self.counts.get(sid, 0) + 1
+
+    def remaining(self, slot_id: str) -> int:
+        return max(0, self.max_requests_per_slot - self.counts.get(str(slot_id), 0))
 
 
 class LMStudioClient:
@@ -249,6 +274,7 @@ def request_structured(
     temperature: float = 0.1,
     max_tokens: int = 4096,
     timeout: int = 600,
+    request_budget: ProviderRequestBudget | None = None,
 ) -> object:
     """Use provider structured output while preserving the local call behavior."""
     from app.llm.scheduler import llm_request_slot
@@ -263,7 +289,7 @@ def request_structured(
             operation=operation, expected_ids=expected_ids,
             expected_id_field=expected_id_field, local_json=local_json,
             system_prompt=system_prompt, temperature=temperature,
-            max_tokens=max_tokens, timeout=timeout,
+            max_tokens=max_tokens, timeout=timeout, request_budget=request_budget,
         )
 
 
@@ -284,7 +310,12 @@ def _request_structured_unlimited(
     temperature: float = 0.1,
     max_tokens: int = 4096,
     timeout: int = 600,
+    request_budget: ProviderRequestBudget | None = None,
 ) -> object:
+    from app.llm.math_strings import MATH_JSON_CONTRACT, sanitize_math_strings
+
+    if agent == "generator":
+        system_prompt = "\n\n".join(filter(None, [system_prompt, MATH_JSON_CONTRACT]))
     if json_schema is None:
         if response_model is None:
             raise ValueError("response_model or json_schema is required")
@@ -297,7 +328,7 @@ def _request_structured_unlimited(
     ):
         if response_model is None:
             raise ValueError("DeepSeek structured output requires a Pydantic model")
-        return method(
+        result = method(
             prompt,
             response_model=response_model,
             json_schema=json_schema,
@@ -311,17 +342,21 @@ def _request_structured_unlimited(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            request_budget=request_budget,
         )
+        return sanitize_math_strings(result)
+    if request_budget is not None:
+        request_budget.consume(expected_ids)
     if local_json:
-        return client.chat_json(
+        return sanitize_math_strings(client.chat_json(
             prompt,
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
-        )
+        ))
     if callable(method):
-        return method(
+        return sanitize_math_strings(method(
             prompt,
             json_schema=json_schema,
             schema_name=schema_name,
@@ -329,11 +364,11 @@ def _request_structured_unlimited(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
-        )
-    return client.chat_json(
+        ))
+    return sanitize_math_strings(client.chat_json(
         prompt,
         system_prompt=system_prompt,
         temperature=temperature,
         max_tokens=max_tokens,
         timeout=timeout,
-    )
+    ))

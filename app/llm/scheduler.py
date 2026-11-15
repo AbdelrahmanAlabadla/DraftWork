@@ -5,7 +5,7 @@ import time
 from contextvars import ContextVar
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 from app import config
 from app.logging_conf import current_job_id, get_logger
@@ -21,6 +21,10 @@ class _JobGate:
     peak: int = 0
     waiting: int = 0
     completed: int = 0
+    total_queue_ms: float = 0.0
+    total_run_ms: float = 0.0
+    max_queue_ms: float = 0.0
+    events: list[dict[str, Any]] | None = None
 
 
 _gates_lock = threading.Lock()
@@ -51,6 +55,7 @@ def _gate(key: str, *, agent: str = "") -> _JobGate:
             gate = _JobGate(
                 semaphore=threading.BoundedSemaphore(limit),
                 lock=threading.Lock(),
+                events=[],
             )
             _gates[gate_key] = gate
         return gate
@@ -91,6 +96,7 @@ def llm_request_slot(
         gate.waiting += 1
     gate.semaphore.acquire()
     started_at = time.perf_counter()
+    queue_ms = (started_at - queued_at) * 1000
     with gate.lock:
         gate.waiting -= 1
         gate.active += 1
@@ -107,6 +113,7 @@ def llm_request_slot(
         yield
     finally:
         finished_at = time.perf_counter()
+        run_ms = (finished_at - started_at) * 1000
         _last_request_metrics.set({
             "queue_ms": round((started_at - queued_at) * 1000, 3),
             "run_ms": round((finished_at - started_at) * 1000, 3),
@@ -114,6 +121,19 @@ def llm_request_slot(
         with gate.lock:
             gate.active -= 1
             gate.completed += 1
+            gate.total_queue_ms += queue_ms
+            gate.total_run_ms += run_ms
+            gate.max_queue_ms = max(gate.max_queue_ms, queue_ms)
+            event = {
+                "agent": agent, "operation": operation,
+                "queue_ms": round(queue_ms, 3), "provider_ms": round(run_ms, 3),
+                "active_at_start": active, "waiting_at_start": waiting,
+                "limit": limit, "finished_monotonic": round(finished_at, 6),
+            }
+            if gate.events is not None:
+                gate.events.append(event)
+                if len(gate.events) > 2000:
+                    del gate.events[:-2000]
             active = gate.active
         gate.semaphore.release()
         logger.info(
@@ -125,7 +145,7 @@ def llm_request_slot(
 
 def scheduler_snapshot(
     job_id: str | None = None, *, agent: str = "",
-) -> dict[str, int]:
+) -> dict[str, int | float]:
     key = job_id or _job_key()
     gate = _gate(key, agent=agent)
     limit = (
@@ -140,7 +160,17 @@ def scheduler_snapshot(
             "waiting": gate.waiting,
             "completed": gate.completed,
             "limit": limit,
+            "total_queue_ms": round(gate.total_queue_ms, 3),
+            "total_run_ms": round(gate.total_run_ms, 3),
+            "max_queue_ms": round(gate.max_queue_ms, 3),
         }
+
+
+def scheduler_request_events(job_id: str | None = None, *, agent: str = "") -> list[dict[str, Any]]:
+    """Return a bounded, read-only request timeline for audit/checkpoints."""
+    gate = _gate(job_id or _job_key(), agent=agent)
+    with gate.lock:
+        return [dict(value) for value in (gate.events or [])]
 
 
 def last_request_metrics() -> dict[str, float]:

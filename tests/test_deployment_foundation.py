@@ -102,10 +102,9 @@ def test_online_generation_parallelism_has_fifty_call_ceiling():
     assert config.MAX_PARALLEL_GENERATION_CALLS == 50
     assert config.LLM_JOB_CONCURRENCY_LIMIT == 50
     assert config.MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS == 10
-    assert config.MAX_PARALLEL_VALIDATOR_CALLS == 50
+    assert config.MAX_PARALLEL_VALIDATOR_CALLS == 30
     assert config.MAX_PARALLEL_CATALOG_CALLS == 50
     assert config.MAX_PARALLEL_DUPLICATE_VALIDATOR_CALLS == 50
-    assert config.LLM_JOB_CONCURRENCY_LIMIT == 50
     assert config.DEEPSEEK_CONCURRENCY_LIMIT == 50
 
 
@@ -156,6 +155,29 @@ def test_cancel_job_is_owned_persisted_and_terminated(monkeypatch):
         "session_id": "11111111-1111-4111-8111-111111111111",
         "cleanup_document": True,
     })]
+
+
+def test_owned_exam_usage_endpoint_returns_persisted_agent_totals(monkeypatch):
+    _session_fakes(monkeypatch)
+    summary = {
+        "exam_id": "exam_usage", "provider_calls": 2,
+        "totals": {"calls": 2, "input_tokens": 30, "output_tokens": 7,
+                   "reasoning_tokens": 2, "estimated_cost_usd": 0.03,
+                   "latency_ms": 80},
+        "agents": [{"agent": "task_alignment_validator", "calls": 2,
+                    "input_tokens": 30, "output_tokens": 7,
+                    "reasoning_tokens": 2, "estimated_cost_usd": 0.03,
+                    "latency_ms": 80}],
+        "stages": [], "stage_wall_time_ms": 120,
+    }
+    monkeypatch.setattr(
+        repositories, "get_exam_usage_summary",
+        lambda exam_id, session_id, user_id=None: summary,
+    )
+    response = TestClient(app).get("/api/v1/exams/exam_usage/usage")
+    assert response.status_code == 200
+    assert response.json()["provider_calls"] == 2
+    assert response.json()["agents"][0]["estimated_cost_usd"] == 0.03
 
 
 def test_local_storage_rejects_keys_outside_root(tmp_path):

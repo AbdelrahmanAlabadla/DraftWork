@@ -66,11 +66,22 @@ DEEPSEEK_CONCURRENCY_LIMIT: int = max(
 DEEPSEEK_MAX_STRUCTURED_ATTEMPTS: int = max(
     1, min(3, int(_env("DEEPSEEK_MAX_STRUCTURED_ATTEMPTS", "3") or "3"))
 )
+GENERATION_PROVIDER_REQUESTS_PER_SLOT: int = max(
+    1, min(8, int(_env("GENERATION_PROVIDER_REQUESTS_PER_SLOT", "4") or "4"))
+)
+REPLACEMENT_SELECTOR_MAX_PAGES: int = max(
+    1, min(10, int(_env("REPLACEMENT_SELECTOR_MAX_PAGES", "4") or "4"))
+)
 # The Catalog's incomplete-batch recovery applies to every compiler provider.
 # Keep this outer attempt budget independent from a provider's own structured
 # response retries, which remain controlled by provider-specific settings.
 CATALOG_BATCH_MAX_ATTEMPTS: int = max(
     1, min(3, int(_env("CATALOG_BATCH_MAX_ATTEMPTS", "3") or "3"))
+)
+# Catalog batches preserve parent-section boundaries.  This limit is used only
+# when one parent has too many children for a single compiler request.
+CATALOG_BATCH_MAX_CHILDREN: int = max(
+    1, min(128, int(_env("CATALOG_BATCH_MAX_CHILDREN", "24") or "24"))
 )
 DEEPSEEK_MAX_TRANSIENT_RETRIES: int = max(
     0, int(_env("DEEPSEEK_MAX_TRANSIENT_RETRIES", "2") or "2")
@@ -109,7 +120,19 @@ MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS: int = max(
     1, min(10, int(_env("MAX_PARALLEL_DIFFICULTY_ADJUSTMENTS", "10") or "10"))
 )
 MAX_PARALLEL_VALIDATOR_CALLS: int = max(
-    1, min(50, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "50") or "50"))
+    1, min(50, int(_env("MAX_PARALLEL_VALIDATOR_CALLS", "30") or "30"))
+)
+# Recovery V3 uses the existing Task Alignment reviewer for one semantic
+# strategy decision per initially failed question.  Its independent gate is
+# intentionally separate from the validator gate (which remains 30).
+RECOVERY_DECISION_BATCH_SIZE: int = max(
+    1, min(3, int(_env("RECOVERY_DECISION_BATCH_SIZE", "3") or "3"))
+)
+MAX_PARALLEL_RECOVERY_DECISION_CALLS: int = max(
+    1, min(50, int(_env("MAX_PARALLEL_RECOVERY_DECISION_CALLS", "50") or "50"))
+)
+RECOVERY_DECISION_MAX_TOKENS: int = max(
+    512, int(_env("RECOVERY_DECISION_MAX_TOKENS", "5000") or "5000")
 )
 REVALIDATION_OPERATIONAL_RETRIES: int = max(
     0, min(5, int(_env("REVALIDATION_OPERATIONAL_RETRIES", "2") or "2"))
@@ -219,11 +242,11 @@ DUPLICATE_PIPELINE_VERSION: str = _env(
     "DUPLICATE_PIPELINE_VERSION", "integrated-duplicate-validation-v2"
 ) or "integrated-duplicate-validation-v2"
 ASSESSMENT_CATALOG_VERSION: str = _env(
-    "ASSESSMENT_CATALOG_VERSION", "catalog-v13-numerical-givens-contract"
-) or "catalog-v13-numerical-givens-contract"
+    "ASSESSMENT_CATALOG_VERSION", "catalog-v15-graph-unit-policy"
+) or "catalog-v15-graph-unit-policy"
 ASSESSMENT_COMPILER_VERSION: str = (
-    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v5-grouped-type-variations")
-    or "compiler-v5-grouped-type-variations"
+    _env("ASSESSMENT_COMPILER_VERSION", "compiler-v7-variation-blueprint-contract")
+    or "compiler-v7-variation-blueprint-contract"
 )
 PROCESSED_DOCUMENT_CACHE_DIR: str = (
     _env("PROCESSED_DOCUMENT_CACHE_DIR", "data/processed_documents")
@@ -290,6 +313,24 @@ MAX_QUESTIONS_PER_GENERATION: int = max(
 )
 MAX_MODELS_PER_GENERATION: int = max(
     1, min(4, int(_env("MAX_MODELS_PER_GENERATION", "4") or "4"))
+)
+GENERATOR_TRUE_FALSE_MAX_TOKENS: int = max(
+    512, int(_env("GENERATOR_TRUE_FALSE_MAX_TOKENS", "2048") or "2048")
+)
+GENERATOR_MCQ_MAX_TOKENS: int = max(
+    1024, int(_env("GENERATOR_MCQ_MAX_TOKENS", "4096") or "4096")
+)
+GENERATOR_EQUATION_MAX_TOKENS: int = max(
+    2048, int(_env("GENERATOR_EQUATION_MAX_TOKENS", "9000") or "9000")
+)
+GENERATOR_WORD_PROBLEM_MAX_TOKENS: int = max(
+    2048, int(_env("GENERATOR_WORD_PROBLEM_MAX_TOKENS", "9000") or "9000")
+)
+GENERATOR_OTHER_MAX_TOKENS: int = max(
+    1024, int(_env("GENERATOR_OTHER_MAX_TOKENS", "4096") or "4096")
+)
+GENERATOR_PROVIDER_MAX_OUTPUT_TOKENS: int = max(
+    2048, int(_env("GENERATOR_PROVIDER_MAX_OUTPUT_TOKENS", "9000") or "9000")
 )
 MAX_ACTIVE_GENERATION_JOBS_PER_SESSION: int = max(
     1, int(_env("MAX_ACTIVE_GENERATION_JOBS_PER_SESSION", "2") or "2")

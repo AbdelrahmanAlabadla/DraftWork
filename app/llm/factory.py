@@ -38,6 +38,42 @@ def _stem_reasoning_effort(stage: str) -> str:
     return config.STEM_REVIEW_REASONING_EFFORT
 
 
+DEEPSEEK_GENERATION_TYPES = frozenset({
+    "fill_in_the_blank", "why", "definition",
+})
+LUNA_GENERATION_TYPES = frozenset({
+    "mcq", "true_false", "equation", "word_problem", "essay",
+})
+LUNA_VALIDATOR_STAGES = frozenset({
+    "correctness_validator", "general_validator", "grounding_validator",
+    "task_alignment_validator", "answer_correctness_validator",
+    "difficulty_validator", "quantitative_validator", "duplicate_validator",
+    "stem_quantitative_validator", "task_alignment_recovery_decision",
+})
+DEEPSEEK_REPAIR_STAGES = frozenset({"options_repairer", "answer_repairer"})
+LUNA_REPAIR_STAGES = frozenset({
+    "question_repairer", "duplicate_repairer", "solution_repairer",
+    "task_alignment_repairer", "difficulty_repairer",
+    "stem_quantitative_repairer", "general_repairer",
+})
+
+
+def _openai_client(stage: str):
+    from app import config
+    from app.llm.openai_client import OpenAIClient
+
+    return OpenAIClient(
+        model=config.STEM_REVIEW_MODEL,
+        reasoning_effort=_stem_reasoning_effort(stage),
+    )
+
+
+def _deepseek_client(model: str | None = None):
+    from app.llm.deepseek import DeepSeekClient
+
+    return DeepSeekClient(model=model)
+
+
 def create_llm_client(
     *,
     local_url: str | None = None,
@@ -47,20 +83,23 @@ def create_llm_client(
     domain: str | None = None,
     stage: str = "online_default",
 ) -> LMStudioClient | DeepSeekClient:
-    """Create an online client, routing every STEM stage through OpenAI."""
+    """Create a client using explicit stage policy, then legacy domain defaults."""
     normalized_domain = _domain(domain)
+    if stage in LUNA_VALIDATOR_STAGES or stage in LUNA_REPAIR_STAGES:
+        return _openai_client(stage)
+    if stage in DEEPSEEK_REPAIR_STAGES:
+        return _deepseek_client(deepseek_model)
+    if stage.endswith("_generator"):
+        question_type = stage[:-len("_generator")]
+        if question_type in DEEPSEEK_GENERATION_TYPES:
+            return _deepseek_client(deepseek_model)
+        if question_type in LUNA_GENERATION_TYPES:
+            return _openai_client(stage)
+        raise ValueError(f"Unsupported generation stage: {stage}")
     if normalized_domain == "STEM":
-        from app import config
-        from app.llm.openai_client import OpenAIClient
-
-        return OpenAIClient(
-            model=config.STEM_REVIEW_MODEL,
-            reasoning_effort=_stem_reasoning_effort(stage),
-        )
+        return _openai_client(stage)
     if normalized_domain == "NON_STEM":
-        from app.llm.deepseek import DeepSeekClient
-
-        return DeepSeekClient(model=deepseek_model)
+        return _deepseek_client(deepseek_model)
     if LLM_PROVIDER == "deepseek":
         from app.llm.deepseek import DeepSeekClient
 
@@ -89,14 +128,32 @@ def create_review_client(*, domain: str, stage: str):
         "correctness_validator", "general_validator", "stem_quantitative_validator",
         "stem_quantitative_repairer", "grounding_validator",
         "task_alignment_validator", "answer_correctness_validator",
+        "task_alignment_recovery_decision",
         "difficulty_validator", "quantitative_validator", "duplicate_validator",
         "answer_repairer", "question_repairer", "options_repairer", "duplicate_repairer",
         "solution_repairer", "task_alignment_repairer", "difficulty_repairer",
+        "general_repairer",
     }:
         raise ValueError(f"Unsupported review stage: {stage}")
     if normalized_domain not in {"STEM", "NON_STEM"}:
         raise ValueError("Assessment profile must contain domain STEM or NON_STEM")
     return create_llm_client(domain=normalized_domain, stage=stage)
+
+
+def create_generation_client(*, question_type: str, domain: str | None = None):
+    """Route a generator by its explicit question-type identifier."""
+    normalized = str(question_type or "").strip().lower()
+    if normalized not in DEEPSEEK_GENERATION_TYPES | LUNA_GENERATION_TYPES:
+        raise ValueError(f"Unsupported generation question type: {question_type}")
+    try:
+        return create_llm_client(domain=domain, stage=f"{normalized}_generator")
+    except TypeError as exc:
+        # Keep the established zero-argument fake-factory seam used by offline
+        # tests; the production factory always accepts explicit identifiers.
+        message = str(exc)
+        if "unexpected keyword argument" not in message and "takes no arguments" not in message:
+            raise
+        return create_llm_client()
 
 
 def assessment_compiler_identity(*, domain_type: str) -> dict[str, str]:
