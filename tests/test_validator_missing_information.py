@@ -330,25 +330,54 @@ def test_repair_receives_exact_missing_requirements(monkeypatch):
 
     captured = {}
 
-    def fake_request(_client, prompt, **_kwargs):
+    def _meta(field, before, after, reason):
+        return {
+            "modified_fields": [field],
+            "changes": [{
+                "field": field, "previous_value": before,
+                "new_value": after, "reason": reason,
+            }],
+            "targeted_failure_codes": ["missing_required_given"],
+        }
+
+    def fake_request(_client, prompt, **kwargs):
         envelope = json.loads(
             prompt.split("<REPAIR_DATA>\n", 1)[1].split("\n</REPAIR_DATA>", 1)[0]
         )
         payload = envelope["questions"][0]
-        captured.update(deepcopy(payload))
+        if not captured:
+            captured.update(deepcopy(payload))
+        agent = kwargs["agent"]
+        if agent == "task_alignment_repairer":
+            patch = {"statement": COMPLETE_STATEMENT}
+            metadata = _meta(
+                "statement", BROKEN_STATEMENT, COMPLETE_STATEMENT,
+                "Adds all omitted constraints and defines c and p.",
+            )
+        elif agent == "answer_repairer":
+            patch = {"answer": True}
+            metadata = _meta(
+                "answer", "True", "True",
+                "The completed statement still satisfies every constraint.",
+            )
+        else:
+            patch = {"solution_certificate": {
+                "method": "constraint check",
+                "important_givens": list(CONSTRAINTS),
+                "calculation_steps": ["7 <= 12 <= 14", "8 <= 10 <= 12", "12 + 10 <= 23"],
+                "final_answer": "True",
+                "units": "",
+                "matching_correct_option": None,
+                "verification_method": "substitute c = 12 and p = 10",
+            }}
+            metadata = _meta(
+                "solution_certificate", "old certificate", "recomputed certificate",
+                "Certificate recomputed for the completed statement.",
+            )
         return {"repairs": [{
             "question_id": item.question_id,
-            "patch": {"statement": COMPLETE_STATEMENT},
-            "repair_metadata": {
-                "modified_fields": ["statement"],
-                "changes": [{
-                    "field": "statement",
-                    "previous_value": BROKEN_STATEMENT,
-                    "new_value": COMPLETE_STATEMENT,
-                    "reason": "Adds all omitted constraints and defines c and p.",
-                }],
-                "targeted_failure_codes": ["missing_required_given"],
-            },
+            "patch": patch,
+            "repair_metadata": metadata,
         }]}
 
     monkeypatch.setattr(multi_repair, "request_structured", fake_request)

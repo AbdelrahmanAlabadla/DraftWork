@@ -15,25 +15,37 @@ from app.online.validator import (
 def _question(qtype: str, index: int) -> dict:
     base = {"question_id": f"q-{qtype}-{index}", "slot_id": f"s-{qtype}-{index}"}
     if qtype == "mcq":
-        return base | {"question": "What is 2 + 2?" if index != 1 else "2+2?",
-                       "options": {"A": "4", "B": "3" if index != 1 else "4", "C": "5", "D": "6"},
-                       "correct_answer": "A" if index != 1 else "B"}
+        if index == 1:
+            return base | {"question": "2+2?", "options": {"A": "4", "B": "4", "C": "5", "D": "6"},
+                           "correct_answer": "B"}
+        value = 2 + index
+        return base | {"question": f"What is 2 + {index}?",
+                       "options": {"A": str(value), "B": str(value + 1),
+                                   "C": str(value + 2), "D": str(value + 3)},
+                       "correct_answer": "A"}
     if qtype == "true_false":
-        return base | {"statement": "Gravity attracts masses.", "answer": True}
+        return base | {"statement": f"Gravity attracts masses ({index}).", "answer": True}
     if qtype == "fill_in_the_blank":
         answers = ("gravity", "attraction", "weight")
         distractors = (("mass", "force"), ("inertia", "energy"), ("speed", "volume"))
         return base | {"question": "___ is the requested source term.", "answers": [answers[index - 1]],
                        "distractors": list(distractors[index - 1])}
     if qtype == "definition":
-        return base | {"term": "mass", "reference_answer": "The amount of matter."}
+        return base | {"term": f"mass-{index}",
+                       "reference_answer": f"The amount of matter in instance {index}."}
     if qtype == "why":
-        return base | {"question": "Why do objects fall?", "reference_answer": "Gravity attracts them."}
+        return base | {"question": f"Why do objects fall in case {index}?",
+                       "reference_answer": "Gravity attracts them."}
     if qtype == "equation":
-        return base | {"equation": "2 + 2", "solution_steps": ["Add the values."], "final_answer": "4"}
+        return base | {"equation": f"{index} + 2",
+                       "solution_steps": [f"Add {index} and 2."],
+                       "final_answer": str(index + 2)}
     if qtype == "word_problem":
-        return base | {"question": "Two apples plus two apples?", "solution_steps": ["2 + 2 = 4"], "final_answer": "4"}
-    return base | {"question": "Explain gravity.", "reference_answer": "Gravity attracts masses.",
+        return base | {"question": f"{index} apples plus two apples?",
+                       "solution_steps": [f"{index} + 2 = {index + 2}"],
+                       "final_answer": str(index + 2)}
+    return base | {"question": f"Explain gravity in case {index}.",
+                   "reference_answer": "Gravity attracts masses.",
                    "key_points": ["attraction", "mass"]}
 
 
@@ -125,6 +137,14 @@ def test_24_question_validation_repair_revalidation_commit(monkeypatch):
 
     monkeypatch.setattr(multi_validator, "request_structured", validator_request)
     monkeypatch.setattr(multi_repair, "request_structured", repair_request)
+    monkeypatch.setattr(
+        "app.online.recovery_decision.request_structured",
+        lambda _client, _prompt, **kwargs: {"decisions": [{
+            "question_id": qid, "decision": "REPAIR", "reason": "localized defect",
+            "fallback_sequence": ["REGENERATE", "SWITCH_TASK"],
+            "switch_preference": None,
+        } for qid in kwargs["expected_ids"]]},
+    )
     monkeypatch.setattr("app.online.duplicate_judge.request_structured", lambda _client, _prompt, **kwargs: {
         "verdicts": [{
             "pair_id": pair_id, "same_core_knowledge": "no",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.language import detect_language, normalize_text
@@ -23,7 +24,7 @@ TYPE_LABELS_BY_LANG = {
     "en": TYPE_LABELS,
     "ar": {
         "mcq": "اختيار من متعدد",
-        "true_false": "صح / خطأ",
+        "true_false": "صح / غلط",
         "fill_in_the_blank": "أكمل الفراغ",
         "definition": "تعريف",
         "why": "علّل",
@@ -41,6 +42,22 @@ UI_STRINGS_BY_LANG = {
 TRUE_FALSE_ANSWER_LABELS = {"en": ("True", "False"), "ar": ("صح", "خطأ")}
 
 
+def numeric_variation_allowed(task: dict[str, Any]) -> bool:
+    """Ordinary constructed STEM data is flexible unless explicitly fixed."""
+    operation = str(task.get("task_operation") or "").casefold()
+    source_dataset_operation = any(token in operation for token in (
+        "interpret_dataset", "analyze_dataset", "interpret_table", "read_table",
+        "experimental_measurement", "recorded_measurement",
+    ))
+    return not bool(
+        task.get("exact_source_instance")
+        or task.get("numeric_values_fixed")
+        or task.get("fixed_numerical_data")
+        or task.get("protected_source_data")
+        or source_dataset_operation
+    )
+
+
 def type_label(question_type: str, language: str = "en") -> str:
     return TYPE_LABELS_BY_LANG.get(language, TYPE_LABELS).get(question_type, question_type)
 
@@ -48,7 +65,120 @@ def type_label(question_type: str, language: str = "en") -> str:
 def tf_answer_label(answer: Any, language: str = "en") -> str:
     true_label, false_label = TRUE_FALSE_ANSWER_LABELS.get(language, ("True", "False"))
     normalized = normalize_true_false_answer(answer)
+    if normalized is None:
+        return ""
     return true_label if normalized is True else false_label
+
+_PROTECTED_VALUE_KEYS = (
+    "fixed_numerical_data",
+    "numeric_values_fixed",
+    "protected_source_data",
+)
+
+
+def _string_values(value: Any) -> list[str]:
+    if value in (None, "", [], {}):
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item).strip()]
+    return [str(value)]
+
+
+def numerical_instance_contract(task: dict[str, Any]) -> dict[str, Any]:
+    """Separate illustrative example values from genuinely immutable source data.
+
+    A concrete number is not immutable merely because it appears in the Catalog,
+    a variation, or ``effective_givens``.  Only an explicit exact-source/immutable
+    contract protects values.  Validation, repair, and recovery all consume this
+    one contract so they cannot disagree about which numbers are authoritative.
+    """
+    givens = authoritative_givens(task)
+    exact_source_instance = bool(task.get("exact_source_instance"))
+    numeric_values_may_change = bool(givens["numeric_adjustment_authorized"])
+    source_example_values = _string_values(task.get("source_example_givens"))
+    protected: list[str] = []
+    for key in _PROTECTED_VALUE_KEYS:
+        protected.extend(_string_values(task.get(key)))
+    if not numeric_values_may_change:
+        protected.extend(_string_values(givens["givens"]))
+        protected.extend(_string_values(givens["source_givens"]))
+        protected.extend(source_example_values)
+    protected = list(dict.fromkeys(value for value in protected if value.strip()))
+    illustrative = (
+        list(dict.fromkeys(
+            _string_values(givens["source_givens"]) + source_example_values
+        ))
+        if numeric_values_may_change and not exact_source_instance
+        else []
+    )
+    if exact_source_instance:
+        policy, reason = "immutable", "exact_source_instance"
+    elif not numeric_values_may_change:
+        policy, reason = "immutable", "explicit_immutable_contract"
+    else:
+        policy, reason = "illustrative", "ordinary_constructed_instance"
+    return {
+        "value_policy": policy,
+        "policy_reason": reason,
+        "numeric_values_may_change": numeric_values_may_change,
+        "exact_source_instance": exact_source_instance,
+        "effective_values": list(givens["givens"]),
+        "source_values": list(givens["source_givens"]),
+        "illustrative_values": illustrative,
+        "immutable_values": protected,
+    }
+
+
+def authoritative_givens(task: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the one numerical instance used by generation and validation."""
+    selected_id = str(task.get("selected_variation_id") or "")
+    selected = task.get("selected_variation")
+    if not isinstance(selected, dict) or (
+        selected_id and str(selected.get("variation_id") or "") != selected_id
+    ):
+        selected = next((
+            value for value in (
+                list(task.get("permitted_variations") or [])
+                + list(task.get("allowed_variations") or [])
+            )
+            if isinstance(value, dict)
+            and str(value.get("variation_id") or "") == selected_id
+        ), {})
+    source_givens = list(
+        (selected or {}).get("givens")
+        or task.get("given_conditions")
+        or task.get("required_givens")
+        or []
+    )
+    effective_id = str(task.get("effective_instance_id") or "")
+    design = task.get("difficulty_design") or {}
+    adaptation = task.get("difficulty_adaptation") or {}
+    identity_valid = bool(effective_id and (
+        (
+            design.get("status") == "designed"
+            and str(design.get("effective_instance_id") or "") == effective_id
+        )
+        or (
+            adaptation.get("status") == "adapted"
+            and str(adaptation.get("effective_instance_id") or "") == effective_id
+        )
+    ))
+    effective_givens = list(task.get("effective_givens") or [])
+    uses_effective = bool(identity_valid and effective_givens)
+    numeric_design = (
+        uses_effective
+        and str(design.get("adjustment_kind") or "") in {"numerical", "combined"}
+    )
+    numeric_authorized = numeric_variation_allowed(task)
+    return {
+        "givens": effective_givens if uses_effective else source_givens,
+        "source_givens": source_givens,
+        "effective_givens": effective_givens,
+        "uses_effective_givens": uses_effective,
+        "effective_instance_consistent": identity_valid if effective_id else True,
+        "numeric_adjustment_authorized": numeric_authorized,
+    }
+
 
 TYPE_ORDER = [
     "mcq",
@@ -146,7 +276,12 @@ def _questions_from(raw: object) -> list[dict[str, Any]]:
 def _clean_str(value: Any) -> str:
     if value is None:
         return ""
-    return str(value).strip()
+    try:
+        from app.llm.math_strings import sanitize_math_string
+        text = sanitize_math_string(str(value))
+    except ValueError:
+        return ""
+    return text.strip()
 
 
 def _keep_slot_id(normalized: dict[str, Any], item: dict[str, Any]) -> dict[str, Any]:

@@ -35,6 +35,19 @@ from app.online.validator import (
 from app.online.graph import _route_after_validation
 
 
+@pytest.fixture(autouse=True)
+def _mock_recovery_v3_decision(monkeypatch):
+    def decide(contexts, **_kwargs):
+        return {row["question_id"]: {
+            "version": "recovery-v3-task-alignment", "status": "ready",
+            "decision": "REPAIR", "reason": "localized defect",
+            "plan": ["REPAIR", "REGENERATE", "SWITCH_TASK"],
+            "fallback_sequence": ["REGENERATE", "SWITCH_TASK"],
+            "next_index": 0, "attempted_strategies": [], "decision_calls": 1,
+        } for row in contexts}, {"calls": 1}
+    monkeypatch.setattr("app.online.recovery_decision.decide_recovery", decide)
+
+
 class FakeClient:
     """chat_json mock; routes by system prompt and records calls."""
 
@@ -559,6 +572,10 @@ def test_why_revalidation_uses_latest_authoritative_plan_task(monkeypatch):
                 "selected_variation_id": None, "selected_variation": None,
                 "selected_variation_group_id": None,
                 "effective_instance_id": None, "effective_givens": [],
+                "source_variation_givens": [], "uses_effective_givens": False,
+                "numeric_adjustment_authorized": True,
+                "value_policy": "illustrative", "illustrative_values": [],
+                "immutable_values": [],
                 "effective_evidence_chunk_ids": ["chunk-current", "chunk-support"],
     }
     assert entry["assigned_sources"] == {
@@ -594,6 +611,7 @@ def test_repair_exam_pins_deepseek_flash_without_pro_config(monkeypatch):
     assert created == [{
         "local_reasoning": val.REPAIR_REASONING,
         "deepseek_model": "deepseek-flash",
+        "stage": "answer_repairer",
     }]
 
 
@@ -1982,7 +2000,14 @@ def test_general_validator_receives_task_contract_and_accepts_task_drift_code():
             "assigned_evidence_ids": ["chunk-a"],
                 "selected_variation_id": None, "selected_variation": None,
                 "selected_variation_group_id": None,
-                "effective_instance_id": None, "effective_givens": [],
+                    "effective_instance_id": None,
+                    "effective_givens": ["two inequalities"],
+                    "source_variation_givens": ["two inequalities"],
+                    "uses_effective_givens": False,
+                    "numeric_adjustment_authorized": True,
+                    "value_policy": "illustrative",
+                    "illustrative_values": ["two inequalities"],
+                    "immutable_values": [],
                 "effective_evidence_chunk_ids": ["chunk-a"],
         }
     assert "Being on the same broad topic is not enough" in val.VALIDATOR_SYSTEM_PROMPT
@@ -2219,7 +2244,25 @@ def test_repair_failure_keeps_original_for_revalidation():
 # ---------------------------------------------------------------------------
 # Graph nodes: revalidation, bounded and per-model attempts, isolation
 # ---------------------------------------------------------------------------
+def _empty_duplicate_review(_exam, **kwargs):
+    """Offline stand-in for the batched candidate duplicate gate."""
+    return {
+        "candidate_pairs": [], "pair_verdicts": [], "duplicate_groups": [],
+        "similarity_distribution": {}, "usage": {},
+        "fact_cache": kwargs.get("fact_cache") or {},
+        "fact_cache_hits": 0, "fact_cache_misses": 0,
+    }
+
+
 def test_selective_revalidation_merges_untouched_passes(monkeypatch):
+    monkeypatch.setattr(
+        "app.online.duplicate_pipeline.scan_exam_duplicates",
+        lambda _state: {"duplicate_reports": []},
+    )
+    monkeypatch.setattr(
+        "app.online.duplicate_judge.review_duplicate_candidates",
+        _empty_duplicate_review,
+    )
     all_ids = [f"model1_mcq_{index}" for index in range(1, 11)]
     invalid_ids = all_ids[-3:]
     balanced_answers = ("B", "D", "A", "C", "C", "A", "D", "B", "B", "D")
@@ -2285,10 +2328,22 @@ def test_selective_revalidation_merges_untouched_passes(monkeypatch):
     assert len(report["verdicts"]) == 10
     assert all(verdict["action"] == "PASS" for verdict in report["verdicts"])
     for verdict in report["verdicts"][:7]:
-        assert verdict == first_passes[verdict["question_id"]]
+        assert verdict["evaluation_origin"] == "historical_retained"
+        assert {
+            key: value for key, value in verdict.items()
+            if key != "evaluation_origin"
+        } == first_passes[verdict["question_id"]]
 
 
 def test_mcq_balance_expands_revalidation_to_every_modified_item(monkeypatch):
+    monkeypatch.setattr(
+        "app.online.duplicate_pipeline.scan_exam_duplicates",
+        lambda _state: {"duplicate_reports": []},
+    )
+    monkeypatch.setattr(
+        "app.online.duplicate_judge.review_duplicate_candidates",
+        _empty_duplicate_review,
+    )
     qids = ["model1_mcq_1", "model1_mcq_2"]
     exam = _exam({"mcq": [_mcq(qid) for qid in qids]})
     scopes = []

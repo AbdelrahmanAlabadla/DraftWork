@@ -112,7 +112,8 @@ def test_general_and_stem_validator_roles_are_disjoint():
 def test_general_and_quantitative_repair_contracts_are_disjoint():
     general = validator.REPAIR_SYSTEM_PROMPT.casefold()
     quantitative = validator.STEM_QUANTITATIVE_REPAIR_SYSTEM_PROMPT.casefold()
-    assert "never repair calculations, equations, units" in general
+    assert "normally belong to the stem quantitative repairer" in general
+    assert "recompute them together with the revised question" in general
     assert "independently solve the repaired problem from scratch" in quantitative
     assert "diagnostic hypotheses, not authority" in quantitative
     assert "never edit planner metadata" in quantitative

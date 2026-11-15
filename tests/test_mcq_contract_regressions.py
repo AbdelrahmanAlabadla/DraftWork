@@ -13,6 +13,20 @@ from app.online import prompts
 from app.online import validator
 
 
+@pytest.fixture(autouse=True)
+def _mock_recovery_v3(monkeypatch):
+    monkeypatch.setattr(
+        "app.online.recovery_decision.decide_recovery",
+        lambda contexts, **_kwargs: ({row["question_id"]: {
+            "version": "recovery-v3-task-alignment", "status": "ready",
+            "decision": "REPAIR", "reason": "localized defect",
+            "plan": ["REPAIR", "REGENERATE", "SWITCH_TASK"],
+            "fallback_sequence": ["REGENERATE", "SWITCH_TASK"],
+            "next_index": 0, "attempted_strategies": [], "decision_calls": 1,
+        } for row in contexts}, {"calls": 1}),
+    )
+
+
 def _mcq(*, question="Which energy principle applies?", correct="Energy is conserved", **options):
     values = {
         "A": correct,
@@ -216,7 +230,7 @@ def test_bundled_mcq_contract_nests_unsuitable_tasks_inside_mcq():
         "mcq": {"questions": [], "unsuitable_tasks": []},
         "true_false": {"questions": [{
             "slot_id": "m1_true_false_1", "statement": "Energy is conserved.",
-            "answer": "True",
+            "answer": True,
         }]},
     }).model_dump()
     assert value["mcq"]["unsuitable_tasks"] == []
@@ -268,7 +282,7 @@ def test_unsuitable_task_is_reassigned_and_does_not_consume_slot(monkeypatch):
             "correct_answer": "A", "solution_certificate": None,
         }], "unsuitable_tasks": []}}
 
-    monkeypatch.setattr("app.llm.factory.create_llm_client", lambda: object())
+    monkeypatch.setattr("app.llm.factory.create_generation_client", lambda **_kwargs: object())
     monkeypatch.setattr(exam_builder, "request_structured", fake_request)
     seen = set()
     bundle, warnings = exam_builder._generate_obj_bundle(

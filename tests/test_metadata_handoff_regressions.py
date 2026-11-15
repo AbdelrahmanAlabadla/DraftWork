@@ -19,7 +19,7 @@ def test_true_false_normalization_is_strict_boolean_and_legacy_compatible():
     assert _normalize_true_false({"statement": "S", "answer": "False"})["answer"] is False
 
     parsed = TrueFalseQuestion.model_validate({
-        "slot_id": "m1_true_false_1", "statement": "S", "answer": "False",
+        "slot_id": "m1_true_false_1", "statement": "S", "answer": False,
     })
     assert _normalize_true_false(parsed.model_dump())["answer"] is False
 
