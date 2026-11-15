@@ -48,7 +48,11 @@ def test_runner_reuses_production_nodes_without_changing_production_graph(runner
 
     assert runner_module.retrieve_context is retrieval.retrieve_context
     assert runner_module.generate_exams_node is exam_builder.generate_exams_node
-    assert 'builder.add_edge("generate_exams", "validate_generated_questions")' in inspect.getsource(graph.build_exam_graph)
+    source = inspect.getsource(graph.build_exam_graph)
+    assert (
+        'builder.add_edge("generate_exams", "validate_generated_questions")' in source
+        or 'builder.add_conditional_edges(\n        "generate_exams"' in source
+    )
 
 
 def test_generation_only_uses_production_node_hooks_and_stops_before_validation(monkeypatch, tmp_path, runner_module):

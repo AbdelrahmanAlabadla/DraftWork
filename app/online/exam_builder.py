@@ -10,7 +10,15 @@ from contextvars import copy_context
 from copy import deepcopy
 from typing import Any, Callable
 
-from app.config import MAX_PARALLEL_GENERATION_CALLS
+from app.config import (
+    GENERATOR_EQUATION_MAX_TOKENS,
+    GENERATOR_MCQ_MAX_TOKENS,
+    GENERATOR_OTHER_MAX_TOKENS,
+    GENERATOR_PROVIDER_MAX_OUTPUT_TOKENS,
+    GENERATOR_TRUE_FALSE_MAX_TOKENS,
+    GENERATOR_WORD_PROBLEM_MAX_TOKENS,
+    MAX_PARALLEL_GENERATION_CALLS,
+)
 from app.llm.client import request_structured
 from app.llm.schemas import (
     fitb_items_response_model,
@@ -37,6 +45,7 @@ from app.online.eval_stats import (
 from app.online.graph import get_exam_graph
 from app.online.models import (
     TYPE_ORDER,
+    authoritative_givens,
     contains_forbidden_phrase,
     normalize_fitb_item,
     normalize_text,
@@ -46,7 +55,7 @@ from app.online.models import (
     split_valid_invalid,
 )
 
-PLAN_SCHEMA_VERSION = "plan-v12-typed-variation-contract"
+PLAN_SCHEMA_VERSION = "plan-v13-graph-tri-state"
 
 
 def _dispatch_generation_jobs(
@@ -113,7 +122,38 @@ _MAX_ATTEMPTS = 3
 
 # Upper bound on a single generation request's max_output_tokens. Keeps combined
 # prompt + output within the model's context window even for large per-type counts.
-_MAX_TOKENS = 4000
+_MAX_TOKENS = GENERATOR_PROVIDER_MAX_OUTPUT_TOKENS
+_GENERATION_OUTPUT_TOKEN_CEILINGS = {
+    "true_false": GENERATOR_TRUE_FALSE_MAX_TOKENS,
+    "mcq": GENERATOR_MCQ_MAX_TOKENS,
+    "equation": GENERATOR_EQUATION_MAX_TOKENS,
+    "word_problem": GENERATOR_WORD_PROBLEM_MAX_TOKENS,
+    "fill_in_the_blank": GENERATOR_OTHER_MAX_TOKENS,
+    "definition": min(2048, GENERATOR_OTHER_MAX_TOKENS),
+    "why": GENERATOR_OTHER_MAX_TOKENS,
+    "essay": GENERATOR_OTHER_MAX_TOKENS,
+}
+
+
+def _generation_output_budget(
+    question_counts: dict[str, int], *, provider_limit: int | None = None,
+) -> int:
+    """Compute a schema-aware maximum for a single generation response."""
+    active = {
+        qtype: int(count) for qtype, count in question_counts.items()
+        if int(count) > 0
+    }
+    if not active:
+        budget = 2048
+    elif len(active) == 1:
+        qtype = next(iter(active))
+        budget = _GENERATION_OUTPUT_TOKEN_CEILINGS.get(qtype, 4096)
+    else:
+        budget = max(2048, sum(
+            min(_GENERATION_OUTPUT_TOKEN_CEILINGS.get(qtype, 4096), count * 768)
+            for qtype, count in active.items()
+        ))
+    return min(int(provider_limit or _MAX_TOKENS), _MAX_TOKENS, budget)
 
 
 def _deepseek_transport_exhausted(exc: Exception) -> bool:
@@ -167,6 +207,48 @@ _TYPE_ID_SLUGS = {
     "word_problem": "word_problem",
     "essay": "essay",
 }
+
+
+def _reassign_supported_variation(
+    item: dict[str, Any], qtype: str,
+) -> dict[str, Any] | None:
+    """Swap a visual-only planned angle for a supported one.
+
+    Returns ``None`` when the task has no eligible alternative, so the caller
+    can fall back to the existing bounded recovery path instead of inventing a
+    graph.
+    """
+    from app.online.assessment_catalog import (
+        _apply_effective_variation,
+        permitted_task_variations,
+        requires_unsupported_supplied_graph,
+    )
+    variations = permitted_task_variations(item, qtype)
+    selected_id = str(item.get("selected_variation_id") or "")
+    selected = next(
+        (value for value in variations if str(value.get("variation_id") or "") == selected_id),
+        None,
+    )
+    if selected is None:
+        selected = next(
+            (value for value in variations
+             if str(value.get("target") or "") == str(item.get("target") or "")
+             and str(value.get("operation") or "") == str(item.get("task_operation") or "")),
+            item,
+        )
+    if not requires_unsupported_supplied_graph(item, selected):
+        return item
+    alternative = next(
+        (value for value in variations if not requires_unsupported_supplied_graph(item, value)),
+        None,
+    )
+    if alternative is None:
+        return None
+    updated = deepcopy(item)
+    # Keep the bound set and the selected ID in the same scoped ID space.
+    updated["permitted_variations"] = variations
+    _apply_effective_variation(updated, updated, alternative)
+    return updated
 
 
 def _slot_ids(items: list[dict[str, Any]], model_number: int, qtype: str) -> list[str]:
@@ -269,6 +351,7 @@ def _generation_plan_items(
 
 def _attach_reuse_context(
     plan_items: dict[str, list[dict[str, Any]]],
+    reference_plan_items: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Attach compact prior-slot plans without creating another task identity."""
     by_slot = {
@@ -277,10 +360,11 @@ def _attach_reuse_context(
         for item in values
         if item.get("slot_id")
     }
+    reference_by_slot = {**(reference_plan_items or {}), **by_slot}
     for item in by_slot.values():
         references = []
         for slot_id in item.get("forced_duplicate_slot_ids") or []:
-            prior = by_slot.get(str(slot_id))
+            prior = reference_by_slot.get(str(slot_id))
             if prior is None:
                 continue
             references.append({
@@ -363,9 +447,7 @@ def _bind_selected_variation(
         return False
     effective_variation = deepcopy(variation)
     if plan_item.get("effective_instance_id"):
-        effective_variation["givens"] = list(
-            plan_item.get("effective_givens") or plan_item.get("given_conditions") or []
-        )
+        effective_variation["givens"] = list(authoritative_givens(plan_item)["givens"])
         effective_variation["base_variation_id"] = selected_id
         effective_variation["effective_instance_id"] = plan_item.get("effective_instance_id")
     inherited = [
@@ -408,6 +490,10 @@ _OPTION_REFERENCE_RE = re.compile(
     r"(?P<prefix>\b(?:option|choice|answer)\s*(?:label\s*)?[:#-]?\s*|"
     r"(?:الخيار|الاختيار|الإجابة)\s*(?:رقم\s*)?[:#-]?\s*)"
     r"(?P<open>[\(\[]?)(?P<label>[ABCD])(?P<close>[\)\]]?)(?![A-Za-z0-9_])"
+)
+_BARE_FINAL_ANSWER_LABEL_RE = re.compile(
+    r"^(?P<leading>\s*)(?P<label>[ABCD])(?P<separator>\s*[:.)-]\s+)",
+    re.IGNORECASE,
 )
 
 
@@ -453,6 +539,49 @@ def _remap_certificate_option_reference(value: Any, source: str, target: str) ->
     return deepcopy(value)
 
 
+def _remap_structured_certificate(
+    certificate: dict[str, Any], source: str, target: str,
+) -> dict[str, Any] | None:
+    """Remap only option references whose meaning is structurally unambiguous.
+
+    New certificates are required to keep their mathematical explanation
+    independent of display letters.  Older checkpoints may start the dedicated
+    ``final_answer`` field with ``A:``; that one anchored label is safe to move.
+    Bare labels elsewhere are ambiguous mathematical prose and make balancing
+    ineligible rather than inviting a string-level rewrite.
+    """
+    references = _certificate_option_references(certificate)
+    if references - {source}:
+        return None
+    for key, value in certificate.items():
+        if key == "final_answer":
+            continue
+        values = value if isinstance(value, list) else [value]
+        if any(
+            isinstance(entry, str) and _BARE_FINAL_ANSWER_LABEL_RE.match(entry)
+            for entry in values
+        ):
+            return None
+    remapped = _remap_certificate_option_reference(certificate, source, target)
+    final_answer = remapped.get("final_answer")
+    if isinstance(final_answer, str):
+        match = _BARE_FINAL_ANSWER_LABEL_RE.match(final_answer)
+        if match:
+            if match.group("label").upper() != source:
+                return None
+            remapped["final_answer"] = _BARE_FINAL_ANSWER_LABEL_RE.sub(
+                lambda found: (
+                    f"{found.group('leading')}{target}{found.group('separator')}"
+                ),
+                final_answer,
+                count=1,
+            )
+    remapped["matching_correct_option"] = target
+    if source in _certificate_option_references(remapped):
+        return None
+    return remapped
+
+
 def _balanced_mcq_candidate(
     item: dict[str, Any], source: str, target: str,
 ) -> dict[str, Any] | None:
@@ -464,16 +593,8 @@ def _balanced_mcq_candidate(
     correct_content = deepcopy(options[source])
     certificate = candidate.get("solution_certificate")
     if isinstance(certificate, dict):
-        # A certificate discussing multiple answer labels cannot be remapped
-        # safely without understanding the prose. Leave this MCQ untouched.
-        references = _certificate_option_references(certificate)
-        if references - {source}:
-            return None
-        certificate = _remap_certificate_option_reference(
-            certificate, source, target,
-        )
-        certificate["matching_correct_option"] = target
-        if source in _certificate_option_references(certificate):
+        certificate = _remap_structured_certificate(certificate, source, target)
+        if certificate is None:
             return None
         candidate["solution_certificate"] = certificate
     options[source], options[target] = options[target], options[source]
@@ -702,18 +823,23 @@ def _repair_invalid_items(
     model_number: int,
     language: str = "en",
     max_attempts: int = 2,
+    request_budget=None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Send rejected raw items + the expected schema back for targeted repair.
 
     The model fixes ONLY the invalid fields/type/structure; it must not invent a
     new question or alter valid content. Returns the newly-valid normalized items.
     """
-    from app.llm.factory import create_llm_client
+    from app.llm.factory import create_generation_client
 
     if not invalid_raw:
         return [], []
     warnings: list[str] = []
-    client = create_llm_client()
+    client = create_generation_client(question_type=qtype)
+    if request_budget is None:
+        from app.config import GENERATION_PROVIDER_REQUESTS_PER_SLOT
+        from app.llm.client import ProviderRequestBudget
+        request_budget = ProviderRequestBudget(GENERATION_PROVIDER_REQUESTS_PER_SLOT)
     schema = _SCHEMAS.get(qtype, "")
     items = list(invalid_raw)
     for attempt in range(1, max_attempts + 1):
@@ -727,6 +853,16 @@ def _repair_invalid_items(
                 for item in items
                 if isinstance(item, dict) and item.get("slot_id")
             ]
+            from app.logging_conf import set_llm_attribution
+            set_llm_attribution(
+                model_number=model_number, stage="generation",
+                slot_ids=repair_slot_ids,
+                question_ids=[str(item.get("question_id") or "") for item in items if item.get("question_id")],
+                task_ids=[str(item.get("task_id") or "") for item in items if item.get("task_id")],
+                variation_ids=[str(item.get("selected_variation_id") or "") for item in items if item.get("selected_variation_id")],
+                generation_attempt=attempt, operation="structural_generation_repair",
+                strategy="repair_invalid_generated_structure",
+            )
             raw = request_structured(
                 client,
                 user_prompt,
@@ -739,7 +875,8 @@ def _repair_invalid_items(
                 local_json=True,
                 system_prompt=system_prompt,
                 temperature=0.3,
-                max_tokens=min(_MAX_TOKENS, 2048),
+                max_tokens=_generation_output_budget({qtype: len(items)}),
+                request_budget=request_budget,
             )
         except Exception as exc:
             logger.exception(
@@ -775,19 +912,40 @@ def _generate_type_from_plan(
     global_plan_by_slot: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Generate and retry exact stable slots instead of inferring gaps by count."""
-    from app.llm.factory import create_llm_client
+    from app.llm.factory import create_generation_client
     from app.online.prompts import build_prompt
 
     ordered_ids = _slot_ids(planned_items, model_number, qtype)
     normalized_plan: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    from app.online.assessment_catalog import requires_unsupported_supplied_graph
     for sid, item in zip(ordered_ids, planned_items):
-        normalized_plan.append({**item, "slot_id": sid})
+        normalized = {**item, "slot_id": sid}
+        resolved = _reassign_supported_variation(normalized, qtype)
+        if resolved is None:
+            warnings.append(
+                f"{qtype}: skipped unsupported supplied-graph assignment for slot {sid} "
+                "(no supported alternative)"
+            )
+            continue
+        normalized = {**resolved, "slot_id": sid}
+        normalized_plan.append(normalized)
     pending = {item["slot_id"]: item for item in normalized_plan}
     accepted_by_slot: dict[str, dict[str, Any]] = {}
-    warnings: list[str] = []
-    client = create_llm_client()
+    client = create_generation_client(question_type=qtype)
+    from app.config import GENERATION_PROVIDER_REQUESTS_PER_SLOT
+    from app.llm.client import ProviderRequestBudget
+    request_budget = ProviderRequestBudget(GENERATION_PROVIDER_REQUESTS_PER_SLOT)
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
+        exhausted_ids = [
+            sid for sid in pending if request_budget.remaining(sid) == 0
+        ]
+        for sid in exhausted_ids:
+            warnings.append(
+                f"{qtype}: provider request budget exhausted for slot {sid}"
+            )
+            pending.pop(sid, None)
         remaining_plan = list(pending.values())
         if not remaining_plan:
             break
@@ -815,6 +973,15 @@ def _generate_type_from_plan(
 
         try:
             remaining_ids = list(pending)
+            from app.logging_conf import set_llm_attribution
+            set_llm_attribution(
+                model_number=model_number, stage="generation",
+                slot_ids=remaining_ids,
+                task_ids=[str(item.get("task_id") or "") for item in remaining_plan],
+                variation_ids=[str(item.get("selected_variation_id") or "") for item in remaining_plan],
+                generation_attempt=attempt, operation="initial_generation",
+                strategy="generate_planned_slots",
+            )
             raw_obj = request_structured(
                 client,
                 user_prompt,
@@ -826,7 +993,8 @@ def _generate_type_from_plan(
                 expected_id_field="slot_id",
                 system_prompt=system_prompt,
                 temperature=0.4,
-                max_tokens=min(_MAX_TOKENS, max(2048, len(remaining_plan) * 256)),
+                max_tokens=_generation_output_budget({qtype: len(remaining_plan)}),
+                request_budget=request_budget,
             )
         except Exception as exc:
             logger.exception(
@@ -859,6 +1027,7 @@ def _generate_type_from_plan(
                     difficulty,
                     model_number,
                     language=language,
+                    request_budget=request_budget,
                 )
                 warnings.extend(repair_warnings)
                 candidates.extend(repaired)
@@ -1106,11 +1275,14 @@ def _generate_fitb_items(
     global_plan_by_slot: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Stage 2: write every blank around its prevalidated per-slot answer."""
-    from app.llm.factory import create_llm_client
+    from app.llm.factory import create_generation_client
     from app.online.prompts import build_fitb_items_prompt
 
     warnings: list[str] = []
-    client = create_llm_client()
+    client = create_generation_client(question_type="fill_in_the_blank")
+    from app.config import GENERATION_PROVIDER_REQUESTS_PER_SLOT
+    from app.llm.client import ProviderRequestBudget
+    request_budget = ProviderRequestBudget(GENERATION_PROVIDER_REQUESTS_PER_SLOT)
     ids = _slot_ids(planned_items, model_number, "fill_in_the_blank")
     normalized_plan = [
         {**item, "slot_id": sid} for sid, item in zip(ids, planned_items)
@@ -1119,6 +1291,9 @@ def _generate_fitb_items(
     accepted: dict[str, dict[str, Any]] = {}
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
+        for sid in [value for value in pending if request_budget.remaining(value) == 0]:
+            warnings.append(f"fill_in_the_blank: provider request budget exhausted for slot {sid}")
+            pending.pop(sid, None)
         if not pending:
             break
         remaining_plan = list(pending.values())
@@ -1129,6 +1304,15 @@ def _generate_fitb_items(
             model_number=model_number, planned_items=remaining_plan, language=language,
         )
         try:
+            from app.logging_conf import set_llm_attribution
+            set_llm_attribution(
+                model_number=model_number, stage="generation",
+                slot_ids=list(pending),
+                task_ids=[str(item.get("task_id") or "") for item in remaining_plan],
+                variation_ids=[str(item.get("selected_variation_id") or "") for item in remaining_plan],
+                generation_attempt=attempt, operation="fitb_items",
+                strategy="generate_planned_slots",
+            )
             raw = request_structured(
                 client,
                 user_prompt,
@@ -1141,7 +1325,10 @@ def _generate_fitb_items(
                 expected_id_field="slot_id",
                 system_prompt=system_prompt,
                 temperature=0.4,
-                max_tokens=min(_MAX_TOKENS, max(2048, len(remaining_plan) * 320)),
+                max_tokens=_generation_output_budget({
+                    "fill_in_the_blank": len(remaining_plan)
+                }),
+                request_budget=request_budget,
             )
         except Exception as exc:
             logger.exception(
@@ -1326,11 +1513,16 @@ def _generate_obj_bundle(
     mcq_task_replacer: Callable[[str, dict[str, Any], str], dict[str, Any] | None] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Generate MCQ and True/False together while tracking exact pending slots."""
-    from app.llm.factory import create_llm_client
+    from app.llm.factory import create_generation_client
     from app.online.prompts import build_obj_bundled_prompt
 
     warnings: list[str] = []
-    client = create_llm_client()
+    # Both members of this shared provider lane are explicitly Luna-routed.
+    client = create_generation_client(question_type="mcq")
+    from app.config import GENERATION_PROVIDER_REQUESTS_PER_SLOT
+    from app.llm.client import ProviderRequestBudget
+    from app.online.assessment_catalog import requires_unsupported_supplied_graph
+    request_budget = ProviderRequestBudget(GENERATION_PROVIDER_REQUESTS_PER_SLOT)
     normalized: dict[str, list[dict[str, Any]]] = {}
     pending: dict[str, dict[str, dict[str, Any]]] = {}
     accepted: dict[str, dict[str, dict[str, Any]]] = {}
@@ -1338,7 +1530,17 @@ def _generate_obj_bundle(
     for qtype in ("mcq", "true_false"):
         items = planned.get(qtype) or []
         ids = _slot_ids(items, model_number, qtype)
-        normalized[qtype] = [{**item, "slot_id": sid} for sid, item in zip(ids, items)]
+        normalized[qtype] = []
+        for sid, item in zip(ids, items):
+            normalized_item = {**item, "slot_id": sid}
+            resolved_item = _reassign_supported_variation(normalized_item, qtype)
+            if resolved_item is None:
+                warnings.append(
+                    f"{qtype}: skipped unsupported supplied-graph assignment for slot {sid} "
+                    "(no supported alternative)"
+                )
+                continue
+            normalized[qtype].append({**resolved_item, "slot_id": sid})
         pending[qtype] = {item["slot_id"]: item for item in normalized[qtype]}
         accepted[qtype] = {}
 
@@ -1368,11 +1570,19 @@ def _generate_obj_bundle(
     attempt = 0
     while incomplete() and attempt < _MAX_ATTEMPTS:
         attempt += 1
+        for qtype in ("mcq", "true_false"):
+            for sid in [
+                value for value in pending[qtype]
+                if request_budget.remaining(value) == 0
+            ]:
+                warnings.append(f"{qtype}: provider request budget exhausted for slot {sid}")
+                pending[qtype].pop(sid, None)
+        if not incomplete():
+            break
         rem_planned = {q: list(pending[q].values()) for q in ("mcq", "true_false")}
-        bundle_max_tokens = min(
-            _MAX_TOKENS,
-            max(2048, sum(len(values) for values in rem_planned.values()) * 256),
-        )
+        bundle_max_tokens = _generation_output_budget({
+            qtype: len(values) for qtype, values in rem_planned.items()
+        })
         feedback = _build_bundle_feedback(
             list(accepted["mcq"].values()),
             list(accepted["true_false"].values()),
@@ -1387,6 +1597,14 @@ def _generate_obj_bundle(
         )
         try:
             expected_ids = [*pending["mcq"], *pending["true_false"]]
+            from app.logging_conf import set_llm_attribution
+            set_llm_attribution(
+                model_number=model_number, stage="generation", slot_ids=expected_ids,
+                task_ids=[str(item.get("task_id") or "") for values in rem_planned.values() for item in values],
+                variation_ids=[str(item.get("selected_variation_id") or "") for values in rem_planned.values() for item in values],
+                generation_attempt=attempt, operation="objective_bundle",
+                strategy="generate_planned_slots",
+            )
             raw = request_structured(
                 client,
                 user_prompt,
@@ -1401,6 +1619,7 @@ def _generate_obj_bundle(
                 system_prompt=system_prompt,
                 temperature=0.4,
                 max_tokens=bundle_max_tokens,
+                request_budget=request_budget,
             )
         except Exception as exc:
             logger.exception(
@@ -1462,6 +1681,7 @@ def _generate_obj_bundle(
                     repaired, rwarn = _repair_invalid_items(
                         qtype, [invalid], _isolated_item_context(plan_item),
                         difficulty, model_number, language=language,
+                        request_budget=request_budget,
                     )
                     warnings.extend(rwarn)
                     candidates.extend(repaired)
@@ -1910,7 +2130,7 @@ def _build_feedback(
 # --------------------------------------------------------------------------
 # Node: generate every exam model (one call per model x type)
 # --------------------------------------------------------------------------
-def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
+def _generate_exams_node_impl(state: dict[str, Any]) -> dict[str, Any]:
     """Generate each model from grounded plans while retaining slot identity."""
 
     document_id = state.get("document_id")
@@ -1974,7 +2194,17 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     )
 
     t0 = time.perf_counter()
-    for model_number in range(1, num_models + 1):
+    active_model_numbers = list(
+        state.get("_active_generation_models") or range(1, num_models + 1)
+    )
+    all_plan_items = {
+        str(item.get("slot_id") or ""): item
+        for model_plan in plans
+        for values in (model_plan.get("items") or {}).values()
+        for item in values or []
+        if item.get("slot_id")
+    }
+    for model_number in active_model_numbers:
         plan = plans[model_number - 1] if model_number - 1 < len(plans) else None
         raw_plan_items = (plan or {}).get("items") or {}
         plan_items = _attach_reuse_context({
@@ -1982,7 +2212,7 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                 list(items or []), qtype, retrieved_chunks, assessment_profile
             )
             for qtype, items in raw_plan_items.items()
-        })
+        }, all_plan_items)
         global_plan_by_slot = {
             str(item.get("slot_id")): item
             for values in plan_items.values()
@@ -2413,10 +2643,132 @@ def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def generate_exams_node(state: dict[str, Any]) -> dict[str, Any]:
+    """Generate model-local exams concurrently with one shared provider gate.
+
+    Each worker invokes the exact single-model implementation with the complete
+    reviewed plan set, but owns only one model's mutable questions, counters,
+    and histories.  Planned reuse references are therefore available without
+    waiting for another model's generated output.
+    """
+    num_models = int(state.get("num_models") or 1)
+    if num_models <= 1 or state.get("_active_generation_models"):
+        return _generate_exams_node_impl(state)
+
+    def generate_model(model_number: int) -> dict[str, Any]:
+        from app.online.performance import finish_timing, start_timing
+        from app.logging_conf import set_llm_attribution
+        set_llm_attribution(model_number=model_number, stage="generation")
+        timing = start_timing(stage="model_generation", model_number=model_number)
+        worker_state = dict(state)
+        worker_state["_active_generation_models"] = [model_number]
+        worker_state["generated_exams"] = [
+            deepcopy(exam) for exam in state.get("generated_exams") or []
+            if int(exam.get("model_number") or 0) == model_number
+        ]
+        worker_state["plans"] = deepcopy(state.get("plans") or [])
+        worker_state["warnings"] = []
+        worker_state["mcq_task_reassignments"] = []
+        worker_state["fitb_recovery_history"] = []
+        worker_state["eval_stats"] = deepcopy(state.get("eval_stats"))
+        # Concurrent workers must not race the checkpoint revision callback.
+        # The coordinator serializes durable checkpoints as workers complete.
+        worker_state["audit_callback"] = None
+        result = _generate_exams_node_impl(worker_state)
+        result.setdefault("performance_telemetry", []).append(
+            finish_timing(timing)
+        )
+        return result
+
+    workers = min(num_models, MAX_PARALLEL_GENERATION_CALLS)
+    model_results: dict[int, dict[str, Any]] = {}
+    completed_exams: list[dict[str, Any]] = []
+    completed_plans = deepcopy(state.get("plans") or [])
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(copy_context().run, generate_model, model_number): model_number
+            for model_number in range(1, num_models + 1)
+        }
+        for future in as_completed(futures):
+            model_number = futures[future]
+            result = future.result()
+            model_results[model_number] = result
+            completed_exams.extend(deepcopy(result.get("generated_exams") or []))
+            result_plans = result.get("plans") or []
+            if model_number - 1 < len(result_plans):
+                completed_plans[model_number - 1] = deepcopy(
+                    result_plans[model_number - 1]
+                )
+            audit = state.get("audit_callback")
+            if audit:
+                audit("generation", "generation_checkpoint", {
+                    "model_number": model_number,
+                    "checkpoint_state": {
+                        "generated_exams": sorted(
+                            deepcopy(completed_exams),
+                            key=lambda exam: int(exam.get("model_number") or 0),
+                        ),
+                        "plans": deepcopy(completed_plans),
+                    },
+                })
+    generated_exams: list[dict[str, Any]] = []
+    plans = deepcopy(state.get("plans") or [])
+    warnings = list(state.get("warnings") or [])
+    mcq_reassignments: list[dict[str, Any]] = []
+    fitb_history: list[dict[str, Any]] = []
+    performance_telemetry = list(state.get("performance_telemetry") or [])
+    eval_stats = deepcopy(state.get("eval_stats"))
+    for model_number in range(1, num_models + 1):
+        result = model_results[model_number]
+        generated_exams.extend(result.get("generated_exams") or [])
+        warnings.extend(result.get("warnings") or [])
+        mcq_reassignments.extend(result.get("mcq_task_reassignments") or [])
+        fitb_history.extend(result.get("fitb_recovery_history") or [])
+        performance_telemetry.extend(result.get("performance_telemetry") or [])
+        result_plans = result.get("plans") or []
+        if model_number - 1 < len(result_plans):
+            plans[model_number - 1] = deepcopy(result_plans[model_number - 1])
+        worker_stats = result.get("eval_stats") or {}
+        if eval_stats is not None and str(model_number) in (worker_stats.get("models") or {}):
+            eval_stats["models"][str(model_number)] = deepcopy(
+                worker_stats["models"][str(model_number)]
+            )
+            worker_runtime = worker_stats.get("_runtime") or {}
+            runtime = eval_stats.setdefault("_runtime", {})
+            for key, value in worker_runtime.items():
+                if isinstance(value, dict):
+                    runtime.setdefault(key, {}).update(deepcopy(value))
+                elif isinstance(value, list):
+                    runtime[key] = list(dict.fromkeys([
+                        *(runtime.get(key) or []), *value,
+                    ]))
+    generated_exams.sort(key=lambda exam: int(exam.get("model_number") or 0))
+    if eval_stats is not None:
+        from app.online.eval_stats import aggregate
+        aggregate(eval_stats)
+    return {
+        "generated_exams": generated_exams,
+        "plans": plans,
+        "mcq_task_reassignments": mcq_reassignments,
+        "fitb_recovery_history": fitb_history,
+        "warnings": warnings,
+        "eval_stats": eval_stats,
+        "performance_telemetry": performance_telemetry[-5000:],
+    }
+
+
 def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
     """Finalize audit data, then expose only authoritative accepted slots."""
     language = state.get("document_language") or "en"
     generated_exams = deepcopy(state.get("generated_exams") or [])
+    difficulty_observation_warnings: list[dict[str, Any]] = []
+    plan_by_slot = {
+        str(item.get("slot_id") or ""): item
+        for plan in state.get("plans") or []
+        for values in (plan.get("items") or {}).values()
+        for item in values or []
+        if item.get("slot_id")
+    }
     reports = state.get("validation_reports") or []
     eval_stats = state.get("eval_stats")
     if eval_stats is not None:
@@ -2459,6 +2811,36 @@ def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
                     else verdict.get("action") == "PASS"
                 )
                 if accepted:
+                    from app.online.lifecycle import question_fingerprint
+                    observation = dict(
+                        (plan_by_slot.get(slot_id) or {}).get("difficulty_observation")
+                        or {}
+                    )
+                    if observation:
+                        if observation.get("question_fingerprint") != question_fingerprint(item):
+                            difficulty_observation_warnings.append({
+                                "model_number": model_number,
+                                "slot_id": slot_id,
+                                "question_id": qid,
+                                "reason": "difficulty observation fingerprint does not match the final question",
+                            })
+                            (plan_by_slot.get(slot_id) or {}).pop(
+                                "difficulty_observation", None
+                            )
+                            observation = {}
+                        else:
+                            item["difficulty_observation"] = deepcopy(observation)
+                            actual = str(observation.get("actual_difficulty") or "")
+                            if actual in {"easy", "medium", "hard"}:
+                                item["actual_difficulty"] = actual
+                                item["difficulty"] = actual
+                    else:
+                        difficulty_observation_warnings.append({
+                            "model_number": model_number,
+                            "slot_id": slot_id,
+                            "question_id": qid,
+                            "reason": "difficulty observation missing for finalized question",
+                        })
                     kept.append(item)
                 else:
                     repair_events = repair_history_by_question.get(qid) or []
@@ -2515,6 +2897,7 @@ def assemble_exams_node(state: dict[str, Any]) -> dict[str, Any]:
         "slot_lifecycle": lifecycle,
         "accepted_slot_ids": sorted(accepted_slots or []),
         "eval_stats": eval_stats,
+        "difficulty_observation_warnings": difficulty_observation_warnings,
     }
 
 
@@ -2554,6 +2937,7 @@ def generate_exams(
     session_id: str | None = None,
     index_job_id: str | None = None,
     processed_document_key: str | None = None,
+    source_document_hash: str | None = None,
     domain_type: str | None = None,
     subject: str | None = None,
     document_language: str | None = None,
@@ -2590,6 +2974,7 @@ def generate_exams(
         "session_id": session_id,
         "index_job_id": index_job_id,
         "processed_document_key": processed_document_key,
+        "source_document_hash": str(source_document_hash or processed_document_key or ""),
         "domain_type": str(domain_type or ""),
         "subject": str(subject or ""),
         "difficulty": difficulty,
@@ -2613,6 +2998,7 @@ def generate_exams(
         "unresolved_plan_duplicate_conflicts": [],
         "difficulty_adjustment_history": [],
         "difficulty_adjustment_attempts": {},
+        "difficulty_adaptation_records": {},
         "generated_exams": [],
         "rejection_feedback": None,
         "mcq_task_reassignments": [],
@@ -2648,8 +3034,16 @@ def generate_exams(
         "duplicate_replacement_failures": {},
         "unresolved_duplicate_conflicts": [],
         "duplicate_scan_count": 0,
+        "duplicate_findings": [],
+        "incompatible_task_ids": [],
         "duplicate_fact_cache": {},
         "duplicate_screen_fingerprints": {},
+        "cross_model_duplicate_scan_complete": False,
+        "cross_model_duplicate_scan_revision": 0,
+        "cross_model_duplicate_findings": [],
+        "cross_model_duplicate_fingerprints": {},
+        "cross_model_duplicate_fact_cache": {},
+        "cross_model_duplicate_last_review": {},
         "slot_lifecycle": initialize_slot_lifecycle(tasks, num_models),
         "developer_diagnostics": [],
         "eval_stats": create_pipeline_eval(tasks, num_models),
@@ -2851,6 +3245,13 @@ def generate_exams(
             "difficulty": item.get("difficulty"),
             "requested_difficulty": item.get("requested_difficulty"),
             "actual_difficulty": item.get("actual_difficulty") or item.get("difficulty"),
+            "native_difficulty": item.get("native_difficulty_prior")
+            or item.get("native_difficulty"),
+            "difficulty_design": item.get("difficulty_design"),
+            "difficulty_observation": item.get("difficulty_observation"),
+            "cognitive_transformations": list(
+                item.get("cognitive_transformations") or []
+            ),
             "base_catalog_task_id": item.get("base_catalog_task_id"),
             "base_task_family_id": item.get("base_task_family_id"),
             "difficulty_adaptation": item.get("difficulty_adaptation"),
@@ -2923,6 +3324,7 @@ def generate_exams(
         "quality_status": quality_status,
         "quality_summary": quality_summary,
         "duplicate_quality": duplicate_quality,
+        "duplicate_findings": list(result.get("duplicate_findings") or []),
         "missing_slot_ids": missing_slot_ids,
         "invalid_slot_ids": invalid_slot_ids,
         "invalid_questions": invalid_questions,
@@ -2940,6 +3342,9 @@ def generate_exams(
         "duplicate_repair_history": list(result.get("duplicate_repair_history") or []),
         "difficulty_adjustment_history": list(result.get("difficulty_adjustment_history") or []),
         "difficulty_adjustment_attempts": dict(result.get("difficulty_adjustment_attempts") or {}),
+        "difficulty_adaptation_records": deepcopy(
+            result.get("difficulty_adaptation_records") or {}
+        ),
         "plan_duplicate_repair_attempts": dict(
             result.get("plan_duplicate_repair_attempts") or {}
         ),

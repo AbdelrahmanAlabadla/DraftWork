@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 from typing import Any
 
 from app.language import source_notation
+from app.online.unit_policy import unit_policy_for
 
 SYSTEM_PROMPT = (
     "You are an assessment-aware exam question generator for teachers. "
@@ -17,12 +19,21 @@ SYSTEM_PROMPT = (
     "- Neutral constructed numbers and givens are allowed for a self-contained quantitative "
     "problem when the catalog task and assessment guidance permit calculation or modeling. "
     "They are problem data, not claims about the source, and must not be presented as source facts.\n"
-    "- Preserve every required_givens value: these are invariant laws, constants, facts, or "
-    "constraints. variable_givens are authorized exercise parameters and may be replaced with "
-    "self-contained values that satisfy the relationship and constraints. When "
+    "- Preserve required_givens that are invariant laws, constants, facts, measurements, or "
+    "constraints. Ordinary numerical exercise data may be replaced with self-contained values "
+    "that satisfy the assigned relationship and constraints. When "
     "exact_source_instance is true, preserve the source instance exactly.\n\n"
 
     "=== QUESTION GENERATION RULES ===\n"
+    "- Treat the effective selected variation as a conceptual blueprint, not as a worked example "
+    "to copy. For mathematical tasks, infer and preserve its general relationship, operation, "
+    "reasoning path, constraints, and requested work product, then create a new valid instance "
+    "with permitted parameter values. For example, a source example 2x + 6 = 18 can authorize "
+    "the structure ax + b = c without making 2, 6, and 18 immutable. Recompute the answer, all "
+    "options, every solution step, and the solution certificate from the final generated instance.\n"
+    "- Values in source_example_givens, given_conditions, effective_givens, or an ordinary variation example are illustrative unless an "
+    "explicit required_givens constraint or exact_source_instance=true makes them immutable. Never "
+    "generalize or replace explicitly immutable source measurements, constants, or quoted data.\n"
     "- Generate completely NEW questions based on the document content.\n"
     "- Do NOT copy existing questions from the document.\n"
     "- Do NOT simply change a few words from sentences in the document.\n"
@@ -33,9 +44,31 @@ SYSTEM_PROMPT = (
     "explicitly names the supported target, operation, givens, and any representation/application. "
     "Being on the same broad topic is not sufficient: solving a system and interpreting "
     "a common solution region are different assessment operations and require explicit support.\n"
-    "- You may vary permitted wording and scenario details. Change numerical variable_givens only "
-    "when the chosen variation says numeric_values_may_change=true. Never introduce an unlisted "
+    "- You may vary permitted wording, scenario details, and ordinary numerical problem data. "
+    "Never introduce an unlisted "
     "concept, unsupported operation, advanced method, or factual claim.\n"
+    "- exact_source_instance=false authorizes a coherent new "
+    "numerical instance while preserving required_givens, the operation, mathematical structure, "
+    "and reasoning. exact_source_instance=true forbids replacing source-specific data. Source "
+    "constraints always outrank difficulty and diversity preferences.\n"
+    "- Never reproduce a source worked example's scenario, values, and requested result when "
+    "exact_source_instance=false and source_example_givens is present. Use it only to identify the "
+    "concept, method, and constraints, then construct a materially different self-contained instance "
+    "whose answer and solution steps you recompute.\n"
+    "- Treat selected_variation.concept, equation_structure, variables, and constraints as the "
+    "conceptual blueprint. Preserve that relationship and operation, choose new permitted values, "
+    "and recompute every dependent answer field. Never copy example coefficients merely because "
+    "they appear in source evidence. A null equation_structure means use the stated conceptual or "
+    "reasoning structure instead; never invent a formula.\n"
+    "- When cognitive_transformations are supplied, the question must require exactly those "
+    "source-supported transformations in addition to the assigned operation. Never add an "
+    "unlisted transformation or remove the assessed operation. Recompute every dependent answer, "
+    "option, solution step, and certificate for the final instance.\n"
+    "- Unit policy for this item is supplied as unit_policy. ESSENTIAL: keep the exact source value "
+    "and unit. FLEXIBLE (mathematics): a dimensionally consistent unit change is allowed when the "
+    "concept is unchanged. CONSTRAINED (science): prefer the source unit; change it only when the "
+    "conversion is dimensionally valid and derivable from stated givens. Never invent a conversion "
+    "factor and never silently normalize a source unit.\n"
     "- Each task supplies permitted_variations and a plan-bound selected_variation_id. Realize only "
     "that selected variation and echo its variation_id in selected_variation_id; never substitute or "
     "invent another angle. Use its evidence_chunk_ids when present; otherwise inherit the task's "
@@ -60,6 +93,12 @@ SYSTEM_PROMPT = (
     "=== QUESTION CLARITY RULES ===\n"
     "- Every question must be self-contained: a student must understand and answer it "
     "without seeing the source material.\n"
+    "- Copy every required student-visible given, category range, table row, constraint, variable "
+    "definition, or other exhibit needed to solve the assigned task into the question itself. A "
+    "source chunk, answer key, or hidden solution certificate is never a student-visible exhibit.\n"
+    "- Ask the student to perform the assigned task_operation and produce the assigned "
+    "student_work_product explicitly. Do not replace graphing with algebraic description, solving "
+    "with identification, or another easier operation unless the selected variation authorizes it.\n"
     "- Never reference the source of information. Do not cite or allude to the document, "
     "passage, context, chapter, PDF, or 'provided information', and avoid phrasings such as "
     "'according to the context', 'in the passage', 'based on the text', 'as discussed above', "
@@ -78,14 +117,24 @@ SYSTEM_PROMPT = (
     "are respected, units and rounding are correct, and the final answer solves exactly what was asked.\n"
     "- For a quantitative MCQ, independently solve the stem and verify that exactly one option "
     "matches the result and every distractor is wrong for the stated givens.\n"
+    "- Each MCQ option must be internally coherent. Never combine mutually exclusive mathematical "
+    "classifications in one option unless the option explicitly states a logically meaningful choice.\n"
     "- Every quantitative or symbolic STEM question, including a quantitative MCQ, "
     "must include an internal solution_certificate object. It is not student-facing. Use exactly "
     "these fields: method, important_givens, calculation_steps, final_answer, units, "
     "matching_correct_option, and verification_method. Set matching_correct_option to the verified "
     "A/B/C/D label for MCQ and null otherwise. The certificate must show checkable equations and "
-    "calculations, not generic claims. verification_method must describe a second check such as "
+    "calculations, not generic claims. Keep final_answer, calculation_steps, and verification_method "
+    "independent of the displayed option letter: state the mathematical value/result, never phrases "
+    "such as 'A is correct' or 'Option B'. Only matching_correct_option may identify the A/B/C/D "
+    "position. verification_method must describe a second check such as "
     "substitution, reverse calculation, constraint testing, or independent recomputation.\n"
     "- Self-check every question and answer before output.\n\n"
+    "- For True/False, answer must be the native JSON boolean true or false, never a quoted "
+    "string. The statement, Boolean key, explanation, and certificate must describe one candidate "
+    "revision and agree mathematically.\n\n"
+    "- Write mathematical infinity as the Unicode symbol ∞ or valid LaTeX \\infty inside a math "
+    "expression. Never emit the bare token infty, malformed escape sequences, or control characters.\n\n"
 
     "=== OUTPUT RULES ===\n"
     "- Generate exactly one valid question for every viable planned slot and copy each "
@@ -635,8 +684,14 @@ PLANNER_SYSTEM_PROMPT = (
     "such as balance_equation, complete_reaction, derive_relationship, prove_relationship, "
     "solve_equation, factor_expression, simplify_expression, calculate_from_scenario, "
     "stoichiometric_conversion, explain_cause, and compare_concepts are examples rather than a "
-    "closed taxonomy. Treat visual-dependent tasks as unsupported unless fully answerable from "
-    "textual or tabular information that can be included in the question.\n\n"
+    "closed taxonomy. Graph-related concepts are valid assessment targets: a student-drawn graph "
+    "(for example, draw y = 2x + 3) and a conceptual graph question (for example, explain the "
+    "meaning of slope) are supported when the source supports them. Do not plan a slot whose only "
+    "supported angle requires the student to read a supplied graph, chart, plot, figure, diagram, "
+    "image, or table that the question cannot reproduce as student-visible text. Set "
+    "requires_supplied_graph=true only for that third case, and leave it false for student-drawn "
+    "graphs and conceptual graph questions. Prefer another source-supported angle for the same "
+    "concept before reporting a planning issue.\n\n"
     "If a requested type cannot support the requested number of distinct grounded tasks, return a "
     "planning_issues entry with requested_count and supported_count. Do not invent support or "
     "substitute another type. Plan only supported_count items for that type.\n\n"
@@ -665,9 +720,12 @@ PLANNER_SYSTEM_PROMPT = (
     "material (for example, 'angle of refraction', not 'angle in glass'). given_conditions lists the important supplied "
     "quantities and conditions that define the task. scenario_family is a stable setup label, without "
     "decorative wording, or null for a non-scenario task. required_givens lists everything the student "
-    "must receive in the generated stem. Set text_answerable true only when the full task can be asked "
-    "and answered without an unavailable image, graph, table, diagram, figure, or visual label. If it "
-    "is false, do not plan the slot; report a planning issue instead.\n\n"
+    "must receive in the generated stem. Set text_answerable true when the full task can be asked "
+    "and answered from text the question can include. Set it false only when the task requires "
+    "reading a supplied graph, image, or other exhibit whose data cannot be carried in the stem; "
+    "prefer a different source-supported angle and report a planning issue only when none exists. "
+    "Student-drawn graphs and conceptual graph questions remain text_answerable=true when the "
+    "equation or data they need can be stated.\n\n"
     "Use only selected chunk IDs. Add support chunks only when genuinely necessary. Every required "
     "fact, condition, relationship, quantity, and scenario detail must be supported by the assigned "
     "chunks. idea_to_test describes the skill rather than supplying question facts.\n\n"
@@ -685,12 +743,14 @@ PLANNER_SYSTEM_PROMPT = (
     "concept, target, given_conditions, and scenario_family. Treat the same operation + relationship + "
     "target as repetition even when values, materials, or question type differ. A different type or story wrapper does "
     "not make the same underlying problem distinct. Do not reuse the same formula/concept, target, "
-    "important values/conditions, and setup to ask a slightly different step. Prefer changing the "
-    "skill, operation, target, or relationship rather than merely changing numbers. Keep models "
+    "important values/conditions, and setup to ask a slightly different step. Prefer a genuinely "
+    "different assessment angle; a new numerical instance of the same authorized angle is acceptable "
+    "when its variation authorizes numeric variation. Keep models "
     "equivalent while assigning distinct "
     "grounded ideas. Difficulty reflects reasoning depth: easy is direct, medium requires selection "
     "or connected steps, and hard requires genuinely deeper multi-step reasoning, inference, proof, "
-    "comparison, or error analysis.\n\n"
+    "comparison, or error analysis. Treat this as an informational prior only; it never restricts "
+    "which source-compatible task may be planned.\n\n"
     "Allowed reasoning_mode values are conceptual_recall, conceptual_reasoning, calculation, "
     "symbolic_manipulation, law_or_theorem_application, derivation_relationship, "
     "logical_proof_reasoning, representation_interpretation, comparison_prediction, error_analysis, "
@@ -927,6 +987,49 @@ def _regeneration_context(item: dict[str, Any]) -> str | None:
     })
 
 
+def _effective_variation_contract(item: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    """Return the single variation contract that generation must realize.
+
+    Difficulty design owns only explicitly adjusted fields. Catalog-owned concept,
+    operation, identity, and constraints remain on the plan item and are never
+    semantically rewritten by Python.
+    """
+    selected_id = str(item.get("selected_variation_id") or "")
+    base = next((
+        variation for variation in (
+            item.get("permitted_variations") or item.get("allowed_variations") or []
+        )
+        if str(variation.get("variation_id") or "") == selected_id
+    ), None)
+    if not isinstance(base, dict):
+        return {}, "missing"
+
+    effective = deepcopy(base)
+    effective_id = str(item.get("effective_instance_id") or "")
+    design = item.get("difficulty_design") or {}
+    adaptation = item.get("difficulty_adaptation") or {}
+    declared_id = str(
+        design.get("effective_instance_id")
+        or adaptation.get("effective_instance_id")
+        or ""
+    )
+    adjusted = bool(
+        effective_id
+        and (not declared_id or declared_id == effective_id)
+        and (
+            str(design.get("status") or "") == "designed"
+            or str(adaptation.get("status") or "") in {"adapted", "succeeded"}
+        )
+    )
+    adjusted_givens = item.get("effective_givens") or item.get("given_conditions") or []
+    if adjusted and adjusted_givens:
+        effective["givens"] = list(adjusted_givens)
+        effective["base_variation_id"] = selected_id
+        effective["effective_instance_id"] = effective_id
+        return effective, "difficulty_adjusted"
+    return effective, "catalog"
+
+
 def _format_planned_item(index: int, item: dict[str, Any]) -> str:
     """Render one plan entry compactly, omitting empty/optional metadata.
 
@@ -972,32 +1075,49 @@ def _format_planned_item(index: int, item: dict[str, Any]) -> str:
     if required_polarity in {"True", "False"}:
         tokens.append(f"required_answer_polarity={required_polarity}")
 
-    given_conditions = item.get("given_conditions") or []
+    effective_variation, variation_origin = _effective_variation_contract(item)
+    effective_givens = list(effective_variation.get("givens") or [])
+    given_conditions = (
+        effective_givens if variation_origin == "difficulty_adjusted"
+        else item.get("given_conditions") or []
+    )
     if given_conditions:
         tokens.append(f"given_conditions={given_conditions}")
     if item.get("scenario_family"):
         tokens.append(f"scenario_family={item.get('scenario_family')}")
     tokens.append(f"required_givens={item.get('required_givens', [])}")
     tokens.append(f"variable_givens={item.get('variable_givens', [])}")
+    if item.get("source_example_givens"):
+        tokens.append(f"source_example_givens={item.get('source_example_givens')}")
     selected_variation_id = str(item.get("selected_variation_id") or "")
     if selected_variation_id:
         tokens.append(f"selected_variation_id={selected_variation_id}")
-        selected_contract = next((
-            variation
-            for variation in (
-                item.get("permitted_variations") or item.get("allowed_variations") or []
-            )
-            if str(variation.get("variation_id") or "") == selected_variation_id
-        ), None)
-        if selected_contract:
-            tokens.append(f"selected_variation={_json_value(selected_contract)}")
+        if effective_variation:
+            tokens.append(f"effective_variation_origin={variation_origin}")
+            tokens.append(f"selected_variation={_json_value(effective_variation)}")
     if item.get("selected_variation_group_id"):
         tokens.append(f"selected_variation_group_id={item.get('selected_variation_group_id')}")
     if item.get("effective_instance_id"):
         tokens.append(f"effective_instance_id={item.get('effective_instance_id')}")
         tokens.append(f"effective_givens={item.get('effective_givens') or item.get('given_conditions', [])}")
     tokens.append(f"complexity_boundaries={item.get('complexity_boundaries', [])}")
+    if item.get("cognitive_transformations"):
+        tokens.append(f"cognitive_transformations={item.get('cognitive_transformations')}")
+    if item.get("allowed_transformations"):
+        tokens.append(f"allowed_transformations={item.get('allowed_transformations')}")
     tokens.append(f"exact_source_instance={bool(item.get('exact_source_instance', False))}")
+    if item.get("subject"):
+        tokens.append(f"subject={item.get('subject')}")
+    tokens.append(
+        "unit_policy=" + unit_policy_for(
+            item.get("subject"),
+            exact_source_instance=bool(item.get("exact_source_instance", False)),
+            operation=str(item.get("task_operation") or ""),
+            target=str(item.get("target") or ""),
+            givens=list(item.get("required_givens") or [])
+            + list(item.get("variable_givens") or []),
+        )
+    )
 
     tokens.append(f"reasoning_mode={item.get('reasoning_mode', '')}")
     tokens.append(f"reasoning_depth={item.get('reasoning_depth', '')}")

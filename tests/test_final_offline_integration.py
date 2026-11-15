@@ -96,7 +96,17 @@ def _candidate(task_id: str, *, target: str, operation: str, concept: str = "mot
     }
 
 
-def test_large_deterministic_replacement_pool_prefers_suitable_unused_candidate():
+def test_large_replacement_pool_reaches_semantic_selector(monkeypatch):
+    from app.llm import client as llm_client
+
+    monkeypatch.setattr(
+        llm_client, "request_structured",
+        lambda *_args, **_kwargs: {
+            "replacement_task_id": "other-10",
+            "slot_to_replace": "replace",
+            "checked_against_active_slots": True,
+        },
+    )
     active = [{
         "slot_id": "keep", "task_id": "old", "concept": "motion", "concept_id": "motion",
         "target": "distance", "task_operation": "calculate", "reasoning_mode": "substitution",
@@ -118,9 +128,9 @@ def test_large_deterministic_replacement_pool_prefers_suitable_unused_candidate(
     )
     elapsed = time.perf_counter() - started
     assert selected is not None
-    assert selected["task_id"].startswith("other-")
-    assert selected["task_id"] not in {"other-0", "other-1", "wrong-type"}
-    assert context["selection_source"] == "deterministic_conflict_ranking"
+    assert selected["task_id"] == "other-10"
+    assert context.get("selection_source") != "deterministic_conflict_ranking"
+    assert context["agent_choice"]["replacement_task_id"] == "other-10"
     assert elapsed < 2
     assert "wrong-type" not in {item.get("task_id") for item in context["candidates"]}
     print("replacement_metrics", {"candidate_count": len(candidates), "seconds": elapsed})
@@ -164,6 +174,47 @@ def test_group_one_reuse_contract_covers_quantitative_and_biology_variations():
     contract = validator._catalog_task_contract(biology_plan)
     assert "food webs" in contract["complexity_boundaries"][0]
     assert contract["allowed_variations"][1]["operation"] == "explain_role"
+
+
+def test_legacy_validator_prefers_current_difficulty_metadata_without_changing_identity():
+    base = {
+        "slot_id": "m1_equation_1", "task_id": "task-linear",
+        "selected_variation_id": "variation-linear",
+        "effective_instance_id": "derived-linear-1",
+        "effective_givens": ["3x + 7 = 22"],
+        "reasoning_requirements": ["Solve the equation."],
+    }
+    designed = {
+        "status": "designed", "adjustment_kind": "numerical",
+        "effective_instance_id": "derived-linear-1",
+    }
+    legacy = {
+        "status": "adapted", "from_difficulty": "easy", "to_difficulty": "medium",
+        "effective_instance_id": "derived-linear-1",
+    }
+
+    current = validator._catalog_task_contract({
+        **base, "difficulty_design": designed, "difficulty_adaptation": legacy,
+    })
+    noop = validator._catalog_task_contract({
+        **base, "effective_instance_id": None, "effective_givens": [],
+        "difficulty_design": {"status": "not_required"},
+        "difficulty_adaptation": None,
+    })
+    legacy_only = validator._catalog_task_contract({
+        **base, "difficulty_adaptation": legacy,
+    })
+    absent = validator._catalog_task_contract({
+        "slot_id": "m1_definition_1", "task_id": "task-definition",
+    })
+
+    assert current["difficulty_adjustment"] == designed
+    assert current["effective_instance_id"] == base["effective_instance_id"]
+    assert current["effective_givens"] == base["effective_givens"]
+    assert noop["difficulty_adjustment"] == {"status": "not_required"}
+    assert noop["effective_instance_id"] is None
+    assert legacy_only["difficulty_adjustment"] == legacy
+    assert "difficulty_adjustment" not in absent
 
 
 def _question(index: int, text: str) -> dict:

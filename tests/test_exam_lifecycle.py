@@ -503,7 +503,7 @@ console.log(warning.textContent);
     assert "Missing: 2." in process.stdout
     assert "Missing: ." not in process.stdout
 @pytest.mark.skipif(NODE is None, reason="node not available")
-def test_complete_saved_exam_displays_persisted_duplicate_warning(tmp_path):
+def test_complete_saved_exam_hides_internal_cross_model_duplicate_warning(tmp_path):
     frontend = Path(__file__).parents[1] / "FrontEnd" / "js"
     module = tmp_path / "exam-lifecycle.mjs"
     module.write_text(
@@ -531,5 +531,74 @@ console.log(JSON.stringify(warning));
     )
     assert process.returncode == 0, process.stderr
     warning = json.loads(process.stdout)
-    assert warning["hidden"] is False
-    assert "2 possible duplicate" in warning["textContent"]
+    assert warning["hidden"] is True
+    assert warning["textContent"] == ""
+
+
+@pytest.mark.skipif(NODE is None, reason="node not available")
+def test_frontend_consumes_concurrent_model_recovery_events(tmp_path):
+    frontend = Path(__file__).parents[1] / "FrontEnd" / "js"
+    module = tmp_path / "exam-lifecycle.mjs"
+    module.write_text(
+        (frontend / "exam-lifecycle.js").read_text(encoding="utf-8")
+        .replace('./i18n.js', './i18n.mjs'), encoding="utf-8",
+    )
+    (tmp_path / "i18n.mjs").write_text(
+        (frontend / "i18n.js").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    script = """
+globalThis.localStorage = {getItem: () => 'en', setItem: () => {}};
+const lifecycle = await import(process.env.MODULE_URL);
+const rows = lifecycle.recoveryProgressRows([
+ {event_type:'model_recovery_progress', payload:{model_number:2, phase:'repairing'}},
+ {event_type:'model_recovery_progress', payload:{model_number:1, phase:'locally_ready'}},
+ {event_type:'model_recovery_progress', payload:{model_number:2, phase:'revalidating'}},
+]);
+console.log(JSON.stringify(rows));
+"""
+    process = subprocess.run(
+        [NODE, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", timeout=30,
+        env={**os.environ, "MODULE_URL": module.resolve().as_uri()},
+    )
+    assert process.returncode == 0, process.stderr
+    assert json.loads(process.stdout) == [
+        {"model": 1, "model_number": 1, "phase": "locally_ready"},
+        {"model": 2, "model_number": 2, "phase": "revalidating"},
+    ]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not available")
+def test_partial_45_of_46_shows_failed_equation_slot_and_reason(tmp_path):
+    frontend = Path(__file__).parents[1] / "FrontEnd" / "js"
+    module = tmp_path / "exam-lifecycle.mjs"
+    module.write_text(
+        (frontend / "exam-lifecycle.js").read_text(encoding="utf-8")
+        .replace('./i18n.js', './i18n.mjs'), encoding="utf-8",
+    )
+    (tmp_path / "i18n.mjs").write_text(
+        (frontend / "i18n.js").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    script = """
+globalThis.localStorage = {getItem: () => 'en', setItem: () => {}};
+const warning = {hidden: true, textContent: '', dir: ''};
+globalThis.document = {getElementById: () => warning};
+const lifecycle = await import(process.env.MODULE_URL);
+lifecycle.renderPartialExamWarning({status:'partial', metadata:{document_language:'en',
+ original_request:{total:46}, quality_summary:{requested:46,generated:46,accepted:45,invalid:1,missing:0},
+ generation_audit:{final_unresolved_slots:[{slot_id:'m1_equation_1',model_number:1,
+ question_type:'equation',failure_reason:'Recovery exhausted without a valid accepted question.'}]}}, warnings:[]});
+console.log(JSON.stringify(warning));
+"""
+    process = subprocess.run(
+        [NODE, "--input-type=module", "-e", script], capture_output=True,
+        text=True, encoding="utf-8", timeout=30,
+        env={**os.environ, "MODULE_URL": module.resolve().as_uri()},
+    )
+    assert process.returncode == 0, process.stderr
+    rendered = json.loads(process.stdout)
+    assert rendered["hidden"] is False
+    assert all(value in rendered["textContent"] for value in (
+        "Exam completed partially", "Requested: 46", "Generated: 46",
+        "Accepted: 45", "Failed: 1", "Model 1", "Equation", "Recovery exhausted",
+    ))
