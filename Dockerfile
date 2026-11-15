@@ -14,6 +14,13 @@ COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir -r requirements.txt
 
+# Keep these ARGs after the dependency layer so changing the source revision
+# does not invalidate cached pip installs.
+ARG GIT_COMMIT=unknown
+ARG SOURCE_FINGERPRINT=unknown
+ENV APP_GIT_COMMIT=$GIT_COMMIT \
+    APP_SOURCE_FINGERPRINT=$SOURCE_FINGERPRINT
+
 COPY . .
 
 RUN addgroup --system --gid 10001 app \
