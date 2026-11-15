@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import Annotated, Literal, Union
+from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, create_model
 
@@ -37,6 +37,31 @@ class StrictOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+RecoveryStrategy = Literal["REPAIR", "REGENERATE", "SWITCH_TASK"]
+
+
+class RecoveryDecision(StrictOutputModel):
+    """One Task Alignment Recovery V3 decision for one failed question."""
+
+    question_id: NonEmptyString
+    decision: RecoveryStrategy
+    reason: str = Field(min_length=1, max_length=2000)
+    fallback_sequence: list[RecoveryStrategy] = Field(max_length=2)
+    switch_preference: str | None = Field(default=None, max_length=500)
+
+
+class RecoveryDecisionResponse(StrictOutputModel):
+    decisions: list[RecoveryDecision] = Field(min_length=1, max_length=3)
+
+
+class TransformationGrant(StrictOutputModel):
+    """One source-grounded cognitive transformation the task may use."""
+
+    transformation: NonEmptyString
+    evidence_chunk_ids: list[NonEmptyString] = Field(min_length=1, max_length=4)
+    support: NonEmptyString
+
+
 class TaskVariation(StrictOutputModel):
     """One exact, source-supported assessment angle for a reusable task."""
 
@@ -44,16 +69,28 @@ class TaskVariation(StrictOutputModel):
 
     target: NonEmptyString
     operation: NonEmptyString
+    concept: NonEmptyString | None = None
+    equation_structure: NonEmptyString | None = None
+    variables: list[NonEmptyString] = Field(default_factory=list, max_length=12)
+    constraints: list[NonEmptyString] = Field(default_factory=list, max_length=12)
     givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
     question_types: list[QuestionType] = Field(default_factory=list)
     evidence_chunk_ids: list[NonEmptyString] | None = Field(default=None, max_length=4)
     reasoning_mode: ReasoningMode | None = None
     student_work_product: NonEmptyString | None = None
+    required_response_components: list[Literal[
+        "selection", "boolean_judgment", "short_text", "written_justification",
+        "worked_solution", "equation", "extended_response",
+    ]] = Field(default_factory=list, max_length=4)
     representation: NonEmptyString | None = Field(default=None, alias="form")
     application: NonEmptyString | None = Field(default=None, alias="context")
     numeric_values_may_change: StrictBool = Field(default=False, alias="vary_numbers")
     variation_group_id: str | None = None
     variation_id: str | None = None
+    # Tri-state: None means the compiler/author did not decide.  A defaulted
+    # False must never be treated as an explicit "no graph needed" statement,
+    # because that masks graph-inspection tasks (see assessment_catalog).
+    requires_supplied_graph: StrictBool | None = None
 
 
 def strict_json_schema(model: type[BaseModel]) -> dict:
@@ -99,11 +136,38 @@ def strict_json_schema(model: type[BaseModel]) -> dict:
     return schema
 
 
+DIFFICULTY_DESIGN_STATUSES = frozenset({
+    "pending", "designed", "not_required", "accepted_source_constraint",
+})
+DifficultyDesignStatus = Literal[
+    "pending", "designed", "not_required", "accepted_source_constraint",
+]
+
+
+class DifficultyDesign(BaseModel):
+    """Current difficulty-design metadata with permissive legacy detail fields."""
+
+    model_config = ConfigDict(extra="allow")
+    status: DifficultyDesignStatus
+    policy_version: str | None = None
+    native_prior: Literal["easy", "medium", "hard"] | None = None
+    requested: Literal["easy", "medium", "hard", "mix"] | None = None
+    reason: str | None = None
+    adjustment_kind: Literal["numerical", "cognitive", "combined"] | None = None
+    effective_instance_id: str | None = None
+    evidence_support: list[NonEmptyString] = Field(default_factory=list)
+    evidence_justification: str | None = None
+    reused: bool | None = None
+
+
 class DifficultyAdaptation(StrictOutputModel):
-    status: Literal["pending", "adapted", "failed", "fallback", "retained"]
+    status: Literal[
+        "pending", "adapting", "adapted", "failed", "fallback", "retained",
+        "accepted_source_constraint", "completed",
+    ]
     from_difficulty: Literal["easy", "medium", "hard"]
     to_difficulty: Literal["easy", "medium", "hard"]
-    base_task_id: str = Field(min_length=1)
+    base_task_id: str | None = Field(default=None, min_length=1)
     strategy: str | None = None
     failed_strategies: list[str] = Field(default_factory=list)
     changed_reasoning_requirements: list[NonEmptyString] = Field(default_factory=list)
@@ -112,6 +176,12 @@ class DifficultyAdaptation(StrictOutputModel):
     base_variation_id: str | None = None
     effective_instance_id: str | None = None
     effective_givens: list[NonEmptyString] = Field(default_factory=list, max_length=12)
+    achieved_difficulty: Literal["easy", "medium", "hard"] | None = None
+    difficulty_floor: Literal["easy", "medium", "hard"] | None = None
+    further_adjustment_possible: bool | None = None
+    policy_version: str | None = None
+    adaptation_fingerprint: str | None = None
+    failure_reason: str | None = None
 
 
 class ReasoningProfile(StrictOutputModel):
@@ -130,6 +200,7 @@ class PlanItem(StrictOutputModel):
     canonical_skill: str = Field(min_length=1, max_length=160)
     knowledge_focus: str = Field(min_length=1, max_length=200)
     student_work_product: str = Field(min_length=1, max_length=160)
+    required_response_components: list[str] = Field(default_factory=list)
     relationship: str | None
     target: str = Field(min_length=1)
     task_operation: str = Field(min_length=1, pattern=r"^[a-z][a-z0-9_]*$")
@@ -145,6 +216,13 @@ class PlanItem(StrictOutputModel):
     complexity_boundaries: list[NonEmptyString] = Field(default_factory=list, max_length=8)
     exact_source_instance: bool = False
     text_answerable: bool
+    requires_supplied_graph: StrictBool | None = None
+    subject: str | None = None
+    allowed_transformations: list[TransformationGrant] = Field(
+        default_factory=list, max_length=8,
+    )
+    difficulty_design: DifficultyDesign | None = None
+    difficulty_observation: dict[str, Any] | None = None
     reasoning_mode: ReasoningMode
     requires_quantitative_validation: StrictBool = False
     difficulty: Literal["easy", "medium", "hard"]
@@ -235,9 +313,7 @@ class TrueFalseQuestion(StrictOutputModel):
     slot_id: str = Field(min_length=1)
     selected_variation_id: str | None = None
     statement: str = Field(min_length=1)
-    # Providers historically emitted string literals. The generation boundary
-    # normalizes either form to the canonical internal boolean.
-    answer: Union[StrictBool, Literal["True", "False"]]
+    answer: StrictBool
     solution_certificate: SolutionCertificate | None = None
 
 
@@ -357,6 +433,10 @@ class ValidationIssue(StrictOutputModel):
     ] | None = None
     missing_information: list[NonEmptyString] = Field(default_factory=list, max_length=20)
     source_evidence_ids: list[NonEmptyString] = Field(default_factory=list, max_length=20)
+    # Grounding failures must name the exact student-visible claim they challenge
+    # so an invented contradiction or ambiguity cannot masquerade as evidence.
+    challenged_claim: str | None = Field(default=None, max_length=1000)
+    defect_scope: Literal["question", "assignment", "uncertain"] | None = None
 
 
 class OriginalIssueCheck(StrictOutputModel):
@@ -376,6 +456,10 @@ class SpecializedValidatorVerdict(StrictOutputModel):
         "SUPPORTED", "CONTRADICTED", "UNSUPPORTED", "INSUFFICIENT_EVIDENCE"
     ] | None = None
     observed_difficulty: Literal["easy", "medium", "hard"] | None = None
+    conceptual_difficulty: Literal["easy", "medium", "hard"] | None = None
+    numerical_difficulty: Literal["easy", "medium", "hard"] | None = None
+    actual_difficulty: Literal["easy", "medium", "hard"] | None = None
+    difficulty_basis: str | None = None
     requested_difficulty: Literal["easy", "medium", "hard"] | None = None
     declared_difficulty: Literal["easy", "medium", "hard"] | None = None
     calculation_evidence: list[str] = Field(default_factory=list, max_length=12)
@@ -392,6 +476,10 @@ class SpecializedValidatorRawVerdict(StrictOutputModel):
         "SUPPORTED", "CONTRADICTED", "UNSUPPORTED", "INSUFFICIENT_EVIDENCE"
     ] | None = None
     observed_difficulty: Literal["easy", "medium", "hard"] | None = None
+    conceptual_difficulty: Literal["easy", "medium", "hard"] | None = None
+    numerical_difficulty: Literal["easy", "medium", "hard"] | None = None
+    actual_difficulty: Literal["easy", "medium", "hard"] | None = None
+    difficulty_basis: str | None = None
     requested_difficulty: Literal["easy", "medium", "hard"] | None = None
     declared_difficulty: Literal["easy", "medium", "hard"] | None = None
     calculation_evidence: list[str] = Field(default_factory=list, max_length=12)
@@ -474,7 +562,7 @@ class RepairMCQQuestion(StrictOutputModel):
 
 class RepairTrueFalseQuestion(StrictOutputModel):
     statement: str = Field(min_length=1)
-    answer: Union[StrictBool, Literal["True", "False"]]
+    answer: StrictBool
     solution_certificate: SolutionCertificate | None = None
 
 

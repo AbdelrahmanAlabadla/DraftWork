@@ -152,15 +152,48 @@ def test_catalog_remap_rejects_ambiguous_or_incomplete_source_manifest():
     }
     current = [{"chunk_id": "new", "fingerprint": "same", "ordinal": 0}]
     assert catalog._remap_catalog_evidence(payload, current) is None
-
     payload["source_chunk_manifest"] = [
         {"chunk_id": "old", "fingerprint": "missing", "ordinal": 0}
     ]
     assert catalog._remap_catalog_evidence(payload, current) is None
 
 
-def test_same_version_compatible_catalog_is_migrated_without_provider_call(
-    monkeypatch, tmp_path,
+def test_source_identity_ignores_uuid_and_retrieval_order_but_not_selection():
+    old_chunks = [
+        {"child_id": "a1", "parent_id": "p1", "section_path": ["Chapter 1"],
+         "page_number": 1, "child_order": 0, "content": "First theorem."},
+        {"child_id": "a2", "parent_id": "p1", "section_path": ["Chapter 1"],
+         "page_number": 1, "child_order": 1, "content": "Second theorem."},
+    ]
+    new_chunks = [
+        {**old_chunks[1], "child_id": "b2", "parent_id": "new-parent"},
+        {**old_chunks[0], "child_id": "b1", "parent_id": "new-parent"},
+    ]
+    old_manifest = catalog._source_chunk_manifest(old_chunks, "pdf-sha256")
+    new_manifest = catalog._source_chunk_manifest(new_chunks, "pdf-sha256")
+    old_membership = sorted(f"chunkfp:{row['fingerprint']}" for row in old_manifest)
+    new_membership = sorted(f"chunkfp:{row['fingerprint']}" for row in new_manifest)
+
+    assert old_membership == new_membership
+    assert catalog.catalog_cache_key("pdf-sha256", old_membership) == catalog.catalog_cache_key(
+        "pdf-sha256", new_membership
+    )
+    assert catalog.compiler_cache_key("pdf-sha256", old_membership) == catalog.compiler_cache_key(
+        "pdf-sha256", new_membership
+    )
+    assert catalog._manifest_id_mapping(old_manifest, new_manifest) == {"a1": "b1", "a2": "b2"}
+    assert catalog.catalog_cache_key("pdf-sha256", old_membership[:1]) != catalog.catalog_cache_key(
+        "pdf-sha256", old_membership
+    )
+
+@pytest.mark.parametrize("source_version", [
+    catalog.config.ASSESSMENT_CATALOG_VERSION,
+    "catalog-v12-grouped-type-variations",
+    "catalog-v13-numerical-givens-contract",
+    "catalog-v13-numerical-givens-contract-live-20261030",
+])
+def test_compatible_historical_catalog_is_migrated_without_provider_call(
+    monkeypatch, tmp_path, source_version,
 ):
     monkeypatch.setattr(catalog.config, "ASSESSMENT_CATALOG_CACHE_DIR", str(tmp_path))
     calls = []
@@ -197,6 +230,8 @@ def test_same_version_compatible_catalog_is_migrated_without_provider_call(
     legacy_path.parent.mkdir(parents=True)
     payload = json.loads(exact_path.read_text(encoding="utf-8"))
     payload["cache_key"] = "f" * 64
+    payload["catalog_version"] = source_version
+    payload.pop("source_document_hash", None)
     legacy_path.write_text(json.dumps(payload), encoding="utf-8")
     exact_path.unlink()
     for compiler_file in (tmp_path / "compiler").rglob("*.json"):
@@ -642,6 +677,53 @@ def test_allocator_never_reuses_one_catalog_task_with_metadata_renaming():
     assert len(chosen) == len(set(chosen)) == 2
 
 
+def test_planner_attaches_two_backups_and_activation_materializes_full_contract():
+    base = {
+        "knowledge_anchor": "solve linear equation", "concept": "linear equation",
+        "relationship": "ax+b=c", "task_operation": "solve_equation",
+        "student_work_product": "solve for x", "target": "value of x",
+        "reasoning_mode": "symbolic_manipulation", "supported_difficulties": ["easy"],
+        "allowed_question_types": ["mcq"], "evidence_chunk_ids": ["c1"],
+        "required_givens": [], "scenario_family": None, "text_answerable": True,
+        "coverage_id": "knowledge_equation", "relationship_id": "rel_equation",
+    }
+    tasks = [
+        {**base, "task_id": f"task_{index}", "knowledge_anchor": f"equation {index}",
+         "concept": f"equation {index}", "target": f"value {index}",
+         "coverage_id": f"knowledge_{index}"}
+        for index in range(3)
+    ]
+    plans, issues = catalog.allocate_catalog_plan(
+        {"tasks": tasks}, [("mcq", 1)], 1, "easy"
+    )
+    assert issues == []
+    item = plans[0]["items"]["mcq"][0]
+    assert item["task_id"] and len(item["backups"]) == 2
+    assert all(backup["variation_id"] for backup in item["backups"])
+    assert {backup["task_id"] for backup in item["backups"]} != {item["task_id"]}
+
+    activated = catalog.activate_backup_assignment(
+        item, {"tasks": tasks}, slot_id=item["slot_id"], difficulty="easy",
+    )
+    assert activated is not None
+    assert activated["task_id"] == item["backups"][0]["task_id"]
+    assert activated["assignment_revision"] == 1
+    assert len(activated["backups"]) == 1
+    assert activated["permitted_variations"]
+    assert activated["effective_givens"] == []
+
+
+def test_generator_format_never_includes_unused_backups():
+    from app.online.prompts import _format_planned_item
+    rendered = _format_planned_item(1, {
+        "slot_id": "m1_mcq_1", "task_id": "task_A", "concept": "linear equation",
+        "target": "value of x", "task_operation": "solve_equation",
+        "backups": [{"task_id": "task_B", "variation_id": "var_B"}],
+    })
+    assert "task_B" not in rendered
+    assert "backups" not in rendered
+
+
 def test_reusable_task_contract_separates_invariants_from_exercise_parameters():
     task = {
         "task_id": "task_systems", "task_family_id": "family_systems",
@@ -766,12 +848,12 @@ def test_catalog_exhaustion_prefers_unused_task_even_when_family_is_used():
     )
 
     assert replacement["task_id"] == "unused"
-    assert replacement["catalog_replacement_stage"] == "unused_task_unused_concept"
+    assert replacement["catalog_replacement_stage"] == "shared_rank_unused_task"
     assert replacement.get("reused_due_to_catalog_exhaustion") is not True
-    assert "s_occupied" in replacement["forced_duplicate_slot_ids"]
+    assert "s_occupied" not in replacement["forced_duplicate_slot_ids"]
 
 
-def test_duplicate_replacement_prefers_unused_concept_before_used_concept():
+def test_duplicate_replacement_ignores_concept_score_and_uses_deterministic_id_tie_break():
     current = _equation_task("current", "family_current", "coverage_current")
     current["concept_id"] = "concept_current"
     occupied = _equation_task("occupied", "family_occupied", "coverage_occupied")
@@ -795,10 +877,10 @@ def test_duplicate_replacement_prefers_unused_concept_before_used_concept():
     )
 
     assert replacement["task_id"] == "unused_concept"
-    assert replacement["catalog_replacement_stage"] == "unused_task_unused_concept"
+    assert replacement["catalog_replacement_stage"] == "shared_rank_unused_task"
 
 
-def test_duplicate_replacement_ranks_unused_tasks_by_active_exam_breadth():
+def test_duplicate_replacement_uses_task_id_tie_break_not_breadth():
     current = _equation_task("current", "family_current", "coverage_current")
     repeated = _equation_task("a_repeated", "family_repeated", "coverage_shared")
     broader = _equation_task("z_broader", "family_broader", "coverage_shared")
@@ -836,7 +918,7 @@ def test_duplicate_replacement_ranks_unused_tasks_by_active_exam_breadth():
         active_slot_ids={"s_replace", "s_active"},
     )
 
-    assert replacement["task_id"] == "z_broader"
+    assert replacement["task_id"] == "a_repeated"
     assert replacement["task_reused"] is False
 
 
@@ -854,18 +936,16 @@ def test_duplicate_replacement_uses_other_used_task_before_original_task():
         forced_duplicate_question_ids=["q_conflict"],
     )
 
-    assert replacement["catalog_replacement_stage"] == "reused_task_after_catalog_exhaustion"
+    assert replacement["catalog_replacement_stage"] == "shared_rank_least_used_task"
     assert replacement["reused_due_to_catalog_exhaustion"] is True
-    assert replacement["task_id"] == "task_b"
+    assert replacement["task_id"] == "task_a"
     assert replacement["reuse_reason"] == "no_unused_compatible_task"
-    assert replacement["forced_duplicate_slot_ids"] == ["s_existing", "s_conflict"]
+    assert replacement["forced_duplicate_slot_ids"] == ["s_conflict"]
     assert replacement["forced_duplicate_question_ids"] == ["q_conflict"]
-    assert "different numerical instance is allowed" in replacement["reuse_rule"]
-    assert "Wording alone never qualifies" in replacement["reuse_rule"]
     inventory = replacement["task_inventory"]
     assert inventory["all_unused_compatible_count"] == 1
     assert inventory["eligible_unused_after_exclusions_count"] == 1
-    assert inventory["remaining_unused_compatible_count"] == 1
+    assert inventory["remaining_unused_compatible_count"] == 0
 
 
 def test_catalog_task_remains_reusable_after_three_prior_uses():
@@ -883,14 +963,14 @@ def test_catalog_task_remains_reusable_after_three_prior_uses():
         {"tasks": [current, reusable]}, plans, "s_replace", "equation", "medium",
     )
 
-    assert replacement["task_id"] == "reusable"
+    assert replacement["task_id"] == "current"
     assert replacement["task_reused"] is True
-    assert replacement["task_usage_count"] == 3
+    assert replacement["task_usage_count"] == 1
     assert replacement["reuse_mode"] == "intentional_practice_variation"
     assert replacement["source_evidence_ids"]
 
 
-def test_duplicate_replacement_ranks_used_tasks_by_active_exam_coverage():
+def test_duplicate_replacement_ranks_used_tasks_only_by_usage_then_id():
     current = _equation_task("current", "family_current", "coverage_current")
     crowded = _equation_task("a_crowded", "family_crowded", "coverage_crowded")
     sparse = _equation_task("z_sparse", "family_sparse", "coverage_sparse")
@@ -916,8 +996,8 @@ def test_duplicate_replacement_ranks_used_tasks_by_active_exam_coverage():
         active_slot_ids={"m1_replace", "m1_crowded", "m1_sparse", "m1_active_overlap"},
     )
 
-    assert replacement["task_id"] == "z_sparse"
-    assert replacement["catalog_replacement_stage"] == "reused_task_after_catalog_exhaustion"
+    assert replacement["task_id"] == "a_crowded"
+    assert replacement["catalog_replacement_stage"] == "shared_rank_least_used_task"
     inventory = replacement["task_inventory"]
     assert inventory["compatible_used_task_ids"] == ["a_crowded", "z_sparse"]
     assert inventory["compatible_unused_task_ids"] == ["current"]
@@ -940,13 +1020,11 @@ def test_duplicate_replacement_uses_original_task_only_after_alternatives_exclud
     )
 
     assert replacement["task_id"] == "current"
-    assert replacement["catalog_replacement_stage"] == "regenerated_original_task_after_duplicate"
-    assert replacement["reused_due_to_catalog_exhaustion"] is False
-    assert replacement["forced_duplicate_slot_ids"] == ["s_conflict"]
-    assert replacement["forced_duplicate_question_ids"] == ["q_conflict"]
+    assert replacement["catalog_replacement_stage"] == "shared_rank_least_used_task"
+    assert replacement["task_reused"] is True
 
 
-def test_duplicate_replacement_uses_operation_target_family_and_reasoning_breadth():
+def test_duplicate_replacement_does_not_rank_operation_target_or_reasoning_breadth():
     current = _equation_task("current", "family_current", "coverage_current")
     repeated = _equation_task("a_repeated", "family_repeated", "coverage_shared")
     broader = _equation_task("z_broader", "family_broader", "coverage_shared")
@@ -976,7 +1054,7 @@ def test_duplicate_replacement_uses_operation_target_family_and_reasoning_breadt
         active_slot_ids={"s_replace", "s_repeated", "s_broader", "s_overlap"},
     )
 
-    assert replacement["task_id"] == "z_broader"
+    assert replacement["task_id"] == "a_repeated"
 
 
 def test_explicitly_excluded_original_task_falls_back_to_other_used_task():
@@ -992,7 +1070,7 @@ def test_explicitly_excluded_original_task_falls_back_to_other_used_task():
         excluded_task_ids={"task_a"},
     )
 
-    assert replacement["catalog_replacement_stage"] == "reused_task_after_catalog_exhaustion"
+    assert replacement["catalog_replacement_stage"] == "shared_rank_least_used_task"
     assert replacement["task_id"] == "task_b"
     inventory = replacement["task_inventory"]
     assert inventory["all_unused_compatible_count"] == 1
@@ -1277,35 +1355,18 @@ def test_profile_uses_effective_type_specific_variation_operation():
     assert "model_linear_balance" not in profile["word_problem"]["task_operations"]
 
 
-def test_planner_score_curves_and_conservative_normalization():
-    variation = {
-        "target": "Solve linear equations", "application": None,
-        "variation_group_id": "group-1",
-    }
-    task = {"native_difficulty": "medium", "scenario_family": None}
-    expected_task = [30, 20, 12, 6, 0]
-    expected_variation = [20, 12, 5, 0, 0]
-    for uses in range(5):
-        scored = catalog.score_task_variation_candidate(
-            task, variation, requested_difficulty="medium",
-            task_uses=uses, variation_group_uses=uses,
-        )
-        assert scored["components"]["task_reuse"] == expected_task[uses]
-        assert scored["components"]["variation_reuse"] == expected_variation[uses]
-    assert catalog.score_task_variation_candidate(
-        {**task, "native_difficulty": "easy"}, variation,
-        requested_difficulty="medium",
-    )["components"]["difficulty"] == 8
-    assert catalog.score_task_variation_candidate(
-        {**task, "native_difficulty": "hard"}, variation,
-        requested_difficulty="easy",
-    )["components"]["difficulty"] == 2
-    assert catalog.score_task_variation_candidate(
-        task, {"target": None, "application": None}, requested_difficulty="mix",
-    )["components"] == {
-        "task_reuse": 30, "difficulty": 0, "scenario_diversity": 10,
-        "target_diversity": 7, "variation_reuse": 20,
-    }
+def test_shared_rank_uses_usage_before_difficulty_and_ids_only_for_ties():
+    variation_a = {"variation_id": "v-a", "question_types": ["equation"]}
+    variation_b = {"variation_id": "v-b", "question_types": ["equation"]}
+    easy_used = ({"task_id": "task-a"}, "easy", variation_a)
+    medium_unused = ({"task_id": "task-b"}, "medium", variation_b)
+    ranked = catalog.rank_task_variation_candidates(
+        [easy_used, medium_unused], question_type="equation",
+        requested_difficulty="easy", task_usage={"task-a": 1, "task-b": 0},
+    )
+    assert ranked == [medium_unused, easy_used]
+    assert catalog._difficulty_distance("easy", "medium") == 1
+    assert catalog._difficulty_distance("easy", "hard") == 2
     assert (
         catalog.normalize_planner_diversity_text("Solve linear equations")
         == catalog.normalize_planner_diversity_text("Solving linear equations")
@@ -1325,3 +1386,32 @@ def test_variation_scoping_is_idempotent_for_reuse_counting():
     assert [value["variation_group_id"] for value in first] == [
         value["variation_group_id"] for value in second
     ]
+def test_structured_true_false_response_form_rejects_written_justification():
+    incompatible = {
+        "variation_id": "v-justify", "question_types": ["true_false"],
+        "operation": "judge_and_justify", "target": "claim",
+        "student_work_product": "judgment with explanation",
+        "reasoning_mode": "logical_proof_reasoning", "givens": [],
+        "evidence_chunk_ids": ["c1"], "numeric_values_may_change": False,
+        "required_response_components": ["boolean_judgment", "written_justification"],
+    }
+    compatible = {
+        **incompatible, "variation_id": "v-judge", "operation": "judge",
+        "required_response_components": ["boolean_judgment"],
+    }
+    assert catalog.variation_response_form_compatible(
+        incompatible, "true_false"
+    ) is False
+    assert catalog.variation_response_form_compatible(
+        compatible, "true_false"
+    ) is True
+    task = {
+        "task_id": "t1", "text_answerable": True,
+        "task_operation": "judge", "target": "claim",
+        "student_work_product": "judgment", "reasoning_mode": "logical_proof_reasoning",
+        "evidence_chunk_ids": ["c1"], "allowed_question_types": ["true_false"],
+        "permitted_variations": [incompatible, compatible],
+    }
+    assert [value["variation_id"] for value in catalog.eligible_task_variation_candidates(
+        task, "true_false", variations=[incompatible, compatible],
+    )] == ["v-judge"]

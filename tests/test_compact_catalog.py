@@ -58,10 +58,12 @@ def _finalize(tasks: list[dict]) -> dict:
         key="catalog", processed_document_key="processed", selected_chunk_ids=["c1"], usage=None)
 
 
-def test_final_task_schema_has_exact_18_semantic_fields():
+def test_final_task_schema_has_blueprint_semantic_fields():
     fields = set(catalog.CatalogTaskDraft.model_fields)
-    assert len(fields) == 18
-    assert {"text_answerable", "native_difficulty", "allowed_variations"} <= fields
+    assert len(fields) == 22
+    assert {"equation_structure", "variable_parameters", "validity_constraints"} <= fields
+    assert {"text_answerable", "native_difficulty", "allowed_variations",
+            "allowed_transformations"} <= fields
     assert not {"topic", "reasoning_depth", "reasoning_requirements"} & fields
 
 
@@ -109,22 +111,28 @@ def test_variation_requires_target_operation_and_valid_boolean():
                 _compact_task(allowed_variations=[invalid]))
 
 
-def test_finalize_emits_18_field_contract_plus_derived_identity_and_support():
+def test_finalize_emits_contract_plus_derived_identity_and_support():
     task = _finalize([_compact_task()])["tasks"][0]
     assert task["text_answerable"] is True
     assert task["allowed_variations"][0]["target"] == "value of x"
     assert task["allowed_variations"][0]["variation_group_id"].startswith("variation_group_")
     assert task["allowed_variations"][0]["variation_id"].startswith("variation_")
-    assert task["supported_difficulties"] == ["medium"]
+    assert task["supported_difficulties"] == []
     assert not {"topic", "reasoning_depth", "reasoning_requirements"} & task.keys()
     assert all(task.get(field) for field in
                ("task_id", "task_family_id", "coverage_id", "concept_id", "relationship_id"))
 
 
-def test_exact_source_instance_cannot_authorize_variable_instances():
+def test_exact_source_instance_disables_numeric_variation_but_keeps_authorized_angles():
     task = _finalize([_compact_task(exact_source_instance=True)])["tasks"][0]
     assert task["exact_source_instance"] is True
-    assert task["allowed_variations"] == []
+    # Group 1: exactness constrains VALUES, not the set of angles.  Alternative
+    # (non-numeric) angles stay authorized; numeric variation is disabled.
+    assert task["allowed_variations"]
+    assert all(
+        value["numeric_values_may_change"] is False
+        for value in task["allowed_variations"]
+    )
 
 
 def test_compact_task_flows_through_planner_with_derived_plan_reasoning():
@@ -170,6 +178,79 @@ def test_profile_is_only_required_by_first_batch():
     first = catalog.CompactCatalogBatchWithProfileResponse.model_fields
     later = catalog.CompactCatalogBatchResponse.model_fields
     assert "assessment_profile" in first and "assessment_profile" not in later
+
+
+def test_compact_contract_preserves_cross_subject_and_mixed_language_values():
+    physics = _compact_task(
+        concept="Work-energy theorem", relationship="W = ½mv_f² − ½mv_i²",
+        allowed_question_types=["equation"],
+        allowed_variations=[{
+            "type": "equation", "op": "derive_work_energy_relation",
+            "target": "Derive W = ΔK", "response": ["worked_solution"],
+            "givens": ["a = F/m", "v_f² = v_i² + 2ad"],
+        }],
+    )
+    chemistry = _compact_task(
+        concept="Balancing reactions", relationship="2H₂ + O₂ → 2H₂O",
+        allowed_question_types=["equation"],
+        allowed_variations=[{
+            "type": "equation", "op": "balance_reaction",
+            "target": "Conserve atom counts", "response": ["worked_solution"],
+        }],
+    )
+    arabic = _compact_task(
+        concept="السرعة الثابتة", target="المسافة",
+        allowed_variations=[{
+            "type": "mcq", "op": "calculate_distance",
+            "target": "المسافة المقطوعة", "response": ["selection"],
+            "givens": ["v = 12 m/s", "t = 4 s"],
+        }],
+    )
+    for raw, expected in (
+        (physics, "W = ½mv_f² − ½mv_i²"),
+        (chemistry, "2H₂ + O₂ → 2H₂O"),
+        (arabic, "السرعة الثابتة"),
+    ):
+        normalized = catalog.CompactCatalogTask.model_validate(raw).model_dump()
+        expanded = catalog._expand_compact_task(normalized)
+        assert expected in json.dumps(expanded, ensure_ascii=False)
+
+
+def test_true_false_with_written_justification_is_not_eligible():
+    task = _compact_task(
+        allowed_question_types=["true_false"],
+        allowed_variations=[{
+            "type": "true_false", "op": "evaluate_claim",
+            "target": "Judge the claim", "response": ["boolean_judgment"],
+        }],
+    )
+    finalized = _finalize([task])["tasks"][0]
+    assert finalized["allowed_question_types"] == ["true_false"]
+    incompatible = _finalize([{
+        **task,
+        "allowed_variations": [{
+            "type": "true_false", "op": "evaluate_claim",
+            "target": "Judge and explain", "response": [
+                "boolean_judgment", "written_justification",
+            ],
+        }],
+    }])
+    assert incompatible["tasks"] == []
+
+
+def test_why_combined_short_text_and_justification_is_compatible():
+    task = _compact_task(
+        allowed_question_types=["why"],
+        allowed_variations=[{
+            "type": "why", "op": "explain_reason",
+            "target": "Explain the observed relationship", "response": [
+                "short_text", "written_justification",
+            ],
+        }],
+    )
+    finalized = _finalize([task])["tasks"][0]
+    assert finalized["allowed_question_types"] == ["why"]
+    assert finalized["allowed_variations"]
 
 
 def test_compact_alias_serialization_is_smaller_than_internal_names():
