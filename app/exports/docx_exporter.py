@@ -1,192 +1,397 @@
-"""Compact DOCX export matching the print-ready PDF exam structure."""
+"""Editable, black-and-white DOCX export from the shared exam IR.
+
+The document uses native Word tables for every content table, native paragraphs
+and runs for prose, and explicit RTL/bidi properties.  Inline math is kept as
+editable Unicode text; complex display math is embedded as a high-resolution
+image with alt text.  No raw LaTeX or Markdown is written into the document.
+"""
 from __future__ import annotations
 
-import base64
-import binascii
 import io
 import re
 from typing import Any
 
 from docx import Document
-from docx.enum.section import WD_SECTION
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Inches, Mm, Pt, RGBColor
+from docx.shared import Mm, Pt, RGBColor
 
-from app.exports.common import (
-    ANSWER_LABELS_BY_LANG,
-    HEADER_LABELS_BY_LANG,
-    RESPONSE_LINE_TEXT,
-    TRUE_FALSE_CHOICES_BY_LANG,
-    expand_fill_blank_text,
-    exam_document_language,
-    group_exam_sections,
-    is_complete_equation_prompt,
-    split_equation_content,
-    response_line_count,
-)
-from app.language import detect_language
+from app.exports.document_ir import build_document_ir
 from app.exports.math_renderer import latex_to_plain_text, render_math
 
-PAGE_MARGIN_IN = 0.5
-CONTENT_WIDTH_IN = 7.27  # A4 width (8.27in) minus two 0.5in margins
+BLACK = RGBColor(0, 0, 0)
 FONT_NAME = "Arial"
-ARABIC_FONT_NAME = "Tajawal"
-INK = RGBColor(31, 41, 55)
-MUTED = RGBColor(100, 116, 139)
-SECTION_FILL = "E8EEF5"
-RULE = "B4BECA"
+BODY_SIZE = 10.5
+SMALL_SIZE = 8.2
+PAGE_MARGIN_MM = 15.0
+CONTENT_WIDTH_MM = 180.0
+CONTENT_WIDTH_IN = CONTENT_WIDTH_MM / 25.4
+_ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
+_NUMERAL_TRANS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
 
 
-def _labels(language: str) -> dict[str, str]:
-    return HEADER_LABELS_BY_LANG.get(language, HEADER_LABELS_BY_LANG["en"])
+def _answer_text(item: dict[str, Any], language: str) -> str:
+    """Compatibility helper used by export contract tests and extensions."""
+    if item.get("qtype") == "true_false" or "answer" in item:
+        answer = item.get("answer")
+        if answer is True:
+            return "صح" if language == "ar" else "True"
+        if answer is False:
+            return "غلط" if language == "ar" else "False"
+    return str(item.get("correct_answer") or item.get("final_answer") or "")
 
 
-def _set_paragraph_rtl(paragraph) -> None:
-    """Mark a paragraph as bidi so Word lays it out right-to-left."""
-    p_pr = paragraph._p.get_or_add_pPr()
-    if p_pr.find(qn("w:bidi")) is None:
-        p_pr.append(OxmlElement("w:bidi"))
+def _rtl(value: object) -> bool:
+    return bool(_ARABIC_RE.search(str(value or "")))
 
 
-def _set_marker_ltr(paragraph, run) -> None:
-    """Keep a Latin option marker as ``A.`` inside an Arabic document."""
-    p_pr = paragraph._p.get_or_add_pPr()
-    bidi = p_pr.find(qn("w:bidi"))
-    if bidi is None:
-        bidi = OxmlElement("w:bidi")
-        p_pr.append(bidi)
-    bidi.set(qn("w:val"), "0")
-    r_pr = run._element.get_or_add_rPr()
-    rtl = r_pr.find(qn("w:rtl"))
-    if rtl is None:
-        rtl = OxmlElement("w:rtl")
-        r_pr.append(rtl)
-    rtl.set(qn("w:val"), "0")
-    lang = r_pr.find(qn("w:lang"))
-    if lang is None:
-        lang = OxmlElement("w:lang")
-        r_pr.append(lang)
-    lang.set(qn("w:val"), "en-US")
+def _clean(value: object) -> str:
+    return re.sub(r"[ \t]+", " ", str(value or "")).strip()
 
 
-_SCRIPT_LETTER_RE = re.compile(r"[A-Za-z\u00c0-\u024f\u0600-\u06ff]")
+def _run_text(runs: list[dict[str, Any]]) -> str:
+    return " ".join(
+        str(run.get("text") or run.get("plain") or "").translate(_NUMERAL_TRANS)
+        for run in runs
+    ).strip()
 
 
-def _set_content_direction(paragraph, text: object, fallback_rtl: bool) -> bool:
-    """Apply paragraph bidi/alignment from its text, with exam language fallback."""
-    value = str(text or "")
-    rtl = detect_language(value) == "ar" if _SCRIPT_LETTER_RE.search(value) else fallback_rtl
-    if rtl:
-        _set_paragraph_rtl(paragraph)
-        # In a bidi Word paragraph, LEFT is the logical start edge, which is
-        # rendered on the physical right. RIGHT would mirror to the left.
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    else:
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    return rtl
-
-
-def _clean(value: object, fallback: str = "") -> str:
-    text = str(value or "").strip()
-    return text or fallback
-
-
-def _image_stream(data_url: object) -> io.BytesIO | None:
-    if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
-        return None
-    try:
-        _, encoded = data_url.split(",", 1)
-        raw = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error):
-        return None
-    if not raw or len(raw) > 2_500_000:
-        return None
-    return io.BytesIO(raw)
-
-
-def _set_run_font(
-    run,
-    *,
-    size: float = 10.5,
-    bold: bool | None = None,
-    italic: bool | None = None,
-    color: RGBColor = INK,
-) -> None:
-    run_is_arabic = detect_language(run.text or "") == "ar"
-    font_name = ARABIC_FONT_NAME if run_is_arabic else FONT_NAME
-    run.font.name = font_name
+def _set_run_font(run, *, size: float = BODY_SIZE, bold: bool = False,
+                  color: RGBColor = BLACK, rtl: bool | None = None) -> None:
+    run.font.name = FONT_NAME
+    run.font.size = Pt(size)
+    run.font.bold = bold
+    run.font.color.rgb = color
     r_pr = run._element.get_or_add_rPr()
     r_fonts = r_pr.rFonts
-    r_fonts.set(qn("w:ascii"), font_name)
-    r_fonts.set(qn("w:hAnsi"), font_name)
-    # Complex-script font so Arabic glyphs use the same face and size.
-    r_fonts.set(qn("w:cs"), font_name)
-    cs_size = r_pr.find(qn("w:szCs"))
-    if cs_size is None:
-        cs_size = OxmlElement("w:szCs")
-        r_pr.append(cs_size)
-    cs_size.set(qn("w:val"), str(int(size * 2)))
-    run.font.size = Pt(size)
-    run.font.color.rgb = color
-    if run_is_arabic:
-        if r_pr.find(qn("w:rtl")) is None:
-            r_pr.append(OxmlElement("w:rtl"))
-        lang = r_pr.find(qn("w:lang"))
-        if lang is None:
-            lang = OxmlElement("w:lang")
-            r_pr.append(lang)
-        lang.set(qn("w:bidi"), "ar-SA")
-    if bold is not None:
-        run.bold = bold
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        r_fonts.set(qn(attr), FONT_NAME)
+    if r_pr.find(qn("w:szCs")) is None:
+        sz_cs = OxmlElement("w:szCs")
+        r_pr.append(sz_cs)
+    r_pr.find(qn("w:szCs")).set(qn("w:val"), str(int(size * 2)))
+    if bold:
         b_cs = OxmlElement("w:bCs")
         r_pr.append(b_cs)
-    if italic is not None:
-        run.italic = italic
+    if rtl is True:
+        if r_pr.find(qn("w:rtl")) is None:
+            r_pr.append(OxmlElement("w:rtl"))
+        if r_pr.find(qn("w:lang")) is None:
+            r_pr.append(OxmlElement("w:lang"))
+        r_pr.find(qn("w:lang")).set(qn("w:bidi"), "ar-SA")
+    elif rtl is False:
+        if r_pr.find(qn("w:rtl")) is None:
+            rtl_node = OxmlElement("w:rtl")
+            rtl_node.set(qn("w:val"), "0")
+            r_pr.append(rtl_node)
+        if r_pr.find(qn("w:lang")) is None:
+            r_pr.append(OxmlElement("w:lang"))
+        r_pr.find(qn("w:lang")).set(qn("w:val"), "en-US")
 
 
-def _shade_paragraph(paragraph, fill: str) -> None:
-    p_pr = paragraph._p.get_or_add_pPr()
-    shading = p_pr.find(qn("w:shd"))
-    if shading is None:
-        shading = OxmlElement("w:shd")
-        p_pr.append(shading)
-    shading.set(qn("w:fill"), fill)
+def _set_paragraph_bidi(p, rtl: bool) -> None:
+    p_pr = p._p.get_or_add_pPr()
+    if rtl:
+        if p_pr.find(qn("w:bidi")) is None:
+            p_pr.append(OxmlElement("w:bidi"))
+        # In a bidi paragraph Word mirrors physical left/right alignment.  The
+        # OOXML logical `start` value is the stable right reading edge in both
+        # Word and LibreOffice; w:jc="right" is physically rendered at the left
+        # edge by Word when w:bidi is present.
+        jc = p_pr.find(qn("w:jc"))
+        if jc is None:
+            jc = OxmlElement("w:jc")
+            p_pr.append(jc)
+        jc.set(qn("w:val"), "start")
+    else:
+        bidi = p_pr.find(qn("w:bidi"))
+        if bidi is not None:
+            bidi.set(qn("w:val"), "0")
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
-def _paragraph_bottom_border(paragraph, color: str = RULE, size: str = "6") -> None:
-    p_pr = paragraph._p.get_or_add_pPr()
-    borders = p_pr.find(qn("w:pBdr"))
+def _keep_with_next(p) -> None:
+    p.paragraph_format.keep_with_next = True
+
+
+def _add_run(p, text: str, *, size: float = BODY_SIZE, bold: bool = False,
+             rtl: bool | None = None, color: RGBColor = BLACK):
+    run = p.add_run(text)
+    _set_run_font(run, size=size, bold=bold, color=color, rtl=rtl)
+    return run
+
+
+def _add_math_image(p, latex: str, *, width_in: float = 5.0) -> bool:
+    rendered = render_math(latex, font_size=13, dpi=300)
+    if not rendered:
+        return False
+    stream = io.BytesIO(rendered.png)
+    stream.name = "display-math.png"
+    natural_w = min(width_in, max(1.0, rendered.width_px / 300 * 25.4 / 25.4))
+    run = p.add_run()
+    run.add_picture(stream, width=Mm(natural_w * 25.4))
+    # Alt text is useful to screen readers and to users who inspect the doc.
+    try:
+        inline = run._r.find(qn("w:drawing")).find(qn("wp:inline"))
+        doc_pr = inline.find(qn("wp:docPr"))
+        # Alt text must remain readable and must not expose raw TeX commands.
+        doc_pr.set("descr", (latex_to_plain_text(latex) or "Mathematical equation")[:500])
+        doc_pr.set("title", "Equation")
+    except Exception:
+        pass
+    return True
+
+
+def _add_inline_math_image(p, latex: str) -> bool:
+    """Insert complex inline math at its natural size and baseline context."""
+    rendered = render_math(latex, font_size=12, dpi=300)
+    if not rendered:
+        return False
+    stream = io.BytesIO(rendered.png)
+    stream.name = "inline-math.png"
+    natural_in = max(0.18, min(2.2, rendered.width_px / 300))
+    run = p.add_run()
+    run.add_picture(stream, width=Mm(natural_in * 25.4))
+    try:
+        inline = run._r.find(qn("w:drawing")).find(qn("wp:inline"))
+        doc_pr = inline.find(qn("wp:docPr"))
+        doc_pr.set("descr", (latex_to_plain_text(latex) or "Mathematical expression")[:500])
+        doc_pr.set("title", "Inline equation")
+    except Exception:
+        pass
+    return True
+
+
+def _add_native_math(p, latex: str) -> bool:
+    """Add editable native Word math for expressions that have a safe linear form.
+
+    Complex TeX remains an image fallback because pretending to convert syntax
+    that we do not fully understand is more damaging than a faithful image.
+    """
+    if not latex or any(token in latex for token in (r"\begin", r"\matrix", r"\cases")):
+        return False
+    plain = latex_to_plain_text(latex).strip()
+    if not plain or "\\" in plain or len(plain) > 240:
+        return False
+    math = OxmlElement("m:oMath")
+    run = OxmlElement("m:r")
+    text = OxmlElement("m:t")
+    text.text = plain.translate(_NUMERAL_TRANS)
+    run.append(text)
+    math.append(run)
+    p._p.append(math)
+    return True
+
+
+def _add_display_math(p, latex: str, *, width_in: float = 5.0) -> bool:
+    # Word's linear OMML import is not interoperable enough for the complex
+    # expressions in these exams (Word can stall while repaginating them).
+    # Preserve the faithful, labelled image fallback until a full TeX-to-OMML
+    # converter is available.
+    return _add_math_image(p, latex, width_in=width_in)
+
+
+def _add_runs(p, runs: list[dict[str, Any]], *, size: float = BODY_SIZE,
+              bold: bool = False, rtl: bool | None = None) -> None:
+    for run in runs:
+        if run.get("type") == "text":
+            value = str(run.get("text") or "").translate(_NUMERAL_TRANS)
+            if value:
+                _add_run(p, value, size=size, bold=bold,
+                         rtl=_rtl(value))
+        elif run.get("type") == "math":
+            if run.get("display"):
+                continue
+            latex = str(run.get("latex") or "")
+            if "\\" in latex and _add_inline_math_image(p, latex):
+                continue
+            plain = str(run.get("plain") or run.get("latex") or "")
+            if not plain or "\\" in plain:
+                plain = re.sub(r"\\[A-Za-z]+", " ", plain).replace("{", "").replace("}", "")
+            plain = plain.translate(_NUMERAL_TRANS)
+            if plain.strip():
+                _add_run(p, plain, size=size, bold=bold, rtl=False)
+
+
+def _add_blocks(doc_or_cell, blocks: list[dict[str, Any]], *, rtl: bool,
+                size: float = BODY_SIZE, bold: bool = False,
+                keep: bool = False) -> None:
+    for block in blocks:
+        kind = block.get("type")
+        if kind == "paragraph":
+            p = doc_or_cell.add_paragraph()
+            _set_paragraph_bidi(p, rtl)
+            p.paragraph_format.space_after = Pt(2)
+            if keep:
+                _keep_with_next(p)
+            _add_runs(p, block.get("runs") or [], size=size, bold=bold, rtl=rtl)
+        elif kind == "math" and block.get("display"):
+            p = doc_or_cell.add_paragraph()
+            _set_paragraph_bidi(p, rtl)
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            p.paragraph_format.space_before = Pt(2)
+            p.paragraph_format.space_after = Pt(2)
+            latex = str(block.get("latex") or "")
+            if not _add_display_math(p, latex, width_in=5.6):
+                _add_run(p, str(block.get("plain") or latex),
+                         size=size, rtl=False)
+        elif kind == "table":
+            _add_table(doc_or_cell, block, rtl=rtl, width_mm=CONTENT_WIDTH_MM)
+        elif kind == "response_area":
+            _add_response_lines(doc_or_cell, int(block.get("lines") or 0), rtl=rtl)
+
+
+def _add_response_lines(container, count: int, *, rtl: bool) -> None:
+    for _ in range(count):
+        p = container.add_paragraph()
+        _set_paragraph_bidi(p, rtl)
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.line_spacing = 1.25
+        _add_run(p, "_" * 92, size=9, rtl=rtl)
+        p.paragraph_format.keep_together = True
+
+
+def _normalize_tbl_pr(table) -> None:
+    """Put OOXML table-property children in schema order.
+
+    Word and LibreOffice can ignore otherwise-valid border properties when
+    they appear after layout/look elements.
+    """
+    order = [
+        "tblStyle", "tblpPr", "tblOverlap", "bidiVisual",
+        "tblStyleRowBandSize", "tblStyleColBandSize", "tblW", "jc",
+        "tblCellSpacing", "tblInd", "tblBorders", "shd", "tblLayout",
+        "tblCellMar", "tblLook", "tblCaption", "tblDescription",
+    ]
+    tbl_pr = table._tbl.tblPr
+    children = list(tbl_pr)
+    by_name = {}
+    for child in children:
+        tag = child.tag.split("}")[-1]
+        by_name.setdefault(tag, []).append(child)
+    for child in children:
+        tbl_pr.remove(child)
+    for name in order:
+        for child in by_name.pop(name, []):
+            tbl_pr.append(child)
+    for remaining in by_name.values():
+        for child in remaining:
+            tbl_pr.append(child)
+
+
+def _normalize_tc_pr(cell) -> None:
+    order = ["tcW", "gridSpan", "hMerge", "vMerge", "tcBorders", "shd",
+             "noWrap", "tcMar", "textDirection", "tcFitText", "vAlign",
+             "hideMark"]
+    tc_pr = cell._tc.get_or_add_tcPr()
+    children = list(tc_pr)
+    by_name = {}
+    for child in children:
+        tag = child.tag.split("}")[-1]
+        by_name.setdefault(tag, []).append(child)
+    for child in children:
+        tc_pr.remove(child)
+    for name in order:
+        for child in by_name.pop(name, []):
+            tc_pr.append(child)
+    for remaining in by_name.values():
+        for child in remaining:
+            tc_pr.append(child)
+
+
+def _set_table_borders(table, *, size: int = 4) -> None:
+    tbl_pr = table._tbl.tblPr
+    borders = tbl_pr.find(qn("w:tblBorders"))
     if borders is None:
-        borders = OxmlElement("w:pBdr")
-        p_pr.append(borders)
-    bottom = borders.find(qn("w:bottom"))
-    if bottom is None:
-        bottom = OxmlElement("w:bottom")
-        borders.append(bottom)
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), size)
-    bottom.set(qn("w:space"), "1")
-    bottom.set(qn("w:color"), color)
+        borders = OxmlElement("w:tblBorders")
+        tbl_pr.append(borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        node = borders.find(qn(f"w:{edge}"))
+        if node is None:
+            node = OxmlElement(f"w:{edge}")
+            borders.append(node)
+        node.set(qn("w:val"), "single")
+        node.set(qn("w:sz"), str(size))
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), "000000")
+    _normalize_tbl_pr(table)
 
 
-def _set_cell_width(cell, width_in: float) -> None:
-    width_dxa = str(round(width_in * 1440))
+def _remove_table_borders(table) -> None:
+    tbl_pr = table._tbl.tblPr
+    style = tbl_pr.find(qn("w:tblStyle"))
+    if style is not None:
+        tbl_pr.remove(style)
+    look = tbl_pr.find(qn("w:tblLook"))
+    if look is not None:
+        tbl_pr.remove(look)
+    borders = tbl_pr.find(qn("w:tblBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        tbl_pr.append(borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        node = borders.find(qn(f"w:{edge}"))
+        if node is None:
+            node = OxmlElement(f"w:{edge}")
+            borders.append(node)
+        node.set(qn("w:val"), "single")
+        node.set(qn("w:sz"), "8")
+        node.set(qn("w:space"), "0")
+        node.set(qn("w:color"), "FFFFFF")
+    # LibreOffice sometimes ignores val="nil" and paints default grid lines.
+    # White borders are visually borderless on the white exam page and keep the
+    # layout table structural only.
+    for row in table.rows:
+        for cell in row.cells:
+            tc_pr = cell._tc.get_or_add_tcPr()
+            tc_borders = tc_pr.find(qn("w:tcBorders"))
+            if tc_borders is None:
+                tc_borders = OxmlElement("w:tcBorders")
+                tc_pr.append(tc_borders)
+            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                node = tc_borders.find(qn(f"w:{edge}"))
+                if node is None:
+                    node = OxmlElement(f"w:{edge}")
+                    tc_borders.append(node)
+                node.set(qn("w:val"), "single")
+                node.set(qn("w:sz"), "8")
+                node.set(qn("w:space"), "0")
+                node.set(qn("w:color"), "FFFFFF")
+            _normalize_tc_pr(cell)
+    _normalize_tbl_pr(table)
+
+
+def _set_table_width(table, widths_mm: list[float]) -> None:
+    table.autofit = False
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    tbl_pr = table._tbl.tblPr
+    tbl_w = tbl_pr.find(qn("w:tblW"))
+    if tbl_w is None:
+        tbl_w = OxmlElement("w:tblW")
+        tbl_pr.append(tbl_w)
+    tbl_w.set(qn("w:w"), str(round(sum(widths_mm) / 25.4 * 1440)))
+    tbl_w.set(qn("w:type"), "dxa")
+    grid = table._tbl.tblGrid
+    for child in list(grid):
+        grid.remove(child)
+    for width_mm in widths_mm:
+        grid_col = OxmlElement("w:gridCol")
+        grid_col.set(qn("w:w"), str(round(width_mm / 25.4 * 1440)))
+        grid.append(grid_col)
+    for row in table.rows:
+        _set_row_cant_split(row)
+        for cell, width_mm in zip(row.cells, widths_mm):
+            cell.width = Mm(width_mm)
+            _set_cell_margins(cell)
+    _normalize_tbl_pr(table)
+
+
+def _set_cell_margins(cell, top: int = 60, start: int = 80,
+                      bottom: int = 60, end: int = 80) -> None:
     tc_pr = cell._tc.get_or_add_tcPr()
-    tc_w = tc_pr.find(qn("w:tcW"))
-    if tc_w is None:
-        tc_w = OxmlElement("w:tcW")
-        tc_pr.append(tc_w)
-    tc_w.set(qn("w:w"), width_dxa)
-    tc_w.set(qn("w:type"), "dxa")
-    cell.width = Inches(width_in)
-
-
-def _set_cell_margins(cell, *, top: int = 60, start: int = 80, bottom: int = 60, end: int = 80) -> None:
-    tc_pr = cell._tc.get_or_add_tcPr()
-    tc_mar = tc_pr.first_child_found_in("w:tcMar")
+    tc_mar = tc_pr.find(qn("w:tcMar"))
     if tc_mar is None:
         tc_mar = OxmlElement("w:tcMar")
         tc_pr.append(tc_mar)
@@ -197,82 +402,483 @@ def _set_cell_margins(cell, *, top: int = 60, start: int = 80, bottom: int = 60,
             tc_mar.append(node)
         node.set(qn("w:w"), str(value))
         node.set(qn("w:type"), "dxa")
+    _normalize_tc_pr(cell)
 
 
-def _set_table_geometry(table, widths_in: list[float], *, indent_dxa: int = 0) -> None:
-    table.autofit = False
-    table.alignment = WD_TABLE_ALIGNMENT.LEFT
-    table_width_dxa = round(sum(widths_in) * 1440)
+def _set_row_cant_split(row) -> None:
+    tr_pr = row._tr.get_or_add_trPr()
+    if tr_pr.find(qn("w:cantSplit")) is None:
+        tr_pr.append(OxmlElement("w:cantSplit"))
+
+
+def _set_table_bidi(table) -> None:
     tbl_pr = table._tbl.tblPr
-    tbl_w = tbl_pr.find(qn("w:tblW"))
-    if tbl_w is None:
-        tbl_w = OxmlElement("w:tblW")
-        tbl_pr.append(tbl_w)
-    tbl_w.set(qn("w:w"), str(table_width_dxa))
-    tbl_w.set(qn("w:type"), "dxa")
-    tbl_ind = tbl_pr.find(qn("w:tblInd"))
-    if tbl_ind is None:
-        tbl_ind = OxmlElement("w:tblInd")
-        tbl_pr.append(tbl_ind)
-    tbl_ind.set(qn("w:w"), str(indent_dxa))
-    tbl_ind.set(qn("w:type"), "dxa")
+    if tbl_pr.find(qn("w:bidiVisual")) is None:
+        node = OxmlElement("w:bidiVisual")
+        tbl_pr.append(node)
+    _normalize_tbl_pr(table)
 
-    grid = table._tbl.tblGrid
-    for child in list(grid):
-        grid.remove(child)
-    for width in widths_in:
-        grid_col = OxmlElement("w:gridCol")
-        grid_col.set(qn("w:w"), str(round(width * 1440)))
-        grid.append(grid_col)
 
-    for row in table.rows:
-        cant_split = OxmlElement("w:cantSplit")
-        row._tr.get_or_add_trPr().append(cant_split)
-        for cell, width in zip(row.cells, widths_in):
-            _set_cell_width(cell, width)
-            _set_cell_margins(cell)
+def _set_header_repeat(row) -> None:
+    tr_pr = row._tr.get_or_add_trPr()
+    if tr_pr.find(qn("w:tblHeader")) is None:
+        node = OxmlElement("w:tblHeader")
+        tr_pr.append(node)
+
+
+def _add_table(container, table_block: dict[str, Any], *, rtl: bool,
+               width_mm: float = CONTENT_WIDTH_MM) -> None:
+    headers = table_block.get("headers") or []
+    rows = table_block.get("rows") or []
+    if not headers:
+        return
+    if hasattr(container, "_tc"):
+        for paragraph in list(container.paragraphs):
+            if not paragraph.text.strip():
+                p_pr = paragraph._p.pPr
+                if p_pr is None or p_pr.find(qn("w:pBdr")) is None:
+                    paragraph._p.getparent().remove(paragraph._p)
+    count = len(headers)
+    widths = [width_mm / count] * count
+    table = container.add_table(rows=1, cols=count)
+    _set_table_width(table, widths)
+    _set_table_borders(table, size=4)
+    if rtl:
+        _set_table_bidi(table)
+    header = table.rows[0]
+    _set_header_repeat(header)
+    for index, cell in enumerate(header.cells):
+        cell.text = ""
+        p = cell.paragraphs[0]
+        _set_paragraph_bidi(p, rtl)
+        p.paragraph_format.space_after = Pt(0)
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        _add_runs(p, headers[index], size=SMALL_SIZE, bold=True, rtl=rtl)
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    for row in rows:
+        tr = table.add_row()
+        _set_row_cant_split(tr)
+        for index, cell in enumerate(tr.cells):
+            if index >= len(row):
+                break
+            cell.text = ""
+            p = cell.paragraphs[0]
+            _set_paragraph_bidi(p, rtl)
+            p.paragraph_format.space_after = Pt(0)
+            align = (table_block.get("align") or [])[index] if index < len(table_block.get("align") or []) else "start"
+            if align == "center":
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            elif not rtl:
+                p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            _add_runs(p, row[index], size=SMALL_SIZE, rtl=rtl)
             cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+    if hasattr(container, "_tc"):
+        # OOXML requires a cell to end with a paragraph after a nested table.
+        p = container.add_paragraph()
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.line_spacing = Pt(1)
+    return table
 
 
-def _remove_table_borders(table) -> None:
-    tbl_pr = table._tbl.tblPr
-    borders = tbl_pr.find(qn("w:tblBorders"))
+def _ensure_cell_trailing_paragraph(cell) -> None:
+    """OOXML requires a table cell to end with a paragraph."""
+    tc = cell._tc
+    if not len(tc) or tc[-1].tag != qn("w:p"):
+        p = cell.add_paragraph()
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        p.paragraph_format.line_spacing = Pt(1)
+
+
+def _strip_empty_paragraphs(container) -> None:
+    paragraphs = list(container.paragraphs)
+    for paragraph in paragraphs:
+        if len(list(container.paragraphs)) <= 1:
+            break
+        if paragraph.text.strip():
+            continue
+        if paragraph._p.findall(".//" + qn("w:drawing")):
+            continue
+        if paragraph._p.findall(".//" + qn("w:pict")):
+            continue
+        p_pr = paragraph._p.pPr
+        if p_pr is not None and p_pr.find(qn("w:pBdr")) is not None:
+            continue
+        if paragraph._p.find(qn("w:tbl")) is not None:
+            continue
+        paragraph._p.getparent().remove(paragraph._p)
+
+
+def _add_options(doc, question: dict[str, Any], rtl: bool,
+                 width_mm: float = CONTENT_WIDTH_MM) -> None:
+    options = question.get("options") or []
+    if not options:
+        return
+    has_table = any(
+        block.get("type") == "table"
+        for option in options for block in (option.get("blocks") or [])
+    )
+    table_blocks = [
+        block for option in options for block in (option.get("blocks") or [])
+        if block.get("type") == "table"
+    ]
+    compact_tables_fit = bool(table_blocks) and all(
+        block.get("compact")
+        and len(block.get("headers") or []) <= 3
+        and len(block.get("rows") or []) <= 5
+        and max(
+            (len(_run_text(cell)) for row in (
+                [block.get("headers") or []] + list(block.get("rows") or [])
+            ) for cell in row),
+            default=0,
+        ) <= 12
+        for block in table_blocks
+    )
+    columns = 2 if not has_table or compact_tables_fit else 1
+    rows = (len(options) + columns - 1) // columns
+    table = doc.add_table(rows=rows, cols=columns)
+    widths = [width_mm / columns] * columns
+    _set_table_width(table, widths)
+    _remove_table_borders(table)
+    for index, option in enumerate(options):
+        row = index // columns
+        col = index % columns
+        visual_col = (columns - 1 - col) if rtl else col
+        cell = table.cell(row, visual_col)
+        cell.text = ""
+        inner_width = widths[col] - 3
+        p = cell.paragraphs[0]
+        _set_paragraph_bidi(p, rtl)
+        p.paragraph_format.space_after = Pt(1)
+        p.paragraph_format.keep_together = True
+        _add_run(p, f"{option.get('label', 'A')}.", size=10.2, bold=True, rtl=False)
+        _add_run(p, "\u00a0", size=10.2, rtl=rtl)
+        for block in option.get("blocks") or []:
+            if block.get("type") == "paragraph":
+                _add_runs(p, block.get("runs") or [], size=10.2, rtl=rtl)
+            elif block.get("type") == "table":
+                _add_table(cell, block, rtl=rtl, width_mm=max(20, inner_width))
+            elif block.get("type") == "math":
+                _add_display_math(p, str(block.get("latex") or ""), width_in=1.8)
+        _strip_empty_paragraphs(cell)
+        _ensure_cell_trailing_paragraph(cell)
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    if hasattr(doc, "_tc"):
+        _ensure_cell_trailing_paragraph(doc)
+
+
+def _start_question_paragraph(container, number: int, rtl: bool):
+    """Create one bidi paragraph containing the marker and question text."""
+    p = container.add_paragraph()
+    _set_paragraph_bidi(p, rtl)
+    p.paragraph_format.space_after = Pt(2)
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.keep_together = True
+    # A strong RTL anchor is required when the entire answer is Latin (for
+    # example an MCQ key of "1. A"); otherwise Word may physically place a
+    # right-aligned bidi paragraph at the left margin.
+    if rtl:
+        _add_run(p, "\u200f", size=1, rtl=True)
+    _add_run(p, f"{number}.", size=10.5, bold=True, rtl=False)
+    _add_run(p, "\u00a0", size=10.5, rtl=rtl)
+    return p
+
+
+def _add_question_frame(container, number: int, rtl: bool, width_mm: float = CONTENT_WIDTH_MM):
+    """Compatibility wrapper returning the shared inline question paragraph."""
+    return container, _start_question_paragraph(container, number, rtl)
+
+
+def _add_question_number(p, number: int) -> None:
+    _add_run(p, f"{number}.", size=10.5, bold=True, rtl=False)
+    _add_run(p, " ", size=10.5)
+
+
+def _question_content(doc, question: dict[str, Any], rtl: bool,
+                      include_number: bool = True) -> None:
+    blocks = question.get("blocks") or []
+    number = int(question.get("number") or 1)
+    content = doc
+    first_paragraph = _start_question_paragraph(doc, number, rtl) if include_number else None
+    for block in blocks:
+        if block.get("type") == "paragraph":
+            p = first_paragraph or content.add_paragraph()
+            if first_paragraph is None:
+                _set_paragraph_bidi(p, rtl)
+            first_paragraph = None
+            p.paragraph_format.space_after = Pt(2)
+            p.paragraph_format.keep_with_next = True
+            _add_runs(p, block.get("runs") or [], size=BODY_SIZE, bold=True, rtl=rtl)
+        elif block.get("type") == "math" and block.get("display"):
+            p = content.add_paragraph()
+            _set_paragraph_bidi(p, rtl)
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            latex = str(block.get("latex") or "")
+            if not _add_display_math(p, latex, width_in=5.4):
+                _add_run(p, str(block.get("plain") or latex), size=BODY_SIZE, rtl=False)
+        elif block.get("type") == "table":
+            _add_table(content, block, rtl=rtl)
+    _add_options(content, question, rtl, width_mm=CONTENT_WIDTH_MM - 8)
+    layout = question.get("response_lines") or 0
+    if layout:
+        _add_response_lines(content, int(layout), rtl=rtl)
+    _strip_empty_paragraphs(content)
+
+
+def _add_true_false(doc, question: dict[str, Any], rtl: bool) -> None:
+    content = doc
+    blocks = question.get("blocks") or []
+    p = _start_question_paragraph(content, int(question.get("number") or 1), rtl)
+    p.paragraph_format.space_after = Pt(2)
+    p.paragraph_format.keep_together = True
+    for block in blocks:
+        if block.get("type") == "paragraph":
+            _add_runs(p, block.get("runs") or [], size=BODY_SIZE, bold=True, rtl=rtl)
+        elif block.get("type") == "math":
+            _add_run(p, str(block.get("plain") or ""), size=BODY_SIZE, rtl=False)
+        elif block.get("type") == "table":
+            _add_table(content, block, rtl=rtl)
+    choices = str(question.get("true_false_choices") or ("صح (   ) غلط (   )" if rtl else "True (   ) False (   )"))
+    # Non-breaking spaces keep the complete choice group together; Word moves
+    # the whole group to the next line when there is not enough room.
+    group = choices.replace(" ", "\u00a0")
+    _add_run(p, "\u00a0", size=BODY_SIZE, rtl=rtl)
+    _add_run(p, group, size=BODY_SIZE, bold=True, rtl=rtl)
+    _strip_empty_paragraphs(content)
+
+
+def _add_side_by_side(doc, question: dict[str, Any], table: dict[str, Any],
+                      rtl: bool) -> None:
+    table_w = 78.0
+    question_w = CONTENT_WIDTH_MM - table_w - 8.0
+    outer = doc.add_table(rows=1, cols=2)
+    if rtl:
+        widths = [table_w, question_w]
+        table_cell = outer.cell(0, 0)
+        question_cell = outer.cell(0, 1)
+    else:
+        widths = [question_w, table_w]
+        question_cell = outer.cell(0, 0)
+        table_cell = outer.cell(0, 1)
+    _set_table_width(outer, widths)
+    outer.autofit = True
+    _remove_table_borders(outer)
+    _set_row_cant_split(outer.rows[0])
+    question_cell.text = ""
+    table_cell.text = ""
+    question_cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    table_cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
+    content = question_cell
+    first_paragraph = _start_question_paragraph(
+        content, int(question.get("number") or 1), rtl
+    )
+    for block in [b for b in question.get("blocks") or [] if b.get("type") != "table"]:
+        if block.get("type") == "paragraph":
+            p = first_paragraph or content.add_paragraph()
+            if first_paragraph is None:
+                _set_paragraph_bidi(p, rtl)
+            first_paragraph = None
+            p.paragraph_format.space_after = Pt(2)
+            _add_runs(p, block.get("runs") or [], size=BODY_SIZE, bold=True, rtl=rtl)
+        elif block.get("type") == "math" and block.get("display"):
+            p = content.add_paragraph()
+            _set_paragraph_bidi(p, rtl)
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _add_math_image(p, str(block.get("latex") or ""), width_in=3.8)
+    _add_options(content, question, rtl, width_mm=question_w - 8)
+    _strip_empty_paragraphs(content)
+    _ensure_cell_trailing_paragraph(content)
+    nested = _add_table(table_cell, table, rtl=rtl, width_mm=table_w - 12)
+    if nested is not None:
+        tc = table_cell._tc
+        if nested._tbl.getparent() is not tc:
+            tc.insert(0, nested._tbl)
+    _strip_empty_paragraphs(table_cell)
+    _ensure_cell_trailing_paragraph(table_cell)
+
+
+def _add_definition(doc, question: dict[str, Any], rtl: bool) -> None:
+    content = doc
+    p = _start_question_paragraph(content, int(question.get("number") or 1), rtl)
+    p.paragraph_format.space_after = Pt(2)
+    for block in question.get("blocks") or []:
+        if block.get("type") == "paragraph":
+            _add_runs(p, block.get("runs") or [], size=BODY_SIZE, bold=True, rtl=rtl)
+    _add_run(p, ":", size=BODY_SIZE, bold=True, rtl=rtl)
+    line = content.add_paragraph()
+    _set_paragraph_bidi(line, rtl)
+    line.paragraph_format.space_before = Pt(8)
+    line.paragraph_format.space_after = Pt(2)
+    _bottom_border(line)
+    _strip_empty_paragraphs(content)
+
+
+def _add_student(doc, document: dict[str, Any]) -> None:
+    rtl = document["direction"] == "rtl"
+    _add_title(doc, document)
+    for section in document.get("sections") or []:
+        _add_section_heading(doc, section.get("heading") or "", rtl)
+        if section.get("word_bank"):
+            p = doc.add_paragraph()
+            _set_paragraph_bidi(p, rtl)
+            _add_run(p, "  |  ".join(section["word_bank"]), size=9.2, bold=True, rtl=rtl)
+        for question in section.get("items") or []:
+            if question.get("qtype") == "definition":
+                _add_definition(doc, question, rtl)
+            elif question.get("qtype") == "true_false":
+                _add_true_false(doc, question, rtl)
+            else:
+                table = next((b for b in question.get("blocks") or [] if b.get("type") == "table"), None)
+                if table:
+                    _add_side_by_side(doc, question, table, rtl)
+                else:
+                    _question_content(doc, question, rtl)
+            _add_paragraph_spacer(doc)
+
+
+def _add_answers(doc, document: dict[str, Any]) -> None:
+    rtl = document["direction"] == "rtl"
+    p = doc.add_paragraph()
+    _set_paragraph_bidi(p, rtl)
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _add_run(p, document["metadata"].get("answer_key_title") or "", size=16, bold=True, rtl=rtl)
+    for section in document.get("sections") or []:
+        _add_section_heading(doc, section.get("heading") or "", rtl)
+        for question in section.get("items") or []:
+            content_cell = doc
+            p = _start_question_paragraph(
+                doc, int(question.get("number") or 1), rtl
+            )
+            first = True
+            for block in question.get("answer_blocks") or []:
+                if block.get("type") == "paragraph":
+                    pp = p if first else content_cell.add_paragraph()
+                    first = False
+                    if pp is not p:
+                        _set_paragraph_bidi(pp, rtl)
+                    pp.paragraph_format.space_after = Pt(2)
+                    _add_runs(pp, block.get("runs") or [], size=9.5, rtl=rtl)
+                elif block.get("type") == "math" and block.get("display"):
+                    pp = content_cell.paragraphs[0] if first else content_cell.add_paragraph()
+                    first = False
+                    _set_paragraph_bidi(pp, rtl)
+                    pp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    _add_display_math(pp, str(block.get("latex") or ""), width_in=4.2)
+                elif block.get("type") == "table":
+                    _add_table(content_cell, block, rtl=rtl, width_mm=CONTENT_WIDTH_MM - 18)
+            _add_paragraph_spacer(doc)
+
+
+def _add_paragraph_spacer(doc) -> None:
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.space_before = Pt(0)
+
+
+def _add_title(doc, document: dict[str, Any]) -> None:
+    rtl = document["direction"] == "rtl"
+    meta = document["metadata"]
+    p = doc.add_paragraph()
+    _set_paragraph_bidi(p, rtl)
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_after = Pt(0)
+    _add_run(p, meta.get("title") or ("امتحان" if rtl else "Examination"),
+             size=20, bold=True, rtl=rtl)
+    p2 = doc.add_paragraph()
+    _set_paragraph_bidi(p2, rtl)
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p2.paragraph_format.space_after = Pt(4)
+    _add_run(p2, meta.get("model_label") or "", size=9.5, rtl=rtl)
+    _bottom_border(p2)
+    fields = [
+        (meta.get("duration_label"), meta.get("duration")),
+        (meta.get("teacher_label"), meta.get("teacher_name")),
+        (meta.get("date_label"), meta.get("exam_date")),
+    ]
+    table = doc.add_table(rows=1, cols=3)
+    _set_table_width(table, [CONTENT_WIDTH_MM / 3] * 3)
+    _remove_table_borders(table)
+    if rtl:
+        _set_table_bidi(table)
+    for index, (label, value) in enumerate(fields):
+        visual = 2 - index if rtl else index
+        cell = table.cell(0, visual)
+        cell.text = ""
+        p = cell.paragraphs[0]
+        _set_paragraph_bidi(p, rtl)
+        p.paragraph_format.space_after = Pt(0)
+        _add_run(p, f"{label}: ", size=9, bold=True, rtl=rtl)
+        _add_run(p, str(value or ""), size=9, rtl=rtl)
+    p = doc.add_paragraph()
+    p.paragraph_format.space_after = Pt(0)
+    _bottom_border(p)
+    p = doc.add_paragraph()
+    _set_paragraph_bidi(p, rtl)
+    p.paragraph_format.space_after = Pt(4)
+    _add_run(p, f"{meta.get('student_name_label')}: ______________________________", size=9.3, rtl=rtl)
+    _add_run(p, "        ", size=9.3)
+    class_value = str(meta.get("class_name") or "").strip()
+    _add_run(p, f"{meta.get('class_label')}: {class_value or '________________'}", size=9.3, rtl=rtl)
+
+
+def _add_section_heading(doc, heading: str, rtl: bool) -> None:
+    p = doc.add_paragraph()
+    _set_paragraph_bidi(p, rtl)
+    p.paragraph_format.space_before = Pt(6)
+    p.paragraph_format.space_after = Pt(3)
+    p.paragraph_format.keep_with_next = True
+    _add_run(p, heading, size=11.5, bold=True, rtl=rtl)
+    _bottom_border(p)
+
+
+def _bottom_border(p) -> None:
+    p_pr = p._p.get_or_add_pPr()
+    borders = p_pr.find(qn("w:pBdr"))
     if borders is None:
-        borders = OxmlElement("w:tblBorders")
-        tbl_pr.append(borders)
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
-        tag = borders.find(qn(f"w:{edge}"))
-        if tag is None:
-            tag = OxmlElement(f"w:{edge}")
-            borders.append(tag)
-        tag.set(qn("w:val"), "nil")
+        borders = OxmlElement("w:pBdr")
+        p_pr.append(borders)
+    bottom = borders.find(qn("w:bottom"))
+    if bottom is None:
+        bottom = OxmlElement("w:bottom")
+        borders.append(bottom)
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), "000000")
 
 
-def _configure_styles(doc: Document) -> None:
+def _configure(doc: Document, *, rtl: bool) -> None:
+    section = doc.sections[0]
+    section.page_width = Mm(210)
+    section.page_height = Mm(297)
+    for attr in ("top_margin", "right_margin", "bottom_margin", "left_margin"):
+        setattr(section, attr, Mm(PAGE_MARGIN_MM))
+    section.header_distance = Mm(6)
+    section.footer_distance = Mm(6)
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    p = footer.paragraphs[0]
+    p.clear()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _set_paragraph_bidi(p, rtl)
+    _add_run(p, "صفحة " if rtl else "Page ", size=8, rtl=rtl)
+    _add_field(p, "PAGE", "1")
+    _add_run(p, " من " if rtl else " of ", size=8, rtl=rtl)
+    _add_field(p, "NUMPAGES", "1")
     normal = doc.styles["Normal"]
     normal.font.name = FONT_NAME
     normal._element.rPr.rFonts.set(qn("w:ascii"), FONT_NAME)
     normal._element.rPr.rFonts.set(qn("w:hAnsi"), FONT_NAME)
-    normal.font.size = Pt(10.5)
-    normal.font.color.rgb = INK
-    normal.paragraph_format.space_before = Pt(0)
-    normal.paragraph_format.space_after = Pt(2.5)
-    normal.paragraph_format.line_spacing = 1.05
-
-    heading = doc.styles["Heading 1"]
-    heading.font.name = FONT_NAME
-    heading._element.rPr.rFonts.set(qn("w:ascii"), FONT_NAME)
-    heading._element.rPr.rFonts.set(qn("w:hAnsi"), FONT_NAME)
-    heading.font.size = Pt(11)
-    heading.font.bold = True
-    heading.font.color.rgb = RGBColor(51, 65, 85)
-    heading.paragraph_format.space_before = Pt(7)
-    heading.paragraph_format.space_after = Pt(5)
-    heading.paragraph_format.keep_with_next = True
+    normal._element.rPr.rFonts.set(qn("w:cs"), FONT_NAME)
+    normal.font.size = Pt(BODY_SIZE)
+    normal.font.color.rgb = BLACK
+    normal.paragraph_format.space_after = Pt(2)
+    normal.paragraph_format.line_spacing = 1.08
 
 
-def _add_field(paragraph, instruction: str, placeholder: str) -> None:
-    run = paragraph.add_run()
+def _add_field(p, instruction: str, placeholder: str) -> None:
+    run = p.add_run()
     begin = OxmlElement("w:fldChar")
     begin.set(qn("w:fldCharType"), "begin")
     instr = OxmlElement("w:instrText")
@@ -286,527 +892,27 @@ def _add_field(paragraph, instruction: str, placeholder: str) -> None:
     end.set(qn("w:fldCharType"), "end")
     for node in (begin, instr, separate, text, end):
         run._r.append(node)
-    _set_run_font(run, size=8, color=MUTED)
+    _set_run_font(run, size=8)
 
 
-def _configure_section(section, title: str, model_number: int, copy_label: str) -> None:
-    section.page_width = Mm(210)
-    section.page_height = Mm(297)
-    section.top_margin = Inches(PAGE_MARGIN_IN)
-    section.right_margin = Inches(PAGE_MARGIN_IN)
-    section.bottom_margin = Inches(PAGE_MARGIN_IN)
-    section.left_margin = Inches(PAGE_MARGIN_IN)
-    section.header_distance = Inches(0.18)
-    section.footer_distance = Inches(0.18)
-
-    header = section.header
-    header.is_linked_to_previous = False
-    p = header.paragraphs[0]
-    p.clear()
-    p.paragraph_format.space_after = Pt(0)
-
-    footer = section.footer
-    footer.is_linked_to_previous = False
-    fp = footer.paragraphs[0]
-    fp.clear()
-    fp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    fp.paragraph_format.space_after = Pt(0)
-    run = fp.add_run("Page ")
-    _set_run_font(run, size=8, color=MUTED)
-    _add_field(fp, "PAGE", "1")
-    run = fp.add_run(" of ")
-    _set_run_font(run, size=8, color=MUTED)
-    _add_field(fp, "NUMPAGES", "1")
-
-
-def _add_logo(cell, data_url: object, alignment: WD_ALIGN_PARAGRAPH) -> None:
-    cell.text = ""
-    p = cell.paragraphs[0]
-    p.alignment = alignment
-    p.paragraph_format.space_after = Pt(0)
-    stream = _image_stream(data_url)
-    if stream is None:
-        return
-    try:
-        p.add_run().add_picture(stream, width=Inches(0.72), height=Inches(0.46))
-    except Exception:
-        return
-
-
-def _add_exam_header(doc: Document, metadata: dict[str, Any], model_number: int, language: str = "en") -> None:
-    rtl = language == "ar"
-    labels = _labels(language)
-    title = _clean(metadata.get("exam_title"), "Examination")
-    table = doc.add_table(rows=1, cols=3)
-    _set_table_geometry(table, [1.0, CONTENT_WIDTH_IN - 2.0, 1.0])
-    _remove_table_borders(table)
-    left_align = WD_ALIGN_PARAGRAPH.RIGHT if rtl else WD_ALIGN_PARAGRAPH.LEFT
-    right_align = WD_ALIGN_PARAGRAPH.LEFT if rtl else WD_ALIGN_PARAGRAPH.RIGHT
-    _add_logo(table.cell(0, 0), metadata.get("left_logo_data"), left_align)
-    _add_logo(table.cell(0, 2), metadata.get("right_logo_data"), right_align)
-    center = table.cell(0, 1)
-    center.text = ""
-    p = center.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(0)
-    run = p.add_run(title)
-    _set_run_font(run, size=16, bold=True)
-    p2 = center.add_paragraph()
-    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p2.paragraph_format.space_after = Pt(0)
-    run = p2.add_run(labels["model"].format(n=model_number))
-    _set_run_font(run, size=9, color=MUTED)
-
-    fields = [
-        (labels["duration"], _clean(metadata.get("duration"), "_______")),
-        (labels["teacher"], _clean(metadata.get("teacher_name"), "_________")),
-        (labels["date"], _clean(metadata.get("exam_date"), "_________")),
-    ]
-    meta = doc.add_table(rows=1, cols=3)
-    widths = [CONTENT_WIDTH_IN / 3] * 3
-    _set_table_geometry(meta, widths)
-    _remove_table_borders(meta)
-    for index, (label, value) in enumerate(fields):
-        visual_col = len(fields) - 1 - index if rtl else index
-        cell = meta.cell(0, visual_col)
-        cell.text = ""
-        para = cell.paragraphs[0]
-        if rtl:
-            _set_paragraph_rtl(para)
-            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        run = para.add_run(f"{label}: ")
-        _set_run_font(run, size=8, bold=True, color=MUTED)
-        blank = value.startswith("_")
-        run = para.add_run(("\u00a0" * len(value)) if blank else value)
-        _set_run_font(run, size=8.5)
-        if blank:
-            run.font.underline = True
-
-    student = doc.add_table(rows=1, cols=2)
-    student_widths = (
-        [CONTENT_WIDTH_IN * 0.32, CONTENT_WIDTH_IN * 0.68]
-        if rtl else [CONTENT_WIDTH_IN * 0.68, CONTENT_WIDTH_IN * 0.32]
-    )
-    _set_table_geometry(student, student_widths)
-    _remove_table_borders(student)
-    student_fields = [
-        (labels["student_name"].rstrip(": "), 38),
-        (labels["class"], _clean(metadata.get("class_name"), "_" * 14)),
-    ]
-    if rtl:
-        student_fields.reverse()
-    for cell, (label, value) in zip(student.rows[0].cells, student_fields):
-        cell.text = ""
-        para = cell.paragraphs[0]
-        para.paragraph_format.space_before = Pt(3)
-        para.paragraph_format.space_after = Pt(5)
-        if rtl:
-            _set_paragraph_rtl(para)
-            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-        run = para.add_run(f"{label}: ")
-        _set_run_font(run, size=9.5)
-        blank = isinstance(value, int) or str(value).startswith("_")
-        blank_length = value if isinstance(value, int) else len(str(value))
-        run = para.add_run("\u00a0" * blank_length if blank else str(value))
-        _set_run_font(run, size=9.5)
-        if blank:
-            run.font.underline = True
-
-
-def _add_section_heading(doc: Document, label: str, *, page_break_before: bool = False, rtl: bool = False) -> None:
-    p = doc.add_paragraph(style="Heading 1")
-    p.paragraph_format.keep_with_next = True
-    p.paragraph_format.page_break_before = page_break_before
-    p.paragraph_format.left_indent = Pt(4)
-    p.paragraph_format.right_indent = Pt(4)
-    if rtl:
-        _set_paragraph_rtl(p)
-    run = p.add_run(label)
-    _set_run_font(run, size=11, bold=True, color=RGBColor(51, 65, 85))
-    _shade_paragraph(p, SECTION_FILL)
-    _paragraph_bottom_border(p, color=RULE, size="5")
-
-
-def _add_mixed_math_runs(
-    paragraph: Any, text: str, *, size: float = 10, bold: bool = False
-) -> None:
-    """Add prose plus inline/display TeX, isolating math as rendered images."""
-    for kind, value in split_equation_content(text, undelimited_as_math=False):
-        if kind == "text":
-            run = paragraph.add_run(value)
-            _set_run_font(run, size=size, bold=bold)
-            continue
-        plain = latex_to_plain_text(value)
-        if plain is not None:
-            run = paragraph.add_run(plain)
-            _set_run_font(run, size=size, bold=bold)
-            run.font.rtl = False
-            continue
-        rendered = render_math(value)
-        if rendered:
-            stream = io.BytesIO(rendered.png)
-            stream.name = "inline-math.png"
-            width = min(CONTENT_WIDTH_IN - 0.5, max(0.18, rendered.width_px / 260))
-            paragraph.add_run().add_picture(stream, width=Inches(width))
-        else:
-            run = paragraph.add_run(value)
-            _set_run_font(run, size=size, bold=bold)
-
-
-def _add_question_stem(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
-    p = doc.add_paragraph()
-    p.paragraph_format.space_after = Pt(2)
-    p.paragraph_format.keep_with_next = True
-    text = _clean(item.get("text"), "(missing question text)")
-    content_rtl = _set_content_direction(p, text, rtl)
-    run = p.add_run(f"{item['number']}. " if content_rtl else f"Q{item['number']}. ")
-    _set_run_font(run, bold=True)
-    _add_mixed_math_runs(p, text, bold=True)
-
-
-def _add_mcq(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
-    _add_question_stem(doc, item, rtl=rtl)
-    options = list((item.get("options") or {}).items())
-    two_column = options and all(len(_clean(option)) <= 90 for _, option in options)
-    if two_column:
-        rows = (len(options) + 1) // 2
-        marker_w = 0.34
-        text_w = (CONTENT_WIDTH_IN / 2) - marker_w
-        widths = [text_w, marker_w, text_w, marker_w] if rtl else [marker_w, text_w, marker_w, text_w]
-        table = doc.add_table(rows=rows, cols=4)
-        _set_table_geometry(table, widths)
-        _remove_table_borders(table)
-        for index, (letter, option) in enumerate(options):
-            pair_position = index % 2
-            if rtl:
-                marker_col = 3 if pair_position == 0 else 1
-                text_col = marker_col - 1
-            else:
-                marker_col = 0 if pair_position == 0 else 2
-                text_col = marker_col + 1
-            marker = table.cell(index // 2, marker_col)
-            content = table.cell(index // 2, text_col)
-            marker.text = ""
-            content.text = ""
-            marker_p = marker.paragraphs[0]
-            marker_p.paragraph_format.space_after = Pt(0)
-            marker_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = marker_p.add_run(f"{letter}.")
-            _set_run_font(run, size=9.5, bold=True)
-            if rtl:
-                _set_marker_ltr(marker_p, run)
-            p = content.paragraphs[0]
-            p.paragraph_format.space_after = Pt(0)
-            option_text = _clean(option)
-            content_rtl = _set_content_direction(p, option_text, rtl)
-            if rtl and not content_rtl:
-                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            _add_mixed_math_runs(p, option_text, size=9.5)
+def _render(exam: dict[str, Any], metadata: dict[str, Any], *, kind: str) -> bytes:
+    document = build_document_ir(exam, metadata, kind=kind)
+    doc = Document()
+    _configure(doc, rtl=document["direction"] == "rtl")
+    doc.core_properties.title = document["metadata"].get("title") or "Exam"
+    doc.core_properties.language = document.get("language") or "en"
+    if kind == "answers":
+        _add_answers(doc, document)
     else:
-        for letter, option in options:
-            widths = [CONTENT_WIDTH_IN - 0.34, 0.34] if rtl else [0.34, CONTENT_WIDTH_IN - 0.34]
-            table = doc.add_table(rows=1, cols=2)
-            _set_table_geometry(table, widths, indent_dxa=180)
-            _remove_table_borders(table)
-            marker_col, text_col = (1, 0) if rtl else (0, 1)
-            marker_p = table.cell(0, marker_col).paragraphs[0]
-            marker_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = marker_p.add_run(f"{letter}.")
-            _set_run_font(run, size=9.5, bold=True)
-            if rtl:
-                _set_marker_ltr(marker_p, run)
-            p = table.cell(0, text_col).paragraphs[0]
-            p.paragraph_format.space_after = Pt(1)
-            option_text = _clean(option)
-            content_rtl = _set_content_direction(p, option_text, rtl)
-            if rtl and not content_rtl:
-                p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-            _add_mixed_math_runs(p, option_text, size=9.5)
-    spacer = doc.add_paragraph()
-    spacer.paragraph_format.space_after = Pt(2)
-
-
-def _add_word_bank(doc: Document, words: list[str], language: str = "en") -> None:
-    if not words:
-        return
-    from app.online.models import UI_STRINGS_BY_LANG
-
-    strings = UI_STRINGS_BY_LANG.get(language, UI_STRINGS_BY_LANG["en"])
-    table = doc.add_table(rows=1, cols=1)
-    _set_table_geometry(table, [CONTENT_WIDTH_IN])
-    cell = table.cell(0, 0)
-    cell.text = ""
-    _shade_paragraph(cell.paragraphs[0], "F8FAFC")
-    p = cell.paragraphs[0]
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(1)
-    run = p.add_run(strings["word_bank"].upper() if language == "en" else strings["word_bank"])
-    _set_run_font(run, size=8.5, bold=True, color=MUTED)
-    p2 = cell.add_paragraph()
-    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p2.paragraph_format.space_after = Pt(0)
-    run = p2.add_run("   |   ".join(words))
-    _set_run_font(run, size=9.5)
-
-
-def _add_answer_lines(doc: Document, count: int, *, rtl: bool = False) -> None:
-    for index in range(count):
-        p = doc.add_paragraph()
-        if rtl:
-            _set_paragraph_rtl(p)
-            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            p.paragraph_format.right_indent = Inches(0.16)
-        else:
-            p.paragraph_format.left_indent = Inches(0.16)
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.space_after = Pt(0 if index < count - 1 else 3)
-        p.paragraph_format.line_spacing = Pt(16)
-        # Explicit underscore glyphs are used instead of paragraph borders.
-        # Some Word/viewer combinations suppress borders on otherwise empty
-        # paragraphs, which made the response area look like blank spacing.
-        run = p.add_run(RESPONSE_LINE_TEXT)
-        _set_run_font(run, size=9, color=RGBColor(71, 85, 105))
-
-
-def _add_definition(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
-    term = _clean(item.get("text"), "(missing term)")
-    term_rtl = detect_language(term) == "ar" if _SCRIPT_LETTER_RE.search(term) else rtl
-    label_width = 2.35
-    line_width = CONTENT_WIDTH_IN - label_width
-    widths = [line_width, label_width] if term_rtl else [label_width, line_width]
-    table = doc.add_table(rows=1, cols=2)
-    _set_table_geometry(table, widths)
-    _remove_table_borders(table)
-    label_col, line_col = (1, 0) if term_rtl else (0, 1)
-    label_p = table.cell(0, label_col).paragraphs[0]
-    label_p.paragraph_format.space_after = Pt(0)
-    _set_content_direction(label_p, term, rtl)
-    run = label_p.add_run(f"{item['number']}. ")
-    _set_run_font(run, bold=True)
-    _add_mixed_math_runs(label_p, term + ":", bold=True)
-    line_p = table.cell(0, line_col).paragraphs[0]
-    line_p.paragraph_format.space_after = Pt(0)
-    line_p.add_run("\u00a0")
-    _paragraph_bottom_border(line_p, color=RULE, size="5")
-    spacer = doc.add_paragraph()
-    spacer.paragraph_format.space_after = Pt(3)
-
-
-def _add_equation(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
-    table = doc.add_table(rows=1, cols=3)
-    _set_table_geometry(table, [0.45, CONTENT_WIDTH_IN - 0.9, 0.45])
-    _remove_table_borders(table)
-    number_cell, equation_cell, _ = table.rows[0].cells
-    number_cell.text = ""
-    equation_cell.text = ""
-    number = number_cell.paragraphs[0]
-    number.paragraph_format.space_after = Pt(0)
-    run = number.add_run(f"{item['number']}.")
-    _set_run_font(run, bold=True)
-    equation_text = _clean(item.get("text"), "(missing equation)")
-    parts = split_equation_content(equation_text)
-    if (parts and any(kind == "text" for kind, _ in parts)
-            and not re.search(r"\$\$|\\\[", equation_text)
-            and all(kind == "text" or latex_to_plain_text(value) is not None
-                    for kind, value in parts)):
-        equation = equation_cell.paragraphs[0]
-        equation.paragraph_format.space_after = Pt(2)
-        _set_content_direction(equation, equation_text, rtl)
-        _add_mixed_math_runs(equation, equation_text, bold=True)
-        _add_answer_lines(doc, response_line_count("equation"), rtl=rtl)
-        return
-    for part_index, (kind, value) in enumerate(parts):
-        equation = equation_cell.paragraphs[0] if part_index == 0 else equation_cell.add_paragraph()
-        equation.paragraph_format.space_after = Pt(2)
-        if kind == "text":
-            _set_content_direction(equation, value, rtl)
-            run = equation.add_run(value)
-            _set_run_font(run, bold=True)
-            continue
-        equation.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        rendered = render_math(value)
-        if rendered:
-            natural_width = rendered.width_px / 220
-            picture_width = min(CONTENT_WIDTH_IN - 0.9, max(0.35, natural_width))
-            stream = io.BytesIO(rendered.png)
-            stream.name = "equation.png"
-            equation.add_run().add_picture(stream, width=Inches(picture_width))
-        else:
-            run = equation.add_run(value)
-            _set_run_font(run, bold=True)
-    _add_answer_lines(doc, response_line_count("equation"), rtl=rtl)
-
-
-def _add_word_problem(doc: Document, item: dict[str, Any], rtl: bool = False) -> None:
-    p = doc.add_paragraph()
-    p.paragraph_format.space_after = Pt(2)
-    p.paragraph_format.keep_with_next = True
-    text = _clean(item.get("text"), "(missing question text)")
-    _set_content_direction(p, text, rtl)
-    run = p.add_run(f"{item['number']}. ")
-    _set_run_font(run, bold=True)
-    _add_mixed_math_runs(p, text, bold=True)
-    _add_answer_lines(doc, response_line_count("word_problem"), rtl=rtl)
-
-
-def _answer_text(item: dict[str, Any], language: str = "en") -> str:
-    labels = ANSWER_LABELS_BY_LANG.get(language, ANSWER_LABELS_BY_LANG["en"])
-    qtype = item["qtype"]
-    if qtype == "mcq":
-        return _clean(item.get("correct_answer"), labels["missing"])
-    if qtype == "true_false":
-        from app.online.models import tf_answer_label
-
-        raw = _clean(item.get("answer"), labels["missing"])
-        if raw.lower() in {"true", "false"}:
-            return tf_answer_label(raw, language)
-        return raw
-    if qtype == "fill_in_the_blank":
-        return ", ".join(_clean(answer) for answer in (item.get("answers") or [])) or labels["missing"]
-    if qtype in {"equation", "word_problem"}:
-        steps = [_clean(step) for step in (item.get("solution_steps") or []) if _clean(step)]
-        final = _clean(item.get("final_answer"), labels["missing_final"])
-        return " → ".join([*steps, final])
-    answer = _clean(item.get("reference_answer"), labels["missing_reference"])
-    points = [_clean(point) for point in (item.get("key_points") or []) if _clean(point)]
-    return answer + ((f" | {labels['key_points']}: " + "; ".join(points)) if points else "")
-
-
-def _render_student_sections(doc: Document, sections: list[dict[str, Any]], language: str = "en") -> None:
-    rtl = language == "ar"
-    tf_choices = TRUE_FALSE_CHOICES_BY_LANG.get(language, TRUE_FALSE_CHOICES_BY_LANG["en"])
-    for section_index, section in enumerate(sections):
-        _add_section_heading(
-            doc,
-            section["label"],
-            page_break_before=section["qtype"] == "essay" and section_index > 0,
-            rtl=rtl,
-        )
-        if section["qtype"] == "fill_in_the_blank":
-            _add_word_bank(doc, section.get("word_bank") or [], language=language)
-        for item in section["items"]:
-            qtype = section["qtype"]
-            if qtype == "mcq":
-                _add_mcq(doc, item, rtl=rtl)
-            elif qtype == "true_false":
-                statement = _clean(item.get("text"))
-                statement_p = doc.add_paragraph()
-                statement_p.paragraph_format.space_after = Pt(0)
-                statement_p.paragraph_format.keep_with_next = True
-                content_rtl = _set_content_direction(statement_p, statement, rtl)
-                marker = f"{item['number']}. " if content_rtl else f"Q{item['number']}. "
-                run = statement_p.add_run(marker)
-                _set_run_font(run, bold=True)
-                _add_mixed_math_runs(statement_p, statement, bold=True)
-
-                choices_p = doc.add_paragraph()
-                choices_p.paragraph_format.space_after = Pt(4)
-                _set_content_direction(choices_p, tf_choices, rtl)
-                choices_p.alignment = WD_ALIGN_PARAGRAPH.LEFT if rtl else WD_ALIGN_PARAGRAPH.RIGHT
-                run = choices_p.add_run(tf_choices)
-                _set_run_font(run, size=9.5)
-            elif qtype == "fill_in_the_blank":
-                printed_item = dict(item)
-                printed_item["text"] = expand_fill_blank_text(item.get("text"))
-                _add_question_stem(doc, printed_item, rtl=rtl)
-            elif qtype == "definition":
-                _add_definition(doc, item, rtl=rtl)
-            elif qtype == "equation":
-                _add_equation(doc, item, rtl=rtl)
-            elif qtype == "word_problem":
-                _add_word_problem(doc, item, rtl=rtl)
-            else:
-                _add_question_stem(doc, item, rtl=rtl)
-                _add_answer_lines(doc, response_line_count(qtype), rtl=rtl)
-
-
-def _render_answer_key(
-    doc: Document,
-    sections: list[dict[str, Any]],
-    model_number: int,
-    title: str,
-    language: str = "en",
-    *,
-    new_section: bool = True,
-) -> None:
-    rtl = language == "ar"
-    labels = _labels(language)
-    section = (
-        doc.add_section(WD_SECTION.NEW_PAGE)
-        if new_section
-        else doc.sections[0]
-    )
-    _configure_section(section, title, model_number, "Teacher answer key")
-    p = doc.add_paragraph()
-    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    p.paragraph_format.space_after = Pt(8)
-    run = p.add_run(labels["answer_key"].format(n=model_number))
-    _set_run_font(run, size=15, bold=True)
-    for section in sections:
-        _add_section_heading(doc, section["label"], rtl=rtl)
-        for item in section["items"]:
-            p = doc.add_paragraph()
-            p.paragraph_format.space_after = Pt(2)
-            answer = _answer_text(item, language=language)
-            direction_text = "إجابة" if rtl and item["qtype"] == "mcq" else answer
-            content_rtl = _set_content_direction(p, direction_text, rtl)
-            run = p.add_run(f"{item['number']}. " if content_rtl else f"Q{item['number']}. ")
-            _set_run_font(run, size=9.5, bold=True)
-            if item["qtype"] == "equation":
-                labels_for_answer = ANSWER_LABELS_BY_LANG.get(
-                    language, ANSWER_LABELS_BY_LANG["en"]
-                )
-                values = [
-                    *[_clean(step) for step in item.get("solution_steps") or [] if _clean(step)],
-                    _clean(item.get("final_answer"), labels_for_answer["missing_final"]),
-                ]
-                for value in values:
-                    line = doc.add_paragraph()
-                    _set_content_direction(line, value, rtl)
-                    _add_mixed_math_runs(line, value, size=9.5)
-            else:
-                _add_mixed_math_runs(p, answer, size=9.5)
+        _add_student(doc, document)
+    output = io.BytesIO()
+    doc.save(output)
+    return output.getvalue()
 
 
 def render_exam_docx(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
-    """Render one model's student exam without an answer-key section."""
-    doc = Document()
-    _configure_styles(doc)
-    metadata = dict(metadata or {})
-    language = exam_document_language(exam, metadata)
-    if exam.get("questions"):
-        model_number = int(exam.get("model_number") or 1)
-        title = _clean(metadata.get("exam_title") or exam.get("title"), "Examination")
-        section = doc.sections[0]
-        _configure_section(section, title, model_number, "Student copy")
-        _add_exam_header(doc, metadata, model_number, language=language)
-        sections = group_exam_sections(exam.get("questions") or {}, language=language)
-        _render_student_sections(doc, sections, language=language)
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+    return _render(exam, metadata, kind="student")
 
 
 def render_answers_docx(exam: dict[str, Any], metadata: dict[str, Any]) -> bytes:
-    """Render one model's answer key as a separate DOCX document."""
-    doc = Document()
-    _configure_styles(doc)
-    metadata = dict(metadata or {})
-    language = exam_document_language(exam, metadata)
-    if exam.get("questions"):
-        model_number = int(exam.get("model_number") or 1)
-        title = _clean(metadata.get("exam_title") or exam.get("title"), "Examination")
-        sections = group_exam_sections(exam.get("questions") or {}, language=language)
-        _render_answer_key(
-            doc,
-            sections,
-            model_number,
-            title,
-            language=language,
-            new_section=False,
-        )
-
-    buf = io.BytesIO()
-    doc.save(buf)
-    return buf.getvalue()
+    return _render(exam, metadata, kind="answers")

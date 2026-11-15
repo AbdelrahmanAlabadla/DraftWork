@@ -53,6 +53,7 @@ def _normalize_clause(clause: str) -> str:
     value = clause.strip()
     if not value:
         return ""
+    value = re.sub(r"(?<!\\)\binfty\b", r"\\infty", value)
 
     # Protect conventional units before recognizing mathematical fractions.
     protected: dict[str, str] = {}
@@ -148,17 +149,27 @@ def latex_to_plain_text(source: object) -> str | None:
     while previous != value:
         previous = value
         value = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1/\2)", value)
+        value = re.sub(r"\\dfrac\{([^{}]+)\}\{([^{}]+)\}", r"(\1/\2)", value)
     value = re.sub(r"\\sqrt\{([^{}]+)\}", r"√(\1)", value)
-    value = re.sub(r"\\(?:mathrm|text)\{([^{}]+)\}", r"\1", value)
+    value = re.sub(r"\\(?:mathrm|text|operatorname)\{([^{}]*)\}", r"\1", value)
     value = re.sub(r"\^\{([^{}]+)\}", r"^(\1)", value)
     value = re.sub(r"_\{([^{}]+)\}", r"_(\1)", value)
     for command, symbol in {
         r"\times": "×", r"\div": "÷", r"\cdot": "·", r"\leq": "≤",
         r"\le": "≤", r"\geq": "≥", r"\ge": "≥", r"\ne": "≠",
-        r"\to": "→", r"\infty": "∞", r"\pi": "π",
+        r"\to": "→", r"\infty": "∞", r"\pi": "π", r"\%": "%",
+        r"\&": "&", r"\#": "#", r"\$": "$", r"\emptyset": "∅",
+        r"\varnothing": "∅", r"\in": "∈", r"\notin": "∉",
+        r"\cup": "∪", r"\cap": "∩", r"\subset": "⊂",
+        r"\subseteq": "⊆", r"\pm": "±", r"\degree": "°",
     }.items():
         value = value.replace(command, symbol)
-    value = re.sub(r"\\[,;!]", " ", value)
+    value = re.sub(r"\\(?:quad|qquad)\b", " ", value)
+    value = re.sub(r"\\[,;:!]", " ", value)
+    value = re.sub(r"\\\s", " ", value)
+    value = value.replace(r"\{", "{").replace(r"\}", "}")
+    value = re.sub(r"\\(?:left|right|big|Big|bigg|Bigg)\b", "", value)
+    value = re.sub(r"\\[A-Za-z]+\s*", " ", value)
     if re.search(r"\\[A-Za-z]+|[{}]", value):
         return None
     return re.sub(r"\s+", " ", value).strip() or None
@@ -168,6 +179,10 @@ def render_math(source: object, *, font_size: float = 13.0, dpi: int = 220) -> R
     """Render equation text to a tightly cropped transparent PNG."""
     mathtext = to_mathtext(source)
     if not mathtext:
+        return None
+    # Matplotlib mathtext does not shape Arabic.  Let the caller render the
+    # readable fallback rather than emitting disconnected Arabic glyphs.
+    if re.search(r"[\u0600-\u06ff]", mathtext):
         return None
     aligned = re.fullmatch(
         r"\\begin\{(?:aligned|array)\}(?:\{[^{}]*\})?([\s\S]+?)"
