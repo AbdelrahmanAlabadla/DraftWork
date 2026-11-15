@@ -3,6 +3,7 @@ import { renderPartialExamWarning } from "./exam-lifecycle.js";
 import { renderExamOutput } from "./exam-view.js";
 import { state } from "./state.js";
 import { applyContentDirection, localizedError, t, uiLang } from "./i18n.js";
+import { loadUsageDashboard } from "./usage-dashboard.js";
 
 let cachedExams = null;
 
@@ -21,6 +22,7 @@ export async function loadExamIntoPreview(examId) {
   state.examId = examId;
   renderExamOutput(saved.data.exams, saved.data.metadata || {});
   renderPartialExamWarning(saved.data);
+  loadUsageDashboard(examId).catch(() => {});
   const url = new URL(window.location.href);
   url.searchParams.set("exam", examId);
   window.history.replaceState({}, "", url);

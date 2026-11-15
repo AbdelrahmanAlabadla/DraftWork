@@ -31,6 +31,7 @@ function replaceScriptRuns(value, pattern, mapping, marker) {
 function normalizeClause(source) {
   let value = source.trim();
   if (!value) return "";
+  value = value.replace(/(?<!\\)\binfty\b/g, String.raw`\infty`);
 
   const protectedUnits = new Map();
   [...UNIT_FRACTIONS.entries()].forEach(([unit, replacement], index) => {
@@ -188,25 +189,53 @@ export function latexToPlainText(source) {
     value = value.replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, "($1/$2)");
   } while (value !== previous);
   value = value
-    .replace(/\\sqrt\{([^{}]+)\}/g, "sqrt($1)")
-    .replace(/\\(?:mathrm|text)\{([^{}]+)\}/g, "$1")
+    .replace(/\\sqrt\{([^{}]+)\}/g, "√($1)")
+    .replace(/\\(?:mathrm|text|operatorname)\{([^{}]*)\}/g, "$1")
     .replace(/\^\{([^{}]+)\}/g, "^($1)")
     .replace(/_\{([^{}]+)\}/g, "_($1)")
     .replace(/\\times\b/g, "×")
     .replace(/\\div\b/g, "÷")
-    .replace(/\\(?:cdot|,|;|!)/g, " ")
+    .replace(/\\cdot\b/g, "·")
+    .replace(/\\(?:quad|qquad)\b/g, " ")
+    .replace(/\\(?:,|;|:|!|\s)/g, " ")
+    .replace(/\\%/g, "%")
+    .replace(/\\&/g, "&")
     .replace(/\\(?:le|leq)\b/g, "≤")
     .replace(/\\(?:ge|geq)\b/g, "≥")
     .replace(/\\ne\b/g, "≠")
-    .replace(/\\to\b/g, "→");
+    .replace(/\\to\b/g, "→")
+    .replace(/\\emptyset\b/g, "∅")
+    .replace(/\\varnothing\b/g, "∅")
+    .replace(/\\in\b/g, "∈")
+    .replace(/\\notin\b/g, "∉")
+    .replace(/\\cup\b/g, "∪")
+    .replace(/\\cap\b/g, "∩")
+    .replace(/\\subseteq\b/g, "⊆")
+    .replace(/\\subset\b/g, "⊂")
+    .replace(/\\(?:left|right|big|Big|bigg|Bigg)\b/g, "");
   if (/\\[A-Za-z]+|[{}]/.test(value)) return null;
   return value.trim() || null;
+}
+
+function plainMathFallback(value) {
+  return String(value ?? "")
+    .replace(/\\(?:begin|end)\{[^{}]*\}/g, " ")
+    .replace(/\\(?:left|right|big|Big|bigg|Bigg)\b/g, " ")
+    .replace(/\\(?:text|mathrm|mathbf|mathit|operatorname)\{([^{}]*)\}/g, "$1")
+    .replace(/\\[A-Za-z]+\s*/g, " ")
+    .replace(/[{}&]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim() || "—";
 }
 
 export function renderEquation(target, source, displayMode = true) {
   const original = String(source ?? "").trim();
   const showFallback = (error) => {
     const converted = latexToPlainText(original);
+    // A known expression gets a readable linear form.  For unsupported TeX,
+    // preserve the exact source rather than silently deleting its command and
+    // changing the mathematical meaning; the diagnostic class/data attribute
+    // makes the degradation visible to the user.
     target.textContent = converted ?? original;
     target.classList?.add("math-render-fallback");
     target.dataset.mathRenderFallback = converted === null ? "original" : "plain-text";

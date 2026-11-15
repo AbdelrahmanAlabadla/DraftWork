@@ -1,43 +1,21 @@
 import { state } from "./state.js";
-import { applyContentDirection, t } from "./i18n.js";
-import { renderEquationContent, renderMixedMath } from "./math-renderer.js";
+import { t } from "./i18n.js";
+import { renderEquation } from "./math-renderer.js";
+import { buildDocumentIR } from "./document-ir.js";
+import { getJSON } from "./api.js";
 
-// Mirrors app.exports.common so screen, PDF, and DOCX use one visual contract.
 const RESPONSE_LINE = "_".repeat(92);
 const RESPONSE_LINE_COUNTS = { why: 3, equation: 5, word_problem: 5, essay: 22 };
-const EQUATION_TASK_RE = /\b(?:calculate|determine|rearrange|solve|derive|prove|show|establish|compare|evaluate|interpret|find)\b|(?:احسب|حدد|أوجد|اوجد|حل|اشتق|أثبت|اثبت|بيّن|بين|قارن|قيّم|فسر)/i;
 const SECTION_ORDER = [
   "mcq", "fill_in_the_blank", "true_false", "definition",
   "why", "equation", "word_problem", "essay",
 ];
-const SECTION_LABELS = {
-  en: {
-    mcq: "Multiple Choice Questions",
-    fill_in_the_blank: "Fill in the Blank",
-    true_false: "True / False",
-    definition: "Define",
-    why: "Why Questions",
-    equation: "Solve the equations and show your steps.",
-    word_problem: "Solve the word problems and show your steps.",
-    essay: "Essay",
-  },
-  ar: {
-    mcq: "أسئلة الاختيار من متعدد",
-    fill_in_the_blank: "أكمل الفراغ",
-    true_false: "صح / خطأ",
-    definition: "تعريف",
-    why: "علّل",
-    equation: "حل المعادلات وأظهر خطواتك.",
-    word_problem: "حل المسائل الكلامية وأظهر خطواتك.",
-    essay: "مقال",
-  },
-};
 const EXAM_LABELS = {
   en: {
     examination: "Examination", model: "Model {n}", className: "Class",
     duration: "Duration", date: "Date", teacher: "Teacher",
     studentName: "Student Name", answerKey: "Answer Key - Model {n}",
-    wordBank: "WORD BANK", trueFalse: "(   ) True     (   ) False",
+    wordBank: "WORD BANK", trueFalse: "True (   ) False (   )",
     missingQuestion: "(missing question text)", missingTerm: "(missing term)",
     noAnswer: "No answer supplied", noFinalAnswer: "No final answer supplied",
     noReferenceAnswer: "No reference answer supplied", finalAnswer: "Final answer",
@@ -47,7 +25,7 @@ const EXAM_LABELS = {
     examination: "امتحان", model: "نسخة {n}", className: "الصف",
     duration: "المدة", date: "التاريخ", teacher: "المعلم",
     studentName: "اسم الطالب", answerKey: "مفتاح الإجابة - نسخة {n}",
-    wordBank: "بنك الكلمات", trueFalse: "(   ) صح     (   ) خطأ",
+    wordBank: "بنك الكلمات", trueFalse: "صح (   ) غلط (   )",
     missingQuestion: "(نص السؤال غير متاح)", missingTerm: "(المصطلح غير متاح)",
     noAnswer: "لم تُرفق إجابة", noFinalAnswer: "لم تُرفق إجابة نهائية",
     noReferenceAnswer: "لم تُرفق إجابة نموذجية", finalAnswer: "الإجابة النهائية",
@@ -56,17 +34,10 @@ const EXAM_LABELS = {
 };
 
 function format(template, params = {}) {
-  let result = template;
-  Object.entries(params).forEach(([key, value]) => {
-    result = result.replace(`{${key}}`, String(value));
-  });
-  return result;
-}
-
-function contentElement(tag, className, text, fallbackLanguage = "en") {
-  const node = applyContentDirection(element(tag, className), text, fallbackLanguage);
-  renderMixedMath(node, text, fallbackLanguage);
-  return node;
+  return Object.entries(params).reduce(
+    (result, [key, value]) => result.replace(`{${key}}`, String(value)),
+    template,
+  );
 }
 
 function element(tag, className = "", text = "") {
@@ -81,261 +52,318 @@ function clean(value, fallback = "") {
   return text || fallback;
 }
 
+function isArabic(value) {
+  return /[\u0600-\u06ff]/.test(String(value ?? ""));
+}
+
 function expandFillBlankText(value) {
   return String(value ?? "").replace(/_{3,}|-{3,}/g, (blank) => (
     blank + blank[0].repeat(4)
   ));
 }
 
-function sectionItems(questions, qtype) {
-  const section = questions?.[qtype];
-  if (qtype === "fill_in_the_blank") return section?.items || [];
-  return Array.isArray(section) ? section : [];
+function renderRuns(target, runs, language) {
+  (runs || []).forEach((run) => {
+    if (run.type === "text") {
+      const text = String(run.text ?? "");
+      if (!text) return;
+      const span = element("span", "run-text", text);
+      span.dir = isArabic(text) ? "rtl" : "ltr";
+      span.lang = isArabic(text) ? "ar" : "en";
+      target.appendChild(span);
+    } else if (run.type === "math") {
+      const math = element("span", "math-inline");
+      math.dir = "ltr";
+      math.lang = "en";
+      target.appendChild(math);
+      renderEquation(math, run.latex || run.plain || "", false);
+    }
+  });
 }
 
-function addTitleBlock(paper, exam, metadata, language, labels) {
+function renderTable(tableBlock, language) {
+  const table = element("table", "exam-table");
+  table.dir = language === "ar" ? "rtl" : "ltr";
+  if (tableBlock.caption) {
+    const caption = element("caption", "", tableBlock.caption);
+    table.appendChild(caption);
+  }
+  if ((tableBlock.headers || []).length) {
+    const thead = element("thead");
+    const tr = element("tr");
+    tableBlock.headers.forEach((cell) => {
+      const th = element("th");
+      renderRuns(th, cell, language);
+      tr.appendChild(th);
+    });
+    thead.appendChild(tr);
+    table.appendChild(thead);
+  }
+  const tbody = element("tbody");
+  (tableBlock.rows || []).forEach((row) => {
+    const tr = element("tr");
+    row.forEach((cell, index) => {
+      const td = element("td");
+      const align = (tableBlock.align || [])[index] || "start";
+      td.className = align === "center" ? "num" : "";
+      renderRuns(td, cell, language);
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  return table;
+}
+
+function renderMathBlock(block, language) {
+  const wrap = element("div", "math-display");
+  wrap.dir = "ltr";
+  renderEquation(wrap, block.latex || block.plain || "", true);
+  return wrap;
+}
+
+function renderBlocks(container, blocks, language) {
+  (blocks || []).forEach((block) => {
+    if (block.type === "table") {
+      container.appendChild(renderTable(block, language));
+    } else if (block.type === "math" && block.display) {
+      container.appendChild(renderMathBlock(block, language));
+    } else if (block.type === "paragraph") {
+      const p = element("div", "preview-paragraph");
+      renderRuns(p, block.runs || [], language);
+      container.appendChild(p);
+    }
+  });
+}
+
+function responseLines(count) {
+  const lines = element("div", "preview-response-lines");
+  for (let index = 0; index < count; index += 1) {
+    lines.appendChild(element("div", "preview-response-line", RESPONSE_LINE));
+  }
+  return lines;
+}
+
+function renderOptions(container, options, language) {
+  if (!options?.length) return;
+  const optionsEl = element("div", "preview-options");
+  options.forEach((option) => {
+    const item = element("div", "preview-option");
+    item.dir = language === "ar" ? "rtl" : "ltr";
+    const label = element("span", "preview-option-marker", `${option.label}.`);
+    label.dir = "ltr";
+    item.appendChild(label);
+    const content = element("div", "preview-option-content");
+    const table = (option.blocks || []).find((block) => block.type === "table");
+    if (table) {
+      content.appendChild(renderTable(table, language));
+    } else {
+      const inline = element("span", "preview-option-inline");
+      (option.blocks || []).forEach((block) => {
+        if (block.type === "paragraph") renderRuns(inline, block.runs, language);
+        if (block.type === "math") {
+          const math = element("span", "math-inline");
+          math.dir = "ltr";
+          inline.appendChild(math);
+          renderEquation(math, block.latex || block.plain || "", false);
+        }
+      });
+      content.appendChild(inline);
+    }
+    item.appendChild(content);
+    optionsEl.appendChild(item);
+  });
+  container.appendChild(optionsEl);
+}
+
+function appendTfChoices(stem, choices, language) {
+  const group = element("span", "preview-tf-choices", choices);
+  group.dir = language === "ar" ? "rtl" : "ltr";
+  group.lang = language;
+  // The exact group is one unbreakable inline unit; if it does not fit it
+  // moves as a whole to the next line.
+  group.style.whiteSpace = "nowrap";
+  stem.appendChild(group);
+}
+
+function renderQuestion(paper, question, language) {
+  const section = element("section", `preview-question preview-${question.qtype}`);
+  section.dataset.number = String(question.number);
+  const blocks = question.blocks || [];
+  const table = blocks.find((block) => block.type === "table");
+  const textBlocks = blocks.filter((block) => block.type !== "table");
+
+  const buildQuestionPanel = (panel) => {
+    const stem = element("div", "preview-question-stem");
+    const number = element("strong", "preview-question-number", `${question.number}.`);
+    number.dir = "ltr";
+    stem.appendChild(number);
+    const content = element("div", "preview-question-content");
+    renderBlocks(content, textBlocks, language);
+    stem.appendChild(content);
+    panel.appendChild(stem);
+    if (question.qtype === "true_false") {
+      const paragraphs = content.querySelectorAll(".preview-paragraph");
+      const target = paragraphs.length ? paragraphs[paragraphs.length - 1] : content;
+      appendTfChoices(target, question.true_false_choices || "", language);
+    }
+    if (question.qtype === "mcq") {
+      renderOptions(panel, question.options, language);
+    }
+    if (["why", "equation", "word_problem", "essay"].includes(question.qtype)) {
+      const count = question.response_lines || RESPONSE_LINE_COUNTS[question.qtype] || 0;
+      panel.appendChild(responseLines(count));
+    }
+  };
+
+  if (table) {
+    const grid = element("div", "preview-with-table");
+    const panel = element("div", "preview-question-panel");
+    const tablePanel = element("div", "preview-table-panel");
+    tablePanel.appendChild(renderTable(table, language));
+    buildQuestionPanel(panel);
+    // DOM order is question first, table second. CSS grid places the table on
+    // the right in English and on the left in Arabic.
+    grid.appendChild(panel);
+    grid.appendChild(tablePanel);
+    section.appendChild(grid);
+  } else {
+    buildQuestionPanel(section);
+  }
+  paper.appendChild(section);
+}
+
+function addTitleBlock(paper, document) {
+  const meta = document.metadata;
   const header = element("header", "preview-title-block");
-  const title = clean(metadata.exam_title || exam.title, labels.examination);
-  header.appendChild(contentElement(
-    "h1",
-    "preview-exam-title",
-    title,
-    language,
-  ));
-  const modelLabel = format(labels.model, { n: exam.model_number || 1 });
-  header.appendChild(contentElement("div", "preview-model", modelLabel, language));
+  const title = element("h1", "preview-exam-title", meta.title);
+  title.dir = document.direction;
+  header.appendChild(title);
+  header.appendChild(element("div", "preview-model", meta.model_label));
   paper.appendChild(header);
 
-  const fields = [
-    [labels.duration, metadata.duration],
-    [labels.teacher, metadata.teacher_name],
-    [labels.date, metadata.exam_date],
-  ];
   const grid = element("div", "preview-meta-row");
-  fields.forEach(([label, value]) => {
+  [
+    [meta.duration_label, meta.duration],
+    [meta.teacher_label, meta.teacher_name],
+    [meta.date_label, meta.exam_date],
+  ].forEach(([label, value]) => {
     const field = element("div", "preview-meta-field");
     field.appendChild(element("strong", "", `${label}:`));
-    const fieldValue = clean(value);
-    field.appendChild(contentElement(
-      "span",
-      fieldValue ? "preview-meta-value" : "preview-meta-blank",
-      fieldValue,
-      language,
-    ));
+    field.appendChild(element("span", value ? "preview-meta-value" : "preview-meta-blank", value || ""));
     grid.appendChild(field);
   });
   paper.appendChild(grid);
 
   const student = element("div", "preview-student-row");
-  [[labels.studentName, "preview-student-name"], [labels.className, "preview-student-class"]]
-    .forEach(([label, className]) => {
-      const field = element("div", `preview-student-field ${className}`);
-      field.appendChild(element("strong", "", `${label}:`));
-      field.appendChild(element("span", "preview-meta-blank"));
-      student.appendChild(field);
-    });
+  const name = element("div", "preview-student-field preview-student-name");
+  name.appendChild(element("strong", "", `${meta.student_name_label}:`));
+  name.appendChild(element("span", "preview-meta-blank"));
+  const klass = element("div", "preview-student-field preview-student-class");
+  klass.appendChild(element("strong", "", `${meta.class_label}:`));
+  klass.appendChild(element("span", "preview-meta-blank"));
+  student.append(name, klass);
   paper.appendChild(student);
 }
 
-function addSectionHeading(parent, label, language) {
-  parent.appendChild(contentElement("h2", "preview-section-heading", label, language));
-}
-
-function addQuestionStem(parent, number, text, language, fallback) {
-  const stem = element("div", "preview-question-stem");
-  const value = clean(text, fallback);
-  applyContentDirection(stem, value, language);
-  stem.appendChild(element("strong", "", language === "ar" ? `${number}. ` : `Q${number}. `));
-  const content = element("span", "preview-question-content");
-  renderMixedMath(content, value, language);
-  stem.appendChild(content);
-  parent.appendChild(stem);
-}
-
-function addPlainNumberedStem(parent, number, text, language, fallback) {
-  const stem = element("div", "preview-question-stem");
-  const value = clean(text, fallback);
-  applyContentDirection(stem, value, language);
-  stem.appendChild(element("strong", "", `${number}. `));
-  const content = element("span", "preview-question-content");
-  renderMixedMath(content, value, language);
-  stem.appendChild(content);
-  parent.appendChild(stem);
-}
-
-function addResponseLines(parent, count) {
-  const lines = element("div", "preview-response-lines");
-  for (let index = 0; index < count; index += 1) {
-    lines.appendChild(element("div", "preview-response-line", RESPONSE_LINE));
-  }
-  parent.appendChild(lines);
-}
-
-function addStudentSection(paper, qtype, label, questions, language, examLabels) {
-  const items = sectionItems(questions, qtype);
-  if (!items.length) return;
-  addSectionHeading(paper, label, language);
-
-  if (qtype === "fill_in_the_blank") {
-    const words = questions[qtype]?.word_bank || [];
-    if (words.length) {
+function renderStudent(document) {
+  const paper = element("article", "exam-paper student-paper");
+  paper.dir = document.direction;
+  paper.lang = document.language;
+  addTitleBlock(paper, document);
+  document.sections.forEach((section) => {
+    const heading = element("h2", "preview-section-heading", section.heading);
+    paper.appendChild(heading);
+    if (section.word_bank?.length) {
       const bank = element("div", "preview-word-bank");
-      bank.appendChild(element("strong", "", examLabels.wordBank));
-      bank.appendChild(contentElement("div", "", words.join("   |   "), language));
+      bank.appendChild(element("strong", "", document.language === "ar" ? "بنك الكلمات" : "WORD BANK"));
+      bank.appendChild(element("div", "", section.word_bank.join("   |   ")));
       paper.appendChild(bank);
     }
-  }
-
-  items.forEach((item, index) => {
-    const question = element("section", `preview-question preview-${qtype}`);
-    let text = qtype === "true_false" ? item.statement
-      : qtype === "definition" ? item.term
-      : qtype === "equation" ? item.equation
-      : item.question;
-    if (qtype === "fill_in_the_blank") text = expandFillBlankText(text);
-
-    if (qtype === "definition") {
-      const row = element("div", "preview-definition-row");
-      const value = clean(text, examLabels.missingTerm);
-      applyContentDirection(row, value, language);
-      row.appendChild(element("strong", "", `${index + 1}. `));
-      const term = element("strong", "preview-question-content");
-      renderMixedMath(term, `${value}:`, language);
-      row.appendChild(term);
-      row.appendChild(element("span", "preview-definition-line"));
-      question.appendChild(row);
-    } else if (qtype === "equation") {
-      const row = element("div", "preview-equation-row");
-      row.appendChild(element("strong", "preview-equation-number", `${index + 1}.`));
-      const value = clean(text, examLabels.missingQuestion);
-      const equation = element("div", "preview-equation-text");
-      renderEquationContent(equation, value, language);
-      row.appendChild(equation);
-      question.appendChild(row);
-    } else if (qtype === "true_false") {
-      const stem = element("div", "preview-question-stem preview-tf-row");
-      const value = clean(text, examLabels.missingQuestion);
-      applyContentDirection(stem, value, language);
-      stem.appendChild(element("strong", "", language === "ar" ? `${index + 1}. ` : `Q${index + 1}. `));
-      const content = element("span", "preview-question-content");
-      renderMixedMath(content, value, language);
-      stem.appendChild(content);
-      stem.appendChild(element("span", "preview-tf-choices", examLabels.trueFalse));
-      question.appendChild(stem);
-    } else if (qtype === "word_problem") {
-      addPlainNumberedStem(question, index + 1, text, language, examLabels.missingQuestion);
-    } else {
-      addQuestionStem(question, index + 1, text, language, examLabels.missingQuestion);
-    }
-
-    if (qtype === "mcq") {
-      const options = element("div", "preview-options");
-      Object.keys(item.options || {}).sort().forEach((letter) => {
-        const option = element("div", "preview-option");
-        option.appendChild(element("span", "preview-option-marker", `${letter}.`));
-        const content = element("span", "preview-option-content");
-        renderMixedMath(content, clean(item.options[letter]), language);
-        option.appendChild(content);
-        options.appendChild(option);
-      });
-      question.appendChild(options);
-    } else if (["why", "equation", "word_problem", "essay"].includes(qtype)) {
-      addResponseLines(question, RESPONSE_LINE_COUNTS[qtype]);
-    }
-    paper.appendChild(question);
+    section.items.forEach((question) => renderQuestion(paper, question, document.language));
   });
+  paper.appendChild(element("div", "preview-page-number", `${document.metadata.page_label} 1`));
+  return paper;
 }
 
-function answerText(qtype, item, labels) {
-  if (qtype === "mcq") return clean(item.correct_answer, labels.noAnswer);
-  if (qtype === "true_false") {
-    const answer = clean(item.answer, labels.noAnswer);
-    if (answer.toLowerCase() === "true") return labels.trueFalse.includes("صح") ? "صح" : "True";
-    if (answer.toLowerCase() === "false") return labels.trueFalse.includes("صح") ? "خطأ" : "False";
-    return answer;
-  }
-  if (qtype === "fill_in_the_blank") {
-    return (item.answers || []).map((answer) => clean(answer)).filter(Boolean).join(", ") || labels.noAnswer;
-  }
-  if (qtype === "equation" || qtype === "word_problem") {
-    const steps = (item.solution_steps || []).map((step) => clean(step)).filter(Boolean);
-    const finalAnswer = clean(item.final_answer, labels.noFinalAnswer);
-    return [...steps, `${labels.finalAnswer}: ${finalAnswer}`].join(" → ");
-  }
-  let answer = clean(item.reference_answer, labels.noReferenceAnswer);
-  const points = (item.key_points || []).map((point) => clean(point)).filter(Boolean);
-  if (points.length) answer += ` | ${labels.keyPoints}: ${points.join("; ")}`;
-  return answer;
-}
-
-function buildAnswerKey(exam, labels, language, examLabels) {
+function renderAnswers(document) {
   const paper = element("article", "exam-paper answer-key-paper");
-  paper.dir = language === "ar" ? "rtl" : "ltr";
-  paper.lang = language;
-  const keyTitle = format(examLabels.answerKey, { n: exam.model_number || 1 });
-  paper.appendChild(contentElement("h1", "preview-key-title", keyTitle, language));
-  SECTION_ORDER.forEach((qtype) => {
-    const items = sectionItems(exam.questions || {}, qtype);
-    if (!items.length) return;
-    addSectionHeading(paper, labels[qtype], language);
-    items.forEach((item, index) => {
+  paper.dir = document.direction;
+  paper.lang = document.language;
+  paper.appendChild(element("h1", "preview-key-title", document.metadata.answer_key_title));
+  document.sections.forEach((section) => {
+    paper.appendChild(element("h2", "preview-section-heading", section.heading));
+    section.items.forEach((question) => {
       const row = element("div", "preview-key-answer");
-      const answer = answerText(qtype, item, examLabels);
-      if (qtype === "mcq") {
-        row.dir = language === "ar" ? "rtl" : "ltr";
-        row.lang = language;
-      } else {
-        applyContentDirection(row, answer, language);
-      }
-      row.appendChild(element("strong", "", language === "ar" ? `${index + 1}. ` : `Q${index + 1}. `));
-      if (qtype === "equation") {
-        const worked = element("div", "preview-equation-answer");
-        (item.solution_steps || []).forEach((step) => {
-          renderEquationContent(worked.appendChild(element("div")), `\\[${clean(step)}\\]`, language);
-        });
-        const final = element("div", "preview-equation-final");
-        final.appendChild(contentElement("strong", "", `${examLabels.finalAnswer}: `, language));
-        const finalMath = element("span");
-        renderEquationContent(finalMath, `\\[${clean(item.final_answer, examLabels.noFinalAnswer)}\\]`, language);
-        final.appendChild(finalMath);
-        worked.appendChild(final);
-        row.appendChild(worked);
-      } else {
-        const content = element("span", "preview-answer-content");
-        renderMixedMath(content, answer, language);
-        row.appendChild(content);
-      }
+      const number = element("strong", "preview-question-number", `${question.number}.`);
+      number.dir = "ltr";
+      row.appendChild(number);
+      const content = element("div", "preview-answer-content");
+      renderBlocks(content, question.answer_blocks || [], document.language);
+      row.appendChild(content);
       paper.appendChild(row);
     });
   });
   return paper;
 }
 
-function buildModelPreview(exam, metadata, index) {
+function diagnosticPanel(document) {
+  const diagnostics = (document.diagnostics || []).filter((item) => item && item.message);
+  if (!diagnostics.length) return null;
+  const panel = element("aside", "document-diagnostics");
+  panel.setAttribute("role", "status");
+  panel.appendChild(element("strong", "document-diagnostics-title", "Rendering warnings"));
+  diagnostics.forEach((item) => {
+    const location = [
+      document.metadata?.model_label,
+      item.section,
+      item.question_number ? `Question ${item.question_number}` : "",
+      item.component,
+    ].filter(Boolean).join(" · ");
+    const severity = item.blocking ? "Export blocked" : "Recoverable";
+    panel.appendChild(element(
+      "div", `document-diagnostic ${item.blocking ? "blocking" : "warning"}`,
+      `${severity}: ${location ? `${location} — ` : ""}${item.message}`,
+    ));
+  });
+  return panel;
+}
+
+function buildModelPreview(exam, metadata, index, canonical = null) {
   const model = element("div", `exam-model${index === 0 ? " active" : ""}`);
   model.dataset.index = String(index);
-
-  const language = clean(exam.document_language || metadata.document_language, "en");
-  const labels = SECTION_LABELS[language] || SECTION_LABELS.en;
-  const examLabels = EXAM_LABELS[language] || EXAM_LABELS.en;
-  const studentPaper = element("article", "exam-paper student-paper");
-  studentPaper.dir = language === "ar" ? "rtl" : "ltr";
-  studentPaper.lang = language;
-  addTitleBlock(studentPaper, exam, metadata, language, examLabels);
-  SECTION_ORDER.forEach((qtype) => {
-    addStudentSection(studentPaper, qtype, labels[qtype], exam.questions || {}, language, examLabels);
-  });
-  model.appendChild(studentPaper);
-  model.appendChild(buildAnswerKey(exam, labels, language, examLabels));
+  const student = canonical?.student || buildDocumentIR(exam, metadata, "student");
+  const answers = canonical?.answers || buildDocumentIR(exam, metadata, "answers");
+  const warning = diagnosticPanel(student);
+  if (warning) model.appendChild(warning);
+  model.appendChild(renderStudent(student));
+  model.appendChild(renderAnswers(answers));
   return model;
+}
+
+async function hydrateCanonicalDocuments(exams, metadata, contentEl) {
+  if (!state.examId) return;
+  const documents = await Promise.all(exams.map(async (exam) => {
+    const model = encodeURIComponent(exam.model_number || 1);
+    const [student, answers] = await Promise.all([
+      getJSON(`/exams/${encodeURIComponent(state.examId)}/document-ir?model_number=${model}&kind=student`),
+      getJSON(`/exams/${encodeURIComponent(state.examId)}/document-ir?model_number=${model}&kind=answers`),
+    ]);
+    if (!student.ok || !answers.ok) throw new Error("Canonical document IR is unavailable");
+    return { student: student.data, answers: answers.data };
+  }));
+  contentEl.replaceChildren();
+  exams.forEach((exam, index) => {
+    contentEl.appendChild(buildModelPreview(exam, metadata, index, documents[index]));
+  });
 }
 
 function orderedQuestionItems(exam) {
   const items = [];
   SECTION_ORDER.forEach((qtype) => {
-    sectionItems(exam.questions || {}, qtype).forEach((item) => {
-      items.push({ qtype, item });
-    });
+    const section = exam.questions?.[qtype];
+    const list = qtype === "fill_in_the_blank" ? section?.items || [] : (Array.isArray(section) ? section : []);
+    list.forEach((item) => items.push({ qtype, item }));
   });
   return items;
 }
@@ -345,6 +373,28 @@ function questionText(qtype, item) {
   if (qtype === "definition") return item.term;
   if (qtype === "equation") return item.equation;
   return item.question;
+}
+
+function answerText(qtype, item, labels) {
+  if (qtype === "mcq") return clean(item.correct_answer, labels.noAnswer);
+  if (qtype === "true_false") {
+    const answer = String(item.answer ?? "").toLowerCase();
+    if (answer === "true") return labels.trueFalse.includes("صح") ? "صح" : "True";
+    if (answer === "false") return labels.trueFalse.includes("صح") ? "غلط" : "False";
+    return clean(item.answer, labels.noAnswer);
+  }
+  if (qtype === "fill_in_the_blank") {
+    return (item.answers || []).map(clean).filter(Boolean).join(", ") || labels.noAnswer;
+  }
+  if (qtype === "equation" || qtype === "word_problem") {
+    const steps = (item.solution_steps || []).map(clean).filter(Boolean);
+    const finalAnswer = clean(item.final_answer, labels.noFinalAnswer);
+    return [...steps, `${labels.finalAnswer}: ${finalAnswer}`].join(" → ");
+  }
+  let answer = clean(item.reference_answer, labels.noReferenceAnswer);
+  const points = (item.key_points || []).map(clean).filter(Boolean);
+  if (points.length) answer += ` | ${labels.keyPoints}: ${points.join("; ")}`;
+  return answer;
 }
 
 function questionMarkdown(qtype, item, labels) {
@@ -363,7 +413,6 @@ export function buildQuestionsFirstMarkdown(exams, metadata = {}) {
   const multiple = exams.length > 1;
   const questions = ["# Questions"];
   const answers = ["# Answers"];
-
   exams.forEach((exam, modelIndex) => {
     const language = clean(exam.document_language || metadata.document_language, "en");
     const labels = EXAM_LABELS[language] || EXAM_LABELS.en;
@@ -385,22 +434,20 @@ export function buildQuestionsFirstMarkdown(exams, metadata = {}) {
 export function renderExamOutput(exams, metadata = {}) {
   state.exams = exams;
   state.rawExam = buildQuestionsFirstMarkdown(exams, metadata);
-
   const tabsEl = document.getElementById("modelTabs");
   const contentEl = document.getElementById("examContent");
   contentEl.replaceChildren();
-
   if (exams.length > 1) {
     tabsEl.replaceChildren();
     tabsEl.style.display = "flex";
-    exams.forEach((ex, index) => {
+    exams.forEach((exam, index) => {
       const tab = element(
         "button",
         `model-tab${index === 0 ? " active" : ""}`,
         format(
-          (EXAM_LABELS[ex.document_language || metadata.document_language] || EXAM_LABELS.en).model,
-          { n: ex.model_number }
-        )
+          (EXAM_LABELS[exam.document_language || metadata.document_language] || EXAM_LABELS.en).model,
+          { n: exam.model_number },
+        ),
       );
       tab.addEventListener("click", () => activateModelTab(index));
       tabsEl.appendChild(tab);
@@ -409,10 +456,12 @@ export function renderExamOutput(exams, metadata = {}) {
     tabsEl.style.display = "none";
     tabsEl.replaceChildren();
   }
-
   exams.forEach((exam, index) => {
     contentEl.appendChild(buildModelPreview(exam, metadata, index));
   });
+  // The local builder provides an immediate/offline fallback.  The authenticated
+  // backend IR is canonical and replaces it as soon as it arrives.
+  hydrateCanonicalDocuments(exams, metadata, contentEl).catch(() => {});
   document.getElementById("examOutput").classList.add("show");
 }
 
