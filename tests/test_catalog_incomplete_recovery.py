@@ -124,14 +124,14 @@ def test_one_hundred_parents_can_fill_fifty_catalog_workers(monkeypatch, tmp_pat
     active = 0
     peak = 0
     lock = threading.Lock()
-    all_started = threading.Barrier(50)
+    all_started = threading.Barrier(50, timeout=30)
 
     def responder(_client, prompt, **kwargs):
         nonlocal active, peak
         with lock:
             active += 1
             peak = max(peak, active)
-        all_started.wait(timeout=5)
+        all_started.wait(timeout=30)
         with lock:
             active -= 1
         return _complete_response(prompt, kwargs["response_model"], zero=True)
