@@ -261,7 +261,11 @@ function addTitleBlock(paper, document) {
   name.appendChild(element("span", "preview-meta-blank"));
   const klass = element("div", "preview-student-field preview-student-class");
   klass.appendChild(element("strong", "", `${meta.class_label}:`));
-  klass.appendChild(element("span", "preview-meta-blank"));
+  klass.appendChild(element(
+    "span",
+    meta.class_name ? "preview-meta-value" : "preview-meta-blank",
+    meta.class_name || "",
+  ));
   student.append(name, klass);
   paper.appendChild(student);
 }
@@ -305,6 +309,16 @@ function renderAnswers(document) {
     });
   });
   return paper;
+}
+
+export function renderPrintDocument(documentIR, target) {
+  if (!documentIR || !target) throw new Error("A document and print target are required");
+  const language = documentIR.language === "ar" ? "ar" : "en";
+  document.documentElement.lang = language;
+  document.documentElement.dir = documentIR.direction || (language === "ar" ? "rtl" : "ltr");
+  target.replaceChildren(
+    documentIR.kind === "answers" ? renderAnswers(documentIR) : renderStudent(documentIR),
+  );
 }
 
 function diagnosticPanel(document) {

@@ -170,3 +170,22 @@ def test_invalid_catalog_answer_never_reaches_generator(fake_llm):
     assert section is None
     assert llm.calls == []
     assert any("invalid or duplicate answers" in warning for warning in warnings)
+
+
+def test_repaired_distractor_rebuilds_shared_word_bank_without_stale_terms():
+    from app.online.validation.questions import _rebuild_fitb_word_bank
+
+    section = {
+        "items": [
+            {"question_id": "q1", "answers": ["الآلة البسيطة"],
+             "distractors": ["آلة بسيطة", "رافعة"]},
+            {"question_id": "q2", "answers": ["الشغل"],
+             "distractors": ["آلة بسيطة", "رافعة"]},
+        ],
+        "word_bank": ["الآلة البسيطة", "الشغل", "آلة بسيطة", "رافعة"],
+    }
+    section["items"][0]["distractors"] = ["بكرة", "رافعة"]
+    assert _rebuild_fitb_word_bank(section, preferred_question_ids={"q1"}) is True
+    assert section["word_bank"] == ["الآلة البسيطة", "الشغل", "بكرة", "رافعة"]
+    assert "آلة بسيطة" not in section["word_bank"]
+    assert all(item["distractors"] == ["بكرة", "رافعة"] for item in section["items"])

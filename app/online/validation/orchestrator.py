@@ -1083,10 +1083,11 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 strategy = str(candidate.get("recovery_v3_strategy") or "")
                 if strategy and strategy not in recovery.setdefault("attempted_strategies", []):
                     recovery["attempted_strategies"].append(strategy)
-                # SWITCH_TASK owns the bounded sequence of authorized
-                # variations/backups/Catalog candidates. A failed replacement
-                # advances that assignment inventory, not the semantic plan.
-                if strategy != "SWITCH_TASK":
+                # SWITCH_TASK and SWITCH_VARIATION own bounded candidate
+                # inventories. A failed candidate advances the inventory, not
+                # the semantic plan; the next call selects another eligible
+                # variation/task before moving to the saved fallback.
+                if strategy not in {"SWITCH_TASK", "SWITCH_VARIATION"}:
                     recovery["next_index"] = int(recovery.get("next_index") or 0) + 1
                 recovery["last_failure_code"] = new_code
                 recovery["last_failure_reason"] = new_reason
@@ -1094,6 +1095,7 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                 next_index = int(recovery.get("next_index") or 0)
                 repair_type = {
                     "REPAIR": "repair_question",
+                    "SWITCH_VARIATION": "switch_variation",
                     "REGENERATE": "regenerate_missing_slot",
                     "SWITCH_TASK": "replace_assignment",
                 }.get(str(next_plan[next_index]).upper(), "recovery_plan_exhausted") if next_index < len(next_plan) else "recovery_plan_exhausted"
@@ -1141,6 +1143,23 @@ def validate_generated_questions(state: Dict[str, Any]) -> Dict[str, Any]:
                     }),
                     "reason": new_reason, "failure_code": new_code,
                 })
+                candidate_variation_id = str(
+                    candidate_plan.get("selected_variation_id") or ""
+                )
+                if candidate_variation_id:
+                    rejected_variations = memory.setdefault("rejected_variation_ids", [])
+                    if candidate_variation_id not in rejected_variations:
+                        rejected_variations.append(candidate_variation_id)
+                if candidate.get("candidate_fitb_entry_id") and new_code in {
+                    "duplicate_question", "excessive_overlap", "insufficient_evidence",
+                }:
+                    blocked_fitb = memory.setdefault("blacklisted_candidate_ids", [])
+                    if candidate_id not in blocked_fitb:
+                        blocked_fitb.append(candidate_id)
+                if new_code in {"mcq_task_unsuitable", "unusable_task"}:
+                    blocked_tasks = memory.setdefault("blacklisted_candidate_ids", [])
+                    if candidate_id not in blocked_tasks:
+                        blocked_tasks.append(candidate_id)
                 fingerprint = str(candidate.get("candidate_fingerprint") or "")
                 if fingerprint and fingerprint not in memory.setdefault("rejected_candidate_fingerprints", []):
                     memory["rejected_candidate_fingerprints"].append(fingerprint)

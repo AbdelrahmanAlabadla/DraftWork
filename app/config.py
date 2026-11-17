@@ -31,6 +31,14 @@ if APP_ENV not in {"local", "test", "production"}:
     raise ValueError("APP_ENV must be local, test, or production")
 IS_PRODUCTION: bool = APP_ENV == "production"
 
+PDF_EXPORT_CONCURRENCY: int = max(
+    1, min(4, int(_env("PDF_EXPORT_CONCURRENCY", "2") or "2"))
+)
+PDF_EXPORT_TIMEOUT_SECONDS: int = max(
+    10, min(300, int(_env("PDF_EXPORT_TIMEOUT_SECONDS", "90") or "90"))
+)
+PDF_CHROMIUM_EXECUTABLE: str | None = _env("PDF_CHROMIUM_EXECUTABLE") or None
+
 
 LLAMA_PARSE_API: str | None = _env("LLAMA_PARSE_API")
 

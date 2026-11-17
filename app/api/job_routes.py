@@ -18,6 +18,7 @@ from app.api.routes import GenerateRequest
 from app.api.export_routes import (
     DocumentExportRequest,
     _document_archive,
+    _pdf_document_archive,
     _selected_models,
     _zip_response,
 )
@@ -28,7 +29,6 @@ from app.jobs import service as job_service
 from app.offline.structure_store import build_structure_payload
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
 from app.exports.document_ir import build_document_ir
-from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
 
 
 router = APIRouter(prefix="/api/v1", tags=["jobs"])
@@ -546,7 +546,7 @@ def get_document_ir(
 
 
 @router.post("/exams/{exam_id}/export/pdf")
-def export_pdf(
+async def export_pdf(
     exam_id: str,
     body: DocumentExportRequest | None = None,
     session_id: str = Depends(require_session_id),
@@ -554,7 +554,7 @@ def export_pdf(
 ) -> StreamingResponse:
     record = _owned_exam(exam_id, session_id, user_id)
     selected = _selected_models(record, body)
-    archive = _document_archive(record, selected, "pdf", render_exam_pdf, render_answers_pdf)
+    archive = await _pdf_document_archive(record, selected)
     return _zip_response(archive)
 
 

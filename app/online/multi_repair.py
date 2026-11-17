@@ -16,7 +16,9 @@ from app import config
 from app.llm.client import request_structured
 from app.llm.schemas import repair_response_model
 from app.logging_conf import current_job_id, get_logger
-from app.online.multi_validator import ROLE_FAILURE_CODES
+from app.online.multi_validator import (
+    FIELD_DEPENDENCIES, ROLE_FAILURE_CODES, dependent_fields_for,
+)
 
 logger = get_logger("MULTI_REPAIR")
 
@@ -174,7 +176,10 @@ _DEPENDENT_STEPS: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
         ("answer", ("reference_answer",)),
         ("solution", ("solution_certificate",)),
     ),
-    "essay": (("answer", ("reference_answer", "key_points")),),
+    "essay": (
+        ("answer", ("reference_answer", "key_points")),
+        ("solution", ("solution_certificate",)),
+    ),
     "fill_in_the_blank": (),
 }
 _MATH_SIGNATURE_RE = re.compile(r"\d+(?:[.,]\d+)?|[=<>≤≥+\-*/^]")
@@ -258,35 +263,106 @@ def _actual_dependent_steps(
     return required
 
 
+def _answer_text_matches(value: object, certificate: object) -> bool:
+    """Best-effort deterministic check for an already-correct certificate."""
+    if not isinstance(certificate, dict):
+        return False
+    left = " ".join(str(value or "").casefold().split())
+    right = " ".join(str(certificate.get("final_answer") or "").casefold().split())
+    if not left or not right:
+        return False
+    return left in right or right in left
+
+
+def _mcq_certificate_matches_option(
+    correct: object, option_value: object, certificate: object,
+) -> bool:
+    if not isinstance(certificate, dict):
+        return False
+    mapped = str(certificate.get("matching_correct_option") or "").upper()
+    if mapped and mapped == str(correct or "").upper():
+        return True
+    return _answer_text_matches(option_value, certificate)
+
+
+def _prose_answer_matches(answer: object, certificate: object) -> bool:
+    """Compare prose reference answers and certificate conclusions."""
+    if not isinstance(certificate, dict):
+        return False
+    left_text = str(answer or "").casefold()
+    right_text = str(certificate.get("final_answer") or "").casefold()
+    if not left_text or not right_text:
+        return False
+    if "less dense" in left_text and "less dense" not in right_text:
+        return False
+    if "less dense" in right_text and "less dense" not in left_text:
+        return False
+    stopwords = {
+        "that", "this", "with", "from", "into", "than", "then", "they",
+        "their", "there", "which", "while", "when", "where", "because",
+        "therefore", "does", "have", "has", "the", "and", "for", "are",
+        "was", "were", "its", "it", "is", "of", "to", "in", "on", "as",
+        "same", "more", "most", "such", "both",
+    }
+    left = {
+        token for token in re.findall(r"[a-z0-9]{4,}", left_text)
+        if token not in stopwords
+    }
+    right = {
+        token for token in re.findall(r"[a-z0-9]{4,}", right_text)
+        if token not in stopwords
+    }
+    if not left or not right:
+        return _answer_text_matches(answer, certificate)
+    return len(left & right) / min(len(left), len(right)) >= 0.5
+
+
 def _stale_dependent_error(
     qtype: str, before: dict[str, Any], after: dict[str, Any],
 ) -> str | None:
     """Reject a committed patch that provably retains stale derived content."""
-    if not _material_stem_change(qtype, before, after):
-        return None
     stale: list[str] = []
-    if qtype in {"mcq", "true_false", "equation", "word_problem", "definition", "why"}:
-        old_certificate = before.get("solution_certificate")
-        if old_certificate is not None and after.get("solution_certificate") == old_certificate:
-            stale.append("solution_certificate")
     if qtype in {"equation", "word_problem"}:
-        for field in ("solution_steps", "final_answer", "solution_certificate"):
-            if before.get(field) == after.get(field):
-                stale.append(field)
-    if qtype == "mcq":
+        final_changed = before.get("final_answer") != after.get("final_answer")
+        steps_changed = before.get("solution_steps") != after.get("solution_steps")
+        certificate = after.get("solution_certificate")
         if (
-            before.get("options") == after.get("options")
-            and before.get("correct_answer") == after.get("correct_answer")
+            before.get("solution_certificate") is not None
+            and (final_changed or steps_changed)
+            and certificate is not None
+            and not _answer_text_matches(after.get("final_answer"), certificate)
         ):
-            stale.append("options/correct_answer")
-    if qtype in {"definition", "why"} and before.get("reference_answer") is not None:
-        if before.get("reference_answer") == after.get("reference_answer"):
-            stale.append("reference_answer")
+            stale.append("solution_certificate")
+    if qtype == "mcq":
+        options_changed = before.get("options") != after.get("options")
+        answer_changed = before.get("correct_answer") != after.get("correct_answer")
+        certificate = after.get("solution_certificate")
+        certificate_changed = (
+            before.get("solution_certificate") != after.get("solution_certificate")
+        )
+        if (
+            before.get("solution_certificate") is not None
+            and (options_changed or answer_changed or certificate_changed)
+            and certificate is not None
+        ):
+            correct = after.get("correct_answer")
+            option_value = (after.get("options") or {}).get(correct)
+            if not _mcq_certificate_matches_option(correct, option_value, certificate):
+                stale.append("solution_certificate")
+    if qtype in {"definition", "why"}:
+        certificate = after.get("solution_certificate")
+        if (
+            before.get("solution_certificate") is not None
+            and before.get("reference_answer") != after.get("reference_answer")
+            and certificate is not None
+            and not _prose_answer_matches(after.get("reference_answer"), certificate)
+        ):
+            stale.append("solution_certificate")
     if not stale:
         return None
     return (
-        "dependent fields not synchronized after a material question change: "
-        + ", ".join(stale)
+        "dependent fields not synchronized after a material repair: "
+        + ", ".join(dict.fromkeys(stale))
     )
 
 
@@ -354,7 +430,7 @@ AGENT_INSTRUCTIONS = {
     "question": "Fix only the student-facing stem, statement, term, or non-mathematical equation wording authorized in editable_fields. Preserve the assigned task, givens, answer meaning, options, and difficulty. When the finding is copied_source_example and numeric variation is authorized, construct a materially different self-contained numerical instance instead of restating the source example. If the fix changes numbers or the mathematical claim, the Answer/Options/Solution steps that follow recompute dependent fields; never leave a stale derived value behind.",
     "options": "Fix only MCQ options or FITB distractors. Preserve valid choices, ensure exactly one MCQ answer is defensible, and never change the task or stem. Preserve the existing correct-answer label unless the Validator separately identified correct_answer as defective; full revalidation checks that the keyed label still maps to the unique correct option.",
     "solution": "Fix only authorized calculations, equations, solution steps, final results, units, option mapping dependencies, and solution certificates. Independently recompute and keep all mathematical fields consistent. Never copy a previous answer or certificate after the question changed.",
-    "task_alignment": "Correct generated question content so it satisfies the immutable task contract, selected variation, givens, operation, and constraints. Catalog and source-example numbers are illustrative unless exact_source_instance is true or value_policy is immutable; never force the question to match example numbers merely because they differ, and never change invariant constraints. For an atomic True/False repair, keep statement, Boolean answer, and solution_certificate about the same displayed mathematical claim; preserve all equations and givens the student needs, and never refer vaguely to inaccessible source context. Never change Planner identities, variation IDs, assigned chunk IDs, or requested difficulty. Never fabricate graph coordinates, table rows, or other exhibit data; if a required premise is a non-textual exhibit, do not invent it. For a copied_source_example finding, re-instantiate the source concept with new values instead of paraphrasing the example. If you change a numerical value, dependent answer/options/solution fields are recomputed by later steps.",
+    "task_alignment": "Correct generated question content so it satisfies the immutable task contract, selected variation, givens, operation, and constraints. Edit only the student-facing question/statement/term/equation wording authorized in editable_fields; Answer and Solution own the Boolean answer, reference answer, key points, final answer, and solution_certificate. Catalog and source-example numbers are illustrative unless exact_source_instance is true or value_policy is immutable; never force the question to match example numbers merely because they differ, and never change invariant constraints. For an atomic True/False repair, edit only the statement and make its truth value independently certifiable by the Answer and Solution steps. Preserve all equations and givens the student needs, and never refer vaguely to inaccessible source context. Never change Planner identities, variation IDs, assigned chunk IDs, or requested difficulty. Never fabricate graph coordinates, table rows, or other exhibit data; if a required premise is a non-textual exhibit, do not invent it. For a copied_source_example finding, re-instantiate the source concept with new values instead of paraphrasing the example. If you change a numerical value, dependent answer/options/solution fields are recomputed by later steps.",
     "difficulty": "Adjust only authorized generated content to match the immutable requested difficulty and reasoning contract. Preserve task identity, variation, evidence, and factual correctness.",
     "duplicate": "Resolve the identified overlap by proposing materially different student work. Never invent task, variation, or evidence identities; Python owns assignment selection and regeneration.",
 }
@@ -391,7 +467,13 @@ def _agent_permissions(agent: str, qtype: str) -> set[str]:
         return set(ANSWER_FIELDS.get(qtype, set()))
     if agent == "solution":
         return set(SOLUTION_FIELDS.get(qtype, set()))
-    if agent in {"task_alignment", "difficulty", "duplicate"}:
+    if agent == "task_alignment":
+        # Task Alignment repairs the student-facing question/task contract.
+        # Answer and Solution remain the owners of keyed answers and
+        # certificates; atomic True/False handling is split into separate
+        # Answer/Solution steps below.
+        return set(QUESTION_FIELDS.get(qtype, set()))
+    if agent in {"difficulty", "duplicate"}:
         return _all_fields(qtype)
     return set()
 
@@ -416,6 +498,16 @@ def _issue_agents(issue: dict[str, Any], qtype: str) -> list[str]:
             routed: list[str] = []
             if fields & option_fields or not fields:
                 routed.append("options")
+            elif (
+                code in {"multiple_correct_options", "no_correct_option", "ambiguous_option"}
+                and fields & prompt_fields
+            ):
+                # FITB validators often name the stem as the affected field when
+                # multiple terms can complete the blank. Fix the stem and the
+                # shared word bank together instead of declaring no route.
+                routed.extend(["question", "options"])
+            elif code in {"weak_distractors", "invalid_word_bank"}:
+                routed.append("options")
             if fields & answer_fields:
                 routed.append("answer")
             return routed
@@ -432,6 +524,20 @@ def _issue_agents(issue: dict[str, Any], qtype: str) -> list[str]:
             if fields & answer_fields:
                 routed.append("answer")
             return routed or ["answer"]
+    if role == "quantitative" and code in {
+        "significant_figures_error", "unit_inconsistency",
+        "incorrect_result", "incorrect_calculation",
+    }:
+        routed: list[str] = []
+        if fields & solution_fields or not fields:
+            routed.append("solution")
+        if fields & option_fields:
+            routed.append("options")
+        if fields & answer_fields and not (
+            qtype in {"equation", "word_problem"} and fields & solution_fields
+        ):
+            routed.append("answer")
+        return list(dict.fromkeys(routed)) or ["solution"]
     spec = FAILURE_ROUTING_REGISTRY.get((role, code))
     if spec and spec.get("agents"):
         return list(spec["agents"])
@@ -458,6 +564,17 @@ def _issue_agents(issue: dict[str, Any], qtype: str) -> list[str]:
     if role == "quantitative":
         if code == "missing_required_given":
             return ["task_alignment"]
+        if code in {
+            "significant_figures_error", "unit_inconsistency",
+            "incorrect_result", "incorrect_calculation",
+        }:
+            routed = ["solution"]
+            if qtype == "mcq":
+                routed.extend(["options", "answer"])
+            else:
+                if fields & answer_fields:
+                    routed.append("answer")
+            return list(dict.fromkeys(routed))
         if code in {"unsupported_given", "constraint_violation", "unsolvable"}:
             return ["task_alignment", "solution"]
         if code == "incorrect_option_mapping":
@@ -632,6 +749,20 @@ def reconcile_repair_conflicts(
     return revised, conflicts
 
 
+def _field_owner(field: str, qtype: str) -> str | None:
+    """Return the specialized agent that owns a dependent field."""
+    root = _field_root(field)
+    if root in {"options", "answers", "distractors"}:
+        return "options"
+    if root in {"correct_answer", "answer", "reference_answer", "key_points"}:
+        return "answer"
+    if root in {"solution_certificate", "solution_steps", "final_answer"}:
+        return "solution"
+    if root in {"question", "statement", "term", "equation"}:
+        return "question" if root in QUESTION_FIELDS.get(qtype, set()) else None
+    return None
+
+
 def build_repair_route(qtype: str, verdict: dict[str, Any]) -> dict[str, Any]:
     issues = _stable_issues(verdict)
     unsupported: list[dict[str, Any]] = []
@@ -663,11 +794,25 @@ def build_repair_route(qtype: str, verdict: dict[str, Any]) -> dict[str, Any]:
         ):
             return {
                 "status": "READY",
-                "steps": [RepairStep(
-                    agent="task_alignment",
-                    issues=tuple(deepcopy(issues)),
-                    fields=("answer", "solution_certificate", "statement"),
-                )],
+                "steps": [
+                    RepairStep(
+                        agent="task_alignment",
+                        issues=tuple(deepcopy(issues)),
+                        fields=("statement",),
+                    ),
+                    RepairStep(
+                        agent="answer",
+                        issues=tuple(deepcopy(issues)),
+                        fields=("answer",),
+                        dependent=True,
+                    ),
+                    RepairStep(
+                        agent="solution",
+                        issues=tuple(deepcopy(issues)),
+                        fields=("solution_certificate",),
+                        dependent=True,
+                    ),
+                ],
                 "issues": issues, "conflicts": [], "unsupported": [],
                 "atomic_true_false": True,
             }
@@ -703,6 +848,24 @@ def build_repair_route(qtype: str, verdict: dict[str, Any]) -> dict[str, Any]:
                 by_agent[agent].append(deepcopy(issue))
                 fields_by_agent[agent].update(selected)
                 direct_agents.add(agent)
+        if "dependent_fields_to_update" in issue:
+            dependent_fields = issue.get("dependent_fields_to_update") or []
+        else:
+            dependent_fields = dependent_fields_for(
+                qtype, list(requested), failure_code=code,
+            )
+        for field in dependent_fields:
+            root = _field_root(field)
+            if not root or root in requested:
+                continue
+            owner = _field_owner(root, qtype)
+            if not owner or root not in _agent_permissions(owner, qtype):
+                continue
+            if issue not in by_agent[owner]:
+                by_agent[owner].append(deepcopy(issue))
+            fields_by_agent[owner].add(root)
+            if owner not in agents:
+                dependent_agents.add(owner)
         spec = FAILURE_ROUTING_REGISTRY.get((role, code)) or {}
         for dependency in spec.get("dependencies") or ():
             if (
@@ -742,6 +905,13 @@ def build_repair_route(qtype: str, verdict: dict[str, Any]) -> dict[str, Any]:
                 "conflicts": [], "unsupported": unsupported}
 
     ordered_agents = list(REPAIR_AGENTS)
+    if qtype in {"definition", "why", "essay", "true_false"}:
+        # The certificate is derived from the reference answer/Boolean answer.
+        # Repair the source answer first, then the certificate.
+        ordered_agents = [
+            "task_alignment", "question", "options", "difficulty",
+            "answer", "solution", "duplicate",
+        ]
     steps = [RepairStep(
         agent=agent,
         issues=tuple(by_agent[agent]),
@@ -1032,6 +1202,17 @@ def _apply_step(qtype: str, current: dict[str, Any], step: RepairStep, row: dict
     for stable in ("question_id", "slot_id", "fitb_entry_id", "selected_variation_id"):
         if stable in current:
             normalized[stable] = current[stable]
+    # Normalization may canonicalize an unrelated field (for example,
+    # certificate.matching_correct_option "" -> None).  That is not an
+    # authorized edit and must not turn a valid question-only Task Alignment
+    # patch into an unauthorized certificate modification.
+    for key in list(normalized):
+        if key in allowed:
+            continue
+        if key in current:
+            normalized[key] = deepcopy(current[key])
+        else:
+            normalized.pop(key, None)
     if _assignment_snapshot(normalized) != assignment_before:
         return None, None, "patch changed immutable assignment metadata"
     violations = _fields_changed_disallowed(qtype, current, normalized, allowed)
@@ -1047,7 +1228,8 @@ def _apply_step(qtype: str, current: dict[str, Any], step: RepairStep, row: dict
         if "solution_certificate" in allowed and not normalized.get("solution_certificate"):
             return None, None, "True/False repair omitted solution_certificate"
         if (
-            statement != str(current.get("statement") or "")
+            "solution_certificate" in allowed
+            and statement != str(current.get("statement") or "")
             and current.get("solution_certificate")
             and normalized.get("solution_certificate")
         ):
@@ -1156,6 +1338,7 @@ def repair_question_specialized(
     content_calls = int(content_repair_calls_used)
     failed_attempts = int(failed_repair_attempts_used)
     revisions: list[dict[str, Any]] = []
+    meaningful_progress = False
     parent_fingerprint = hashlib.sha256(json.dumps(
         current, ensure_ascii=False, sort_keys=True, default=str,
         separators=(",", ":"),
@@ -1309,22 +1492,14 @@ def repair_question_specialized(
                     f"Use a materially different patch and preserve the current candidate: {error}"
                 )
                 if error == "patch made no canonical change":
-                    # Repeating an identical canonical request cannot turn an
-                    # unchanged field into a repair. Preserve any accepted
-                    # revision in candidate_revisions for audit/resume, then
-                    # let Recovery choose revalidation or another bounded
-                    # strategy instead of paying for the same no-op again.
-                    base_result.update(
-                        repair_traces=traces[-config.REPAIR_TRACE_MAX_ATTEMPTS:],
-                        content_repair_calls=content_calls,
-                        failed_repair_attempts=failed_attempts,
-                        candidate_revisions=revisions,
-                        route_status="REPAIR_NO_PROGRESS",
-                    )
+                    # This owner has nothing to change, but a later independent
+                    # owner may still repair another field. Keep any accepted
+                    # revision and continue instead of cancelling the whole
+                    # transaction.
                     base_result["warnings"].append(
                         f"specialized repair {step.agent} rejected unchanged canonical output"
                     )
-                    return base_result
+                    break
                 if (
                     failed_attempts >= config.MAX_FAILED_REPAIR_ATTEMPTS_PER_SLOT
                     or content_calls >= config.MAX_CONTENT_REPAIR_CALLS_PER_SLOT
@@ -1342,6 +1517,7 @@ def repair_question_specialized(
                     return base_result
                 continue
             current = repaired or current
+            meaningful_progress = True
             combined_steps.append(metadata or {})
             if _material_stem_change(qtype, step_start, current):
                 required = _actual_dependent_steps(qtype, step_start, current)
@@ -1383,6 +1559,17 @@ def repair_question_specialized(
             parent_fingerprint = fingerprint
             break
 
+    if not meaningful_progress:
+        base_result.update(
+            repair_traces=traces[-config.REPAIR_TRACE_MAX_ATTEMPTS:],
+            content_repair_calls=content_calls,
+            failed_repair_attempts=failed_attempts,
+            candidate_revisions=revisions,
+            route_status="REPAIR_NO_PROGRESS",
+        )
+        if not base_result["warnings"]:
+            base_result["warnings"].append("specialized repair made no meaningful progress")
+        return base_result
     stale_error = _stale_dependent_error(qtype, original, current)
     if stale_error:
         failed_attempts += 1

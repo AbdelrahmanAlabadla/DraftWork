@@ -265,20 +265,19 @@ def test_saved_103_chunk_catalog_mocked_graph_reaches_final_assembly(
 ):
     """Run the production graph and planner with every paid call mocked."""
     root = Path(__file__).parents[1]
-    source_catalog = root / "data" / "assessment_catalogs" / "33" / (
-        "339d652657343eec2e1a6f5af7dcee91b9523cdd66d9e86f95bceb47171ae3e7.json"
+    source_catalog = root / "data" / "assessment_catalogs" / "9c" / (
+        "9c4dad5da719b88542307f666f86eb83a1b3fdd0bc2f05d9c1751cd72b143530.json"
     )
     # The saved live artifact is intentionally optional for clean CI clones.
     if not source_catalog.exists():
         pytest.skip("saved 103-chunk mathematics Catalog is unavailable")
     processed_key = "772d2717699ca1dc2b015371744fb5d9df8f50751dc7a80b8eb63d716697f84e"
-    # The filesystem copy under data/processed_documents predates the current
-    # Docker index and has different chunk IDs despite sharing this legacy key.
-    # Read the authoritative, persisted child rows used by the saved Catalog.
+    # Use the current catalog/chunk cache generation. The old 175ef217
+    # document predates the active Docker index and has no child rows.
     query = """
         SELECT json_agg(metadata ORDER BY chunk_order)::text
           FROM document_chunks
-         WHERE document_id = '175ef217-a754-4e58-8bae-2bbb4841f824'
+         WHERE document_id = '1d54187a-0034-46da-80c3-ad537d7566fa'
            AND chunk_type = 'child'
     """
     try:
@@ -304,13 +303,23 @@ def test_saved_103_chunk_catalog_mocked_graph_reaches_final_assembly(
         )
     else:
         children = list(json.loads(docker_result.stdout.strip() or "[]"))
+    if not children:
+        pytest.skip("saved 103-chunk PostgreSQL child rows are unavailable")
     assert len(children) == 103
     catalog_payload = json.loads(source_catalog.read_text(encoding="utf-8"))
     assert {str(row["child_id"]) for row in children} == set(
         catalog_payload["selected_chunk_ids"]
     )
+    source_document_hash = str(catalog_payload.get("source_document_hash") or "")
+    from app.online import assessment_catalog as _catalog
+    current_manifest = _catalog._source_chunk_manifest(children, source_document_hash)
+    if catalog_payload.get("source_chunk_manifest") != current_manifest:
+        pytest.skip(
+            "saved 103-chunk catalog and persisted chunk cache are from different "
+            "index generations"
+        )
 
-    cache_copy = tmp_path / "33" / source_catalog.name
+    cache_copy = tmp_path / source_catalog.parent.name / source_catalog.name
     cache_copy.parent.mkdir(parents=True)
     cache_copy.write_bytes(source_catalog.read_bytes())
     calls: list[str] = []
@@ -408,6 +417,7 @@ def test_saved_103_chunk_catalog_mocked_graph_reaches_final_assembly(
     tasks = [("mcq", 10), ("true_false", 5), ("equation", 4), ("word_problem", 4)]
     result = graph.build_exam_graph().invoke({
         "document_id": "saved-math-document", "processed_document_key": processed_key,
+        "source_document_hash": source_document_hash,
         "tasks": tasks, "num_models": 1, "difficulty": "easy",
         "selected_child_ids": [str(row["child_id"]) for row in reversed(children)],
         "domain_type": "stem", "subject": "mathematics", "document_language": "ar",

@@ -25,6 +25,7 @@ from app.api.session_middleware import SessionMiddleware
 from app.logging_conf import configure_logging, get_logger, set_request_id
 from app.errors import AppError, ErrorCode, public_error_payload
 from app.metrics import increment, observe
+from app.exports.html_pdf import renderer as html_pdf_renderer
 
 configure_logging(config.LOG_LEVEL)
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -38,6 +39,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        await html_pdf_renderer.close()
         db.close_pool()
 
 app = FastAPI(

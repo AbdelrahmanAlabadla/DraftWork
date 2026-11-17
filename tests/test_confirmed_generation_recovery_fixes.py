@@ -7,7 +7,7 @@ from pydantic import ValidationError
 
 from app.exports.docx_exporter import _answer_text as docx_answer_text
 from app.exports.math_renderer import latex_to_plain_text, to_mathtext
-from app.exports.pdf_exporter import _answer_text as pdf_answer_text
+from app.exports.document_ir import build_document_ir
 from app.llm.schemas import RepairTrueFalseQuestion, TrueFalseQuestion
 from app.online import duplicate_pipeline
 from app.online.assessment_catalog import (
@@ -178,8 +178,16 @@ def test_true_false_provider_contract_is_native_boolean_but_legacy_normalizer_is
 
 def test_false_answer_is_not_treated_as_missing_by_exports():
     item = {"qtype": "true_false", "answer": False}
-    assert pdf_answer_text(item, "en") == "False"
     assert docx_answer_text(item, "en") == "False"
+    document = build_document_ir(
+        {"model_number": 1, "questions": {"true_false": [{
+            "statement": "False statement", "answer": False,
+        }]}},
+        {},
+        kind="answers",
+    )
+    runs = document["sections"][0]["items"][0]["answer_blocks"][0]["runs"]
+    assert runs == [{"type": "text", "text": "False"}]
 
 
 def test_one_fallback_builder_writes_complete_authoritative_state():

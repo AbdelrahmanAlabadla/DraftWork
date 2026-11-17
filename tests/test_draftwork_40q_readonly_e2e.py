@@ -949,7 +949,7 @@ def test_40q_mocked_end_to_end_pipeline(monkeypatch):
         if any(row.get("question_id") == "Q3" for row in call.get("questions") or [])
     ]
     q3_agents = [call["repair_agent"] for call in q3_repair_objects]
-    assert q3_agents[:3] == ["question", "options", "answer"], q3_agents
+    assert q3_agents[:4] == ["question", "options", "solution", "answer"], q3_agents
 
     # --- Q26: difficulty-only mismatch is terminal-accepted (Group 2) ----
     q26_events = [

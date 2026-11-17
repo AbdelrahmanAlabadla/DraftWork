@@ -110,16 +110,26 @@ def test_mcq_conflict_reconciles_then_revalidates_with_production_nodes(monkeypa
         provider_calls.append(prompt)
         payload = json.loads(prompt.split("<REPAIR_DATA>\n", 1)[1].split("\n</REPAIR_DATA>", 1)[0])
         current = payload["questions"][0]["current_question"]
+        agent = payload["repair_agent"]
         repaired = _certificate("C", "-10 matches option C.")
+        if agent == "options":
+            patch = {"options": dict(current["options"])}
+        elif agent == "answer":
+            patch = {"correct_answer": "C"}
+        else:
+            patch = {"solution_certificate": repaired}
+        changes = [{
+            "field": field,
+            "previous_value": json.dumps(current.get(field), ensure_ascii=False, sort_keys=True),
+            "new_value": json.dumps(value, ensure_ascii=False, sort_keys=True),
+            "reason": f"{agent} synchronization.",
+        } for field, value in patch.items()]
         return {"repairs": [{
             "question_id": question["question_id"],
-            "patch": {"solution_certificate": repaired},
+            "patch": patch,
             "repair_metadata": {
-                "modified_fields": ["solution_certificate"],
-                "changes": [{"field": "solution_certificate",
-                             "previous_value": json.dumps(current["solution_certificate"], ensure_ascii=False, sort_keys=True),
-                             "new_value": json.dumps(repaired, ensure_ascii=False, sort_keys=True),
-                             "reason": "Synchronizes the certificate mapping."}],
+                "modified_fields": list(patch),
+                "changes": changes,
                 "targeted_failure_codes": ["answer_inconsistent", "incorrect_option_mapping"],
             },
         }]}
@@ -128,7 +138,7 @@ def test_mcq_conflict_reconciles_then_revalidates_with_production_nodes(monkeypa
     first = repair_invalid_questions(state)
     assert first["question_repair_attempts"] == {"m1_mcq_4": 1}
     assert first["repair_manifest"][0]["status"] == "candidate_generated"
-    assert len(provider_calls) == 1
+    assert len(provider_calls) == 3
     assert first["repair_candidates"][0]["repair_strategy"] == "recovery_v3_targeted_repair"
 
     monkeypatch.setattr(multi_validator, "validate_exam_multi", lambda *_a, **_k: _pass_report(question["question_id"]))
@@ -197,24 +207,33 @@ def test_tf5_descriptive_metadata_stages_atomically_and_reaches_revalidation(mon
         "verification_method": "substitute (-1,-5,7) into all displayed equations",
     }
 
-    monkeypatch.setattr(multi_repair, "request_structured", lambda *_a, **_k: {
-        "repairs": [{
-            "question_id": qid,
-            "patch": {
-                "statement": "The tuple (-1,-5,7) satisfies this displayed system: ...",
-                "answer": False, "solution_certificate": new_certificate,
-            },
+    def tf_repair(_client, prompt, **_kwargs):
+        payload = json.loads(
+            prompt.split("<REPAIR_DATA>\n", 1)[1].split("\n</REPAIR_DATA>", 1)[0]
+        )["questions"][0]
+        agent = payload["repair_agent"]
+        current = payload["current_question"]
+        if agent == "task_alignment":
+            patch = {"statement": "The tuple (-1,-5,7) satisfies this displayed system: ..."}
+        elif agent == "answer":
+            patch = {"answer": False}
+        else:
+            patch = {"solution_certificate": new_certificate}
+        changes = [{
+            "field": field,
+            "previous_value": json.dumps(current.get(field), ensure_ascii=False, sort_keys=True),
+            "new_value": json.dumps(value, ensure_ascii=False, sort_keys=True),
+            "reason": "Synchronize the atomic True/False claim.",
+        } for field, value in patch.items()]
+        return {"repairs": [{
+            "question_id": qid, "patch": patch,
             "repair_metadata": {
-                "modified_fields": ["statement", "answer", "solution_certificate"],
-                "changes": [
-                    {"field": "statement", "previous_value": "old statement", "new_value": "new", "reason": "grounding"},
-                    {"field": "answer", "previous_value": "true", "new_value": "false", "reason": "consistency"},
-                    {"field": "solution_certificate", "previous_value": "old certificate description", "new_value": "new certificate description", "reason": "consistency"},
-                ],
+                "modified_fields": list(patch), "changes": changes,
                 "targeted_failure_codes": ["unsupported"],
             },
-        }]
-    })
+        }]}
+
+    monkeypatch.setattr(multi_repair, "request_structured", tf_repair)
     staged = repair_invalid_questions(state)
     assert len(staged["repair_candidates"]) == 1
     called = []
@@ -294,7 +313,7 @@ def test_terminal_slot_is_excluded_and_partial_assembly_keeps_three_questions(mo
     assert assembled["accepted_slot_ids"] == ["m1_mcq_1", "m1_mcq_2", "m1_mcq_3"]
 
 
-def test_failed_content_recovery_moves_to_separate_completion_budget(monkeypatch):
+def test_failed_generation_does_not_consume_completion_budget(monkeypatch):
     question = _mcq("q-fail", "m1_mcq_1")
     state = _state(question, _issue("incorrect_answer", ["solution_certificate"], "wrong", "fix"))
     provider_calls: list[str] = []
@@ -316,8 +335,10 @@ def test_failed_content_recovery_moves_to_separate_completion_budget(monkeypatch
     assert first["question_repair_attempts"] == {"m1_mcq_1": 1}
     assert second["question_repair_attempts"] == {"m1_mcq_1": 2}
     assert third["question_repair_attempts"] == {"m1_mcq_1": 2}
-    assert third["slot_completion_attempts"] == {"m1_mcq_1": 1}
-    assert resumed["slot_completion_attempts"] == {"m1_mcq_1": 2}
+    # A generation that produced no candidate is not a completed replacement;
+    # it must not consume the inventory budget needed for the next eligible task.
+    assert third["slot_completion_attempts"] == {}
+    assert resumed["slot_completion_attempts"] == {}
     assert provider_calls == ["targeted"]
     assert graph._route_after_validation({**state, **third}) == "repair_invalid_questions"
 

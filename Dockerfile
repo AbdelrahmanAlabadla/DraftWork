@@ -14,6 +14,15 @@ COPY requirements.txt ./
 RUN python -m pip install --no-cache-dir --upgrade pip \
     && python -m pip install --no-cache-dir -r requirements.txt
 
+# Chromium requires libatomic.so.1 during Playwright's browser installation.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the version-matched headless Chromium runtime and its Linux font /
+# shared-library dependencies for deterministic server-side PDF exports.
+RUN python -m playwright install --with-deps chromium
+
 # Keep these ARGs after the dependency layer so changing the source revision
 # does not invalidate cached pip installs.
 ARG GIT_COMMIT=unknown

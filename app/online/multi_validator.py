@@ -113,7 +113,7 @@ _JOB_VERDICT_CACHE: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = defa
 # Backward-compatible test/import alias. The cache now stores deterministic
 # PASS and FAIL verdicts; operational errors are never cached.
 _JOB_PASS_CACHE = _JOB_VERDICT_CACHE
-SPECIALIZED_VALIDATION_CACHE_VERSION = "specialized-role-verdict-v7-illustrative-values-grounding-evidence"
+SPECIALIZED_VALIDATION_CACHE_VERSION = "specialized-role-verdict-v8-dependent-fields"
 
 # The structured response schema is immutable for a process build.  Rebuilding
 # it for every role fingerprint was measured at ~3.3 ms per question/role and
@@ -679,6 +679,95 @@ ROLE_INSTRUCTIONS = {
 }
 
 
+# Deterministic field-dependency contract shared with Repair routing.
+# Values are fields that must be checked after the key field changes; they are
+# not automatically authorized edits.
+FIELD_DEPENDENCIES: dict[str, dict[str, tuple[str, ...]]] = {
+    "mcq": {
+        "question": ("options", "correct_answer", "solution_certificate"),
+        "options": ("correct_answer", "solution_certificate"),
+        "correct_answer": ("solution_certificate",),
+        "solution_certificate": ("options", "correct_answer"),
+    },
+    "true_false": {
+        "statement": ("answer", "solution_certificate"),
+        "answer": ("solution_certificate",),
+        "solution_certificate": ("answer",),
+    },
+    "equation": {
+        "equation": ("solution_steps", "final_answer", "solution_certificate"),
+        "solution_steps": ("final_answer", "solution_certificate"),
+        "final_answer": ("solution_steps", "solution_certificate"),
+        "solution_certificate": ("solution_steps", "final_answer"),
+    },
+    "word_problem": {
+        "question": ("solution_steps", "final_answer", "solution_certificate"),
+        "solution_steps": ("final_answer", "solution_certificate"),
+        "final_answer": ("solution_steps", "solution_certificate"),
+        "solution_certificate": ("solution_steps", "final_answer"),
+    },
+    "definition": {
+        "term": ("reference_answer", "solution_certificate"),
+        "reference_answer": ("solution_certificate",),
+        "solution_certificate": ("reference_answer",),
+    },
+    "why": {
+        "question": ("reference_answer", "solution_certificate"),
+        "reference_answer": ("solution_certificate",),
+        "solution_certificate": ("reference_answer",),
+    },
+    "essay": {
+        "question": ("reference_answer", "key_points", "solution_certificate"),
+        "reference_answer": ("key_points", "solution_certificate"),
+        "key_points": ("reference_answer", "solution_certificate"),
+        "solution_certificate": ("reference_answer", "key_points"),
+    },
+    "fill_in_the_blank": {
+        "question": ("answers", "distractors"),
+        "answers": ("distractors",),
+        "distractors": ("answers",),
+    },
+}
+
+
+_QUESTION_DEPENDENCY_CODES = {
+    "wrong_givens", "task_drift", "wrong_variation",
+    "question_type_operation_mismatch", "incorrect_calculation",
+    "incorrect_result", "unit_inconsistency", "significant_figures_error",
+    "answer_inconsistent", "unsupported", "contradicted",
+    "incomplete_solution",
+}
+
+
+def dependent_fields_for(
+    qtype: str, fields: list[str] | tuple[str, ...],
+    reported: list[str] | tuple[str, ...] | None = None,
+    failure_code: str = "",
+) -> list[str]:
+    """Return deterministic dependent roots for the reported defect fields."""
+    mapping = FIELD_DEPENDENCIES.get(str(qtype or ""), {})
+    roots = {_field_root(field) for field in fields or []}
+    known_values = {
+        value for values in mapping.values() for value in values
+    }
+    dependent: list[str] = []
+    for root in roots:
+        if root in {"question", "statement"} and str(failure_code) not in _QUESTION_DEPENDENCY_CODES:
+            # Wording-only and missing-information repairs must not fan out to
+            # numerical/keyed owners merely because the stem is involved.
+            continue
+        for value in mapping.get(root, ()):
+            if value not in roots and value not in dependent:
+                dependent.append(value)
+    # A supplied dependency can add a known field but cannot smuggle in an
+    # unknown or original-defect field.
+    for field in reported or ():
+        value = _field_root(field)
+        if value in known_values and value not in roots and value not in dependent:
+            dependent.append(value)
+    return dependent
+
+
 # Validator payloads nest student text under ``question_and_answer`` for
 # transport, but Repair contracts address the generated question object's
 # top-level fields.  State the distinction in every structured-validator
@@ -697,6 +786,10 @@ STUDENT_FACING_FIELD_CONTRACT = (
     "the answer key does not need an embedded graph image when it gives correct inequalities, "
     "boundary descriptions, feasible-region/shading guidance, and applicable vertices. Missing "
     "answer-key graphing guidance is an answer-key completeness issue, not a missing student given."
+    " For every issue, list the exact original defect in fields_to_fix and any likely stale "
+    "dependent fields in dependent_fields_to_update (for example solution_steps -> "
+    "final_answer and solution_certificate, or MCQ correct_answer -> solution_certificate). "
+    "Dependent fields are checks, not automatic authorization to edit them."
 )
 
 
@@ -1371,7 +1464,7 @@ def _compatibility_verdict(
         return {
             "question_id": item.question_id, "question_valid": True, "answer_valid": True,
             "action": "PASS", "validation_status": "PASS", "failure_code": "pass",
-            "fields_to_fix": [], "expected_results": [], "reason": "", "expected_fix": "",
+            "fields_to_fix": [], "dependent_fields_to_update": [], "expected_results": [], "reason": "", "expected_fix": "",
             "required_fixes": [], "role_statuses": role_statuses,
             "difficulty_observation": observation,
             "input_protection_events": item.sanitization_events,
@@ -1393,6 +1486,22 @@ def _compatibility_verdict(
                 word in code for word in ("question", "given", "task", "ground", "unsupported", "difficulty")
             ) else _answer_fields(item.question_type))
         issue["fields_to_fix"] = mapped
+        issue["dependent_fields_to_update"] = dependent_fields_for(
+            item.question_type, mapped,
+            issue.get("dependent_fields_to_update"),
+            str(issue.get("failure_code") or ""),
+        )
+        if (
+            issue["dependent_fields_to_update"]
+            and not str(issue.get("dependency_reason") or "").strip()
+        ):
+            issue["dependency_reason"] = (
+                "Repairing "
+                + ", ".join(mapped)
+                + " can make "
+                + ", ".join(issue["dependent_fields_to_update"])
+                + " stale; check and update them when needed."
+            )
         for field in mapped:
             by_field[field].add(str(issue.get("expected_fix") or issue.get("reason") or ""))
             issues_by_field[field].append(issue)
@@ -1426,6 +1535,12 @@ def _compatibility_verdict(
             conflict["instructions"] = sorted(value for value in instructions if value)
             conflicts.append(conflict)
     fields = sorted(by_field)
+    dependent_fields = sorted({
+        str(value)
+        for issue in issues
+        for value in issue.get("dependent_fields_to_update") or []
+        if str(value) not in set(fields)
+    })
     question_fields = set(_prompt_fields(item.question_type))
     answer_fields = set(_answer_fields(item.question_type))
     touches_q, touches_a = bool(question_fields & set(fields)), bool(answer_fields & set(fields))
@@ -1435,6 +1550,7 @@ def _compatibility_verdict(
         "question_id": item.question_id, "question_valid": not touches_q,
         "answer_valid": not touches_a, "action": action, "validation_status": "FAIL",
         "failure_code": primary.get("failure_code") or "other", "fields_to_fix": fields,
+        "dependent_fields_to_update": dependent_fields,
         "expected_results": [], "reason": " | ".join(str(issue.get("reason") or "") for issue in issues),
         "expected_fix": " | ".join(str(issue.get("expected_fix") or "") for issue in issues if issue.get("expected_fix")),
         "required_fixes": issues, "repair_instruction_conflicts": conflicts,

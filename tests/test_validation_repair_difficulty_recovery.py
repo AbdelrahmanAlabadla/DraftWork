@@ -149,11 +149,12 @@ def test_true_false_atomic_route_coordinates_statement_answer_and_certificate():
     route = multi_repair.build_repair_route("true_false", verdict)
     assert route["status"] == "READY"
     assert route["atomic_true_false"] is True
-    assert len(route["steps"]) == 1
-    assert route["steps"][0].agent == "task_alignment"
-    assert set(route["steps"][0].fields) == {
-        "statement", "answer", "solution_certificate",
-    }
+    assert [step.agent for step in route["steps"]] == [
+        "task_alignment", "answer", "solution",
+    ]
+    assert route["steps"][0].fields == ("statement",)
+    assert route["steps"][1].fields == ("answer",)
+    assert route["steps"][2].fields == ("solution_certificate",)
 
 
 def test_true_false_compatible_certificate_findings_reconcile():

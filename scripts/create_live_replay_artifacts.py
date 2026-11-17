@@ -15,7 +15,10 @@ from psycopg.rows import dict_row
 
 from app import config, db
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
-from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
+from app.exports.html_pdf import (
+    render_answers_pdf_sync as render_answers_pdf,
+    render_exam_pdf_sync as render_exam_pdf,
+)
 
 SOURCE_JOB = "d12480df-9961-4c0c-93a2-64f86495a33b"
 JOB = "dce90847-63df-4017-a3c7-f43fb1e420db"

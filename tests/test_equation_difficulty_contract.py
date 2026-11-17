@@ -13,7 +13,7 @@ import pypdf
 
 from app.exports.common import split_equation_content
 from app.exports.docx_exporter import render_exam_docx
-from app.exports.pdf_exporter import render_exam_pdf
+from app.exports.html_pdf import render_exam_pdf_sync as render_exam_pdf
 from app.exports.math_renderer import render_math
 from app.online import assessment_catalog, planner
 

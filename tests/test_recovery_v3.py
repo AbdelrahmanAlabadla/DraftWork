@@ -37,13 +37,14 @@ def test_recovery_decision_batches_are_three(monkeypatch, count, expected):
 def test_recovery_decision_supports_fifty_real_inflight_calls(monkeypatch):
     lock = threading.Lock()
     current = peak = 0
+    all_inflight = threading.Barrier(50, timeout=5)
 
     def fake_request(_client, _prompt, **kwargs):
         nonlocal current, peak
         with lock:
             current += 1
             peak = max(peak, current)
-        time.sleep(0.03)
+        all_inflight.wait()
         with lock:
             current -= 1
         return {"decisions": [{
@@ -64,8 +65,9 @@ def test_job_scheduler_allows_fifty_recovery_requests():
     scheduler.reset_scheduler_for_tests()
     lock = threading.Lock()
     current = peak = 0
+    all_inflight = threading.Barrier(50, timeout=5)
 
-    def worker():
+    def worker(index: int):
         nonlocal current, peak
         with scheduler.llm_request_slot(
             agent="task_alignment_validator", operation="recovery_decision",
@@ -74,16 +76,22 @@ def test_job_scheduler_allows_fifty_recovery_requests():
             with lock:
                 current += 1
                 peak = max(peak, current)
-            time.sleep(0.03)
+            if index < 50:
+                all_inflight.wait()
+            time.sleep(0.01)
             with lock:
                 current -= 1
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=55) as executor:
-        list(executor.map(lambda _value: worker(), range(55)))
+        list(executor.map(worker, range(55)))
+    snapshot = scheduler.scheduler_snapshot("__unscoped__")
     assert config.LLM_JOB_CONCURRENCY_LIMIT == 50
     assert peak == 50
-    assert scheduler.scheduler_snapshot("__unscoped__")["peak"] == 50
+    assert snapshot["peak"] == 50
+    assert snapshot["completed"] == 55
+    assert snapshot["active"] == 0
+    assert snapshot["waiting"] == 0
 
 
 def test_invalid_batch_is_persisted_as_resumable_block(monkeypatch):
@@ -124,6 +132,7 @@ def test_recovery_eligibility_does_not_select_strategy():
 
 @pytest.mark.parametrize("strategy,action", [
     ("REPAIR", "repair_question"),
+    ("SWITCH_VARIATION", "switch_variation"),
     ("REGENERATE", "regenerate_missing_slot"),
     ("SWITCH_TASK", "replace_assignment"),
 ])
@@ -166,3 +175,49 @@ def test_decision_is_not_called_again_after_checkpoint_resume(monkeypatch):
     assert audit is None
     assert resumed[0]["recovery_v3"]["decision_calls"] == 1
     assert calls == [["q1"]]
+
+
+def test_recovery_strategy_schema_accepts_variation_and_rejects_invented_strategy(monkeypatch):
+    from pydantic import ValidationError
+    from app.llm.schemas import RecoveryDecision
+
+    accepted = RecoveryDecision.model_validate({
+        "question_id": "q1", "strategy": "SWITCH_VARIATION",
+        "reason": "an eligible narrower variation exists",
+        "fallback_sequence": ["SWITCH_TASK"],
+    })
+    assert accepted.strategy == "SWITCH_VARIATION"
+    with pytest.raises(ValidationError):
+        RecoveryDecision.model_validate({
+            "question_id": "q1", "strategy": "MAKE_NEW_QUESTION",
+            "reason": "invented", "fallback_sequence": [],
+        })
+
+    def fake_request(_client, _prompt, **kwargs):
+        return {"decisions": [{
+            "question_id": qid, "strategy": "SWITCH_VARIATION",
+            "reason": "evidence is variation-specific",
+            "fallback_sequence": ["SWITCH_TASK"],
+            "switch_preference": None,
+        } for qid in kwargs["expected_ids"]]}
+
+    monkeypatch.setattr(recovery_decision, "request_structured", fake_request)
+    decisions, _audit = recovery_decision.decide_recovery(
+        _contexts(1), domain="STEM", client_factory=lambda: object(),
+    )
+    assert decisions["q0"]["plan"] == ["SWITCH_VARIATION", "SWITCH_TASK"]
+
+
+def test_recovery_decision_does_not_invent_fixed_fallbacks(monkeypatch):
+    def fake_request(_client, _prompt, **kwargs):
+        return {"decisions": [{
+            "question_id": qid, "strategy": "REPAIR",
+            "reason": "localized repair", "fallback_sequence": [],
+            "switch_preference": None,
+        } for qid in kwargs["expected_ids"]]}
+
+    monkeypatch.setattr(recovery_decision, "request_structured", fake_request)
+    decisions, _audit = recovery_decision.decide_recovery(
+        _contexts(1), domain="STEM", client_factory=lambda: object(),
+    )
+    assert decisions["q0"]["plan"] == ["REPAIR"]

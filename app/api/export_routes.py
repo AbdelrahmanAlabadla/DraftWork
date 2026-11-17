@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import zipfile
+import asyncio
 from collections.abc import Callable
 from typing import Any
 
@@ -17,7 +18,7 @@ from pydantic import BaseModel
 from app.api import exam_store
 from app.exports.common import document_export_filenames
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
-from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
+from app.exports.html_pdf import render_answers_pdf, render_exam_pdf
 from app.logging_conf import get_logger, set_request_id
 
 logger = get_logger("EXPORT")
@@ -84,6 +85,31 @@ def _document_archive(
     return output.getvalue()
 
 
+async def _pdf_document_archive(
+    record: dict[str, Any], selected: list[dict[str, Any]]
+) -> bytes:
+    """Render selected models through the shared HTML Review renderer."""
+    metadata = dict(record.get("metadata") or {})
+    jobs = [
+        operation(exam, metadata)
+        for exam in selected
+        for operation in (render_exam_pdf, render_answers_pdf)
+    ]
+    rendered = await asyncio.gather(*jobs)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        index = 0
+        for exam in selected:
+            model_number = int(exam.get("model_number") or 1)
+            exam_name, answers_name = document_export_filenames(
+                metadata, model_number, "pdf"
+            )
+            archive.writestr(exam_name, rendered[index])
+            archive.writestr(answers_name, rendered[index + 1])
+            index += 2
+    return output.getvalue()
+
+
 def _zip_response(content: bytes) -> StreamingResponse:
     return StreamingResponse(
         io.BytesIO(content),
@@ -95,16 +121,14 @@ def _zip_response(content: bytes) -> StreamingResponse:
 
 
 @router.post("/pdf")
-def export_pdf(
+async def export_pdf(
     exam_id: str, body: DocumentExportRequest | None = None
 ) -> StreamingResponse:
     record = _load_record(exam_id)
     selected = _selected_models(record, body)
     set_request_id(exam_id)
     try:
-        archive = _document_archive(
-            record, selected, "pdf", render_exam_pdf, render_answers_pdf
-        )
+        archive = await _pdf_document_archive(record, selected)
     except Exception as exc:
         logger.error("PDF export failed | exam_id=%s | exc=%s", exam_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail="PDF export failed")
