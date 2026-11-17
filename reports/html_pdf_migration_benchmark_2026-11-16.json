@@ -1,0 +1,39 @@
+{
+  "fixture": {
+    "exam_id": "exam_1b866d011562",
+    "model": 2,
+    "language": "ar"
+  },
+  "legacy": {
+    "times_seconds": [
+      4.5654890000000705,
+      1.2732248000002073,
+      2.9708071999998538,
+      1.2541300000002593
+    ],
+    "average_seconds": 2.5159127500000977,
+    "student_bytes": 115415,
+    "answers_bytes": 61640,
+    "observed_process_tree_peak_bytes": 147738624
+  },
+  "html_to_pdf": {
+    "times_seconds": [
+      1.6450783999998748,
+      0.6834462000001622,
+      0.7936453000002075,
+      0.6768747999999505
+    ],
+    "cold_start_seconds": 1.6450783999998748,
+    "warm_average_seconds": 0.7179887666667734,
+    "average_seconds": 0.9497611750000488,
+    "student_bytes": 171596,
+    "answers_bytes": 102995,
+    "two_document_concurrent_seconds": 1.098873299999923,
+    "concurrent_bytes": [
+      171596,
+      102995
+    ],
+    "observed_process_tree_peak_bytes": 676425728
+  },
+  "measurement_note": "RSS is an observed process-tree snapshot, not an instrumented high-water mark; final Python RSS was 144154624 bytes."
+}

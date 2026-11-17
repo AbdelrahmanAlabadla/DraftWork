@@ -6,7 +6,7 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-pytest.importorskip("fpdf")
+pytest.importorskip("playwright")
 pytest.importorskip("docx")
 
 from app.exports.common import (
@@ -16,7 +16,10 @@ from app.exports.common import (
     group_exam_sections,
 )
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
-from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
+from app.exports.html_pdf import (
+    render_answers_pdf_sync as render_answers_pdf,
+    render_exam_pdf_sync as render_exam_pdf,
+)
 from app.exports.common import split_equation_content
 from app.exports.math_renderer import latex_to_plain_text, render_math
 

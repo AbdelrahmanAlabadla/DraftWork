@@ -14,7 +14,7 @@ from app.exports.content_parser import (
 )
 from app.exports.document_ir import build_document_ir
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
-from app.exports.pdf_exporter import render_exam_pdf
+from app.exports.html_pdf import render_exam_pdf_sync as render_exam_pdf
 
 
 def _arabic_exam() -> dict:

@@ -7,7 +7,7 @@ from app.online import assessment_catalog, independent_recovery
 from app.online.exam_builder import assemble_exams_node
 from app.online.lifecycle import initialize_slot_lifecycle
 from app.exports.docx_exporter import render_exam_docx
-from app.exports.pdf_exporter import render_exam_pdf
+from app.exports.html_pdf import render_exam_pdf_sync as render_exam_pdf
 
 
 def _task(task_id: str) -> dict:

@@ -1,0 +1,84 @@
+@font-face {
+  font-family: "Amiri";
+  src: url("../../app/exports/fonts/Amiri-Regular.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "Amiri";
+  src: url("../../app/exports/fonts/Amiri-Bold.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+html,
+body.print-renderer-body,
+#printRoot {
+  margin: 0;
+  padding: 0;
+  background: #ffffff;
+  color: #000000;
+}
+
+body.print-renderer-body .exam-paper {
+  width: 210mm;
+  min-height: 0;
+  height: auto;
+  margin: 0;
+  padding: 3mm 15mm;
+  border: 0;
+  box-shadow: none;
+  background: #ffffff;
+}
+
+body.print-renderer-body .preview-page-number {
+  display: none;
+}
+
+body.print-renderer-body .answer-key-paper {
+  page-break-before: auto;
+}
+
+body.print-renderer-body .preview-section-heading {
+  break-after: avoid-page;
+  page-break-after: avoid;
+}
+
+body.print-renderer-body .preview-question,
+body.print-renderer-body .preview-question-stem,
+body.print-renderer-body .preview-options,
+body.print-renderer-body .preview-option,
+body.print-renderer-body .preview-with-table,
+body.print-renderer-body .exam-table,
+body.print-renderer-body .preview-key-answer {
+  break-inside: avoid-page;
+  page-break-inside: avoid;
+}
+
+body.print-renderer-body .preview-response-line {
+  height: 6mm;
+}
+
+body.print-renderer-body .preview-question-content,
+body.print-renderer-body .preview-answer-content {
+  orphans: 3;
+  widows: 3;
+}
+
+body.print-renderer-body .preview-key-answer {
+  display: grid;
+  grid-template-columns: 7mm minmax(0, 1fr);
+  align-items: start;
+}
+
+body.print-renderer-body .exam-paper[dir="rtl"] .preview-key-answer {
+  grid-template-columns: 7mm minmax(0, 1fr);
+}
+
+@page {
+  size: A4;
+  margin: 10mm 0 16mm;
+}

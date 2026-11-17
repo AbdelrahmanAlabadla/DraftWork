@@ -3,7 +3,10 @@ import io
 
 from app.api import exam_store
 from app.exports.common import flatten_exam_items
-from app.exports.pdf_exporter import render_answers_pdf, render_exam_pdf
+from app.exports.html_pdf import (
+    render_answers_pdf_sync as render_answers_pdf,
+    render_exam_pdf_sync as render_exam_pdf,
+)
 from app.exports.docx_exporter import render_answers_docx, render_exam_docx
 
 exam = {

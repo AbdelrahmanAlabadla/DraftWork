@@ -114,7 +114,7 @@ def test_two_model_production_recovery_assembly_and_export(monkeypatch):
     assert len(assembled["accepted_slot_ids"]) == 46
 
     from app.exports.docx_exporter import render_exam_docx
-    from app.exports.pdf_exporter import render_exam_pdf
+    from app.exports.html_pdf import render_exam_pdf_sync as render_exam_pdf
     model_one = next(
         exam for exam in assembled["generated_exams"]
         if int(exam.get("model_number") or 0) == 1
