@@ -3,7 +3,7 @@ from __future__ import annotations
 import copy
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, create_model
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StrictBool, create_model
 
 NonEmptyString = Annotated[str, Field(min_length=1)]
 
@@ -37,16 +37,20 @@ class StrictOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-RecoveryStrategy = Literal["REPAIR", "REGENERATE", "SWITCH_TASK"]
+RecoveryStrategy = Literal[
+    "REPAIR", "SWITCH_VARIATION", "SWITCH_TASK", "REGENERATE",
+]
 
 
 class RecoveryDecision(StrictOutputModel):
     """One Task Alignment Recovery V3 decision for one failed question."""
 
     question_id: NonEmptyString
-    decision: RecoveryStrategy
+    strategy: RecoveryStrategy = Field(
+        validation_alias=AliasChoices("strategy", "decision"),
+    )
     reason: str = Field(min_length=1, max_length=2000)
-    fallback_sequence: list[RecoveryStrategy] = Field(max_length=2)
+    fallback_sequence: list[RecoveryStrategy] = Field(max_length=3)
     switch_preference: str | None = Field(default=None, max_length=500)
 
 
@@ -388,6 +392,7 @@ class ValidatorVerdict(StrictOutputModel):
         "FIX_QUESTION_AND_ANSWER",
     ]
     fields_to_fix: list[str]
+    dependent_fields_to_update: list[str] = Field(default_factory=list, max_length=24)
     failure_code: Literal[
         "pass",
         "incorrect_result",
@@ -421,6 +426,8 @@ class QuantitativeValidatorVerdict(ValidatorVerdict):
 class ValidationIssue(StrictOutputModel):
     failure_code: str = Field(min_length=1, max_length=80)
     fields_to_fix: list[str] = Field(default_factory=list, max_length=12)
+    dependent_fields_to_update: list[str] = Field(default_factory=list, max_length=12)
+    dependency_reason: str = Field(default="", max_length=2000)
     reason: str = Field(min_length=1, max_length=2000)
     expected_fix: str = Field(default="", max_length=2000)
     category: Literal[

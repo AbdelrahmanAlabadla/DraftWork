@@ -112,7 +112,7 @@ def test_dependency_route_repairs_solution_before_answer_mapping():
         ],
     }
     route = multi_repair.build_repair_route("mcq", verdict)
-    assert [step.agent for step in route["steps"]] == ["solution", "answer"]
+    assert [step.agent for step in route["steps"]] == ["options", "solution", "answer"]
 
 
 def test_successful_intermediate_revision_is_input_to_next_agent(monkeypatch):
@@ -132,7 +132,9 @@ def test_successful_intermediate_revision_is_input_to_next_agent(monkeypatch):
     def fake_call_step(*, payload, **_kwargs):
         seen.append((payload["repair_agent"], payload["current_question"]["correct_answer"]))
         current = payload["current_question"]
-        if payload["repair_agent"] == "solution":
+        if payload["repair_agent"] == "options":
+            patch = {"options": dict(current["options"])}
+        elif payload["repair_agent"] == "solution":
             certificate = dict(current["solution_certificate"])
             certificate.update({"final_answer": "B", "matching_correct_option": "B",
                                 "verification_method": "4 is B"})
@@ -161,12 +163,12 @@ def test_successful_intermediate_revision_is_input_to_next_agent(monkeypatch):
         source_chunks={}, domain="STEM", client_factory=lambda _agent: object(),
     )
     assert result["route_status"] == "COMPLETE"
-    assert result["content_repair_calls"] == 2
+    assert result["content_repair_calls"] == 3
     assert result["failed_repair_attempts"] == 0
     assert [row["status"] for row in result["candidate_revisions"]] == [
-        "accepted", "accepted",
+        "accepted", "accepted", "accepted",
     ]
-    assert seen == [("solution", "A"), ("answer", "A")]
+    assert seen == [("options", "A"), ("solution", "A"), ("answer", "A")]
     assert exam["questions"]["mcq"][0]["correct_answer"] == "B"
     assert exam["questions"]["mcq"][0]["solution_certificate"]["matching_correct_option"] == "B"
 
@@ -185,21 +187,21 @@ def test_rejected_later_patch_preserves_last_accepted_revision(monkeypatch):
 
     def fake_call_step(**_kwargs):
         calls["count"] += 1
-        if _kwargs["payload"]["repair_agent"] == "solution":
+        if _kwargs["payload"]["repair_agent"] == "answer":
             return ({"question_id": "q1",
-                "patch": {"solution_certificate": {
-                    "method": "rebuilt", "important_givens": ["mass"],
-                    "calculation_steps": ["define mass"], "final_answer": "wrong",
-                    "units": "", "matching_correct_option": None,
-                    "verification_method": "check definition",
-                }},
-                "repair_metadata": {"modified_fields": ["solution_certificate"],
+                "patch": {"reference_answer": "amount of matter"},
+                "repair_metadata": {"modified_fields": ["reference_answer"],
                                     "changes": [], "targeted_failure_codes": []}}, None, {})
-        # The later Answer patch is rejected; the accepted Solution revision
+        # The later Solution patch is rejected; the accepted Answer revision
         # remains available in the revision history.
         return ({"question_id": "q1",
-            "patch": {"reference_answer": "amount of matter", "term": "changed"},
-            "repair_metadata": {"modified_fields": ["reference_answer", "term"],
+            "patch": {"solution_certificate": {
+                "method": "rebuilt", "important_givens": ["mass"],
+                "calculation_steps": ["define mass"], "final_answer": "wrong",
+                "units": "", "matching_correct_option": None,
+                "verification_method": "check definition",
+            }, "term": "changed"},
+            "repair_metadata": {"modified_fields": ["solution_certificate", "term"],
                                 "changes": [], "targeted_failure_codes": []}}, None, {})
 
     monkeypatch.setattr(multi_repair, "_call_step", fake_call_step)
@@ -221,7 +223,5 @@ def test_rejected_later_patch_preserves_last_accepted_revision(monkeypatch):
     assert result["failed_repair_attempts"] == 3
     assert result["candidate_revisions"][0]["status"] == "accepted"
     assert result["candidate_revisions"][1]["status"] == "rejected"
-    assert result["candidate_revisions"][0]["candidate"]["solution_certificate"][
-        "method"
-    ] == "rebuilt"
+    assert result["candidate_revisions"][0]["candidate"]["reference_answer"] == "amount of matter"
     assert exam["questions"]["definition"][0]["reference_answer"] == "wrong"

@@ -122,6 +122,13 @@ def test_24_question_validation_repair_revalidation_commit(monkeypatch):
             patch = {"question": "What is 2 + 2?"}
         elif agent == "options":
             patch = {"options": {"A": "4", "B": "3", "C": "5", "D": "6"}}
+        elif agent == "solution":
+            patch = {"solution_certificate": {
+                "method": "addition", "important_givens": ["2+2"],
+                "calculation_steps": ["2 + 2 = 4"], "final_answer": "4",
+                "units": "", "matching_correct_option": "A",
+                "verification_method": "4 is option A",
+            }}
         else:
             patch = {"correct_answer": "A"}
         changes = []
@@ -173,11 +180,11 @@ def test_24_question_validation_repair_revalidation_commit(monkeypatch):
              "repair_manifest": manifest, "validation_reports": [initial], "validated_models": [],
              "question_repair_attempts": {}, "warnings": []}
     staged = repair_invalid_questions(state)
-    assert repair_calls == ["question", "options", "answer"], staged.get("warnings")
+    assert repair_calls == ["question", "options", "solution", "answer"], staged.get("warnings")
     candidate = staged["repair_candidates"][0]
-    assert len(candidate["repair_metadata"]["steps"]) == 3
+    assert len(candidate["repair_metadata"]["steps"]) == 4
     assert [change["agent"] for change in candidate["repair_metadata"]["changes"]] == [
-        "question", "options", "answer",
+        "question", "options", "solution", "answer",
     ]
 
     phase["value"] = "revalidation"

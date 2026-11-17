@@ -1547,6 +1547,12 @@ def _merge_plan_replacements(
             "coverage_id": str(replacement.get("coverage_id") or ""),
             "concept_id": str(replacement.get("concept_id") or ""),
             "relationship_id": replacement.get("relationship_id"),
+            "fitb_entry_id": replacement.get("fitb_entry_id"),
+            "fitb_answer": replacement.get("fitb_answer"),
+            "normalized_fitb_answer": replacement.get("normalized_fitb_answer"),
+            "clue_basis": replacement.get("clue_basis"),
+            "fitb_entry_used": replacement.get("fitb_entry_used"),
+            "fitb_alias_of_entry_id": replacement.get("fitb_alias_of_entry_id"),
             "source_chunk_id": str(replacement.get("source_chunk_id") or "").strip(),
             "support_chunk_ids": list(dict.fromkeys(
                 str(chunk_id).strip()
@@ -1976,6 +1982,58 @@ def _deterministic_catalog_replacements(
     return ranked
 
 
+def _fitb_repair_replacements(
+    state: ExamState,
+    plans: list[dict[str, Any]],
+    sid: str,
+    qtype: str,
+    errors: list[str],
+) -> list[dict[str, Any]]:
+    """Return unused FITB bank entries for a duplicate FITB slot.
+
+    FITB items are materialized from ``fitb_bank`` rather than catalog tasks.
+    Without this path, a duplicate FITB slot cannot be repaired even when the
+    catalog contains many unused entries.
+    """
+    if qtype != "fill_in_the_blank":
+        return []
+    from app.online.assessment_catalog import materialize_fitb_plan_item
+
+    catalog = state.get("assessment_catalog") or {}
+    entries = [
+        entry for entry in catalog.get("fitb_bank") or []
+        if isinstance(entry, dict)
+        and entry.get("fitb_entry_id")
+        and not entry.get("alias_of_fitb_entry_id")
+    ]
+    if not entries:
+        return []
+    current = _plan_items_by_slot(plans).get(sid) or {}
+    current_entry_id = str(current.get("fitb_entry_id") or "")
+    used = {
+        str(item.get("fitb_entry_id"))
+        for other_sid, item in _plan_items_by_slot(plans).items()
+        if other_sid != sid and item.get("fitb_entry_id")
+    }
+    failed = set(map(str, state.get("plan_failed_candidate_ids") or []))
+    requested = str(state.get("difficulty") or "mix")
+    replacements: list[dict[str, Any]] = []
+    for entry in entries:
+        entry_id = str(entry.get("fitb_entry_id") or "")
+        if entry_id == current_entry_id or entry_id in used:
+            continue
+        attempt_id = f"{sid}:fitb:{entry_id}"
+        if attempt_id in failed:
+            continue
+        replacement = materialize_fitb_plan_item(entry, sid, requested)
+        replacement["planner_candidate_attempt_id"] = attempt_id
+        replacement["catalog_replacement_stage"] = "deterministic_fitb_bank"
+        replacements.append(replacement)
+        if len(replacements) >= 32:
+            break
+    return replacements
+
+
 def _repair_plan_slot(
     state: ExamState,
     plans: list[dict[str, Any]],
@@ -1988,6 +2046,30 @@ def _repair_plan_slot(
     if location is None:
         return plans, errors, False
     _model_number, qtype, _index = location
+    if qtype == "fill_in_the_blank" and state.get("assessment_catalog"):
+        valid_ids = {
+            str(chunk.get("child_id")) for chunk in state.get("retrieved_chunks") or []
+            if chunk.get("child_id")
+        }
+        for replacement in _fitb_repair_replacements(state, plans, sid, qtype, errors):
+            candidate = finalize_plans(
+                _merge_plan_replacements(plans, [replacement]), state.get("tasks") or []
+            )
+            candidate_errors = validate_plans(
+                candidate, state.get("tasks") or [], int(state.get("num_models") or 1),
+                valid_ids or None, state.get("difficulty") or "mix",
+                state.get("assessment_profile") or {}, state.get("planning_issues") or [],
+            )
+            other_errors = [error for error in candidate_errors if sid not in error]
+            if not any(sid in error for error in candidate_errors) and len(
+                other_errors
+            ) <= len([error for error in errors if sid not in error]):
+                return candidate, candidate_errors, True
+            attempt_id = str(replacement.get("planner_candidate_attempt_id") or "")
+            if attempt_id:
+                failed = state.setdefault("plan_failed_candidate_ids", [])
+                if attempt_id not in failed:
+                    failed.append(attempt_id)
     catalog = state.get("assessment_catalog") or {}
     if catalog:
         deterministic = _deterministic_variation_replacements(

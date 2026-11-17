@@ -18,7 +18,8 @@ from app.online.validator import repair_invalid_questions, validate_generated_qu
 def _issue(role, code, fields, expected="fix"):
     return {
         "validator": role, "validation_status": "FAIL", "failure_code": code,
-        "fields_to_fix": fields, "reason": f"{code} detected", "expected_fix": expected,
+        "fields_to_fix": fields, "dependent_fields_to_update": [],
+        "reason": f"{code} detected", "expected_fix": expected,
         "grounding_outcome": None, "observed_difficulty": None,
         "calculation_evidence": [],
     }
@@ -385,6 +386,38 @@ def test_failure_routing_registry_covers_authoritative_allow_lists_exactly():
     }
 
 
+def test_fitb_ambiguous_word_bank_routes_to_question_and_options():
+    issue = _issue(
+        "answer_correctness", "multiple_correct_options", ["question"],
+        "Replace the ambiguous distractor and narrow the blank.",
+    )
+    verdict = {
+        "action": "FIX_QUESTION_AND_ANSWER", "failure_code": "multiple_correct_options",
+        "fields_to_fix": ["question"], "required_fixes": [issue],
+        "repair_instruction_conflicts": [],
+    }
+    route = build_repair_route("fill_in_the_blank", verdict)
+    assert route["status"] == "READY"
+    agents = [step.agent for step in route["steps"]]
+    assert "options" in agents
+    assert "question" in agents
+
+
+def test_fitb_invalid_word_bank_routes_to_options_repair():
+    issue = _issue(
+        "answer_correctness", "invalid_word_bank", ["question"],
+        "Replace the semantically equivalent distractor.",
+    )
+    verdict = {
+        "action": "FIX_QUESTION_AND_ANSWER", "failure_code": "invalid_word_bank",
+        "fields_to_fix": ["question"], "required_fixes": [issue],
+        "repair_instruction_conflicts": [],
+    }
+    route = build_repair_route("fill_in_the_blank", verdict)
+    assert route["status"] == "READY"
+    assert [step.agent for step in route["steps"]] == ["options"]
+
+
 def test_equation_task_alignment_route_skips_redundant_answer_step():
     """A wrong-variation Equation repair must not call Answer after Solution.
 
@@ -538,8 +571,12 @@ def test_legacy_tf5_certificate_conflict_reaches_atomic_repair_route():
     route = build_repair_route("true_false", reconciled)
     assert original_conflicts
     assert reconciled["repair_instruction_conflicts"] == []
-    assert [step.agent for step in route["steps"]] == ["task_alignment"]
-    assert route["steps"][0].fields == ("answer", "solution_certificate", "statement")
+    assert [step.agent for step in route["steps"]] == [
+        "task_alignment", "answer", "solution",
+    ]
+    assert route["steps"][0].fields == ("statement",)
+    assert route["steps"][1].fields == ("answer",)
+    assert route["steps"][2].fields == ("solution_certificate",)
 
 
 def test_legacy_explicit_answer_conflict_is_not_silently_merged():
@@ -1212,3 +1249,39 @@ def test_operational_revalidation_retries_candidate_without_new_repair(monkeypat
     assert completed["generated_exams"][0]["questions"]["definition"][0]["reference_answer"] == "Amount of matter."
     assert repair_calls == ["q1"]
     assert staged["question_repair_attempts"] == content_attempts
+
+
+def test_numeric_mcq_repair_routes_option_answer_and_certificate():
+    issue = _issue(
+        "quantitative", "significant_figures_error", ["solution_certificate"],
+        "Report 6.0 and update the keyed option.",
+    )
+    issue["dependent_fields_to_update"] = ["options", "correct_answer"]
+    route = build_repair_route("mcq", _verdict(issue))
+    assert route["status"] == "READY"
+    assert set(step.agent for step in route["steps"]) >= {
+        "solution", "options", "answer",
+    }
+
+
+def test_definition_unit_repair_routes_answer_and_certificate():
+    issue = _issue(
+        "quantitative", "unit_inconsistency", ["reference_answer"],
+        "Preserve 2500 W without conversion.",
+    )
+    issue["dependent_fields_to_update"] = ["solution_certificate"]
+    route = build_repair_route("definition", _verdict(issue))
+    assert route["status"] == "READY"
+    assert set(step.agent for step in route["steps"]) >= {"solution", "answer"}
+
+
+def test_essay_wrong_variation_routes_certificate_dependency():
+    issue = _issue(
+        "task_alignment", "wrong_variation", ["question"],
+        "Restore the required comparison and make the certificate consistent.",
+    )
+    route = build_repair_route("essay", _verdict(issue))
+    assert route["status"] == "READY"
+    assert set(step.agent for step in route["steps"]) >= {
+        "task_alignment", "answer", "solution",
+    }

@@ -550,6 +550,30 @@ def _recover_catalog_checkpoint(
     return recovered
 
 
+_UUID_EVIDENCE_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_adjacent_transposition(left: str, right: str) -> bool:
+    """Return True for two strings differing only by one swapped pair."""
+    if len(left) != len(right):
+        return False
+    mismatches = [
+        index for index, (a, b) in enumerate(zip(left.casefold(), right.casefold()))
+        if a != b
+    ]
+    if len(mismatches) != 2:
+        return False
+    first, second = mismatches
+    return (
+        second == first + 1
+        and left[first].casefold() == right[second].casefold()
+        and left[second].casefold() == right[first].casefold()
+    )
+
+
 def _validate_completed_batch(
     value: Any, *, response_model: type[StrictOutputModel], valid_chunk_ids: set[str],
     batch_id: str = "batch_1",
@@ -562,6 +586,66 @@ def _validate_completed_batch(
     allowed = sorted(map(str, valid_chunk_ids))
     diagnostics: list[dict[str, Any]] = []
     preserved_tasks: list[dict[str, Any]] = []
+
+    def canonical_evidence_id(raw: Any) -> str:
+        """Repair one unambiguous adjacent transposition in a UUID evidence ID.
+
+        Compiler models occasionally copy a valid child UUID with two adjacent
+        characters swapped (for example ``...-ad8c`` instead of ``...-adc8``).
+        Accepting that near-miss only when it maps to exactly one allowed UUID
+        preserves the evidence link without allowing arbitrary hallucinated IDs.
+        """
+        text = str(raw or "").strip()
+        if text in valid_chunk_ids or not _UUID_EVIDENCE_PATTERN.fullmatch(text):
+            return text
+        candidates = [
+            candidate for candidate in map(str, valid_chunk_ids)
+            if _UUID_EVIDENCE_PATTERN.fullmatch(candidate)
+            and _is_adjacent_transposition(text, candidate)
+        ]
+        if len(candidates) == 1:
+            logger.warning(
+                "Canonicalized transposed catalog evidence ID | batch=%s | "
+                "received=%s | allowed=%s",
+                batch_id, text, candidates[0],
+            )
+            return candidates[0]
+        return text
+
+    def canonical_evidence_list(values: Any) -> list[str] | None:
+        if values is None:
+            return None
+        return [canonical_evidence_id(value) for value in values]
+
+    # Normalize near-miss UUIDs before collecting diagnostics so a single
+    # transposition does not discard an otherwise valid compiler batch.
+    profile = normalized.get("assessment_profile")
+    if isinstance(profile, dict):
+        for contract in (profile.get("question_types") or {}).values():
+            if isinstance(contract, dict) and "evidence_chunk_ids" in contract:
+                contract["evidence_chunk_ids"] = canonical_evidence_list(
+                    contract.get("evidence_chunk_ids")
+                )
+    for task in normalized.get("tasks") or []:
+        if "evidence_chunk_ids" in task:
+            task["evidence_chunk_ids"] = canonical_evidence_list(
+                task.get("evidence_chunk_ids")
+            )
+        for transformation in task.get("allowed_transformations") or []:
+            if isinstance(transformation, dict) and "evidence_chunk_ids" in transformation:
+                transformation["evidence_chunk_ids"] = canonical_evidence_list(
+                    transformation.get("evidence_chunk_ids")
+                )
+        for variation in task.get("allowed_variations") or []:
+            if isinstance(variation, dict) and "evidence_chunk_ids" in variation:
+                variation["evidence_chunk_ids"] = canonical_evidence_list(
+                    variation.get("evidence_chunk_ids")
+                )
+    for entry in normalized.get("fitb_bank") or []:
+        if isinstance(entry, dict) and "evidence_chunk_id" in entry:
+            entry["evidence_chunk_id"] = canonical_evidence_id(
+                entry.get("evidence_chunk_id")
+            )
 
     def task_identity(task: dict[str, Any], index: int) -> str:
         explicit = str(task.get("task_id") or "").strip()
@@ -4435,11 +4519,17 @@ def catalog_exhaustion_replacement(
     profile = catalog.get("assessment_profile") or {}
     valid_chunks = set(map(str, catalog.get("selected_chunk_ids") or [])) or None
     compatible: list[tuple[dict[str, Any], str, dict[str, Any]]] = []
+    excluded_variation_ids = {
+        str(value) for value in (exclude_variation_ids or set()) if str(value)
+    }
     for task in catalog.get("tasks") or []:
         level = _native_difficulty(task) or "medium"
-        variations = eligible_task_variation_candidates(
-            task, qtype, assessment_profile=profile, valid_chunk_ids=valid_chunks,
-        )
+        variations = [
+            variation for variation in eligible_task_variation_candidates(
+                task, qtype, assessment_profile=profile, valid_chunk_ids=valid_chunks,
+            )
+            if str(variation.get("variation_id") or "") not in excluded_variation_ids
+        ]
         if (
             variations
             and str(task.get("task_id") or "") not in {

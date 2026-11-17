@@ -291,6 +291,7 @@ def recovery_v3_dispatch_action(strategy: str) -> str:
     try:
         return {
             "REPAIR": "repair_question",
+            "SWITCH_VARIATION": "switch_variation",
             "REGENERATE": "regenerate_missing_slot",
             "SWITCH_TASK": "replace_assignment",
         }[normalized]
@@ -393,6 +394,26 @@ def copied_source_repair_options(
         "replace_or_switch_required": not current_repairable,
         "contract_complete": contract_complete,
     }
+
+
+def _store_plan_item(
+    plans: list[Dict[str, Any]], model_number: int, qtype: str,
+    slot_id: str, item: Dict[str, Any],
+) -> bool:
+    """Write a switched plan item back to its canonical model partition."""
+    clean = {
+        key: deepcopy(value) for key, value in item.items()
+        if key != "assessment_guidance"
+    }
+    for plan in plans:
+        if int(plan.get("model_number") or 0) != int(model_number):
+            continue
+        values = (plan.get("items") or {}).get(qtype) or []
+        for index, existing in enumerate(values):
+            if str(existing.get("slot_id") or "") == slot_id:
+                values[index] = clean
+                return True
+    return False
 
 
 def _switch_recovery_variation(
@@ -721,13 +742,13 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             "original_candidate_id": target.get("fitb_entry_id") or target.get("task_id"),
             "attempted_candidate_ids": [], "blacklisted_candidate_ids": [],
             "candidate_failures": [], "replacement_attempt_count": 0,
-            "assignment_validated_attempts": {},
+            "assignment_validated_attempts": {}, "rejected_variation_ids": [],
         })
         plan = list(recovery_v3.get("plan") or [])
         cursor = int(recovery_v3.get("next_index") or 0)
         while cursor < len(plan):
             strategy = str(plan[cursor] or "").upper()
-            if strategy in {"REPAIR", "REGENERATE"} and not eligibility["content_allowed"]:
+            if strategy in {"REPAIR", "REGENERATE", "SWITCH_VARIATION"} and not eligibility["content_allowed"]:
                 cursor += 1
                 continue
             if strategy == "SWITCH_TASK" and not eligibility["replacement_allowed"]:
@@ -754,11 +775,29 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             target["status"] = "completion_pending"
         repair_strategy = {
             "REPAIR": "recovery_v3_targeted_repair",
+            "SWITCH_VARIATION": "recovery_v3_switch_variation",
             "REGENERATE": "recovery_v3_regenerate_assignment",
             "SWITCH_TASK": ("recovery_v3_switch_variation" if switched_variation_id
                             else "recovery_v3_switch_assignment"),
         }[selected_strategy]
-        if selected_strategy == "REPAIR":
+        difficulty_findings = (
+            (target.get("verdict") or {}).get("required_fixes")
+            or target.get("required_fixes") or []
+        )
+        if (
+            selected_strategy == "REPAIR"
+            and difficulty_findings
+            and target.get("history")
+            and all(
+                str(issue.get("validator") or "") == "difficulty"
+                for issue in difficulty_findings
+            )
+        ):
+            # A difficulty-only mismatch is a policy observation, not a content
+            # repair target. Preserve the existing terminal-accept behavior.
+            repair_action = "accept_difficulty"
+            repair_strategy = "accepted_source_constraint"
+        if selected_strategy == "REPAIR" and repair_action == "repair_question":
             # Strategy remains Task Alignment's decision. This is a technical
             # executability check only: a blocked route must not consume calls
             # or hide the saved REGENERATE/SWITCH_TASK fallbacks.
@@ -804,6 +843,63 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
                 target.setdefault("history", []).append(deepcopy(event))
                 history.append(event)
                 continue
+        if selected_strategy == "SWITCH_VARIATION":
+            current_plan = plan_by_slot.get(slot_id) or {}
+            options = copied_source_repair_options(
+                current_plan, qtype,
+                available_evidence_ids=set(source_by_chunk),
+            )
+            rejected_variations = set(memory.get("rejected_variation_ids") or [])
+            alternatives = [
+                str(variation_id)
+                for variation_id in options.get("alternative_variation_ids") or []
+                if str(variation_id) and str(variation_id) not in rejected_variations
+            ]
+            switched_variation_id = next(iter(alternatives), "")
+            if not switched_variation_id or not _switch_recovery_variation(
+                current_plan, switched_variation_id, qtype, source_by_chunk,
+            ):
+                switched_variation_id = ""
+                recovery_v3.setdefault("attempted_strategies", []).append("SWITCH_VARIATION")
+                recovery_v3["next_index"] = cursor + 1
+                recovery_v3["last_failure_code"] = "variation_candidates_exhausted"
+                recovery_v3["last_failure_reason"] = (
+                    "No eligible non-rejected same-task variation remained."
+                )
+                target["recovery_v3"] = recovery_v3
+                target.update(
+                    status="invalid",
+                    failure_code="variation_candidates_exhausted",
+                    failure_reason=recovery_v3["last_failure_reason"],
+                    repair_type="switch_variation",
+                )
+                event = {
+                    "model_number": mn, "slot_id": slot_id, "question_id": qid,
+                    "attempt": attempt, "repair_action": "switch_variation",
+                    "repair_strategy": "recovery_v3_switch_variation",
+                    "status": "strategy_skipped",
+                    "new_failure_code": "variation_candidates_exhausted",
+                    "new_failure_reason": recovery_v3["last_failure_reason"],
+                }
+                target.setdefault("history", []).append(deepcopy(event))
+                history.append(event)
+                continue
+            if not _store_plan_item(
+                staged_plans, mn, qtype, slot_id, current_plan,
+            ):
+                switched_variation_id = ""
+                target.update(
+                    status="invalid",
+                    failure_code="variation_plan_write_failed",
+                    failure_reason="Switched variation could not be written to the plan.",
+                )
+                continue
+            target["status"] = "completion_pending"
+            target["repair_type"] = "switch_variation"
+            repair_action = "switch_variation"
+            repair_strategy = "recovery_v3_switch_variation"
+            staged_state = {**state, "plans": staged_plans}
+            plan_by_slot, source_by_chunk = _plan_context_for_model(staged_state, mn)
         if (
             repair_action == "replace_assignment"
             and not eligibility["replacement_allowed"]
@@ -828,10 +924,6 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             )
             continue
         use_replacement = repair_action == "replace_assignment"
-        if use_replacement:
-            completion_attempts[slot_id] = int(
-                completion_attempts.get(slot_id) or 0
-            ) + 1
         def repair_input_fingerprint() -> str:
             return hashlib.sha256(json.dumps({
                 "question": staged_exam,
@@ -950,7 +1042,8 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
                 str(state.get("difficulty") or "mix"), active_slot_ids, excluded,
                 prefer_task_id=None,
                 exclude_variation_ids={
-                    str((plan_by_slot.get(slot_id) or {}).get("selected_variation_id") or "")
+                    str((plan_by_slot.get(slot_id) or {}).get("selected_variation_id") or ""),
+                    *map(str, memory.get("rejected_variation_ids") or []),
                 },
             )
             for candidate in candidate_pool:
@@ -1437,7 +1530,7 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
                         "Targeted Difficulty Adjustment did not produce an accepted assignment: "
                         + failure_reason
                     ]
-        elif repair_action in {"regenerate_missing_slot", "replace_fitb_entry", "replace_task"}:
+        elif repair_action in {"regenerate_missing_slot", "replace_fitb_entry", "replace_task", "switch_variation"}:
             generated_ok, outcome_warnings = _runtime._regenerate_plan_slot(
                 staged_state, staged_exam, mn, qid, plan_by_slot, source_by_chunk)
         else:
@@ -1696,7 +1789,11 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
                 failures[slot_id] = int(failures.get(slot_id) or 0) + 1
             is_operational = bool(outcome.get("operational_error"))
             operational_failures = int(memory.get("candidate_generation_failures") or 0)
-            if not is_operational and repair_action != "repair_question":
+            if (
+                not is_operational
+                and repair_action != "repair_question"
+                and not generated_ok
+            ):
                 operational_failures += 1
                 memory["candidate_generation_failures"] = operational_failures
                 memory["force_alternative_strategy"] = True
@@ -1711,7 +1808,23 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             ):
                 memory["force_backup"] = True
             if selected_id and not is_operational:
-                memory["blacklisted_candidate_ids"].append(selected_id)
+                candidate_variation_id = str(
+                    (plan_by_slot.get(slot_id) or {}).get("selected_variation_id") or ""
+                )
+                candidate_failure_code = str(target.get("failure_code") or "")
+                if (
+                    not generated_ok
+                    or candidate_failure_code in {"mcq_task_unsuitable", "unusable_task"}
+                    or (qtype == "fill_in_the_blank" and candidate_failure_code in {
+                        "duplicate_question", "excessive_overlap", "insufficient_evidence",
+                    })
+                ):
+                    if selected_id not in memory["blacklisted_candidate_ids"]:
+                        memory["blacklisted_candidate_ids"].append(selected_id)
+                elif candidate_variation_id:
+                    rejected = memory.setdefault("rejected_variation_ids", [])
+                    if candidate_variation_id not in rejected:
+                        rejected.append(candidate_variation_id)
                 memory["candidate_failures"].append({"candidate_id": selected_id,
                                                       "reason": reason, "attempt": attempt})
             target.update(
@@ -1872,6 +1985,13 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
         lifecycle_record = ((state.get("slot_lifecycle") or {}).get(slot_id) or {})
         expected_assignment_fingerprint = lifecycle_record.get("assignment_fingerprint")
         expected_assignment_revision = lifecycle_record.get("assignment_revision")
+        # Count only candidates that actually changed Task ID. Another
+        # variation of the same task is inventory inside the current task, not
+        # a replacement attempt against the task budget.
+        if use_replacement and str(candidate_plan.get("task_id") or "") != current_task_id:
+            completion_attempts[slot_id] = int(
+                completion_attempts.get(slot_id) or 0
+            ) + 1
         candidates.append({"model_number": mn, "slot_id": slot_id, "question_id": qid,
             "candidate_id": candidate_id, "candidate_fingerprint": candidate_fingerprint,
             "question_type": qtype, "attempt": attempt, "repair_action": repair_action,
@@ -1884,6 +2004,7 @@ def _repair_invalid_questions_serial(state: Dict[str, Any]) -> Dict[str, Any]:
             "had_original": had_original, "previous_failure_code": target.get("failure_code"),
             "previous_failure_reason": target.get("failure_reason"),
             "candidate_task_id": candidate_plan.get("task_id"),
+            "candidate_variation_id": candidate_plan.get("selected_variation_id"),
             "candidate_fitb_entry_id": candidate_plan.get("fitb_entry_id"),
             "assignment_fingerprint": assignment_fingerprint,
             "expected_assignment_revision": expected_assignment_revision,
@@ -2080,6 +2201,199 @@ def _ensure_recovery_v3_decisions(
     return manifest, audit
 
 
+def _reassess_exhausted_recovery(
+    state: Dict[str, Any], manifest: list[Dict[str, Any]],
+) -> tuple[list[Dict[str, Any]], Dict[str, Any] | None]:
+    """Ask the strategy agent again after a saved plan is exhausted.
+
+    The first decision is still made by the Recovery Decision LLM. Reassessment
+    is bounded by the same slot budgets and by a small decision cap; Python
+    supplies the latest failure, attempted strategies, and remaining eligible
+    strategies.
+    """
+    from app.online.recovery_decision import decide_recovery
+    from app.online.duplicate_pipeline import _candidate_pool
+
+    contexts: list[dict[str, Any]] = []
+    by_id: dict[str, Dict[str, Any]] = {}
+    exams = {
+        int(exam.get("model_number") or 0): exam
+        for exam in state.get("generated_exams") or []
+    }
+    for target in manifest:
+        recovery = target.get("recovery_v3") or {}
+        if recovery.get("status") != "ready":
+            continue
+        plan = list(recovery.get("plan") or [])
+        if int(recovery.get("next_index") or 0) < len(plan):
+            continue
+        if target.get("status") in {
+            "resolved", "terminal_failure", "exhausted", "failed_to_repair",
+        }:
+            continue
+        if str(target.get("failure_code") or "") in {
+            "difficulty_mismatch", "reasoning_complexity_mismatch",
+        }:
+            # Difficulty-only findings are terminal policy decisions, not a
+            # failed semantic strategy that should trigger another repair loop.
+            continue
+        if any(
+            str(event.get("status") or "") in {"accepted", "resolved", "PASSED"}
+            for event in target.get("history") or []
+        ):
+            continue
+        if int(recovery.get("decision_calls") or 1) >= 3:
+            continue
+        mn = int(target.get("model_number") or 1)
+        slot_id = str(target.get("slot_id") or "")
+        qid = str(target.get("question_id") or "")
+        if not slot_id or not qid:
+            continue
+        plan_by_slot, sources = _plan_context_for_model(state, mn)
+        assignment = deepcopy(plan_by_slot.get(slot_id) or {})
+        entry = _build_by_id((exams.get(mn) or {}).get("questions") or {}).get(qid)
+        question = deepcopy((entry or (None, None, {}))[2])
+        if not question:
+            continue
+        options = copied_source_repair_options(
+            assignment, str(target.get("question_type") or ""),
+            available_evidence_ids=set(sources),
+        )
+        alternatives = [
+            value for value in (
+                assignment.get("permitted_variations")
+                or assignment.get("allowed_variations") or []
+            )
+            if isinstance(value, dict)
+            and str(value.get("variation_id") or "") in set(
+                options.get("alternative_variation_ids") or []
+            )
+        ]
+        attempted = {
+            str(value).upper() for value in recovery.get("attempted_strategies") or []
+        }
+        content_budget = int(
+            (state.get("question_repair_failures") or {}).get(slot_id) or 0
+        )
+        completion_budget = int(
+            (state.get("slot_completion_attempts") or {}).get(slot_id) or 0
+        )
+        remaining: list[str] = []
+        if content_budget < MAX_QUESTION_REPAIR_ATTEMPTS:
+            remaining.extend(("REPAIR", "REGENERATE"))
+        if alternatives:
+            remaining.append("SWITCH_VARIATION")
+        if completion_budget < MAX_COMPLETION_ATTEMPTS_PER_SLOT:
+            remaining.append("SWITCH_TASK")
+        remaining = [value for value in remaining if value not in attempted]
+        if not remaining:
+            continue
+        active_slots = {
+            str(item.get("slot_id") or "")
+            for exam in state.get("generated_exams") or []
+            for _kind, _container, item in _iter_questions(exam.get("questions") or {})
+            if item.get("slot_id")
+        }
+        try:
+            catalog_alternatives = [
+                {
+                    "task_id": item.get("task_id"),
+                    "variation_id": item.get("selected_variation_id"),
+                    "target": item.get("target"),
+                    "task_operation": item.get("task_operation"),
+                    "difficulty": item.get("difficulty"),
+                    "evidence_ids": _plan_source_ids(item),
+                }
+                for item in _candidate_pool(
+                    state.get("assessment_catalog") or {}, state.get("plans") or [],
+                    slot_id, str(target.get("question_type") or ""),
+                    str(state.get("difficulty") or "mix"), active_slots, set(),
+                    limit=10,
+                )
+            ]
+        except (KeyError, TypeError, ValueError):
+            catalog_alternatives = []
+        context = {
+            "question_id": qid,
+            "slot_id": slot_id,
+            "model_number": mn,
+            "question_type": target.get("question_type"),
+            "question": question,
+            "assignment": assignment,
+            "authoritative_givens": authoritative_givens(assignment),
+            "assigned_evidence": _assigned_source_chunks(assignment, sources),
+            "validator_findings": deepcopy(
+                (target.get("verdict") or {}).get("required_fixes")
+                or target.get("required_fixes") or []
+            ),
+            "previous_recovery": deepcopy(target.get("history") or []),
+            "previous_strategy": next((
+                value for value in reversed(
+                    recovery.get("attempted_strategies") or []
+                ) if value
+            ), None),
+            "previous_result": "FAILED",
+            "previous_failure_reason": target.get("failure_reason") or "",
+            "remaining_strategies": remaining,
+            "remaining_budgets": {
+                "repair": max(0, MAX_QUESTION_REPAIR_ATTEMPTS - content_budget),
+                "replacement": max(
+                    0, MAX_COMPLETION_ATTEMPTS_PER_SLOT - completion_budget,
+                ),
+            },
+            "authorized_alternative_variations": alternatives,
+            "catalog_alternatives": catalog_alternatives,
+            "backups": deepcopy(assignment.get("backups") or []),
+        }
+        contexts.append(context)
+        by_id[qid] = target
+    if not contexts:
+        return manifest, None
+    domain = str((state.get("assessment_profile") or {}).get("domain") or "")
+    decisions, audit = decide_recovery(contexts, domain=domain)
+    for qid, target in by_id.items():
+        old = target.get("recovery_v3") or {}
+        decision = decisions.get(qid) or {}
+        chosen = str(decision.get("decision") or "").upper()
+        attempted = {
+            str(value).upper() for value in old.get("attempted_strategies") or []
+        }
+        allowed = {
+            str(value).upper()
+            for value in (next((
+                context["remaining_strategies"] for context in contexts
+                if context["question_id"] == qid
+            ), []) or [])
+        }
+        if decision.get("status") != "ready" or chosen not in allowed:
+            target.update(
+                status="terminal_failure",
+                failure_code="recovery_strategies_exhausted",
+                failure_reason=(
+                    "No remaining eligible Recovery strategy could be selected "
+                    "after the previous strategy failed."
+                ),
+            )
+            continue
+        updated = deepcopy(decision)
+        updated["attempted_strategies"] = sorted(attempted)
+        updated["decision_calls"] = int(old.get("decision_calls") or 1) + 1
+        updated["prior_plan"] = deepcopy(old.get("plan") or [])
+        target["recovery_v3"] = updated
+        target.setdefault("history", []).append({
+            "attempt": 0,
+            "status": "strategy_reassessed",
+            "previous_strategy": next((
+                value for value in reversed(old.get("attempted_strategies") or [])
+                if value
+            ), None),
+            "new_strategy": chosen,
+            "remaining_strategies": sorted(allowed),
+            "reason": decision.get("reason") or "",
+        })
+    return manifest, audit
+
+
 def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     """Build independent repair candidates concurrently, then merge by slot.
 
@@ -2087,8 +2401,11 @@ def repair_invalid_questions(state: Dict[str, Any]) -> Dict[str, Any]:
     section-level dependency. Every other target receives an isolated snapshot.
     """
     manifest = deepcopy(state.get("repair_manifest") or [])
+    manifest, reassess_audit = _reassess_exhausted_recovery(state, manifest)
     manifest, decision_audit = _runtime._ensure_recovery_v3_decisions(state, manifest)
     state = {**state, "repair_manifest": manifest}
+    if reassess_audit:
+        state.setdefault("recovery_decision_audit", []).append(reassess_audit)
     incompatible_task_ids = {
         str(value) for value in state.get("incompatible_task_ids") or [] if value
     }

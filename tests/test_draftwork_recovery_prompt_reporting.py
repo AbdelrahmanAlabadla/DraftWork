@@ -290,7 +290,9 @@ def test_impossible_copied_source_skips_content_repair_agent(monkeypatch):
     assert target["repair_type"] == "replace_assignment"
     assert target["recovery_routing_reason"] == "task_alignment_recovery_v3"
     assert result["question_repair_calls"] == {}
-    assert result["slot_completion_attempts"]["s1"] == 1
+    # No candidate was generated, so the bounded replacement inventory was
+    # not consumed by this failed preflight.
+    assert result["slot_completion_attempts"].get("s1", 0) == 0
 
 
 def test_merge_marks_fresh_and_historical_verdicts_explicitly():

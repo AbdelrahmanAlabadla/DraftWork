@@ -553,6 +553,43 @@ def test_fitb_plan_allows_grounded_short_term():
     ) == []
 
 
+def test_duplicate_fitb_slot_repairs_from_unused_bank_entry():
+    entries = [{
+        "fitb_entry_id": f"fitb_test_{index}",
+        "answer": answer,
+        "normalized_answer": answer,
+        "evidence_chunk_id": "chunk-a",
+        "clue_basis": f"Source clue for {answer}.",
+        "alias_of_fitb_entry_id": None,
+    } for index, answer in enumerate(("machine", "compound machine", "efficiency"))]
+    first = assessment_catalog.materialize_fitb_plan_item(entries[0], "m1_fill_in_the_blank_1", "easy")
+    duplicate = assessment_catalog.materialize_fitb_plan_item(entries[0], "m1_fill_in_the_blank_2", "easy")
+    plans = [{"model_number": 1, "items": {"fill_in_the_blank": [first, duplicate]}}]
+    profile = _profile()
+    profile["question_types"]["fill_in_the_blank"]["task_operations"] = [
+        "identify_term_from_text_clue"
+    ]
+    state = {
+        "document_id": "doc", "tasks": [("fill_in_the_blank", 2)], "num_models": 1,
+        "difficulty": "easy", "assessment_profile": profile,
+        "retrieved_chunks": [{"child_id": "chunk-a"}], "planning_issues": [],
+        "assessment_catalog": {
+            "selected_chunk_ids": ["chunk-a"], "tasks": [], "fitb_bank": entries,
+        },
+        "plans": plans,
+    }
+    errors = planner.validate_plans(
+        plans, [("fill_in_the_blank", 2)], 1, {"chunk-a"}, "easy", profile, [],
+    )
+    assert any("duplicates the planned reasoning task" in error for error in errors)
+    revised, revised_errors, accepted = planner._repair_plan_slot(
+        state, plans, "m1_fill_in_the_blank_2", errors,
+    )
+    assert accepted is True
+    assert revised[0]["items"]["fill_in_the_blank"][1]["fitb_entry_id"] != "fitb_test_0"
+    assert not any("m1_fill_in_the_blank_2" in error for error in revised_errors)
+
+
 def test_fitb_relationship_notation_is_not_by_itself_a_formula_answer():
     term = _item(
         "chunk-a",

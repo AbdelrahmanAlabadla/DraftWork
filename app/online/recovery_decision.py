@@ -20,21 +20,25 @@ from app.llm.schemas import RecoveryDecisionResponse
 
 
 SYSTEM_PROMPT = """You are the existing Task Alignment reviewer performing Recovery V3 decisions.
-For every failed question choose exactly one strategy: REPAIR, REGENERATE, or SWITCH_TASK.
-REPAIR: the assigned task/variation is valid and defects are localized and correctable.
-REGENERATE: the assignment is valid but this generated question is fundamentally unsuitable for targeted repair.
-SWITCH_TASK: the assignment/variation is contradictory, unsupported, response-incompatible, unusable, or cannot produce a distinct valid assessment.
+For every failed question choose exactly one strategy: REPAIR, SWITCH_VARIATION, SWITCH_TASK, or REGENERATE.
+REPAIR: the assigned task/variation is valid and defects are localized and correctable by the Repair Router.
+SWITCH_VARIATION: the current variation cannot be repaired reliably, but an eligible alternative
+variation under the same Task ID is supplied and may resolve the failure.
+SWITCH_TASK: the current Task ID/variation is contradictory, unsupported, response-incompatible,
+unusable, or cannot produce a distinct valid assessment, and no suitable same-task variation remains.
+REGENERATE: the assignment is valid but this generated question is fundamentally unsuitable for
+targeted repair; regenerate the same authorized assignment with a meaningfully different instance.
 The specialized Repair Router can repair only findings that map to executable field-owning
 Question, Options, Solution, Answer, Task Alignment, or Difficulty steps. Do not choose
 REPAIR when the supplied route feasibility says no executable route exists.
 Cross-model duplication is not automatically content-repairable. For substantive overlap,
-prefer SWITCH_TASK or an authorized alternative variation. Different numbers or wording alone
+prefer SWITCH_VARIATION or SWITCH_TASK. Different numbers or wording alone
 do not establish uniqueness. Choose REGENERATE only when the current valid assignment can
 support a meaningfully different question under its authorized contract.
 Use all validator and Duplicate V2 findings, not only the first finding. Never return PASS.
-Give an ordered fallback_sequence containing only different remaining strategies. Always return
-switch_preference=null; Python selects the concrete Task ID and Variation ID with the shared
-question-type / global Task-ID usage / difficulty rank. Keep reasons concise.
+Provide an ordered fallback_sequence containing only different, genuinely viable strategies.
+Do not invent Task IDs or Variation IDs; Python selects concrete candidates and verifies eligibility.
+Always return switch_preference=null. Keep reasons concise.
 Each question is isolated: never use another question's evidence or authorization as support."""
 
 
@@ -48,23 +52,22 @@ def _prompt(contexts: list[dict[str, Any]]) -> str:
 
 
 def _normalize(row: dict[str, Any]) -> dict[str, Any]:
-    decision = str(row["decision"]).upper()
+    decision = str(row.get("strategy") or row.get("decision") or "").upper()
     sequence: list[str] = []
     for value in row.get("fallback_sequence") or []:
         value = str(value).upper()
         if value != decision and value not in sequence:
             sequence.append(value)
-    # A saved plan must remain useful without asking Task Alignment again.
-    for value in ("REPAIR", "REGENERATE", "SWITCH_TASK"):
-        if value != decision and value not in sequence:
-            sequence.append(value)
+    # The LLM owns the order. Python does not append a fixed fallback ladder;
+    # ineligible fallbacks are skipped by the executor and reported back.
     return {
         "version": "recovery-v3-task-alignment",
         "status": "ready",
         "decision": decision,
+        "strategy": decision,
         "reason": str(row.get("reason") or ""),
-        "fallback_sequence": sequence[:2],
-        "plan": [decision, *sequence[:2]],
+        "fallback_sequence": sequence[:3],
+        "plan": [decision, *sequence[:3]],
         "next_index": 0,
         "attempted_strategies": [],
         "switch_preference": row.get("switch_preference"),

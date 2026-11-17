@@ -150,6 +150,20 @@ def test_evidence_diagnostics_preserve_valid_task_and_sibling_variation():
     assert [item["target"] for item in mixed["allowed_variations"]] == ["valid variation"]
 
 
+def test_adjacent_uuid_transposition_is_canonicalized_to_allowed_evidence():
+    allowed = "b97d2f45-b1e6-445c-adc8-5a518d616e1c"
+    received = "b97d2f45-b1e6-445c-ad8c-5a518d616e1c"
+    response = {
+        "tasks": [_task("typo", received)],
+        "fitb_bank": [], "batch_complete": True,
+    }
+    result = catalog._validate_completed_batch(
+        response, response_model=catalog.CompactCatalogBatchResponse,
+        valid_chunk_ids={allowed}, batch_id="batch_3",
+    )
+    assert result["tasks"][0]["evidence_chunk_ids"] == [allowed]
+
+
 def test_profile_evidence_is_bound_to_the_first_compiler_batch():
     response = {
         "assessment_profile": _profile("outside"),
