@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Evaluation · Pipeline Analytics — SmartExam AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/evaluation/base.css" />
+  <link rel="stylesheet" href="../css/evaluation/pipeline.css" />
+</head>
+
+<body class="dash">
+  <header id="dashHeader"></header>
+  <main class="shell">
+    <div class="page-head">
+      <div>
+        <h1>Pipeline Analytics</h1>
+        <p>How generation, validation, repair, Recovery V3, duplicates and provider calls perform across the selected period.</p>
+      </div>
+      <div class="page-head-actions">
+        <label class="field">
+          <span>Period</span>
+          <select class="select" id="windowSelect" aria-label="Time window">
+            <option value="7">Last 7 days</option>
+            <option value="30" selected>Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="0">All recorded</option>
+          </select>
+        </label>
+        <label class="checkbox" title="Include controlled benchmark runs">
+          <input type="checkbox" id="includeBenchmarks" /> <span>Include benchmarks</span>
+        </label>
+      </div>
+    </div>
+    <div id="pageBody"></div>
+    <footer class="dash-footer">
+      <span>Recovery metrics require the per-run outcome telemetry added with migration 0009; older runs show “not recorded”.</span>
+      <a href="reports.html" class="muted">Inspect individual exams →</a>
+    </footer>
+  </main>
+  <script type="module" src="../js/evaluation/pipeline.js"></script>
+</body>
+
+</html>
