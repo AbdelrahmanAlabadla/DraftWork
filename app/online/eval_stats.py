@@ -37,6 +37,7 @@ COUNT_FIELDS = (
 REASON_FIELDS = (
     "generation_rejection_reasons",
     "validation_failure_reasons",
+    "validation_failure_actions",
     "validator_failure_reasons",
 )
 
@@ -188,6 +189,10 @@ def record_shortfall_result(
     aggregate(stats)
 
 
+# Repair-action categories are retained as a stable compatibility taxonomy for
+# older runs. Current Validator verdicts also carry a diagnostic ``failure_code``
+# (produced by the deterministic, general, quantitative, grounding and duplicate
+# roles), which is the more precise rejection reason and is recorded when present.
 def validation_failure_category(verdict: dict[str, Any]) -> str:
     return {
         "FIX_ANSWER": "wrong_answer",
@@ -195,6 +200,35 @@ def validation_failure_category(verdict: dict[str, Any]) -> str:
         "FIX_QUESTION": "unclear_or_invalid_question",
         "FIX_QUESTION_AND_ANSWER": "question_and_answer",
     }.get(str(verdict.get("action") or "").upper(), "other")
+
+
+def validation_rejection_reason(verdict: dict[str, Any]) -> str:
+    """Return the diagnostic rejection code, falling back to the repair action."""
+    code = str(verdict.get("failure_code") or "").strip()
+    if code and code.lower() != "pass":
+        return code
+    return validation_failure_category(verdict)
+
+
+def validator_operational_reason(verdict: dict[str, Any]) -> str:
+    """Classify a question whose validation could not complete.
+
+    Mirrors the operational states emitted by ``validate_exam_multi``:
+    ``INPUT_INVALID``, ``VALIDATION_BLOCKED`` (operational or prerequisite), and
+    malformed/missing provider output. These are validator outages, not content
+    rejections, so they are counted separately from failure reasons.
+    """
+    status = str(verdict.get("validation_status") or "").upper()
+    if status == "INPUT_INVALID":
+        return "input_invalid"
+    if status == "ERROR":
+        return "validator_error"
+    if status == "VALIDATION_BLOCKED":
+        category = str(verdict.get("block_category") or "").strip().lower()
+        if category in {"prerequisite", "operational"}:
+            return f"{category}_validation_block"
+        return "validation_blocked"
+    return "missing_verdict"
 
 
 def _question_type_by_id(exam: dict[str, Any]) -> dict[str, str]:
@@ -224,17 +258,22 @@ def record_first_validation(
             continue
         counters = _type_counts(stats, model_number, qtype)
         counters["validation_total_first"] += 1
-        if verdict.get("action") == "PASS":
+        action = str(verdict.get("action") or "").upper()
+        if action == "PASS":
             counters["validation_passed_first"] += 1
-        elif verdict.get("action") == "UNVALIDATED":
+        elif action == "UNVALIDATED":
             counters["validation_unvalidated_first"] += 1
             reasons = counters["validator_failure_reasons"]
-            reasons["missing_verdict"] = reasons.get("missing_verdict", 0) + 1
+            reason = validator_operational_reason(verdict)
+            reasons[reason] = reasons.get(reason, 0) + 1
         else:
             counters["validation_failed_first"] += 1
-            category = validation_failure_category(verdict)
             reasons = counters["validation_failure_reasons"]
-            reasons[category] = reasons.get(category, 0) + 1
+            reason = validation_rejection_reason(verdict)
+            reasons[reason] = reasons.get(reason, 0) + 1
+            actions = counters["validation_failure_actions"]
+            action_key = action.lower() if action else "other"
+            actions[action_key] = actions.get(action_key, 0) + 1
     aggregate(stats)
 
 
@@ -388,10 +427,16 @@ def safe_rate(numerator: int, denominator: int) -> float | None:
 
 
 def derived_rates(bucket: dict[str, Any]) -> dict[str, float | None]:
+    generated_first = int(bucket.get("generated_first", 0))
+    rejected = int(bucket.get("generation_rejected", 0))
     return {
         "generation_completion_rate": safe_rate(
-            int(bucket.get("generated_first", 0)),
+            generated_first,
             int(bucket.get("requested_questions", 0)),
+        ),
+        "generation_rejection_rate": safe_rate(
+            rejected,
+            generated_first + rejected,
         ),
         "shortfall_recovery_rate": safe_rate(
             int(bucket.get("shortfall_generated", 0)),
@@ -400,6 +445,10 @@ def derived_rates(bucket: dict[str, Any]) -> dict[str, float | None]:
         "first_validation_pass_rate": safe_rate(
             int(bucket.get("validation_passed_first", 0)),
             int(bucket.get("validation_total_first", 0)),
+        ),
+        "validation_coverage_rate": safe_rate(
+            int(bucket.get("validation_total_first", 0)),
+            generated_first,
         ),
         "repair_success_rate": safe_rate(
             int(bucket.get("repair_succeeded", 0)),
@@ -418,3 +467,261 @@ def add_derived_rates(bucket: dict[str, Any]) -> dict[str, Any]:
     for qtype, type_bucket in result.get("question_types", {}).items():
         result["question_types"][qtype] = add_derived_rates(type_bucket)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Whole-pipeline outcome telemetry
+#
+# The counters above describe question acceptance.  The functions below derive
+# additional outcome summaries from records the pipeline already produces: the
+# authoritative per-slot lifecycle, the repair/recovery attempt history, the
+# duplicate-repair bookkeeping, and the assessment-catalog cache flags.  They
+# only count recorded decisions; nothing is inferred or estimated.
+# ---------------------------------------------------------------------------
+RECOVERY_ATTEMPT_SUCCESS = frozenset({"accepted", "repaired"})
+_ATTEMPT_OUTCOME_PRIORITY = {
+    "accepted": 6,
+    "repaired": 6,
+    "rejected": 5,
+    "candidate_generation_failed": 4,
+    "strategy_skipped": 3,
+    "validation_pending": 2,
+    "invalid": 1,
+}
+# Canonical Recovery V3 strategy identifiers, mapped from the descriptive
+# strategy recorded in validation repair history.  Unknown identifiers are kept
+# verbatim so no production value is hidden by the dashboard.
+RECOVERY_STRATEGIES = ("REPAIR", "REGENERATE", "SWITCH_VARIATION", "SWITCH_TASK")
+_STRATEGY_ALIASES = {
+    "recovery_v3_targeted_repair": "REPAIR",
+    "recovery_v3_content_repair": "REPAIR",
+    "targeted_repair": "REPAIR",
+    "repair_question": "REPAIR",
+    "recovery_v3_regenerate_assignment": "REGENERATE",
+    "regenerate_missing_slot": "REGENERATE",
+    "recovery_v3_switch_variation": "SWITCH_VARIATION",
+    "switch_variation": "SWITCH_VARIATION",
+    "recovery_v3_switch_assignment": "SWITCH_TASK",
+    "recovery_v3_switch_task": "SWITCH_TASK",
+    "replace_task": "SWITCH_TASK",
+    "switch_task": "SWITCH_TASK",
+    # Historical strategy descriptors recorded before the Recovery V3 naming
+    # was standardized.  They map to the same dispatch strategy.
+    "targeted_followup_repair": "REPAIR",
+    "reconciled_targeted_repair": "REPAIR",
+    "accepted_source_constraint": "REPAIR",
+    "targeted_difficulty_adjustment": "REPAIR",
+    "catalog_replacement": "SWITCH_TASK",
+    "catalog_replacement_after_difficulty": "SWITCH_TASK",
+    "on_demand_completion_replacement": "SWITCH_TASK",
+    "regenerate_original_assignment": "REGENERATE",
+    "regenerate_authorized_alternative_variation": "SWITCH_VARIATION",
+}
+
+
+def recovery_strategy_name(value: Any) -> str:
+    """Map a recorded repair strategy to its canonical Recovery V3 identifier."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "UNKNOWN"
+    mapped = _STRATEGY_ALIASES.get(raw.lower())
+    return mapped or raw
+
+
+def _bump(mapping: dict[str, int], key: Any, count: int = 1) -> None:
+    name = str(key or "unknown")
+    mapping[name] = mapping.get(name, 0) + int(count)
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(int(value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def summarize_repair_attempts(history: Any) -> dict[str, Any]:
+    """Collapse repair history events into one outcome per slot attempt.
+
+    A single attempt can append several events (candidate generated, then
+    rejected/accepted).  Counting events would overstate attempts, so events are
+    grouped by ``(slot, attempt)`` and the strongest recorded outcome wins.
+    """
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    for event in history or []:
+        if not isinstance(event, dict):
+            continue
+        slot_id = str(event.get("slot_id") or event.get("question_id") or "")
+        if not slot_id:
+            continue
+        try:
+            attempt = int(event.get("attempt") or 1)
+        except (TypeError, ValueError):
+            attempt = 1
+        grouped.setdefault((slot_id, attempt), []).append(event)
+
+    outcomes: dict[str, int] = {}
+    strategies: dict[str, int] = {}
+    strategy_details: dict[str, int] = {}
+    strategy_outcomes: dict[str, dict[str, int]] = {}
+    strategy_detail_outcomes: dict[str, dict[str, int]] = {}
+    actions: dict[str, int] = {}
+    failure_codes: dict[str, int] = {}
+    accepted = 0
+    for events in grouped.values():
+        best = max(
+            events,
+            key=lambda item: _ATTEMPT_OUTCOME_PRIORITY.get(
+                str(item.get("status") or "").strip().lower(), 0
+            ),
+        )
+        status = str(best.get("status") or "unknown").strip().lower()
+        if status == "repaired":
+            status = "accepted"
+        _bump(outcomes, status)
+        if status in RECOVERY_ATTEMPT_SUCCESS:
+            accepted += 1
+        strategy_detail = str(
+            best.get("repair_strategy")
+            or next(
+                (
+                    event.get("repair_strategy")
+                    for event in events
+                    if event.get("repair_strategy")
+                ),
+                "",
+            )
+            or "unknown"
+        )
+        _bump(strategy_details, strategy_detail)
+        strategy_name = recovery_strategy_name(strategy_detail)
+        _bump(strategies, strategy_name)
+        _bump(strategy_outcomes.setdefault(strategy_name, {}), status)
+        _bump(
+            strategy_detail_outcomes.setdefault(strategy_detail, {}), status
+        )
+        action = str(
+            best.get("repair_action")
+            or next(
+                (event.get("repair_action") for event in events if event.get("repair_action")),
+                "",
+            )
+            or "unknown"
+        )
+        _bump(actions, action)
+        if status not in RECOVERY_ATTEMPT_SUCCESS:
+            _bump(
+                failure_codes,
+                best.get("new_failure_code")
+                or best.get("failure_code")
+                or "unspecified",
+            )
+    return {
+        "attempts": len(grouped),
+        "accepted": accepted,
+        "outcomes": outcomes,
+        "strategies": strategies,
+        "strategy_details": strategy_details,
+        "strategy_outcomes": strategy_outcomes,
+        "strategy_detail_outcomes": strategy_detail_outcomes,
+        "actions": actions,
+        "failure_codes": failure_codes,
+    }
+
+
+def summarize_recovery_outcomes(
+    slot_lifecycle: Any, repair_history: Any = None
+) -> dict[str, Any]:
+    """Summarize authoritative slot terminal states and recovery attempts."""
+    records = slot_lifecycle if isinstance(slot_lifecycle, dict) else {}
+    terminal_status: dict[str, int] = {}
+    failure_stages: dict[str, int] = {}
+    failure_codes: dict[str, int] = {}
+    slots = 0
+    entered = 0
+    recovered = 0
+    for record in records.values():
+        if not isinstance(record, dict):
+            continue
+        slots += 1
+        status = str(record.get("terminal_status") or "unknown")
+        _bump(terminal_status, status)
+        finalized = status == "finalized"
+        in_recovery = bool(
+            record.get("repaired")
+            or record.get("repair_attempts")
+            or record.get("repair_manifest_status")
+        )
+        if in_recovery:
+            entered += 1
+            if finalized:
+                recovered += 1
+        if finalized:
+            continue
+        _bump(failure_stages, record.get("failure_stage") or "unknown")
+        _bump(failure_codes, record.get("failure_code") or "unknown")
+    repair = summarize_repair_attempts(repair_history)
+    return {
+        "slots": slots,
+        "entered_recovery": entered,
+        "recovered": recovered,
+        "unresolved": max(entered - recovered, 0),
+        "terminal_status": terminal_status,
+        "slot_failure_stages": failure_stages,
+        "slot_failure_codes": failure_codes,
+        "attempts": repair["attempts"],
+        "accepted": repair["accepted"],
+        "attempt_outcomes": repair["outcomes"],
+        "attempt_strategies": repair["strategies"],
+        "attempt_strategy_details": repair["strategy_details"],
+        "attempt_strategy_outcomes": repair["strategy_outcomes"],
+        "attempt_strategy_detail_outcomes": repair["strategy_detail_outcomes"],
+        "attempt_actions": repair["actions"],
+        "attempt_failure_codes": repair["failure_codes"],
+    }
+
+
+def summarize_duplicate_outcomes(result: dict[str, Any]) -> dict[str, Any]:
+    replacements = result.get("duplicate_replacement_attempts") or {}
+    failures = result.get("duplicate_replacement_failures") or {}
+    unresolved = result.get("unresolved_duplicate_conflicts") or []
+    replacement_attempts = 0
+    if isinstance(replacements, dict):
+        replacement_attempts = sum(
+            _nonnegative_int(value) for value in replacements.values()
+        )
+    replacement_failures = 0
+    if isinstance(failures, dict):
+        replacement_failures = sum(
+            len(value) for value in failures.values() if isinstance(value, list)
+        )
+    return {
+        "repair_rounds": _nonnegative_int(result.get("duplicate_repair_rounds")),
+        "replacement_attempts": replacement_attempts,
+        "slots_replaced": len(replacements) if isinstance(replacements, dict) else 0,
+        "replacement_failures": replacement_failures,
+        "unresolved_conflicts": len(unresolved) if isinstance(unresolved, list) else 0,
+    }
+
+
+def summarize_catalog_cache(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "catalog_cache_hit": bool(result.get("assessment_catalog_cache_hit")),
+        "compiler_cache_hit": bool(result.get("assessment_compiler_cache_hit")),
+        "compatibility_cache_hit": bool(
+            result.get("assessment_catalog_compatibility_cache_hit")
+        ),
+    }
+
+
+def summarize_pipeline_outcomes(result: dict[str, Any]) -> dict[str, Any]:
+    """Return the JSON-safe outcome payload persisted with one evaluation run."""
+    if not isinstance(result, dict):
+        return {}
+    return {
+        "recovery": summarize_recovery_outcomes(
+            result.get("slot_lifecycle"), result.get("validation_repair_history")
+        ),
+        "duplicates": summarize_duplicate_outcomes(result),
+        "catalog_cache": summarize_catalog_cache(result),
+    }

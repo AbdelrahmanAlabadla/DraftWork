@@ -1,0 +1,65 @@
+/* Pipeline analytics */
+.stat-strip { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.split-wide { display: grid; grid-template-columns: 1.25fr 1fr; gap: 12px; }
+.strategy-table td:first-child { font-family: var(--code); }
+.coverage-line { color: var(--muted2); font-size: 12.5px; margin-bottom: 12px; }
+.subsection { margin-top: 18px; }
+.subsection h4 {
+  margin: 0 0 8px;
+  color: var(--muted2);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pipeline-note { color: var(--muted2); font-size: 12px; margin-top: 10px; line-height: 1.6; }
+
+@media (max-width: 980px) {
+  .stat-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .split, .split-wide { grid-template-columns: 1fr; }
+}
+@media (max-width: 620px) {
+  .stat-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.qtype-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+.qtype-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+  display: grid;
+  gap: 8px;
+}
+.qtype-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.qtype-card-head h4 { margin: 0; font-size: 14px; font-weight: 650; }
+.qtype-counts { color: var(--muted2); font-size: 12px; }
+.qtype-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; }
+.qtype-metrics div { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+.qtype-metrics span { color: var(--muted2); }
+.qtype-metrics strong { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
+.qtype-reasons {
+  border-top: 1px solid var(--border);
+  padding-top: 7px;
+  color: var(--muted2);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+.qtype-reasons span {
+  display: block;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 10.5px;
+  font-weight: 700;
+}
+@media (max-width: 980px) {
+  .qtype-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 620px) {
+  .qtype-grid { grid-template-columns: 1fr; }
+}

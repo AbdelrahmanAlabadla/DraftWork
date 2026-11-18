@@ -19,6 +19,7 @@ from app import config
 from app import db
 from app.api.export_routes import router as export_router
 from app.api.auth_routes import router as auth_router
+from app.api.evaluation_routes import router as evaluation_router
 from app.api.job_routes import router as job_router
 from app.api.routes import router
 from app.api.session_middleware import SessionMiddleware
@@ -66,6 +67,7 @@ app.include_router(router)
 app.include_router(export_router)
 app.include_router(job_router)
 app.include_router(auth_router)
+app.include_router(evaluation_router)
 
 # Serve the frontend (ES modules require http://, not file://).
 _FRONTEND_DIR = Path(__file__).resolve().parents[2] / "FrontEnd"

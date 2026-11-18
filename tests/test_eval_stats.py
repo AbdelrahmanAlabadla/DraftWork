@@ -4,6 +4,7 @@ import json
 
 from app.online.eval_stats import (
     create_pipeline_eval,
+    derived_rates,
     finalize_pipeline_eval,
     public_eval,
     record_first_validation,
@@ -11,6 +12,11 @@ from app.online.eval_stats import (
     record_initial_generation,
     record_repair_outcome,
     record_shortfall_result,
+    summarize_catalog_cache,
+    summarize_duplicate_outcomes,
+    summarize_pipeline_outcomes,
+    summarize_recovery_outcomes,
+    summarize_repair_attempts,
 )
 
 
@@ -238,3 +244,207 @@ def test_validation_and_final_metrics_separate_unvalidated_and_invalid():
         model["final_unvalidated"],
         model["final_missing"],
     ) == (1, 1, 1, 1)
+
+def test_failure_code_is_preferred_over_generic_action_category():
+    stats = create_pipeline_eval([("mcq", 2)], 1)
+    exam = {"model_number": 1, "questions": {"mcq": [_mcq("q1"), _mcq("q2")]}}
+    report = _report(1, [
+        {**_verdict("q1", "FIX_ANSWER"), "failure_code": "incorrect_result"},
+        {**_verdict("q2", "FIX_QUESTION_AND_ANSWER"), "failure_code": "contradicted"},
+    ])
+    record_first_validation(stats, exam, report)
+    model = public_eval(stats)["models"]["1"]
+    assert model["validation_failure_reasons"] == {
+        "incorrect_result": 1,
+        "contradicted": 1,
+    }
+    assert model["validation_failure_actions"] == {
+        "fix_answer": 1,
+        "fix_question_and_answer": 1,
+    }
+
+
+def test_operational_validation_failures_are_classified_separately():
+    stats = create_pipeline_eval([("mcq", 4)], 1)
+    exam = {"model_number": 1, "questions": {
+        "mcq": [_mcq("blocked"), _mcq("input"), _mcq("error"), _mcq("missing")],
+    }}
+    report = _report(1, [
+        {**_verdict("blocked", "UNVALIDATED"), "validation_status": "VALIDATION_BLOCKED",
+         "block_category": "prerequisite"},
+        {**_verdict("input", "UNVALIDATED"), "validation_status": "INPUT_INVALID"},
+        {**_verdict("error", "UNVALIDATED"), "validation_status": "ERROR"},
+        _verdict("missing", "UNVALIDATED"),
+    ])
+    record_first_validation(stats, exam, report)
+    model = public_eval(stats)["models"]["1"]
+    assert model["validation_unvalidated_first"] == 4
+    assert model["validator_failure_reasons"] == {
+        "prerequisite_validation_block": 1,
+        "input_invalid": 1,
+        "validator_error": 1,
+        "missing_verdict": 1,
+    }
+    # Operational failures never appear as content rejection reasons.
+    assert model["validation_failure_reasons"] == {}
+
+
+def test_derived_rates_include_rejection_and_validation_coverage():
+    rates = derived_rates({
+        "requested_questions": 10,
+        "generated_first": 8,
+        "generation_rejected": 2,
+        "validation_total_first": 6,
+        "validation_passed_first": 3,
+        "repair_sent": 2,
+        "repair_succeeded": 1,
+        "final_valid": 7,
+    })
+    assert rates["generation_rejection_rate"] == round(2 / 10, 4)
+    assert rates["validation_coverage_rate"] == round(6 / 8, 4)
+    assert rates["first_validation_pass_rate"] == 0.5
+    assert rates["repair_success_rate"] == 0.5
+    assert rates["final_success_rate"] == 0.7
+
+
+def _lifecycle(**overrides):
+    record = {
+        "terminal_status": "finalized",
+        "failure_stage": None,
+        "failure_code": None,
+        "repaired": False,
+        "repair_attempts": [],
+        "repair_manifest_status": None,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_recovery_summary_uses_authoritative_slot_lifecycle():
+    lifecycle = {
+        "m1_mcq_1": _lifecycle(),
+        "m1_mcq_2": _lifecycle(repaired=True, repair_manifest_status="candidate_generated"),
+        "m1_mcq_3": _lifecycle(
+            terminal_status="repair_failed",
+            failure_stage="repair",
+            failure_code="recovery_v3_plan_exhausted",
+            repaired=True,
+            repair_manifest_status="terminal_failure",
+        ),
+        "m1_mcq_4": _lifecycle(
+            terminal_status="generation_failed",
+            failure_stage="generation",
+            failure_code="missing_requested_slot",
+        ),
+    }
+    history = [
+        {"slot_id": "m1_mcq_2", "attempt": 1, "status": "rejected",
+         "repair_strategy": "recovery_v3_targeted_repair", "repair_action": "repair_question",
+         "new_failure_code": "incorrect_result"},
+        {"slot_id": "m1_mcq_2", "attempt": 1, "status": "accepted",
+         "repair_strategy": "recovery_v3_targeted_repair", "repair_action": "repair_question"},
+        {"slot_id": "m1_mcq_3", "attempt": 1, "status": "candidate_generation_failed",
+         "repair_strategy": "recovery_v3_switch_assignment", "repair_action": "replace_task",
+         "new_failure_code": "no_valid_source_grounded_replacement"},
+        {"slot_id": "m1_mcq_3", "attempt": 2, "status": "rejected",
+         "repair_strategy": "recovery_v3_switch_variation", "repair_action": "switch_variation",
+         "new_failure_code": "duplicate_question"},
+    ]
+    summary = summarize_recovery_outcomes(lifecycle, history)
+    assert summary["slots"] == 4
+    assert summary["terminal_status"] == {
+        "finalized": 2, "repair_failed": 1, "generation_failed": 1,
+    }
+    assert summary["entered_recovery"] == 2
+    assert summary["recovered"] == 1
+    assert summary["unresolved"] == 1
+    assert summary["slot_failure_codes"] == {
+        "recovery_v3_plan_exhausted": 1, "missing_requested_slot": 1,
+    }
+    assert summary["slot_failure_stages"] == {"repair": 1, "generation": 1}
+    assert summary["attempts"] == 3
+    assert summary["accepted"] == 1
+    assert summary["attempt_outcomes"] == {
+        "accepted": 1, "candidate_generation_failed": 1, "rejected": 1,
+    }
+    assert summary["attempt_strategies"] == {
+        "REPAIR": 1, "SWITCH_TASK": 1, "SWITCH_VARIATION": 1,
+    }
+    assert summary["attempt_strategy_outcomes"]["SWITCH_TASK"] == {
+        "candidate_generation_failed": 1,
+    }
+    assert summary["attempt_failure_codes"] == {
+        "no_valid_source_grounded_replacement": 1, "duplicate_question": 1,
+    }
+
+
+def test_repair_attempt_grouping_prefers_strongest_outcome_per_attempt():
+    summary = summarize_repair_attempts([
+        {"slot_id": "s1", "attempt": 1, "status": "candidate_generated"},
+        {"slot_id": "s1", "attempt": 1, "status": "rejected",
+         "repair_strategy": "targeted_repair", "new_failure_code": "contradicted"},
+    ])
+    assert summary["attempts"] == 1
+    assert summary["outcomes"] == {"rejected": 1}
+    assert summary["strategies"] == {"REPAIR": 1}
+    assert summary["failure_codes"] == {"contradicted": 1}
+
+
+def test_duplicate_and_cache_summaries_only_use_recorded_values():
+    duplicates = summarize_duplicate_outcomes({
+        "duplicate_repair_rounds": 2,
+        "duplicate_replacement_attempts": {"s1": 3, "s2": 1},
+        "duplicate_replacement_failures": {"s1": [{"reason": "x"}]},
+        "unresolved_duplicate_conflicts": [{"question_ids": ["q1", "q2"]}],
+    })
+    assert duplicates == {
+        "repair_rounds": 2,
+        "replacement_attempts": 4,
+        "slots_replaced": 2,
+        "replacement_failures": 1,
+        "unresolved_conflicts": 1,
+    }
+    assert summarize_catalog_cache({}) == {
+        "catalog_cache_hit": False,
+        "compiler_cache_hit": False,
+        "compatibility_cache_hit": False,
+    }
+    assert summarize_catalog_cache({
+        "assessment_catalog_cache_hit": True,
+        "assessment_compiler_cache_hit": False,
+        "assessment_catalog_compatibility_cache_hit": True,
+    }) == {
+        "catalog_cache_hit": True,
+        "compiler_cache_hit": False,
+        "compatibility_cache_hit": True,
+    }
+
+
+def test_pipeline_outcome_payload_is_json_safe_and_separates_failure_maps():
+    summary = summarize_pipeline_outcomes({
+        "slot_lifecycle": {"m1_mcq_1": _lifecycle(repaired=True)},
+        "validation_repair_history": [],
+        "duplicate_repair_rounds": 1,
+    })
+    json.dumps(summary)
+    assert summary["recovery"]["slot_failure_codes"] == {}
+    assert summary["recovery"]["attempt_failure_codes"] == {}
+    assert summary["duplicates"]["repair_rounds"] == 1
+
+def test_repair_attempt_summary_tracks_raw_strategy_outcomes():
+    summary = summarize_repair_attempts([
+        {"slot_id": "s1", "attempt": 1, "status": "accepted",
+         "repair_strategy": "targeted_followup_repair"},
+        {"slot_id": "s2", "attempt": 1, "status": "rejected",
+         "repair_strategy": "targeted_followup_repair", "new_failure_code": "contradicted"},
+        {"slot_id": "s3", "attempt": 1, "status": "accepted",
+         "repair_strategy": "catalog_replacement"},
+    ])
+    assert summary["strategy_outcomes"]["REPAIR"] == {"accepted": 1, "rejected": 1}
+    assert summary["strategy_outcomes"]["SWITCH_TASK"] == {"accepted": 1}
+    assert summary["strategy_detail_outcomes"]["targeted_followup_repair"] == {
+        "accepted": 1, "rejected": 1,
+    }
+    assert summary["strategy_detail_outcomes"]["catalog_replacement"] == {
+        "accepted": 1,
+    }

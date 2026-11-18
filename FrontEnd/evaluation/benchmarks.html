@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Evaluation · Benchmarks — SmartExam AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/evaluation/base.css" />
+  <link rel="stylesheet" href="../css/evaluation/benchmarks.css" />
+</head>
+
+<body class="dash">
+  <header id="dashHeader"></header>
+  <main class="shell">
+    <div class="page-head">
+      <div>
+        <h1>Benchmark Runner</h1>
+        <p>Run controlled evaluations through the production pipeline and compare DraftWork versions. Benchmarks are isolated from ordinary user generation records.</p>
+      </div>
+      <div class="page-head-actions">
+        <a class="btn ghost" href="benchmarks.html" id="newBenchmarkLink">New benchmark</a>
+      </div>
+    </div>
+    <div id="pageBody"></div>
+    <footer class="dash-footer">
+      <span>Benchmark runs make real paid provider calls. Review the cost estimate and confirm before starting.</span>
+      <a href="overview.html" class="muted">← Back to overview</a>
+    </footer>
+  </main>
+  <script type="module" src="../js/evaluation/benchmarks.js"></script>
+</body>
+
+</html>
