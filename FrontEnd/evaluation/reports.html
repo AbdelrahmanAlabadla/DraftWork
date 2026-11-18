@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Evaluation · Exam Reports — SmartExam AI</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="../css/evaluation/base.css" />
+  <link rel="stylesheet" href="../css/evaluation/reports.css" />
+</head>
+
+<body class="dash">
+  <header id="dashHeader"></header>
+  <main class="shell">
+    <div class="page-head">
+      <div id="reportsTitle">
+        <h1>Exam Reports</h1>
+        <p>Inspect the quality, cost and resource usage of every generation run.</p>
+      </div>
+      <div class="page-head-actions" id="reportsControls"></div>
+    </div>
+    <div id="pageBody"></div>
+    <footer class="dash-footer">
+      <span>Only the last 100 reports are shown per page. Historical runs without provider telemetry are labelled.</span>
+      <a href="/evaluation/overview.html" class="muted">← Back to overview</a>
+    </footer>
+  </main>
+  <script type="module" src="../js/evaluation/reports.js"></script>
+</body>
+
+</html>

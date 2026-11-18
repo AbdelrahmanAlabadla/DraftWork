@@ -377,6 +377,15 @@ REQUIRE_IDEMPOTENCY_KEY: bool = _env_bool(
 GENERATION_REQUESTS_PER_MINUTE: int = max(
     1, int(_env("GENERATION_REQUESTS_PER_MINUTE", "2") or "2")
 )
+# Benchmark runs are explicit operator actions and bypass the per-minute user
+# generation limit, but they still honour the active-job limit.
+BENCHMARK_MAX_REPEATS: int = max(
+    1, min(25, int(_env("BENCHMARK_MAX_REPEATS", "10") or "10"))
+)
+# Optional machine credential for the evaluation dashboard.  When configured, a
+# request carrying the matching X-Evaluation-Token header may read evaluation
+# analytics without a Clerk session.  Leave unset to require a signed-in user.
+EVALUATION_DASHBOARD_TOKEN: str | None = _env("EVALUATION_DASHBOARD_TOKEN")
 PARSING_TIMEOUT_SECONDS: int = max(
     1, int(_env("PARSING_TIMEOUT_SECONDS", "120") or "120")
 )

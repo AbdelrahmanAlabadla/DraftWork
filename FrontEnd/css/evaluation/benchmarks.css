@@ -1,0 +1,55 @@
+/* Benchmark runner */
+.bench-layout { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(280px, 1fr); gap: 14px; align-items: start; }
+.bench-fields { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+.bench-fields .field-wide { grid-column: span 2; }
+.count-input { width: 100%; }
+.estimate-card { position: sticky; top: 76px; }
+.estimate-line { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.estimate-line:last-of-type { border-bottom: 0; }
+.estimate-line strong { color: var(--text); font-weight: 650; font-variant-numeric: tabular-nums; }
+.estimate-total { font-size: 28px; font-weight: 700; letter-spacing: -0.6px; margin: 6px 0 2px; color: var(--accent); }
+.bench-list { display: grid; gap: 8px; }
+.bench-item {
+  display: grid;
+  grid-template-columns: minmax(200px, 1.6fr) repeat(4, minmax(70px, 0.7fr)) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  text-decoration: none;
+  color: inherit;
+}
+.bench-item:hover { background: var(--surface2); }
+.bench-item.selected { border-color: var(--accent); }
+.bench-item-title { display: grid; gap: 2px; }
+.bench-item-title strong { font-size: 13.5px; }
+.bench-item-meta { color: var(--muted2); font-size: 11.5px; }
+.bench-item-num { text-align: right; font-variant-numeric: tabular-nums; font-size: 13px; color: var(--muted); }
+.bench-item-num span { display: block; color: var(--muted2); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+.bench-progress { display: grid; gap: 6px; margin-top: 10px; }
+.compare-table td:first-child { color: var(--muted2); }
+.delta-up { color: var(--success); }
+.delta-down { color: var(--danger); }
+.delta-flat { color: var(--muted2); }
+.repro-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.repro-item { background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; }
+.repro-item span { display: block; color: var(--muted2); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; }
+.repro-item strong { font-family: var(--code); font-size: 11.5px; font-weight: 500; word-break: break-all; }
+.confirm-box { display: grid; gap: 8px; margin-top: 14px; }
+
+@media (max-width: 1080px) {
+  .bench-layout { grid-template-columns: 1fr; }
+  .estimate-card { position: static; }
+  .bench-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 720px) {
+  .bench-item { grid-template-columns: 1fr 1fr; }
+  .bench-item-num:nth-child(n+5) { display: none; }
+  .repro-grid { grid-template-columns: 1fr; }
+}
+@media (max-width: 620px) {
+  .bench-fields { grid-template-columns: 1fr; }
+  .bench-fields .field-wide { grid-column: span 1; }
+}

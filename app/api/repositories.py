@@ -393,6 +393,7 @@ def create_generation_job(
     *, session_id: str, document_id: str, request_data: dict[str, Any],
     user_id: str | None = None,
     idempotency_key: str | None = None, request_hash: str | None = None,
+    benchmark: bool = False,
 ) -> dict[str, Any]:
     job_id = str(uuid.uuid4())
     exam_id = f"exam_{uuid.uuid4().hex[:12]}"
@@ -470,7 +471,7 @@ def create_generation_job(
                 (session_id,),
             )
             recent = cursor.fetchall()
-            if len(recent) >= config.GENERATION_REQUESTS_PER_MINUTE:
+            if not benchmark and len(recent) >= config.GENERATION_REQUESTS_PER_MINUTE:
                 oldest = recent[0]["created_at"]
                 retry_after = int(max(1, 60 - (now - oldest).total_seconds()))
                 raise GenerationRateLimitExceeded(retry_after)

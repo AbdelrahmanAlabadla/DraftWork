@@ -54,3 +54,70 @@ def test_evaluation_row_combines_models_and_preserves_question_types():
     assert "rates" not in row["model_performance"]["1"]
     assert "final_missing_or_invalid" not in row["model_performance"]["1"]
     assert "final_missing_or_invalid" not in row
+
+
+def test_evaluation_row_records_extended_outcome_telemetry():
+    stats = _bucket(10, 9)
+    stats["question_types"] = {"mcq": _bucket(10, 9)}
+    outcomes = {
+        "recovery": {"slots": 10, "entered_recovery": 2, "recovered": 1, "unresolved": 1},
+        "duplicates": {"repair_rounds": 1, "unresolved_conflicts": 0},
+        "catalog_cache": {"catalog_cache_hit": True, "compiler_cache_hit": False,
+                          "compatibility_cache_hit": True},
+    }
+    row = evaluation_row(
+        "exam_extended",
+        {"overall": stats, "models": {}},
+        1,
+        10,
+        job_id="11111111-1111-1111-1111-111111111111",
+        duration_ms=12345,
+        outcomes=outcomes,
+        benchmark_id=None,
+    )
+    assert row["job_id"] == "11111111-1111-1111-1111-111111111111"
+    assert row["duration_ms"] == 12345
+    assert row["recovery_outcomes"] == outcomes["recovery"]
+    assert row["duplicate_outcomes"] == outcomes["duplicates"]
+    assert row["catalog_cache"] == outcomes["catalog_cache"]
+    assert row["benchmark_id"] is None
+    assert row["validation_failure_actions"] == {}
+    assert row["status"] in {"healthy", "needs_attention"}
+
+
+def test_evaluation_row_supports_terminal_failure_status_override():
+    empty = {
+        "overall": {"requested_questions": 12, "final_missing": 12},
+        "models": {},
+    }
+    row = evaluation_row(
+        "exam_failed",
+        empty,
+        1,
+        12,
+        status_override="failed",
+        failure_code="TIMEOUT",
+        failure_message="Generation exceeded its configured time limit",
+        duration_ms=9000,
+    )
+    assert row["status"] == "failed"
+    assert row["failure_code"] == "TIMEOUT"
+    assert row["final_missing"] == 12
+    assert row["final_valid"] == 0
+    assert "final_missing_or_invalid" not in row
+
+    cancelled = evaluation_row(
+        "exam_cancelled", empty, 1, 12, status_override="cancelled",
+    )
+    assert cancelled["status"] == "cancelled"
+
+
+def test_evaluation_row_keeps_legacy_payloads_backwards_compatible():
+    row = evaluation_row("exam_legacy", {"overall": _bucket(20, 20)}, 1, 20)
+    assert row["job_id"] is None
+    assert row["duration_ms"] is None
+    assert row["recovery_outcomes"] == {}
+    assert row["duplicate_outcomes"] == {}
+    assert row["catalog_cache"] == {}
+    assert row["failure_code"] is None
+    assert row["status"] == "healthy"

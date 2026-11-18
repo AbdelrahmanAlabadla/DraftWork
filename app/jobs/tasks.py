@@ -27,6 +27,7 @@ from app.online.exam_builder import (
     generate_exams, immutable_exam_request, request_fingerprint,
 )
 from app.online.assessment_catalog import CatalogCompilationCancelled
+from app.online.eval_stats import summarize_pipeline_outcomes
 from app.metrics import increment, observe
 from app.online.diagnostics import record_optional_failure
 
@@ -178,6 +179,12 @@ class TrackedJobTask(Task):
                         _public_error_message(exc, "Background job"),
                         claim_generation=int(generation),
                     )
+                    _record_terminal_evaluation(
+                        str(args[0]),
+                        status="failed",
+                        error_code=_error_code(exc),
+                        error_message=_public_error_message(exc, "Background job"),
+                    )
             except Exception:
                 logger.exception("Could not persist task failure | task_id=%s", task_id)
         super().on_failure(exc, task_id, args, kwargs, einfo)
@@ -227,6 +234,51 @@ def _complete_generation_with_transient_retry(*args, **kwargs) -> bool:
                 raise
             time.sleep(1 << attempt)
     raise AssertionError("unreachable")
+
+
+def _record_terminal_evaluation(
+    job_id: str,
+    *,
+    status: str,
+    error_code: str | None = None,
+    error_message: str | None = None,
+    duration_ms: int | None = None,
+) -> None:
+    """Persist a failed or cancelled run so evaluation reliability is measurable.
+
+    This is deliberately best-effort: telemetry must never change the outcome of
+    a generation job or mask its original error.
+    """
+    try:
+        job = repositories.get_job(job_id)
+        if not job or job.get("type") != "exam_generation":
+            return
+        request_data = dict(job.get("request_data") or {})
+        exam_id = str(request_data.get("exam_id") or "") or str(
+            repositories.get_exam_id_for_job(job_id) or ""
+        )
+        if not exam_id:
+            return
+        tasks = [tuple(item) for item in request_data.get("tasks") or []]
+        per_model = sum(int(count) for _qtype, count in tasks)
+        evaluation_store.save_terminal_failure(
+            exam_id=exam_id,
+            models_count=int(request_data.get("num_models") or 1),
+            questions_requested_per_model=per_model,
+            status=status,
+            job_id=job_id,
+            duration_ms=duration_ms,
+            failure_code=error_code,
+            failure_message=error_message,
+            benchmark_id=request_data.get("benchmark_id"),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Terminal evaluation telemetry was not saved | job_id=%s | error=%s: %s",
+            job_id,
+            type(exc).__name__,
+            exc,
+        )
 
 
 def _public_error_message(exc: BaseException, operation: str) -> str:
@@ -460,10 +512,18 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
     )
     if not exam_id:
         repositories.fail_job(job_id, "EXAM_NOT_FOUND", "Pre-created exam record is missing", claim_generation=claim_generation)
+        _record_terminal_evaluation(
+            job_id, status="failed", error_code="EXAM_NOT_FOUND",
+            error_message="Pre-created exam record is missing",
+        )
         return {"job_id": job_id, "status": "failed"}
     document = repositories.get_document(str(job["document_id"]))
     if document is None:
         repositories.fail_job(job_id, "DOCUMENT_NOT_FOUND", "Document record is missing", claim_generation=claim_generation)
+        _record_terminal_evaluation(
+            job_id, status="failed", error_code="DOCUMENT_NOT_FOUND",
+            error_message="Document record is missing",
+        )
         return {"job_id": job_id, "status": "failed"}
     set_job_context(job_id, str(document["id"]), exam_id=exam_id)
 
@@ -558,6 +618,11 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                 )
         if repositories.job_is_cancelled(job_id, claim_generation=claim_generation):
             increment("genexam_jobs", type="exam_generation", status="cancelled")
+            _record_terminal_evaluation(
+                job_id, status="cancelled", error_code="CANCELLED",
+                error_message="Generation was cancelled after generation",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             return {"job_id": job_id, "status": "cancelled"}
         exams = result.get("exams") or []
         accepted_count = _accepted_question_count(result)
@@ -585,6 +650,8 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             )
         metadata = dict(request_data.get("metadata") or {})
         metadata["document_language"] = result.get("document_language") or "en"
+        if request_data.get("benchmark_id"):
+            metadata["benchmark_id"] = str(request_data["benchmark_id"])
         metadata["quality_summary"] = dict(result.get("quality_summary") or {})
         metadata["duplicate_quality"] = dict(result.get("duplicate_quality") or {})
         metadata["original_request"] = {
@@ -672,6 +739,11 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         )
         if completed is False:
             increment("genexam_jobs", type="exam_generation", status="cancelled")
+            _record_terminal_evaluation(
+                job_id, status="cancelled", error_code="CANCELLED",
+                error_message="Generation was cancelled before persistence",
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             return {"job_id": job_id, "status": "cancelled"}
         try:
             evaluation_store.save_evaluation(
@@ -679,6 +751,10 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
                 eval_stats=dict(result.get("eval") or {}),
                 models_count=int(request_data["num_models"]),
                 questions_requested_per_model=sum(int(count) for _, count in tasks),
+                job_id=job_id,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                outcomes=summarize_pipeline_outcomes(result),
+                benchmark_id=request_data.get("benchmark_id"),
             )
         except Exception as exc:
             logger.warning("Evaluation telemetry was not saved | exam_id=%s | error=%s", exam_id, exc)
@@ -702,9 +778,19 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         }
     except (CatalogCompilationCancelled, PipelineCancelled):
         increment("genexam_jobs", type="exam_generation", status="cancelled")
+        _record_terminal_evaluation(
+            job_id, status="cancelled", error_code="CANCELLED",
+            error_message="Generation was cancelled",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         return {"job_id": job_id, "status": "cancelled"}
     except (DeadlineExceeded, SoftTimeLimitExceeded) as exc:
         repositories.fail_job(job_id, "TIMEOUT", "Generation exceeded its configured time limit", claim_generation=claim_generation)
+        _record_terminal_evaluation(
+            job_id, status="failed", error_code="TIMEOUT",
+            error_message="Generation exceeded its configured time limit",
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         increment("genexam_jobs", type="exam_generation", status="failed")
         raise exc
     except (repositories.StaleJobExecution, repositories.StaleCheckpoint):
@@ -714,6 +800,11 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
         repositories.fail_job(
             job_id, "CHECKPOINT_INCOMPATIBLE", str(exc),
             claim_generation=claim_generation,
+        )
+        _record_terminal_evaluation(
+            job_id, status="failed", error_code="CHECKPOINT_INCOMPATIBLE",
+            error_message=str(exc),
+            duration_ms=int((time.perf_counter() - started) * 1000),
         )
         return {"job_id": job_id, "status": "failed"}
     except Exception as exc:
@@ -727,6 +818,11 @@ def generate_exam(self: Task, job_id: str) -> dict[str, Any]:
             increment("genexam_jobs", type="exam_generation", status="retrying")
             raise self.retry(exc=exc, countdown=15)
         repositories.fail_job(job_id, _error_code(exc), _public_error_message(exc, "Exam generation"), claim_generation=claim_generation)
+        _record_terminal_evaluation(
+            job_id, status="failed", error_code=_error_code(exc),
+            error_message=_public_error_message(exc, "Exam generation"),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         increment("genexam_jobs", type="exam_generation", status="failed")
         return {"job_id": job_id, "status": "failed"}
 
